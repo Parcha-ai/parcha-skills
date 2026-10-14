@@ -163,6 +163,7 @@ class _LocatedUpload(LogicalEvidenceUpload):
     # or parent-sized Python list survives alongside the immutable upload.
     body_locators: _LocatorSpool | None = None
     inline_document_ids: tuple[str, ...] = ()
+    append_base_manifest_id: str | None = None
 
 
 def _close_body_locators(upload):
@@ -361,6 +362,7 @@ class CanonicalLogicalEvidenceProjector:
         ),
         retention_profile: str = "conversation-useful-v1",
         cursor_fetch_rows: int = 10_000,
+        append_enabled: bool = False,
     ) -> None:
         if bound_tenant_id is not None and (
             not isinstance(bound_tenant_id, str)
@@ -392,6 +394,9 @@ class CanonicalLogicalEvidenceProjector:
         self.excluded_structural_types = excluded_structural_types
         self.retention_profile = retention_profile
         self.cursor_fetch_rows = cursor_fetch_rows
+        if type(append_enabled) is not bool:
+            raise LogicalEvidenceError("logical_evidence_budget_invalid")
+        self.append_enabled = append_enabled
         self._committed_body_keys: dict[tuple[str, str, str], None] = {}
         self._prefer_recent_admission = False
 
@@ -530,8 +535,8 @@ class CanonicalLogicalEvidenceProjector:
                 actor_links=attributed,
             )
 
-    def _record_stream(self, cursor: Any, *, locate=None):
-        next_ordinal = 0
+    def _record_stream(self, cursor: Any, *, locate=None, start_ordinal=0):
+        next_ordinal = start_ordinal
         for row in cursor:
             _validate_source_body(row)
             text = row["event_text"]
@@ -881,10 +886,17 @@ class CanonicalLogicalEvidenceProjector:
             pins: dict[int, dict[str, Any]] = {}
             pinned_parts: dict[int, list[dict[str, Any]]] = {}
             recovered: set[int] = set()
+            append_ordinals: set[int] = set()
+            append_candidate = (self.append_enabled and len(candidates) == 1
+                                and self.excluded_structural_types == DEFAULT_EXCLUDED_STRUCTURAL_TYPES)
             with self.store.connect() as connection:
                 existing_parts: dict[int, list[dict[str, Any]]] = {}
+                append_columns = ",to_jsonb(append_queue) AS append_queue" if append_candidate else ""
+                append_join = ("LEFT JOIN canonical_evidence_document_queue append_queue "
+                    "ON append_queue.tenant_id=evidence.tenant_id AND append_queue.source_id=evidence.source_id "
+                    "AND append_queue.native_parent_id=evidence.native_parent_id") if append_candidate else ""
                 part_rows = connection.execute(
-                    """WITH selected(
+                    f"""WITH selected(
                            candidate_ordinal,tenant_id,source_id,
                            native_parent_id
                        ) AS MATERIALIZED (
@@ -893,7 +905,7 @@ class CanonicalLogicalEvidenceProjector:
                            )
                        )
                        SELECT selected.candidate_ordinal,part.*,
-                              to_jsonb(evidence) AS manifest
+                              to_jsonb(evidence) AS manifest{append_columns}
                          FROM selected
                          JOIN canonical_evidence_documents evidence
                            ON evidence.tenant_id=selected.tenant_id
@@ -906,6 +918,7 @@ class CanonicalLogicalEvidenceProjector:
                           AND part.logical_document_id
                               =evidence.logical_document_id
                           AND part.revision=evidence.revision
+                         {append_join}
                         ORDER BY selected.candidate_ordinal,
                                  part.part_ordinal""",
                     (
@@ -918,6 +931,10 @@ class CanonicalLogicalEvidenceProjector:
                 for row in part_rows:
                     ordinal = int(row["candidate_ordinal"])
                     pins[ordinal] = row["manifest"]
+                    if append_candidate:
+                        from .logical_append_reader import eligible
+                        if eligible(candidates[ordinal], row["manifest"], row.get("append_queue")):
+                            append_ordinals.add(ordinal)
                     pinned_parts.setdefault(ordinal, []).append(row)
                     existing_parts.setdefault(
                         int(row["candidate_ordinal"]),
@@ -944,6 +961,34 @@ class CanonicalLogicalEvidenceProjector:
                         [candidate.source_id for candidate in candidates],
                         [candidate.native_parent_id for candidate in candidates],
                     )
+                if append_ordinals:
+                    # Preserve the original NULL-position race guards without
+                    # hydrating prefix bodies, chunks or raw event payloads.
+                    prefix_locations = body_locators[0] = _LocatorSpool(complete_metadata=True)
+                    with connection.cursor(name="logical_append_null_locator_stream") as null_cursor:
+                        null_cursor.itersize = self.cursor_fetch_rows
+                        null_cursor.execute("""SELECT document.document_id,document.event_id,document.native_id,
+                                document.revision,document.text_sha256
+                            FROM canonical_events event JOIN canonical_documents document
+                              ON document.tenant_id=event.tenant_id AND document.source_id=event.source_id
+                             AND document.event_id=event.event_id
+                            WHERE event.tenant_id=%s AND event.source_id=%s
+                              AND COALESCE(event.native_parent_id,event.native_id)=%s
+                              AND event.source_ordinal<=%s AND document.is_current
+                              AND document.deleted_at IS NULL
+                              AND document.body_record_ordinal IS NULL AND document.body_record_count IS NULL
+                            ORDER BY event.source_ordinal,event.occurred_at,event.native_id""",
+                            (candidates[0].tenant_id, candidates[0].source_id, candidates[0].native_parent_id,
+                             pins[0]["append_source_ordinal"]))
+                        next_null_check = time.monotonic() + PROJECTION_PROGRESS_INTERVAL_SECONDS
+                        for row in null_cursor:
+                            if require_current_queue and time.monotonic() >= next_null_check:
+                                self._check_candidate_current(candidates[0], connection=connection)
+                                next_null_check = time.monotonic() + PROJECTION_PROGRESS_INTERVAL_SECONDS
+                            prefix_locations.append((row["document_id"],row["event_id"],row["native_id"],
+                                row["revision"],row["text_sha256"],None,None))
+                append_filter = " WHERE event.source_ordinal>%s" if append_ordinals else ""
+                append_values = (pins[0]["append_source_ordinal"],) if append_ordinals else ()
                 with connection.cursor(
                     name="logical_evidence_batch_stream",
                 ) as cursor:
@@ -1075,9 +1120,9 @@ class CanonicalLogicalEvidenceProjector:
                                          AND binding.source_id=event.source_id
                                 ) link
                          ) attributed ON true"""
-                        f""" ORDER BY {parent_order}
+                        f""" {append_filter} ORDER BY {parent_order}
                           byte_start,event.occurred_at,event.native_id""",
-                        (*parent_values, OVERSIZED_MEDIA_TYPE),
+                        (*parent_values, OVERSIZED_MEDIA_TYPE, *append_values),
                     )
                     previous_ordinal = -1
                     next_stream_check = time.monotonic() + PROJECTION_PROGRESS_INTERVAL_SECONDS
@@ -1100,6 +1145,8 @@ class CanonicalLogicalEvidenceProjector:
                             # accepted as input from another process or source.
                             pickle.dump(dict(row), input_spool, protocol=5)
                         input_ranges.append((ordinal, start, input_spool.tell()))
+                if append_ordinals and not input_ranges:
+                    input_ranges.append((0, input_spool.tell(), input_spool.tell()))
             # Worker-only checkpoint: direct corpus audits can prepare groups
             # without queued work. Stop obsolete workers before archive reads,
             # re-encoding or uploads; the final commit CAS remains authoritative.
@@ -1154,12 +1201,15 @@ class CanonicalLogicalEvidenceProjector:
                         locations.finish()
 
                 final_start = spool.tell()
-                locations = body_locators[ordinal] = _LocatorSpool(
-                    complete_metadata=True
-                )
+                locations = body_locators.get(ordinal)
+                if locations is None:
+                    locations = body_locators[ordinal] = _LocatorSpool(complete_metadata=True)
+                if ordinal in append_ordinals:
+                    locations.append_source_ordinal = pins[ordinal]["append_source_ordinal"]
                 try:
                     for record in self._record_stream(
-                        resolved_rows(), locate=locations.locate
+                        resolved_rows(), locate=locations.locate,
+                        **({"start_ordinal": pins[ordinal]["record_count"]} if ordinal in append_ordinals else {}),
                     ):
                         if checkpoint is not None:
                             checkpoint()
@@ -1171,13 +1221,13 @@ class CanonicalLogicalEvidenceProjector:
                         lookup.close()
                 inline_document_ids[ordinal] = tuple(inline_ids)
                 ranges.append((ordinal, final_start, spool.tell()))
-            if recovered:
-                self._check_recovery_pins(candidates, pins, recovered)
+            if recovered or append_ordinals:
+                self._check_recovery_pins(candidates, pins, recovered | append_ordinals)
             # No upload starts until every source row in this shard has
             # passed its document and chunk hashes. The SQL cursor and pool
             # connection are released before publishing the validated data.
             for ordinal, start, end in ranges:
-                if start == end:
+                if start == end and ordinal not in append_ordinals:
                     body_locators[ordinal].close()
                     continue
                 candidate = candidates[ordinal]
@@ -1190,6 +1240,11 @@ class CanonicalLogicalEvidenceProjector:
                             verify_canonical=False,
                         )
 
+                prefix = None
+                if ordinal in append_ordinals:
+                    from .logical_append_reader import from_catalog
+                    prefix = from_catalog(candidate, pins[ordinal], pinned_parts[ordinal],
+                        reference=self._reference, timestamp=_timestamp, retention_profile=self.retention_profile)
                 upload = self.projection.put_records(
                     tenant_id=candidate.tenant_id,
                     source_id=candidate.source_id,
@@ -1199,10 +1254,12 @@ class CanonicalLogicalEvidenceProjector:
                     retention_profile=self.retention_profile,
                     existing_part_references=tuple(existing_parts.get(ordinal, ())),
                     on_failed_upload=self._schedule_cleanup,
+                    **({"prefix": prefix, "prefix_checkpoint": checkpoint} if prefix is not None else {}),
                 )
                 upload = _LocatedUpload(
                     **vars(upload), body_locators=body_locators[ordinal],
                     inline_document_ids=inline_document_ids[ordinal],
+                    append_base_manifest_id=(prefix.manifest_reference["artifact_id"] if prefix else None),
                 )
                 uploads[ordinal] = upload
                 completed.append(upload)
@@ -1707,6 +1764,9 @@ class CanonicalLogicalEvidenceProjector:
                     ):
                         return "adopted"
                     return "stale"
+                append_base = getattr(upload, "append_base_manifest_id", None)
+                if append_base is not None and (current is None or current["manifest_artifact_id"] != append_base):
+                    return "stale"
                 locator_changes = self._publish_body_locators(connection, candidate, getattr(upload, "body_locators", None))
                 old_manifest, old_parts = self._old_references(
                     connection,
@@ -1796,8 +1856,12 @@ class CanonicalLogicalEvidenceProjector:
                     capability = deleted.fetchone()
                     if capability and capability.get("append_capability"):
                         from .logical_append_capability import record_frontier
-                        record_frontier(connection, candidate, getattr(upload, "body_locators", None),
-                                        restored_manifest["artifact_id"])
+                        record_frontier(
+                            connection, candidate,
+                            getattr(upload, "body_locators", None)
+                            if self.excluded_structural_types == DEFAULT_EXCLUDED_STRUCTURAL_TYPES else None,
+                            restored_manifest["artifact_id"],
+                        )
                     from .retirement_policy import enroll_published_parent
                     enroll_published_parent(self.store, connection,
                         (candidate.tenant_id, candidate.source_id, candidate.native_parent_id))
@@ -2065,8 +2129,12 @@ class CanonicalLogicalEvidenceProjector:
                 capability = deleted.fetchone()
                 if capability and capability.get("append_capability"):
                     from .logical_append_capability import record_frontier
-                    record_frontier(connection, candidate, getattr(upload, "body_locators", None),
-                                    manifest_reference["artifact_id"])
+                    record_frontier(
+                        connection, candidate,
+                        getattr(upload, "body_locators", None)
+                        if self.excluded_structural_types == DEFAULT_EXCLUDED_STRUCTURAL_TYPES else None,
+                        manifest_reference["artifact_id"],
+                    )
                 from .retirement_policy import enroll_published_parent
                 enroll_published_parent(self.store, connection,
                     (candidate.tenant_id, candidate.source_id, candidate.native_parent_id))
