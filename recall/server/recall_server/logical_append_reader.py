@@ -39,6 +39,32 @@ def eligible(candidate, manifest, queued):
     )
 
 
+def continues_snapshot(candidate, manifest, queued):
+    """A later queue may extend, but never invalidate, this captured append."""
+    if not manifest or not queued:
+        return False
+    generation, changed = queued.get("generation"), queued.get("changed_at")
+    return (
+        type(generation) is int
+        and generation > candidate.generation
+        and isinstance(changed, str)
+        and datetime.fromisoformat(changed) >= candidate.source_updated_at
+        and queued.get("reason") == "ingest"
+        and queued.get("append_generation") == generation
+        and queued.get("append_base_manifest_id")
+        == manifest.get("manifest_artifact_id")
+        and manifest.get("append_manifest_id") == manifest.get("manifest_artifact_id")
+        and type(manifest.get("append_source_ordinal")) is int
+        and manifest.get("revision") == candidate.revision - 1
+        and (
+            manifest.get("tenant_id"),
+            manifest.get("source_id"),
+            manifest.get("native_parent_id"),
+        )
+        == (candidate.tenant_id, candidate.source_id, candidate.native_parent_id)
+    )
+
+
 def from_catalog(
     candidate, manifest, parts, *, reference, timestamp, retention_profile
 ):
