@@ -23,6 +23,7 @@ __all__ = [
 
 
 PASSAGE_CONTRACT = "recall.lossless-message-passage.v4:actor-aware"
+PROVENANCE_PASSAGE_CONTRACT = "recall.lossless-message-passage.v5:native-provenance"
 PASSAGE_SEPARATOR = "\n"
 # H2-a contextual header: embedding input only, never part of the passage
 # text, spans, receipts, text_sha256, or passage id.
@@ -118,7 +119,7 @@ class PassagePolicy:
 
     def __post_init__(self) -> None:
         if (
-            self.contract != PASSAGE_CONTRACT
+            self.contract not in {PASSAGE_CONTRACT, PROVENANCE_PASSAGE_CONTRACT}
             or isinstance(self.target_tokens, bool)
             or not isinstance(self.target_tokens, int)
             or not 4 <= self.target_tokens <= 8192
@@ -142,6 +143,10 @@ class PassagePolicy:
 DEFAULT_PASSAGE_POLICY = PassagePolicy(
     target_tokens=1024,
     overlap_tokens=128,
+)
+
+PROVENANCE_PASSAGE_POLICY = PassagePolicy(
+    target_tokens=1024, overlap_tokens=128, contract=PROVENANCE_PASSAGE_CONTRACT,
 )
 
 
@@ -202,6 +207,64 @@ class PassageSpan:
     source_byte_end: int
     passage_byte_start: int
     passage_byte_end: int
+
+
+@dataclass(frozen=True)
+class NativeMessageProvenance:
+    native_session_id: str | None
+    fork_parent_session_id: str | None
+    native_message_id: str | None
+    record_type: str | None
+    serialized_at: str
+    visible_text_sha256: str
+    # Source serialization time is not proof of original authoring time.
+    original_occurred_at: None = None
+    contract: str = PROVENANCE_PASSAGE_CONTRACT
+
+    def validate(self) -> None:
+        if (
+            self.contract != PROVENANCE_PASSAGE_CONTRACT
+            or self.original_occurred_at is not None
+            or not isinstance(self.visible_text_sha256, str)
+            or len(self.visible_text_sha256) != 64
+            or any(character not in "0123456789abcdef" for character in self.visible_text_sha256)
+            or any(identity is not None and _native_id(identity) != identity for identity in (
+                self.native_session_id, self.fork_parent_session_id,
+                self.native_message_id, self.record_type,
+            ))
+            or (self.fork_parent_session_id is not None and (
+                self.native_session_id is None or self.fork_parent_session_id == self.native_session_id
+            ))
+            or not isinstance(self.serialized_at, str)
+            or len(self.serialized_at) > 64
+        ):
+            raise ValueError("passage native provenance is invalid")
+        try:
+            parsed = datetime.fromisoformat(self.serialized_at.replace("Z", "+00:00"))
+        except ValueError:
+            raise ValueError("passage native provenance time is invalid") from None
+        if parsed.tzinfo is None:
+            raise ValueError("passage native provenance time is invalid")
+
+
+@dataclass(frozen=True, kw_only=True)
+class ProvenancePassageMessage(PassageMessage):
+    provenance: NativeMessageProvenance
+
+    def validate(self) -> None:
+        super().validate()
+        value = self.provenance
+        if not isinstance(value, NativeMessageProvenance):
+            raise ValueError("passage native provenance is invalid")
+        value.validate()
+        if (value.visible_text_sha256 != hashlib.sha256(self.text.encode()).hexdigest()
+                or value.serialized_at != self.occurred_at):
+            raise ValueError("passage native provenance does not match message")
+
+
+@dataclass(frozen=True, kw_only=True)
+class ProvenancePassageSpan(PassageSpan):
+    provenance: NativeMessageProvenance
 
 
 @dataclass(frozen=True)
@@ -307,8 +370,11 @@ def _spans(tokens: list[_Token], messages: tuple[PassageMessage, ...]) -> tuple[
         if index:
             passage_offset += len(separator_bytes)
         span_size = source_end - source_start
+        message = messages[message_index]
+        span_class = ProvenancePassageSpan if isinstance(message, ProvenancePassageMessage) else PassageSpan
+        provenance = {"provenance": message.provenance} if isinstance(message, ProvenancePassageMessage) else {}
         spans.append(
-            PassageSpan(
+            span_class(
                 message_index=message_index,
                 record_ordinal=messages[message_index].record_ordinal,
                 record_count=messages[message_index].record_count,
@@ -316,6 +382,7 @@ def _spans(tokens: list[_Token], messages: tuple[PassageMessage, ...]) -> tuple[
                 source_byte_end=source_end,
                 passage_byte_start=passage_offset,
                 passage_byte_end=passage_offset + span_size,
+                **provenance,
             )
         )
         passage_offset += span_size
@@ -524,6 +591,8 @@ def build_passages(
         if not isinstance(message, PassageMessage):
             raise ValueError("lossless passage message is invalid")
         message.validate()
+        if isinstance(message, ProvenancePassageMessage) != (policy.contract == PROVENANCE_PASSAGE_CONTRACT):
+            raise ValueError("passage provenance requires its explicit policy")
     if any(
         following.record_ordinal
         < prior.record_ordinal + prior.record_count
@@ -697,11 +766,72 @@ def _typed_communication_message(event_kind: str, text: str) -> bool:
     )
 
 
+def _without_hidden(value: object) -> object:
+    """Exclude explicit hidden structures without truncating visible nesting."""
+    result: list[object] = [None]
+    pending = [(result, 0, value)]
+    while pending:
+        parent, key, item = pending.pop()
+        if isinstance(item, dict):
+            if (item.get("type") in ("reasoning", "agent_reasoning", "thinking", "redacted_thinking")
+                    or item.get("channel") == "analysis"):
+                parent[key] = None
+                continue
+            copied = {}
+            parent[key] = copied
+            pending.extend((copied, name, child) for name, child in item.items())
+        elif isinstance(item, list):
+            copied_list = [None] * len(item)
+            parent[key] = copied_list
+            pending.extend((copied_list, index, child) for index, child in enumerate(item))
+        else:
+            parent[key] = item
+    return result[0]
+
+
+def _native_id(value: object) -> str | None:
+    return value if isinstance(value, str) and 0 < len(value) <= 512 and IDENTITY_RE.fullmatch(value) else None
+
+
+def _native_content(text: str) -> dict:
+    try:
+        value = orjson.loads(text)
+    except orjson.JSONDecodeError:
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _native_session(content: dict) -> tuple[str | None, str | None]:
+    """Only the document's first explicit session header establishes lineage."""
+    payload = content.get("payload")
+    if content.get("type") != "session_meta" or not isinstance(payload, dict):
+        return None, None
+    session_id = _native_id(payload.get("id"))
+    source = payload.get("source")
+    subagent = source.get("subagent") if isinstance(source, dict) else None
+    spawn = subagent.get("thread_spawn") if isinstance(subagent, dict) else None
+    parents = [payload[key] for key in ("forked_from_id", "parent_thread_id") if key in payload]
+    if isinstance(spawn, dict) and "parent_thread_id" in spawn:
+        parents.append(spawn["parent_thread_id"])
+    valid = [_native_id(value) for value in parents]
+    parent = valid[0] if valid and all(value == valid[0] for value in valid) else None
+    if not session_id or parent == session_id:
+        parent = None
+    return session_id, parent
+
+
 def visible_messages(
     records: Iterable[LogicalEvidenceRecord],
+    *,
+    policy: PassagePolicy = DEFAULT_PASSAGE_POLICY,
 ) -> tuple[PassageMessage, ...]:
     """Combine physical segments into exact visible source messages."""
 
+    if not isinstance(policy, PassagePolicy):
+        raise ValueError("passage policy is invalid")
+    with_provenance = policy.contract == PROVENANCE_PASSAGE_CONTRACT
+    native_session_id = fork_parent_id = None
+    lineage_conflict = False
     values = iter(records)
     messages: list[PassageMessage] = []
     expected_ordinal = 0
@@ -733,6 +863,16 @@ def visible_messages(
             group.append(continuation)
         expected_ordinal += len(group)
         source_text = "".join(record.text for record in group)
+        content = _native_content(source_text) if with_provenance else {}
+        if with_provenance and content.get("type") == "session_meta":
+            identity = _native_session(content)
+            if first.ordinal == 0:
+                native_session_id, fork_parent_id = identity
+            elif identity != (native_session_id, fork_parent_id):
+                lineage_conflict = True
+        payload = content.get("payload")
+        if not isinstance(payload, dict):
+            payload = {}
         dense_roles = first.roles
         if not dense_roles and (
             any(link.relation == "author" for link in first.actor_links)
@@ -747,7 +887,11 @@ def visible_messages(
             or not set(dense_roles) <= VISIBLE_DENSE_ROLES
         ):
             continue
-        text = visible_message_text(source_text)
+        visible_source = (
+            json.dumps(_without_hidden(content), ensure_ascii=False)
+            if with_provenance and content else source_text
+        )
+        text = visible_message_text(visible_source)
         if text is None:
             continue
         message = PassageMessage(
@@ -759,6 +903,29 @@ def visible_messages(
             text=text,
             actor_links=first.actor_links,
         )
+        if with_provenance:
+            message = ProvenancePassageMessage(
+                **{field: getattr(message, field) for field in PassageMessage.__dataclass_fields__},
+                provenance=NativeMessageProvenance(
+                    native_session_id=native_session_id,
+                    fork_parent_session_id=fork_parent_id,
+                    native_message_id=(
+                        _native_id(payload.get("id"))
+                        if content.get("type") == "response_item" and payload.get("type") == "message"
+                        else None
+                    ),
+                    record_type=_native_id(content.get("type")),
+                    serialized_at=first.occurred_at,
+                    visible_text_sha256=hashlib.sha256(text.encode()).hexdigest(),
+                ),
+            )
         message.validate()
         messages.append(message)
+    if lineage_conflict:
+        messages = [
+            replace(message, provenance=replace(
+                message.provenance, native_session_id=None, fork_parent_session_id=None,
+            ))
+            for message in messages
+        ]
     return tuple(messages)
