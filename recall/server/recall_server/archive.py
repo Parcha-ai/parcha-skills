@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import copy
+
 import hashlib
 import hmac
 import json
@@ -329,6 +331,12 @@ class _ArchiveStore:
             tenant_id=value["tenant_id"],
             source_id=value["source_id"],
         )
+
+    def verify_raw_bounded(self, value: dict[str, Any], *, deadline_at: float) -> None:
+        """Check metadata without downloading content within the caller budget."""
+        _remaining(deadline_at)
+        self.verify_raw(value)
+        _remaining(deadline_at)
 
     def delete_internal_raw(self, value: dict[str, Any]) -> bool:
         """Delete a trusted persisted reference without downloading its payload.
@@ -907,6 +915,19 @@ class S3ArchiveStore(_ArchiveStore):
                     body.close()
                 except Exception:
                     pass
+
+    def verify_raw_bounded(self, value: dict[str, Any], *, deadline_at: float) -> None:
+        if self.deadline_client is None:
+            raise ArchiveError("archive deadline reader is not configured")
+        if _remaining(deadline_at) < S3_DEADLINE_CONNECT_TIMEOUT + self.deadline_read_timeout_seconds:
+            raise ArchiveDeadlineExceeded("archive read deadline exceeded")
+        # Keep the existing scope, version and metadata verifier unchanged.
+        # Copying the wrapper selects its no-retry client without mutating a
+        # store concurrently used by ordinary reads or other HEAD checks.
+        bounded = copy.copy(self)
+        bounded.client = self.deadline_client
+        bounded.verify_raw(value)
+        _remaining(deadline_at)
 
     def verify(
         self,

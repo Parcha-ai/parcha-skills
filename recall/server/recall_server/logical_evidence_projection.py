@@ -1595,6 +1595,8 @@ class CanonicalLogicalEvidenceProjector:
         manifest_reference = upload.manifest_reference
         with self.store.connect() as connection:
             with connection.transaction():
+                from .archive_ownership import admit_references
+                admit_references(connection, self.projection.archive, upload.all_references)
                 connection.execute(
                     "SELECT pg_advisory_xact_lock(hashtextextended(%s,0))",
                     ("logical-evidence\x1f" + prepared.logical_document_id,),

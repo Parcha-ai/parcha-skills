@@ -14,6 +14,7 @@ from .canonical_history import (
     HistoryAuthorityError, HistoryUnavailable, prepare_history, restore_outgoing,
 )
 from .db import BrainStore
+from .archive_ownership import admit_references
 from .identity_cache import REGISTRATION_CACHE, IdentityRegistrationCache
 from .canonical_text import (
     MAX_CANONICAL_CHUNK_BYTES as MAX_CANONICAL_CHUNK_BYTES,
@@ -649,7 +650,7 @@ class CanonicalPlane:
                 ).fetchone()
                 if forgotten:
                     raise CanonicalLifecycleError("canonical_identity_forgotten")
-                _guard_artifact_admission(conn, tenant_id, source_id, [artifact["artifact_id"]])
+                admit_references(conn, self.archive, [artifact])
                 conn.execute(
                     """INSERT INTO raw_artifacts(
                            tenant_id,source_id,artifact_id,storage_backend,object_key,
@@ -1283,7 +1284,7 @@ class CanonicalPlane:
                 if forgotten:
                     raise CanonicalLifecycleError("canonical_identity_forgotten")
 
-                _guard_artifact_admission(connection, tenant_id, source_id, list(artifacts))
+                admit_references(connection, self.archive, artifacts.values())
                 artifact_rows = [
                     {
                         key: artifact[key]
@@ -1881,7 +1882,13 @@ class CanonicalPlane:
         evidence_deleted = 0
         try:
             for reference in references:
-                self.archive.delete_raw(reference)
+                # The first forget transaction revoked these raw owners. Other
+                # archive catalogues can still own the same immutable object.
+                from .archive_ownership import live_references, reference_key
+                with self.store.connect() as connection:
+                    _lock_artifacts(connection, tenant_id, source_id, [reference["artifact_id"]])
+                    if reference_key(reference) not in live_references(connection, [reference]):
+                        self.archive.delete_raw(reference)
             if self.evidence_projector is not None:
                 evidence_deleted = self.evidence_projector.delete_native_ids(
                     tenant_id=tenant_id,

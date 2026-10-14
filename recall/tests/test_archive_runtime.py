@@ -85,7 +85,7 @@ class ArchiveRuntimeTest(unittest.TestCase):
         self.assertEqual(store.compatibility_profile, "r2")
         self.assertIs(store.client.client, client)
         self.assertEqual(
-            calls,
+            calls[:1],
             [
                 {
                     "service_name": "s3",
@@ -96,6 +96,8 @@ class ArchiveRuntimeTest(unittest.TestCase):
                 }
             ],
         )
+        self.assertEqual(len(calls), 2)
+        self.assertIsNotNone(store.deadline_client)
         self.assertNotIn("CF_R2_API_TOKEN", calls[0])
 
     def test_r2_environment_fails_closed_on_missing_or_invalid_values(self):
@@ -180,7 +182,8 @@ class ArchiveRuntimeTest(unittest.TestCase):
         ):
             build_archive_store(environment)
 
-        config_factory.assert_called_once_with(max_pool_connections=64)
+        self.assertEqual(config_factory.call_count, 2)
+        self.assertEqual(config_factory.call_args_list[0], mock.call(max_pool_connections=64))
         self.assertIs(calls[0]["config"], config)
 
     def test_aws_environment_rejects_cross_region_endpoint(self):

@@ -56,6 +56,35 @@ class ArchiveFixture:
 
 
 class ArchiveDeadlineTest(ArchiveFixture, unittest.TestCase):
+    def test_metadata_admission_uses_only_bounded_head(self):
+        self.client.head_object.return_value = self.response
+        contract = self.reference.to_contract(tenant_id='tenant:test', source_id='source:test',
+            created_at='2026-10-13T00:00:00Z')
+        self.store.verify_raw_bounded(contract, deadline_at=time.monotonic()+3)
+        self.client.head_object.assert_called_once_with(Bucket='evidence-test',
+            Key=self.reference.object_key, VersionId='version-test')
+        self.store.client.head_object.assert_not_called()
+        self.client.get_object.assert_not_called()
+        self.store.client.get_object.assert_not_called()
+
+    def test_metadata_admission_refuses_missing_client_and_expired_budget(self):
+        contract = self.reference.to_contract(tenant_id='tenant:test', source_id='source:test',
+            created_at='2026-10-13T00:00:00Z')
+        with self.assertRaises(archive.ArchiveDeadlineExceeded):
+            self.store.verify_raw_bounded(contract, deadline_at=time.monotonic()-1)
+        self.store.deadline_client=None
+        with self.assertRaisesRegex(archive.ArchiveError, 'not configured'):
+            self.store.verify_raw_bounded(contract, deadline_at=time.monotonic()+3)
+        self.client.head_object.assert_not_called()
+        self.store.client.head_object.assert_not_called()
+
+    def test_metadata_admission_keeps_metadata_integrity_checks(self):
+        contract = self.reference.to_contract(tenant_id='tenant:test', source_id='source:test',
+            created_at='2026-10-13T00:00:00Z')
+        self.client.head_object.return_value = dict(self.response, ContentLength=999)
+        with self.assertRaises(archive.ArchiveCorruption):
+            self.store.verify_raw_bounded(contract, deadline_at=time.monotonic()+3)
+
     def test_success_checks_exact_bytes_closes_body_and_passes_version(self):
         self.assertEqual(self.read(), self.payload)
         self.assertTrue(self.body.closed)
@@ -153,12 +182,12 @@ def environment():
 
 class ArchiveDeadlineTransportTest(ArchiveFixture, unittest.TestCase):
     # Real SDK/HTTP fault injection; no live service, credentials, or detached I/O.
-    def test_dedicated_client_configuration_is_opt_in(self):
+    def test_dedicated_client_is_available_for_admission_without_body_read_opt_in(self):
         calls = []
         factory = lambda **kwargs: calls.append(kwargs) or mock.Mock()
         plain = build_evidence_archive_store(environment(), client_factory=factory)
-        self.assertIsNone(plain.deadline_client)
-        self.assertEqual(len(calls), 1)
+        self.assertIsNotNone(plain.deadline_client)
+        self.assertEqual(len(calls), 2)
         calls.clear()
         bounded = build_evidence_archive_store(environment(), client_factory=factory, deadline_reads=True)
         self.assertEqual(len(calls), 2)
