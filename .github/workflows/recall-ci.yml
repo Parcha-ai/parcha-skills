@@ -157,6 +157,7 @@ jobs:
             e2e_logical_append_capability.py \
             e2e_logical_append_reader.py \
             e2e_logical_append_observability.py \
+            e2e_logical_append_admission.py \
             e2e_locator_backfill_plan.py \
             e2e_locator_backfill_apply.py \
             e2e_revision_history.py \

@@ -136,6 +136,9 @@ def scenario(store, root):
         and remaining() == 3
     ), first
     assert all(n == 1 for n in archive.reads.values()), "runner repeated archive proof"
+    assert 0 < first["committed_hash_ms"] <= first["committed_sql_ms"]
+    assert first["parent_wall_ms"] >= first["committed_sql_ms"]
+    assert first["archive_read_ms"] > 0 and first["claim_wall_ms"] > 0
     partial = state()
     runner.enroll_cohort(store, scope=scope, reviewed_plan=page)
     assert state() == partial
