@@ -602,3 +602,134 @@ def retire_parent_chunks(store, archive, *, tenant_id, source_id, native_parent_
         failure.committed = totals
         failure.attempt_metrics = attempt_metrics
         raise failure from None
+
+
+def _singleton_metadata_candidates(store, connection, *, tenant_id, source_id, document_ids, deadline_at):
+    from .canonical import _opaque
+    from .projectors import item_receipt
+
+    rows = store._execute_bounded(connection, '''SELECT document.document_id,document.native_id,
+        document.revision,document.text_sha256,document.created_at::text AS created_at,
+        document.chunk_receipt_profile,document.body_location,items.chunks
+        FROM canonical_documents document LEFT JOIN LATERAL (
+            SELECT jsonb_agg(to_jsonb(candidate) ORDER BY candidate.ordinal) AS chunks FROM (
+                SELECT chunk_id,ordinal,receipt,text_sha256,created_at::text AS created_at,
+                       deleted_at,octet_length(text_redacted) AS body_bytes
+                FROM canonical_chunks WHERE tenant_id=document.tenant_id
+                  AND source_id=document.source_id AND document_id=document.document_id
+                ORDER BY ordinal LIMIT 2
+            ) candidate
+        ) items ON true
+        WHERE document.tenant_id=%s AND document.source_id=%s AND document.document_id=ANY(%s)
+          AND document.is_current AND document.deleted_at IS NULL ORDER BY document.document_id''',
+        (tenant_id, source_id, list(document_ids)), deadline_at).fetchall()
+    if len(rows) != len(document_ids):
+        raise ChunkRetirementError('singleton_metadata_target_changed')
+    for row in rows:
+        if (row['chunk_receipt_profile'] is not None or row['body_location'] != 'chunks'
+                or not row['chunks'] or len(row['chunks']) != 1):
+            raise ChunkRetirementError('singleton_metadata_target_ineligible')
+        chunk = row['chunks'][0]
+        if (chunk['ordinal'] != 0 or chunk['deleted_at'] is not None or chunk['body_bytes'] != 0
+                or chunk['chunk_id'] != _opaque('chk', tenant_id, source_id, row['document_id'], '0')
+                or chunk['receipt'] != item_receipt(source_id, row['native_id'], row['revision'], 0)
+                or chunk['text_sha256'] != row['text_sha256'] or chunk['created_at'] != row['created_at']):
+            raise ChunkRetirementError('singleton_metadata_target_ineligible')
+    # Avoid the legacy embedding FK's ON DELETE CASCADE. This owner removes
+    # exactly the reviewed empty chunk row and no dependent projection rows.
+    dependencies = store._execute_bounded(connection, '''SELECT chunk_id FROM canonical_chunk_embeddings
+        WHERE tenant_id=%s AND source_id=%s AND chunk_id=ANY(%s) LIMIT 1''',
+        (tenant_id, source_id, [row['chunks'][0]['chunk_id'] for row in rows]), deadline_at).fetchone()
+    if dependencies is not None:
+        raise ChunkRetirementError('singleton_metadata_dependency_present')
+    return rows
+
+
+def _require_singleton_archive_runtime(store):
+    if (os.environ.get('RECALL_CHUNK_BODY_READS') != 'archive'
+            or getattr(store, 'search_plane', None) != 'turbopuffer'
+            or not getattr(store, 'verified_singleton_receipts', False)):
+        raise ChunkRetirementError('singleton_metadata_archive_runtime_required')
+
+
+def retire_singleton_metadata(store, archive, *, tenant_id, source_id, principal_id,
+                              document_ids, apply=False, reviewed_plan=None, deadline_at=None):
+    """Admit exact already-empty singleton rows using the existing archive proof.
+
+    The caller must attest that every reader uses the compatible archive+TP
+    contract before invoking this separately reviewed operation. This function
+    does not install a profile column or enable any runtime. A failed or unknown
+    commit returns no acknowledged counts and is never retried automatically.
+    """
+    if (any(not isinstance(value, str) or not IDENTITY_RE.fullmatch(value)
+            for value in (tenant_id, source_id, principal_id))
+            or not isinstance(document_ids, tuple) or not 1 <= len(document_ids) <= MAX_DOCUMENTS
+            or any(not isinstance(doc, str) or not DOCUMENT_ID_RE.fullmatch(doc) for doc in document_ids)
+            or len(set(document_ids)) != len(document_ids) or type(apply) is not bool):
+        raise ChunkRetirementError('singleton_metadata_scope_invalid')
+    deadline_at = time.monotonic() + 25 if deadline_at is None else deadline_at
+    if type(deadline_at) not in (float, int) or not math.isfinite(deadline_at):
+        raise ChunkRetirementError('singleton_metadata_deadline_invalid')
+    _check(deadline_at)
+    _require_singleton_archive_runtime(store)
+    scope = (tenant_id, source_id)
+    document_ids = tuple(sorted(document_ids))
+    with store.connect() as connection, connection.transaction():
+        connection.execute('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY')
+        require_retirement_owner(store, connection, scope, principal_id, deadline_at, lock=False)
+        candidates = _singleton_metadata_candidates(store, connection, tenant_id=tenant_id,
+            source_id=source_id, document_ids=document_ids, deadline_at=deadline_at)
+        catalog, current = _capture(store, tenant_id=tenant_id, source_id=source_id,
+            document_ids=document_ids, deadline_at=deadline_at, connection=connection)
+        if any(row['pending'] for row in catalog.values()):
+            raise ChunkRetirementError('singleton_metadata_publication_pending')
+    # Reuse the unchanged owning byte verifier. Empty physical text does not
+    # bypass immutable archive receipt/content/locator validation.
+    proof = retire_current_chunks(store, archive, tenant_id=tenant_id, source_id=source_id,
+        document_ids=document_ids, deadline_at=deadline_at)['plan']
+    if _plan(catalog, current, proof['runtime_profile'], proof['operation']) != proof:
+        raise ChunkRetirementError('singleton_metadata_proof_changed')
+    plan = dict(contract='recall.singleton-metadata.v1', tenant_id=tenant_id, source_id=source_id,
+                candidates=candidates, archive_proof=proof)
+    if not apply:
+        return dict(status='dry_run', plan=plan, eligible_chunks=len(candidates), retired_chunks=0)
+    if reviewed_plan != plan:
+        raise ChunkRetirementError('singleton_metadata_plan_changed')
+    _require_singleton_archive_runtime(store)
+    with store.connect() as connection, connection.transaction():
+        connection.execute("SET LOCAL lock_timeout='250ms'")
+        require_retirement_owner(store, connection, scope, principal_id, deadline_at)
+        def query(sql, values=()):
+            return store._execute_bounded(connection, sql, values, deadline_at)
+        if not _try_parent_native_locks(query, scope, candidates):
+            raise ChunkRetirementError('singleton_metadata_lock_busy')
+        documents = query('''SELECT document_id FROM canonical_documents
+            WHERE tenant_id=%s AND source_id=%s AND document_id=ANY(%s)
+              AND is_current AND deleted_at IS NULL ORDER BY document_id FOR UPDATE NOWAIT''',
+            (*scope, list(document_ids))).fetchall()
+        if len(documents) != len(document_ids):
+            raise ChunkRetirementError('singleton_metadata_target_changed')
+        parents = sorted({row['manifest']['logical_document_id'] for row in catalog.values()})
+        locked_parents = query('''SELECT logical_document_id FROM canonical_evidence_documents
+            WHERE tenant_id=%s AND source_id=%s AND logical_document_id=ANY(%s)
+            ORDER BY logical_document_id FOR SHARE NOWAIT''', (*scope, parents)).fetchall()
+        if len(locked_parents) != len(parents):
+            raise ChunkRetirementError('singleton_metadata_proof_changed')
+        current_catalog, current_chunks = _capture(store, tenant_id=tenant_id, source_id=source_id,
+            document_ids=document_ids, deadline_at=deadline_at, connection=connection, lock_chunks=True)
+        current_candidates = _singleton_metadata_candidates(store, connection, tenant_id=tenant_id,
+            source_id=source_id, document_ids=document_ids, deadline_at=deadline_at)
+        if (current_candidates != candidates or any(row['pending'] for row in current_catalog.values())
+                or _plan(current_catalog, current_chunks, proof['runtime_profile'], proof['operation']) != proof):
+            raise ChunkRetirementError('singleton_metadata_proof_changed')
+        marked = query('''UPDATE canonical_documents SET chunk_receipt_profile=1
+            WHERE tenant_id=%s AND source_id=%s AND document_id=ANY(%s)
+              AND is_current AND deleted_at IS NULL AND chunk_receipt_profile IS NULL''',
+            (*scope, list(document_ids)))
+        deleted = query('''DELETE FROM canonical_chunks WHERE tenant_id=%s AND source_id=%s
+            AND chunk_id=ANY(%s) AND ordinal=0 AND deleted_at IS NULL AND text_redacted='' ''',
+            (*scope, [row['chunks'][0]['chunk_id'] for row in candidates]))
+        if marked.rowcount != len(candidates) or deleted.rowcount != len(candidates):
+            raise ChunkRetirementError('singleton_metadata_target_changed')
+        _check(deadline_at)
+    return dict(status='retired', plan=plan, retired_chunks=len(candidates), retired_body_bytes=0)
