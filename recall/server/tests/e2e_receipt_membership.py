@@ -127,7 +127,7 @@ class ReceiptMembershipTests(unittest.TestCase):
 
     def test_default_path_does_not_require_future_column_and_multichunk_rows_are_unchanged(self):
         from recall_server.receipt_membership import lookup_receipt_metadata
-        written=self.ingest('turn/multiple','Synthetic multi-chunk text α '*2000)
+        self.ingest('turn/multiple','Synthetic multi-chunk text α '*2000)
         with self.store.connect() as connection:
             receipts=tuple(row['receipt'] for row in connection.execute('SELECT receipt FROM canonical_chunks WHERE tenant_id=%s ORDER BY ordinal',(self.tenant,)))
         self.assertGreater(len(receipts),1)
