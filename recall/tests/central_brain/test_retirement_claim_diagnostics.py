@@ -163,6 +163,7 @@ class ClaimDiagnosticTests(unittest.TestCase):
                 "archive_read_ms",
                 "claim_wall_ms",
                 "parent_wall_ms",
+                "metadata_capture_ms",
                 "archive_bytes",
                 "body_eligibility",
                 "physical_reclaimed_bytes",
