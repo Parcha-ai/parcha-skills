@@ -1451,7 +1451,7 @@ class BackgroundThinningTests(unittest.TestCase):
         self.assertEqual(prepared_on, [coordinator, coordinator])
         self.assertNotEqual(starts[0][0], coordinator)
 
-    def test_failed_background_attempt_surfaces_once_and_keeps_same_owner_for_retry(
+    def test_failed_background_attempt_is_reported_once_without_aborting_caller(
         self,
     ):
         from recall_server.projection_worker import BackgroundBodyThinner
@@ -1476,8 +1476,18 @@ class BackgroundThinningTests(unittest.TestCase):
 
         with BackgroundBodyThinner(prepare, clock=clock) as thinner:
             self.assertIsNone(thinner.tick(True))
-            with self.assertRaises(ConnectionError):
-                self.poll_result(thinner)
+            import time
+            with self.assertLogs("recall_server.projection_worker", level="WARNING") as logs:
+                deadline = time.monotonic() + 2
+                while not getattr(thinner, "failed_attempts", 0):
+                    self.assertLess(time.monotonic(), deadline)
+                    thinner.tick(True)
+                    time.sleep(0.005)
+            self.assertEqual(thinner.failed_attempts, 1)
+            self.assertIn("type=ConnectionError failed_attempts=1", logs.output[0])
+            self.assertIn("Traceback (most recent call last)", logs.output[0])
+            self.assertIn("in thin", logs.output[0])
+            self.assertIn("ConnectionError: lost_commit_ack", logs.output[0])
             self.assertIsNone(thinner.tick(True))
             self.assertEqual(history, [0])
             clock.advance(30)
@@ -1485,6 +1495,50 @@ class BackgroundThinningTests(unittest.TestCase):
             self.assertEqual(self.poll_result(thinner)["documents"], 0)
             self.assertIsNone(thinner.tick(True))
         self.assertEqual(history, [0, 1])
+
+    def test_foreground_failure_still_propagates(self):
+        from recall_server.projection_worker import BackgroundBodyThinner
+
+        class Logical(_Logical):
+            def project_pending(inner, **kwargs):
+                raise ValueError("foreground publication failed")
+
+        with BackgroundBodyThinner(lambda busy: lambda: {}) as thinner:
+            with self.assertRaisesRegex(ValueError, "foreground publication failed"):
+                run_projection_worker(
+                    Logical([]), _Passages([]), tenant_id="tenant:test", once=True,
+                    logical_batch_size=5, passage_batch_size=5, embedding_batch_size=64,
+                    max_batches_per_cycle=1, upload_concurrency=1, passage_concurrency=1,
+                    interval_seconds=5, background_thinner=thinner,
+                )
+
+    def test_shutdown_failed_attempt_is_reported_once_before_owner_closes(self):
+        import threading
+        from recall_server.projection_worker import BackgroundBodyThinner, projection_totals
+
+        entered = threading.Event()
+        order = []
+        def prepare(busy):
+            def fail():
+                entered.set()
+                order.append("owner_finished")
+                raise ConnectionError("lost shutdown acknowledgment")
+            return fail
+        before = projection_totals()["bodies_thinned"]
+        thinner = BackgroundBodyThinner(prepare)
+        thinner.tick(True)
+        self.assertTrue(entered.wait(2))
+        with self.assertLogs("recall_server.projection_worker", level="WARNING") as logs:
+            thinner.close()
+            order.append("pool_closed")
+            thinner.close()
+        self.assertEqual(order, ["owner_finished", "pool_closed"])
+        self.assertEqual(thinner.failed_attempts, 1)
+        self.assertEqual(thinner.completed_attempts, 0)
+        self.assertEqual(projection_totals()["bodies_thinned"], before)
+        self.assertEqual(len(logs.output), 1)
+        self.assertIn("in fail", logs.output[0])
+        self.assertIn("ConnectionError: lost shutdown acknowledgment", logs.output[0])
 
     def test_shutdown_waits_for_inflight_completion_and_records_it_exactly_once(self):
         import threading
