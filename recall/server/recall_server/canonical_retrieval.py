@@ -4687,7 +4687,35 @@ class BoundCanonicalRetrieval:
             if self.chunk_body_archive is not None else None
         )
         body_sql = "NULL::text" if self.chunk_body_archive is not None else "chunk.text_redacted"
+        singleton_reads = getattr(self.store, "verified_singleton_receipts", False)
+        chunks_sql, order_column, scope_values = "canonical_chunks", "", ()
+        if singleton_reads:
+            deadline_at = deadline_at if deadline_at is not None else time.monotonic() + self.store.search_deadline_ms / 1000
+            order_column = ",chunk.chunk_id AS _order_chunk_id"
+            scope_values = (self.tenant_id, list(self.authorized_sources)) * 2
+            # Derive the existing canonical chunk identity before LIMIT so ties
+            # retain their original order across physical and admitted rows.
+            chunks_sql = """(
+                SELECT tenant_id,source_id,chunk_id,document_id,ordinal,receipt,text_redacted,deleted_at
+                  FROM canonical_chunks WHERE tenant_id=%s AND source_id=ANY(%s)
+                UNION ALL
+                SELECT document.tenant_id,document.source_id,
+                       'chk_' || substr(encode(sha256(convert_to(
+                           document.tenant_id || chr(31) || document.source_id || chr(31) ||
+                           document.document_id || chr(31) || '0','UTF8')),'hex'),1,32),
+                       document.document_id,0,NULL::text,NULL::text,NULL::timestamptz
+                  FROM canonical_documents document
+                 WHERE document.tenant_id=%s AND document.source_id=ANY(%s)
+                   AND document.is_current AND document.deleted_at IS NULL
+                   AND document.chunk_receipt_profile IS NOT NULL
+                   AND NOT EXISTS (SELECT 1 FROM canonical_chunks retained
+                       WHERE retained.tenant_id=document.tenant_id
+                         AND retained.source_id=document.source_id
+                         AND retained.document_id=document.document_id)
+            )"""
         with self.store.connect() as connection:
+            if singleton_reads:
+                connection.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
             rows = self.store._execute_bounded(
                 connection,
                 f"""SELECT chunk.source_id,chunk.document_id,chunk.ordinal,
@@ -4695,8 +4723,8 @@ class BoundCanonicalRetrieval:
                           event.native_parent_id,event.occurred_at,event.observed_at,
                           event.created_at,{body_sql} AS text_redacted,chunk.receipt,
                           event.canonical_redacted #>> '{{provenance,cwd}}' AS path,
-                          event.canonical_redacted #>> '{{provenance,branch}}' AS branch
-                   FROM canonical_chunks chunk
+                          event.canonical_redacted #>> '{{provenance,branch}}' AS branch{order_column}
+                   FROM {chunks_sql} chunk
                    JOIN canonical_documents document
                      USING(tenant_id,source_id,document_id)
                    JOIN canonical_events event
@@ -4712,7 +4740,7 @@ class BoundCanonicalRetrieval:
                           event.canonical_redacted #>> '{{provenance,branch}}'=%s)
                    ORDER BY event.occurred_at DESC,chunk.chunk_id
                    LIMIT %s""",
-                (
+                scope_values + (
                     self.tenant_id,
                     list(self.authorized_sources),
                     cwd,
@@ -4723,6 +4751,26 @@ class BoundCanonicalRetrieval:
                 ),
                 deadline_at,
             ).fetchall()
+            admitted = [row for row in rows if row["receipt"] is None]
+            if admitted:
+                from .projectors import item_receipt
+                from .receipt_membership import lookup_receipt_metadata
+
+                if self.chunk_body_archive is None:
+                    raise ChunkBodyError("archived_chunk_body_unavailable")
+                receipts = tuple(item_receipt(row["source_id"], row["native_id"], row["revision"], 0)
+                                 for row in admitted)
+                members = lookup_receipt_metadata(
+                    self.store, tenant_id=self.tenant_id, authorized_sources=self.authorized_sources,
+                    receipts=receipts, allow_verified_singletons=True,
+                    deadline_at=deadline_at, connection=connection,
+                )
+                for row, receipt in zip(admitted, receipts):
+                    member = members.get(receipt)
+                    if (member is None or member["document_id"] != row["document_id"]
+                            or member["chunk_id"] != row["_order_chunk_id"]):
+                        raise ChunkBodyError("archived_chunk_body_unavailable")
+                    row["receipt"] = receipt
         self._hydrate_chunk_rows(rows, deadline_at=deadline_at)
         return {
             "results": [
