@@ -481,12 +481,26 @@ class LargeAppendReader(unittest.TestCase):
                     ).fetchone()["QUERY PLAN"][0]
                     actual_loops.append(loops(plan["Plan"]))
             self.assertEqual(actual_loops, [10_010, 10])
+            self.plane.ingest_batch(
+                tenant_id=self.tenant, principal_id=self.principal,
+                events=[self.event("later-arrival", 10_011, "Later exact body")],
+            )
+            commit_started = time.monotonic()
             self.assertEqual(
                 self.logical._commit_upload(candidate, appended), "committed"
             )
+            snapshot_commit_seconds = time.monotonic() - commit_started
+            with self.store.connect() as connection:
+                retained = connection.execute(
+                    "SELECT generation FROM canonical_evidence_document_queue WHERE tenant_id=%s AND source_id=%s",
+                    (self.tenant, self.source),
+                ).fetchone()
+            self.assertGreater(retained["generation"], candidate.generation)
+            self.assertEqual(self.publish()["records"], 10_011)
             print(
                 dict(
                     seed_seconds=round(seed_seconds, 3),
+                    snapshot_commit_seconds=round(snapshot_commit_seconds, 3),
                     full_seconds=round(times[0], 3),
                     append_seconds=round(times[1], 3),
                     full_sql=actual[0],

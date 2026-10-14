@@ -164,6 +164,37 @@ class AppendSnapshot(unittest.TestCase):
         self.assertEqual(self.catalog()["append_source_ordinal"], 10)
         self.assertIsNotNone(self.queue())
 
+    def test_repeated_arrivals_make_progress_without_a_quiet_interval(self):
+        _, prepared = self.prepare()
+        prepared.body_locators.close()
+        original = self.archive.read_raw
+        for cycle in range(3):
+            triggered = []
+
+            def read(reference):
+                payload = original(reference)
+                if not triggered and reference["media_type"].endswith("part+jsonl"):
+                    triggered.append(True)
+                    self.ingest(f"continuous-{cycle}", 11 + cycle)
+                return payload
+
+            with (
+                patch.object(self.archive, "read_raw", read),
+                patch(
+                    "recall_server.logical_evidence_projection.PROJECTION_PROGRESS_INTERVAL_SECONDS",
+                    0,
+                ),
+            ):
+                result = self.publish()
+            self.assertEqual(triggered, [True])
+            self.assertEqual(result["documents"], 1)
+            self.assertEqual(self.catalog()["record_count"], 4 + cycle)
+            self.assertEqual(self.catalog()["append_source_ordinal"], 10 + cycle)
+            self.assertIsNotNone(self.queue())
+        self.assertEqual(self.publish()["documents"], 1)
+        self.assertEqual(self.catalog()["record_count"], 7)
+        self.assertIsNone(self.queue())
+
     def test_edited_captured_record_still_refuses_after_later_append(self):
         candidate, upload = self.prepare()
         self.addCleanup(upload.body_locators.close)
@@ -189,6 +220,31 @@ class AppendSnapshot(unittest.TestCase):
         self.ingest("later", 11)
         self.assertIsNone(self.queue()["append_generation"])
         self.assertEqual(self.logical._commit_upload(candidate, upload), "stale")
+
+    def test_catalog_deletion_cannot_restore_prepared_append(self):
+        candidate, upload = self.prepare()
+        self.addCleanup(upload.body_locators.close)
+        self.ingest("later", 11)
+        with self.store.connect() as connection:
+            connection.execute(
+                "DELETE FROM canonical_evidence_documents WHERE tenant_id=%s AND source_id=%s",
+                (self.tenant, self.source),
+            )
+        self.assertEqual(self.logical._commit_upload(candidate, upload), "stale")
+        self.assertIsNone(self.catalog())
+        self.assertIsNotNone(self.queue())
+
+    def test_partial_recovery_keeps_exact_generation_fence(self):
+        from recall_server.logical_evidence import LogicalEvidenceError
+
+        candidate, upload = self.prepare()
+        self.addCleanup(upload.body_locators.close)
+        pinned = upload.append_snapshot_catalog
+        self.ingest("later", 11)
+        # The real SQL pin owner must not apply append tolerance to a source
+        # whose input required archive recovery, even with an intact catalog.
+        with self.assertRaises(LogicalEvidenceError):
+            self.logical._check_recovery_pins((candidate,), {0: pinned}, {0})
 
     def test_catalog_identity_change_refuses_even_with_same_manifest(self):
         candidate, upload = self.prepare()
