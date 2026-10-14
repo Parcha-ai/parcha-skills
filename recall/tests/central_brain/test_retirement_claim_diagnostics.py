@@ -152,6 +152,7 @@ class ClaimDiagnosticTests(unittest.TestCase):
                 "batches",
                 "cleared_documents",
                 "cleared_chunks",
+                "retired_metadata_chunks",
                 "cleared_utf8_bytes",
                 "eligible_documents",
                 "commit_outcome_unknown",
@@ -170,6 +171,7 @@ class ClaimDiagnosticTests(unittest.TestCase):
             },
         )
         self.assertEqual(result["status"], "claim_refused")
+        self.assertEqual(result["retired_metadata_chunks"], 0)
         self.assertEqual(
             (
                 result["attempted_parents"],
