@@ -61,6 +61,7 @@ jobs:
             e2e_slack_deletion_ordering.py \
             e2e_compact_ingest_metadata.py \
             e2e_audit_retirement.py \
+            e2e_audit_retirement_batch.py \
             e2e_binary_archive.py \
             e2e_storage_legacy_cut.py \
             e2e_canonical_body_thinning.py \
