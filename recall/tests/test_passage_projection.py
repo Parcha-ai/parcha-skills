@@ -825,6 +825,8 @@ class PassageProjectionTests(unittest.TestCase):
             def execute(self, sql, params=None):
                 normalized = " ".join(sql.split())
                 self.statements.append((normalized, params))
+                if "to_regclass('public.canonical_artifact_forget_tombstones')" in normalized:
+                    return Result(one={"present": True})
                 if normalized.startswith("SELECT current_setting('statement_timeout')"):
                     return Result(one={"value": "0"})
                 if normalized == "SELECT 1 FROM schema_migrations WHERE version=76":
@@ -852,7 +854,7 @@ class PassageProjectionTests(unittest.TestCase):
         projector = CanonicalLogicalEvidenceProjector(
             SimpleNamespace(connect=lambda: connection,
                 _execute_bounded=lambda conn, sql, params, _deadline: conn.execute(sql, params)),
-            object(),  # type: ignore[arg-type]
+            SimpleNamespace(archive=mock.Mock(spec=["verify_raw_bounded"])),
         )
         old_manifest = reference("art_" + "0" * 32)
         kept_part = reference("art_" + "1" * 32)

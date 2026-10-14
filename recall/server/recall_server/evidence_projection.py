@@ -37,6 +37,8 @@ class EvidenceArchive(Protocol):
                          source_id: str, expires_in: int) -> str: ...
     def read_raw(self, value: dict[str, Any]) -> bytes: ...
     def delete_raw(self, value: dict[str, Any]) -> bool: ...
+    def verify_raw_bounded(self, value: dict[str, Any], *, deadline_at: float) -> None: ...
+    def delete_internal_raw_bounded(self, value: dict[str, Any], *, deadline_at: float) -> bool: ...
 
 
 def _timestamp(value: str) -> str:
@@ -702,7 +704,7 @@ class CanonicalEvidenceProjector:
         assert tenant_id is not None
         if not native_ids:
             return 0
-        from .archive_ownership import live_references, reference_key
+        from .archive_ownership import delete_persisted_reference, live_references, reference_key
         from .canonical import _lock_artifacts
         with self.store.connect() as connection:
             for native in sorted(set(native_ids)):
@@ -727,7 +729,7 @@ class CanonicalEvidenceProjector:
                 excluding_evidence_documents=[row["document_id"] for row in rows])
             for reference in references:
                 if reference_key(reference) not in retained:
-                    self.projection.delete(reference)
+                    delete_persisted_reference(self.projection.archive, reference)
             connection.execute(
                 """DELETE FROM canonical_evidence_objects evidence
                    USING canonical_documents document

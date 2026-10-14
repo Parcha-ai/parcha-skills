@@ -55,6 +55,12 @@ class CountingArchive:
     def delete_raw(self, reference):
         return self.archive.delete_raw(reference)
 
+    def verify_raw_bounded(self, reference, *, deadline_at):
+        return self.archive.verify_raw_bounded(reference, deadline_at=deadline_at)
+
+    def delete_internal_raw_bounded(self, reference, *, deadline_at):
+        return self.archive.delete_internal_raw_bounded(reference, deadline_at=deadline_at)
+
 
 class RevisionConnector:
     connector_id = "synthetic.v2"

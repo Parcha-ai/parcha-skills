@@ -23,6 +23,17 @@ def reference_key(reference):
     return tuple(reference[name] for name in REFERENCE_FIELDS)
 
 
+def delete_persisted_reference(archive, reference):
+    """Bound the HEAD and DELETE while the caller holds the artifact guard."""
+    seconds = 2 * (
+        S3_DEADLINE_CONNECT_TIMEOUT
+        + getattr(archive, "deadline_read_timeout_seconds", 0.5)
+    ) + 0.25
+    return archive.delete_internal_raw_bounded(
+        reference, deadline_at=time.monotonic() + seconds
+    )
+
+
 def live_references(connection, references, *, excluding_evidence_documents=()):
     """Return exact live descriptors; a deleted revision cannot prove existence."""
     if not references:

@@ -1140,6 +1140,7 @@ class CanonicalLogicalEvidenceProjector:
                     records=records(),
                     retention_profile=self.retention_profile,
                     existing_part_references=tuple(existing_parts.get(ordinal, ())),
+                    on_failed_upload=self._schedule_cleanup,
                 )
                 upload = _LocatedUpload(
                     **vars(upload), body_locators=body_locators[ordinal],

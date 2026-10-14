@@ -56,6 +56,8 @@ class ArchiveLifecycle(Protocol):
     ) -> dict[str, Any]: ...
 
     def delete_raw(self, reference: dict[str, Any]) -> bool: ...
+    def verify_raw_bounded(self, reference: dict[str, Any], *, deadline_at: float) -> None: ...
+    def delete_internal_raw_bounded(self, reference: dict[str, Any], *, deadline_at: float) -> bool: ...
 
 
 def _validate_oversized_pointer(event: dict[str, Any], artifact: dict[str, Any]) -> None:
@@ -1902,11 +1904,11 @@ class CanonicalPlane:
             for reference in references:
                 # The first forget transaction revoked these raw owners. Other
                 # archive catalogues can still own the same immutable object.
-                from .archive_ownership import live_references, reference_key
+                from .archive_ownership import delete_persisted_reference, live_references, reference_key
                 with self.store.connect() as connection:
                     _lock_artifacts(connection, tenant_id, source_id, [reference["artifact_id"]])
                     if reference_key(reference) not in live_references(connection, [reference]):
-                        self.archive.delete_raw(reference)
+                        delete_persisted_reference(self.archive, reference)
             if self.evidence_projector is not None:
                 evidence_deleted = self.evidence_projector.delete_native_ids(
                     tenant_id=tenant_id,

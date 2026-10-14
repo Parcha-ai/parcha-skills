@@ -56,6 +56,19 @@ class ArchiveFixture:
 
 
 class ArchiveDeadlineTest(ArchiveFixture, unittest.TestCase):
+    def test_trusted_delete_uses_bounded_metadata_and_delete_without_body_read(self):
+        self.client.head_object.return_value = self.response
+        contract = self.reference.to_contract(tenant_id='tenant:test', source_id='source:test',
+            created_at='2026-10-13T00:00:00Z')
+        self.assertTrue(self.store.delete_internal_raw_bounded(
+            contract, deadline_at=time.monotonic()+3))
+        expected = dict(Bucket='evidence-test', Key=self.reference.object_key,
+            VersionId='version-test')
+        self.client.head_object.assert_called_once_with(**expected)
+        self.client.delete_object.assert_called_once_with(**expected)
+        self.client.get_object.assert_not_called()
+        self.assertEqual(self.store.client.mock_calls, [])
+
     def test_metadata_admission_uses_only_bounded_head(self):
         self.client.head_object.return_value = self.response
         contract = self.reference.to_contract(tenant_id='tenant:test', source_id='source:test',
@@ -66,6 +79,27 @@ class ArchiveDeadlineTest(ArchiveFixture, unittest.TestCase):
         self.store.client.head_object.assert_not_called()
         self.client.get_object.assert_not_called()
         self.store.client.get_object.assert_not_called()
+
+    def test_trusted_delete_preserves_scope_metadata_and_deadline_before_delete(self):
+        contract = self.reference.to_contract(tenant_id='tenant:test', source_id='source:test',
+            created_at='2026-10-13T00:00:00Z')
+        self.client.head_object.return_value = dict(self.response, ContentLength=999)
+        with self.assertRaises(archive.ArchiveCorruption):
+            self.store.delete_internal_raw_bounded(contract, deadline_at=time.monotonic()+3)
+        self.client.head_object.return_value = self.response
+        # An invalid contract cannot authorize an object in another scope.
+        self.assertFalse(self.store.delete_internal_raw_bounded(
+            dict(contract, object_key='invalid'), deadline_at=time.monotonic()+3))
+        now = [10.0]
+        def head(**kwargs):
+            now[0] = 11.5
+            return self.response
+        self.client.head_object.side_effect = head
+        with mock.patch.object(archive.time, 'monotonic', side_effect=lambda: now[0]):
+            with self.assertRaises(archive.ArchiveDeadlineExceeded):
+                self.store.delete_internal_raw_bounded(contract, deadline_at=12.0)
+        self.client.delete_object.assert_not_called()
+        self.client.get_object.assert_not_called()
 
     def test_metadata_admission_refuses_missing_client_and_expired_budget(self):
         contract = self.reference.to_contract(tenant_id='tenant:test', source_id='source:test',
@@ -182,6 +216,68 @@ def environment():
 
 class ArchiveDeadlineTransportTest(ArchiveFixture, unittest.TestCase):
     # Real SDK/HTTP fault injection; no live service, credentials, or detached I/O.
+    def test_trusted_delete_real_http_has_no_get_or_retry_and_bounds_stall(self):
+        for stage in ('success', '503', 'stall'):
+            attempts = []
+            release = threading.Event()
+            owner = self
+            class Handler(BaseHTTPRequestHandler):
+                def log_message(self, *args):
+                    pass
+
+                def do_HEAD(self):
+                    attempts.append('HEAD')
+                    self.send_response(200)
+                    self.send_header('Content-Length', str(len(owner.payload)))
+                    for key, value in owner.response['Metadata'].items():
+                        self.send_header('x-amz-meta-' + key, value)
+                    self.end_headers()
+
+                def do_DELETE(self):
+                    attempts.append('DELETE')
+                    if stage == 'stall':
+                        release.wait(2)
+                        return
+                    self.send_response(503 if stage == '503' else 204)
+                    self.send_header('Content-Length', '0')
+                    self.end_headers()
+
+                def do_GET(self):
+                    attempts.append('GET')
+                    self.send_error(500)
+
+            server = HTTPServer(('127.0.0.1', 0), Handler)
+            thread = threading.Thread(target=server.serve_forever, kwargs={'poll_interval': 0.01})
+            thread.start()
+            clients = []
+            def factory(**kwargs):
+                kwargs['endpoint_url'] = f'http://127.0.0.1:{server.server_port}'
+                client = boto3.client(**kwargs)
+                clients.append(client)
+                return client
+            store = build_evidence_archive_store(environment(), client_factory=factory)
+            contract = self.reference.to_contract(tenant_id='tenant:test', source_id='source:test',
+                created_at='2026-10-13T00:00:00Z')
+            try:
+                started = time.monotonic()
+                with self.subTest(stage=stage):
+                    if stage == 'success':
+                        self.assertTrue(store.delete_internal_raw_bounded(contract,
+                            deadline_at=started+3))
+                    else:
+                        with self.assertRaises(archive.ArchiveError):
+                            store.delete_internal_raw_bounded(contract, deadline_at=started+3)
+                    self.assertLess(time.monotonic()-started, 1.5)
+                    self.assertEqual(attempts, ['HEAD', 'DELETE'])
+            finally:
+                release.set()
+                server.shutdown()
+                thread.join(2)
+                server.server_close()
+                for client in clients:
+                    client.close()
+                self.assertFalse(thread.is_alive())
+
     def test_dedicated_client_is_available_for_admission_without_body_read_opt_in(self):
         calls = []
         factory = lambda **kwargs: calls.append(kwargs) or mock.Mock()

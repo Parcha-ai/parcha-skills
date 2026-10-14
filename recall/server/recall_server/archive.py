@@ -356,6 +356,17 @@ class _ArchiveStore:
         except ArchiveNotFound:
             return False
 
+    def delete_internal_raw_bounded(self, value: dict[str, Any], *, deadline_at: float) -> bool:
+        """Delete a trusted catalog reference using metadata, never its body."""
+        _remaining(deadline_at)
+        try:
+            self.verify_raw_bounded(value, deadline_at=deadline_at)
+        except ArchiveNotFound:
+            return False
+        removed = self.delete_internal_raw(value)
+        _remaining(deadline_at)
+        return removed
+
     def read_raw(self, value: dict[str, Any]) -> bytes:
         """Resolve one closed reference without exposing namespace-key material."""
         reference = self._from_contract(value)
@@ -928,6 +939,29 @@ class S3ArchiveStore(_ArchiveStore):
         bounded.client = self.deadline_client
         bounded.verify_raw(value)
         _remaining(deadline_at)
+
+    def delete_internal_raw_bounded(self, value: dict[str, Any], *, deadline_at: float) -> bool:
+        # Only server-owned catalog references may use this metadata-only path.
+        # The ordinary connector-facing delete retains its full body check.
+        try:
+            self.verify_raw_bounded(value, deadline_at=deadline_at)
+        except ArchiveNotFound:
+            return False
+        if _remaining(deadline_at) < S3_DEADLINE_CONNECT_TIMEOUT + self.deadline_read_timeout_seconds:
+            raise ArchiveDeadlineExceeded("archive delete deadline exceeded")
+        reference = self._from_contract(value)
+        try:
+            self.deadline_client.delete_object(
+                Bucket=self.bucket, Key=reference.object_key,
+                **self._version_kwargs(reference),
+            )
+        except ArchiveNotFound:
+            return False
+        except Exception:
+            _remaining(deadline_at)
+            raise ArchiveError("archive provider request failed") from None
+        _remaining(deadline_at)
+        return True
 
     def verify(
         self,

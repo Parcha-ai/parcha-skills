@@ -25,6 +25,20 @@ class ArchiveAdmissionTests(unittest.TestCase):
     write = fixtures.ArchiveReferenceTests.write
     references = fixtures.ArchiveReferenceTests.references
 
+    def test_forget_deletes_raw_and_bundle_without_reading_object_bodies(self):
+        self.write(self.event())
+        self.evidence.project_pending(tenant_id=self.tenant, batch_size=1, max_batches=1)
+        with patch.object(self.archive, "read", side_effect=AssertionError("body read under lock")):
+            result = self.plane.forget(dict(
+                contract="recall.forget-request.v1", schema_version=1,
+                tenant_id=self.tenant, principal_id=self.principal, source_id=self.source,
+                target_receipt=f"recall://{self.source}/turn?rev=1#item=0",
+                mode="explicit_forget", reason="owner_requested",
+                requested_at="2026-10-13T00:00:00Z", idempotency_key="forget-no-body",
+            ))
+        self.assertEqual(result["status"], "deleted")
+        self.assertEqual(self.references(), [])
+
     def remove_unregistered(self, references):
         self.logical._schedule_cleanup(tuple(references))
         result = self.logical.drain_cleanup(tenant_id=self.tenant)
@@ -304,6 +318,33 @@ class ArchiveAdmissionTests(unittest.TestCase):
                 (self.tenant,),
             ).fetchone()["n"]
         self.assertEqual(count, 0, "logical catalogue references deleted uploads")
+
+    def test_failed_logical_upload_does_not_delete_a_concurrent_winners_part(self):
+        from recall_server.logical_evidence import PART_MEDIA_TYPE, MANIFEST_MEDIA_TYPE
+        self.write(self.event())
+        original = self.archive.put_raw
+        shared = []
+
+        def loser_put(**kwargs):
+            if kwargs["media_type"] == MANIFEST_MEDIA_TYPE and shared:
+                raise RuntimeError("synthetic manifest upload failure")
+            reference = original(**kwargs)
+            if kwargs["media_type"] == PART_MEDIA_TYPE and not shared:
+                shared.append(reference)
+                with patch.object(self.archive, "put_raw", side_effect=original):
+                    winner = self.logical.project_pending(tenant_id=self.tenant,
+                        batch_size=1, max_batches=1, upload_concurrency=1)
+                self.assertEqual(winner["documents"], 1)
+            return reference
+
+        with patch.object(self.archive, "put_raw", side_effect=loser_put):
+            loser = self.logical.project_pending(tenant_id=self.tenant,
+                batch_size=1, max_batches=1, upload_concurrency=1)
+        self.assertEqual(loser["failed"], 1)
+        self.assertEqual(len(shared), 1)
+        self.archive.verify_raw(shared[0])
+        self.logical.drain_cleanup(tenant_id=self.tenant)
+        self.archive.verify_raw(shared[0])
 
     def test_parquet_admission_refuses_objects_deleted_after_upload(self):
         self.write(self.event())
