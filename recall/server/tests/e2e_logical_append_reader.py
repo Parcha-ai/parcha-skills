@@ -257,7 +257,7 @@ class AppendReader(unittest.TestCase):
         finally:
             upload.body_locators.close()
 
-    def test_append_during_archive_read_preserves_stale_generation_fence(self):
+    def test_append_during_archive_read_commits_only_captured_snapshot(self):
         candidate, upload = self.prepare()
         upload.body_locators.close()
         read = self.logical.projection.read_part
@@ -273,8 +273,12 @@ class AppendReader(unittest.TestCase):
         with patch.object(self.logical.projection, "read_part", append_during_read):
             upload = self.logical._prepare_batch_and_upload((candidate,))[0]
         try:
-            self.assertEqual(self.logical._commit_upload(candidate, upload), "stale")
-            self.assertEqual(self.catalog()["append_source_ordinal"], 3)
+            self.assertEqual(self.logical._commit_upload(candidate, upload), "committed")
+            self.assertEqual(self.catalog()["append_source_ordinal"], 10)
+            self.assertIsNotNone(self.queue())
+            self.assertEqual(self.publish()["documents"], 1)
+            self.assertEqual(self.catalog()["append_source_ordinal"], 11)
+            self.assertIsNone(self.queue())
         finally:
             upload.body_locators.close()
 
@@ -477,12 +481,26 @@ class LargeAppendReader(unittest.TestCase):
                     ).fetchone()["QUERY PLAN"][0]
                     actual_loops.append(loops(plan["Plan"]))
             self.assertEqual(actual_loops, [10_010, 10])
+            self.plane.ingest_batch(
+                tenant_id=self.tenant, principal_id=self.principal,
+                events=[self.event("later-arrival", 10_011, "Later exact body")],
+            )
+            commit_started = time.monotonic()
             self.assertEqual(
                 self.logical._commit_upload(candidate, appended), "committed"
             )
+            snapshot_commit_seconds = time.monotonic() - commit_started
+            with self.store.connect() as connection:
+                retained = connection.execute(
+                    "SELECT generation FROM canonical_evidence_document_queue WHERE tenant_id=%s AND source_id=%s",
+                    (self.tenant, self.source),
+                ).fetchone()
+            self.assertGreater(retained["generation"], candidate.generation)
+            self.assertEqual(self.publish()["records"], 10_011)
             print(
                 dict(
                     seed_seconds=round(seed_seconds, 3),
+                    snapshot_commit_seconds=round(snapshot_commit_seconds, 3),
                     full_seconds=round(times[0], 3),
                     append_seconds=round(times[1], 3),
                     full_sql=actual[0],
@@ -505,6 +523,21 @@ class AppendReaderCapabilityMatrix(fixtures.AppendCapability):
     def setUp(self):
         super().setUp()
         self.logical.append_enabled = True
+
+    def test_stale_prepared_publication_cannot_advance_frontier(self):
+        # The full-only capability suite retains the original stale fence.
+        # An enabled append now publishes its captured prefix, never later rows.
+        self.seed()
+        self.ingest("second", 20)
+        candidate = self.logical._pending(tenant_id=self.tenant, limit=1)[0]
+        upload = self.logical._prepare_batch_and_upload((candidate,))[0]
+        self.addCleanup(upload.body_locators.close)
+        self.ingest("third", 30)
+        self.assertEqual(self.logical._commit_upload(candidate, upload), "committed")
+        self.assertEqual(self.catalog()["append_source_ordinal"], 20)
+        self.assertTrue(self.safe())
+        self.assertEqual(self.publish()["documents"], 1)
+        self.assertEqual(self.catalog()["append_source_ordinal"], 30)
 
 
 if __name__ == "__main__":

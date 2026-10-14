@@ -422,6 +422,7 @@ class RunArchive:
     def __init__(self, delegate, *, max_bytes):
         self.delegate, self.max_bytes = delegate, max_bytes
         self.gets = self.bytes = 0
+        self.read_ms = 0.0
 
     def read_raw(self, reference):
         size = reference["size_bytes"]
@@ -429,7 +430,11 @@ class RunArchive:
             raise ChunkRetirementError("retirement_runner_archive_budget")
         self.gets += 1
         self.bytes += size
-        return self.delegate.read_raw(reference)
+        started = time.monotonic()
+        try:
+            return self.delegate.read_raw(reference)
+        finally:
+            self.read_ms += (time.monotonic() - started) * 1000
 
     def read_raw_bounded(self, reference, *, deadline_at):
         # _VerifiedArchive calls this surface when available. Preserve transport
@@ -440,11 +445,15 @@ class RunArchive:
         self.gets += 1
         self.bytes += size
         bounded = getattr(self.delegate, "read_raw_bounded", None)
-        return (
-            bounded(reference, deadline_at=deadline_at)
-            if callable(bounded)
-            else self.delegate.read_raw(reference)
-        )
+        started = time.monotonic()
+        try:
+            return (
+                bounded(reference, deadline_at=deadline_at)
+                if callable(bounded)
+                else self.delegate.read_raw(reference)
+            )
+        finally:
+            self.read_ms += (time.monotonic() - started) * 1000
 
 
 def run_retirement(
@@ -494,6 +503,10 @@ def run_retirement(
         cleared_chunks=0,
         cleared_utf8_bytes=0,
         eligible_documents=0,
+        committed_sql_ms=0.0,
+        committed_hash_ms=0.0,
+        claim_wall_ms=0.0,
+        parent_wall_ms=0.0,
         commit_outcome_unknown=False,
     )
     errors, excluded, attempted = Counter(), Counter(), []
@@ -506,6 +519,7 @@ def run_retirement(
         if remaining_bytes <= 0 or remaining_archive <= 0:
             break
         claim_diagnostic = {}
+        claim_started = time.monotonic()
         try:
             candidate = _claim(
                 store,
@@ -528,6 +542,8 @@ def run_retirement(
                 errors[label] += 1
             report["status"] = "claim_refused"
             break
+        finally:
+            report["claim_wall_ms"] += (time.monotonic() - claim_started) * 1000
         if candidate is None:
             report["status"] = "no_ready_parents"
             break
@@ -538,6 +554,7 @@ def run_retirement(
             # Persist caller execution intent after the epoch claim and before
             # any archive read or clearing. A failed observer stops this call.
             before_parent(candidate)
+        parent_started = time.monotonic()
         try:
             selected_limits = parent_limits if parent_limits_for is None else parent_limits_for(candidate)
             if not isinstance(selected_limits, ParentRetirementLimits):
@@ -575,6 +592,13 @@ def run_retirement(
                 # Stop; a later explicit invocation resumes from the durable ledger.
                 report["commit_outcome_unknown"] = True
                 report["status"] = "commit_outcome_unknown"
+        finally:
+            report["parent_wall_ms"] += (time.monotonic() - parent_started) * 1000
+        # These nested timers cover only acknowledged batches, including an
+        # acknowledged prefix attached to a later unknown commit. Parent wall
+        # time also includes proof, refusals, and unacknowledged attempts.
+        report["committed_sql_ms"] += result.get("sql_ms", 0.0)
+        report["committed_hash_ms"] += result.get("hash_ms", 0.0)
         for field in (
             "batches",
             "cleared_documents",
@@ -600,6 +624,7 @@ def run_retirement(
         excluded=dict(excluded),
         archive_gets=meter.gets,
         archive_bytes=meter.bytes,
+        archive_read_ms=meter.read_ms,
         body_eligibility="proved_targets_only",
         physical_reclaimed_bytes=None,
     )
