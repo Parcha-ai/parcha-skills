@@ -200,6 +200,23 @@ def related_candidate_limit(result_limit: int) -> int:
     return min(400, max(100, result_limit * 20))
 
 
+def singleton_receipt_capability(verified_singleton_receipts=None):
+    """Shared activation contract for serving and the bounded retirement child."""
+    if verified_singleton_receipts is None:
+        configured_profile = os.environ.get("RECALL_VERIFIED_SINGLETON_RECEIPTS", "0")
+        if configured_profile not in {"0", "1"}:
+            raise ValueError("RECALL_VERIFIED_SINGLETON_RECEIPTS must be 0 or 1")
+        verified_singleton_receipts = configured_profile == "1"
+        if verified_singleton_receipts and (
+            os.environ.get("RECALL_CHUNK_BODY_READS", "postgres") != "archive"
+            or os.environ.get("RECALL_SEARCH_PLANE", "postgres") != "turbopuffer"
+        ):
+            raise ValueError("singleton receipts require archive bodies and turbopuffer")
+    if type(verified_singleton_receipts) is not bool:
+        raise ValueError("invalid singleton receipt capability")
+    return verified_singleton_receipts
+
+
 class BrainStore:
     def __init__(self, dsn: str, search_deadline_ms: int | None = None,
                  semantic_runtime: SemanticRuntime | None = None,
@@ -209,18 +226,7 @@ class BrainStore:
                  audit_batch_rows: int | None = None,
                  audit_batch_seconds: float | None = None,
                  verified_singleton_receipts: bool | None = None):
-        if verified_singleton_receipts is None:
-            configured_profile = os.environ.get("RECALL_VERIFIED_SINGLETON_RECEIPTS", "0")
-            if configured_profile not in {"0", "1"}:
-                raise ValueError("RECALL_VERIFIED_SINGLETON_RECEIPTS must be 0 or 1")
-            verified_singleton_receipts = configured_profile == "1"
-            if verified_singleton_receipts and (
-                os.environ.get("RECALL_CHUNK_BODY_READS", "postgres") != "archive"
-                or os.environ.get("RECALL_SEARCH_PLANE", "postgres") != "turbopuffer"
-            ):
-                raise ValueError("singleton receipts require archive bodies and turbopuffer")
-        if type(verified_singleton_receipts) is not bool:
-            raise ValueError("invalid singleton receipt capability")
+        verified_singleton_receipts = singleton_receipt_capability(verified_singleton_receipts)
         # Off by default. Migration and explicit activation never admit rows.
         self.verified_singleton_receipts = verified_singleton_receipts
         self.dsn = dsn

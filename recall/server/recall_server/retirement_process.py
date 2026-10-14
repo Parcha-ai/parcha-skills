@@ -15,7 +15,8 @@ from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 
 from .archive_runtime import build_evidence_archive_store
-from .db import BrainStore, SearchDeadlineExceeded
+from .db import BrainStore, SearchDeadlineExceeded, singleton_receipt_capability
+from .turbopuffer_plane import search_plane_from_env
 from .retirement_maintenance import RetirementMaintenance
 
 
@@ -43,7 +44,9 @@ class RetirementStore:
             raise SearchDeadlineExceeded("search deadline exceeded") from exc
 
     def __init__(self, dsn):
-        self.pool = ConnectionPool(
+        self.verified_singleton_receipts = singleton_receipt_capability()
+        self.search_plane = search_plane_from_env()
+        pool = ConnectionPool(
             dsn,
             kwargs={
                 "row_factory": dict_row,
@@ -57,6 +60,15 @@ class RetirementStore:
             open=True,
             name="recall-retirement",
         )
+        try:
+            if self.verified_singleton_receipts:
+                with pool.connection() as connection:
+                    BrainStore.verify_search_plane(self, connection)
+        except BaseException:
+            pool.close(timeout=2)
+            raise
+        # No caller can obtain the pool until optional-schema validation passes.
+        self.pool = pool
 
     def connect(self):
         return self.pool.connection()
