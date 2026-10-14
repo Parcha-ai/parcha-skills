@@ -96,14 +96,14 @@ print(json.dumps({'status':'complete','cleared_documents':3,'cleared_utf8_bytes'
         result = dict(status='commit_outcome_unknown', cleared_documents=1,
             cleared_utf8_bytes=99, commit_outcome_unknown=True,
             committed_sql_ms=15., committed_hash_ms=3., archive_read_ms=8.,
-            claim_wall_ms=2., parent_wall_ms=31.)
+            claim_wall_ms=2., parent_wall_ms=31., metadata_capture_ms=5.)
         self.worker.child = Mock(returncode=0, stdout=BytesIO(json.dumps(result).encode()))
         self.worker.child.poll.return_value = 0
         with self.assertLogs('recall_server.retirement_supervisor', level='INFO') as logs:
             observed = self.worker.cycle()
         self.assertTrue(observed['commit_outcome_unknown'])
         for field in ('committed_sql_ms','committed_hash_ms','archive_read_ms',
-                      'claim_wall_ms','parent_wall_ms'):
+                      'claim_wall_ms','parent_wall_ms','metadata_capture_ms'):
             self.assertIn(f'{field}={result[field]}', logs.output[0])
 
     def test_shutdown_reaps_exact_child_and_refuses_another_launch(self):
