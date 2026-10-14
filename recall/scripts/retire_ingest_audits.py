@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""One reviewed audit page per durable Render operation; never automatic replay."""
+"""Bounded audit pages per durable Render operation; never automatic replay."""
 import argparse
 import json
 from pathlib import Path
@@ -12,6 +12,58 @@ from recall_server.retirement_campaign import _check, _mkdir, _write, digest
 from recall_server.retirement_jobs import RenderJob, reconcile_enrollment
 
 
+def validate_receipts(scope, receipts):
+    _check(isinstance(receipts,list) and 1 <= len(receipts) <= 10, 'batch_page_budget')
+    seen = set()
+    for index, receipt in enumerate(receipts):
+        _check(isinstance(receipt,dict) and all(receipt.get(k) == v for k,v in scope.items()),
+               'receipt_scope')
+        _check(receipt.get('contract') == 'recall.ingest-audit-retirement.v1' and
+               receipt.get('sha256') == digest({k:v for k,v in receipt.items() if k != 'sha256'}),
+               'receipt_digest')
+        _check(receipt['sha256'] not in seen, 'duplicate_receipt')
+        seen.add(receipt['sha256'])
+        _check(type(receipt['scanned']) is int and 0 <= receipt['scanned'] <= 50000 and
+               type(receipt['row_count']) is int and 0 <= receipt['row_count'] <= receipt['scanned'],
+               'page_row_budget')
+        _check(type(receipt['raw_bytes']) is int and 0 <= receipt['raw_bytes'] <= 32*1024*1024,
+               'page_byte_budget')
+        _check(type(receipt['exhausted']) is bool and all(
+            receipt[k] is None or isinstance(receipt[k],str) for k in ('after','next_after')),
+            'page_cursor')
+        _check((receipt['next_after'] != receipt['after']) if receipt['scanned'] else
+               (receipt['next_after'] == receipt['after'] and receipt['exhausted']), 'page_progress')
+        if index:
+            previous = receipts[index-1]
+            _check(not previous['exhausted'] and previous['next_after'] == receipt['after'],
+                   'receipt_chain')
+
+
+def require_durable_archive(config, payload):
+    directory = Path(payload['archive_operation'])
+    intent = json.loads((directory/'intent.json').read_bytes())
+    _check(intent['sha256'] == digest({k:intent[k] for k in ('config','payload')}), 'archive_intent_digest')
+    _check(intent['payload']['operation'] == 'archive_batch' and
+           intent['config']['scope'] == config['scope'], 'archive_intent_scope')
+    # A recovered result must come from the original GET-only reconciliation.
+    paths = [directory/'result.json', *sorted(directory.glob('reconcile-*/result.json'))]
+    results = [json.loads(path.read_bytes()) for path in paths if path.is_file()]
+    _check(bool(results) and all(r.get('status') == 'archived' and
+           r.get('receipts') == payload['receipts'] for r in results), 'durable_archive_receipts')
+    for path in paths:
+        if not path.is_file():
+            continue
+        result = json.loads(path.read_bytes())
+        events = [json.loads(p.read_bytes()) for p in sorted(path.parent.glob('event-*.json'))]
+        verified = [e['value'] for e in events if e['name'] == 'verified_job_result']
+        _check(len(verified) == 1 and verified[0] == dict(
+            pin=intent['sha256'], result_sha256=digest(result), result=result), 'archive_verified_result')
+    receipts = payload['receipts']
+    _check(receipts[0]['after'] == intent['payload']['after'] and
+           len(receipts) <= intent['payload']['max_pages'] and
+           all(r['scanned'] <= intent['payload']['limit'] for r in receipts), 'archive_requested_bounds')
+
+
 def package_body(config, payload):
     required = {'recall_server.' + name for name in ('audit_retirement','archive','archive_runtime','db')}
     _check(set(config['owner_modules']) == required and all(
@@ -22,9 +74,21 @@ def package_body(config, payload):
     scope = config['scope']
     _check(set(scope) == {'tenant_id','source_id','cutoff'}, 'audit_scope')
     operation = payload['operation']
-    _check(operation in {'archive','clear','inspect','restore'}, 'audit_operation')
-    if operation == 'archive':
-        _check(set(payload) == {'operation','after','limit'}, 'archive_payload')
+    _check(operation in {'archive','clear','inspect','restore','archive_batch','clear_batch','inspect_batch'}, 'audit_operation')
+    if operation in {'archive','archive_batch'}:
+        keys = {'operation','after','limit'} | ({'max_pages'} if operation == 'archive_batch' else set())
+        _check(set(payload) == keys, 'archive_payload')
+        _check(type(payload['limit']) is int and 1 <= payload['limit'] <= 50000, 'page_row_budget')
+        _check(payload['after'] is None or isinstance(payload['after'],str), 'page_cursor')
+        if operation == 'archive_batch':
+            _check(type(payload['max_pages']) is int and 1 <= payload['max_pages'] <= 10, 'batch_page_budget')
+    elif operation in {'clear_batch','inspect_batch'}:
+        keys = {'operation','receipts'} | ({'archive_operation'} if operation == 'clear_batch' else set())
+        _check(set(payload) == keys, 'batch_payload')
+        validate_receipts(scope,payload['receipts'])
+        if operation == 'clear_batch':
+            _check(isinstance(payload['archive_operation'],str) and bool(payload['archive_operation']),
+                   'archive_operation_required')
     else:
         _check(set(payload) == {'operation','receipt'}, 'receipt_payload')
         _check(all(payload['receipt'].get(k) == v for k,v in scope.items()), 'receipt_scope')
@@ -57,6 +121,23 @@ try:
     owner = AuditRetirement(store, archive)
     if payload['operation'] == 'archive':
         result = owner.archive_page(**config['scope'], after=payload['after'], limit=payload['limit'])
+    elif payload['operation'] == 'archive_batch':
+        receipts, after = [], payload['after']
+        for _ in range(payload['max_pages']):
+            receipt = owner.archive_page(**config['scope'], after=after, limit=payload['limit'])
+            receipts.append(receipt)
+            after = receipt['next_after']
+            if receipt['exhausted']:
+                break
+        result = dict(status='archived', receipts=receipts, next_after=after,
+                      exhausted=receipts[-1]['exhausted'])
+    elif payload['operation'] in {'clear_batch','inspect_batch'}:
+        operation = payload['operation'].removesuffix('_batch')
+        results = []
+        for receipt in payload['receipts']:
+            outcome = getattr(owner, operation)(receipt)
+            results.append(dict(receipt_sha256=receipt['sha256'], outcome=outcome))
+        result = dict(status=operation + '_finished', results=results)
     else:
         result = getattr(owner, payload['operation'])(payload['receipt'])
     for event in encode_result(result, PIN):
@@ -72,6 +153,8 @@ finally:
 def run_operation(config, payload, directory, expected_sha256):
     body,pin = package_body(config,payload)
     _check(pin == expected_sha256, 'reviewed_operation_digest')
+    if payload['operation'] == 'clear_batch':
+        require_durable_archive(config,payload)
     directory = Path(directory)
     _mkdir(directory)  # Exclusive creation prevents reopening/replaying an uncertain attempt.
     _write(directory/'intent.json',dict(config=config,payload=payload,sha256=pin))

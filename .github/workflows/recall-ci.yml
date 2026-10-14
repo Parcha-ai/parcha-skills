@@ -52,6 +52,8 @@ jobs:
       - run: ruff check . --select E9,F,PLE
       - run: bandit -q -lll -r . -x tests,server/tests
       - run: pip-audit -r server/requirements.txt
+      - name: Retired job-index lifecycle (isolated PostgreSQL 17)
+        run: bash server/tests/run_job_status_index_fixture.sh
       - name: Fresh-PostgreSQL end-to-end suite
         run: |
           for test in \
@@ -62,6 +64,7 @@ jobs:
             e2e_compact_ingest_metadata.py \
             e2e_compact_canonical_bodies.py \
             e2e_audit_retirement.py \
+            e2e_audit_retirement_batch.py \
             e2e_binary_archive.py \
             e2e_storage_legacy_cut.py \
             e2e_canonical_body_thinning.py \
