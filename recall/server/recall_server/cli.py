@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import argparse
-from contextlib import nullcontext
+from contextlib import ExitStack
+from functools import partial
 from datetime import datetime, timezone
 import gzip
 import hashlib
@@ -48,7 +49,7 @@ from .passage_index import CanonicalPassageProjector, passage_embed_plan
 from .passage_projection import PassagePolicy
 from .parquet_scan import CanonicalParquetScanProjector
 from .passage_worker import run_passage_worker
-from .projection_worker import run_embedding_worker, run_projection_worker
+from .projection_worker import BackgroundBodyThinner, run_embedding_worker, run_projection_worker
 from .federation import QUALITY_SCORES, SOURCE_FAMILIES
 from .live_providers import (
     LiveProviderError,
@@ -2614,7 +2615,23 @@ def main() -> None:
                 tenant_id=args.tenant,
                 max_months=args.search_plane_months_per_cycle,
             )
-        with retirement if args.retirement == "on" and not args.once else nullcontext():
+
+        def prepare_thinning(busy):
+            # The logical coordinator owns its hint dictionary. Snapshot here,
+            # before submitting work; only the retained thinner runs in the slot.
+            return partial(
+                body_thinner.thin,
+                committed_keys=logical._take_committed_body_keys(),
+                batch_size=args.thin_busy_batch_size if busy else args.thin_batch_size,
+            )
+
+        with ExitStack() as maintenance:
+            if args.retirement == "on" and not args.once:
+                maintenance.enter_context(retirement)
+            background_thinner = (
+                None if args.once else
+                maintenance.enter_context(BackgroundBodyThinner(prepare_thinning))
+            )
             print(
                 json.dumps(
                     run_projection_worker(
@@ -2638,14 +2655,8 @@ def main() -> None:
                         skip_embedding=args.skip_embedding,
                         search_plane=search_plane,
                         retirement_maintainer=(lambda busy: retirement.cycle(busy=busy)) if retirement else None,
-                        body_thinner=lambda busy: body_thinner.thin(
-                            committed_keys=logical._take_committed_body_keys(),
-                            batch_size=(
-                                args.thin_busy_batch_size
-                                if busy
-                                else args.thin_batch_size
-                            ),
-                        ),
+                        body_thinner=(lambda busy: prepare_thinning(busy)()) if args.once else None,
+                        background_thinner=background_thinner,
                     ),
                     sort_keys=True,
                 )

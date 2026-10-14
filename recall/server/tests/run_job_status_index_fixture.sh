@@ -13,7 +13,7 @@ docker run -d --name "$fixture_container" "${fixture_group[@]}" --memory=1g --me
   -e POSTGRES_USER=fixture_bootstrap -e POSTGRES_DB=postgres -e POSTGRES_PASSWORD=synthetic-ci-password \
   -p 127.0.0.1::5432 pgvector/pgvector:0.8.2-pg17 >/dev/null
 for fixture_attempt in {1..30}; do
-  if docker exec "$fixture_container" pg_isready -U fixture_bootstrap >/dev/null; then break; fi
+  if docker exec "$fixture_container" pg_isready -h 127.0.0.1 -U fixture_bootstrap >/dev/null; then break; fi
   sleep 1
 done
 fixture_port=$(docker port "$fixture_container" 5432/tcp | cut -d: -f2)
