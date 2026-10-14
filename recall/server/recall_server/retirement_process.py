@@ -103,6 +103,7 @@ def main():
             tenant_id=configuration["tenant_id"],
             enabled=True,
             seconds=seconds,
+            max_clear_bytes=512 * 1024**2,
             max_archive_bytes=64 * 1024**3,
             catalog_archive_budget=True,
         )
