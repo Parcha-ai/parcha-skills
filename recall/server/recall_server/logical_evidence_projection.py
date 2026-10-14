@@ -102,12 +102,21 @@ class _LocatorSpool:
         self.count = 0
         self._current = None
         self._desired = None
+        self._ordinals_complete = True
+        self.append_source_ordinal = None
 
     def append(self, location):
         self._file.write(orjson.dumps(location) + b"\n")
         self.count += 1
 
     def observe(self, row):
+        ordinal = row.get("byte_start")
+        if type(ordinal) is not int:
+            self._ordinals_complete = False
+            self.append_source_ordinal = None
+        elif self._ordinals_complete:
+            self.append_source_ordinal = (ordinal if self.append_source_ordinal is None
+                                          else max(self.append_source_ordinal, ordinal))
         self._current = row
         self._desired = (None, None)
 
@@ -169,6 +178,7 @@ def mark_logical_evidence_dirty(
     source_id: str,
     native_ids: list[str],
     reason: str,
+    new_native_ids: tuple[str, ...] = (),
 ) -> int:
     """Queue affected logical documents in the same transaction as canonical state."""
 
@@ -194,9 +204,17 @@ def mark_logical_evidence_dirty(
                generation=canonical_evidence_document_queue.generation+1,
                reason=CASE WHEN canonical_evidence_document_queue.reason='forget'
                            THEN 'forget' ELSE excluded.reason END,
-               changed_at=clock_timestamp()""",
+               changed_at=clock_timestamp()
+           RETURNING EXISTS(SELECT 1 FROM schema_migrations WHERE version=79)
+                     AS append_capability""",
         (reason, tenant_id, source_id, native_ids),
     )
+    if new_native_ids and reason == "ingest":
+        capability = result.fetchone()
+        if capability and capability.get("append_capability"):
+            from .logical_append_capability import classify_new_natives
+            classify_new_natives(connection, tenant_id=tenant_id, source_id=source_id,
+                                 native_ids=native_ids, new_native_ids=new_native_ids)
     return max(0, result.rowcount)
 
 
@@ -1761,7 +1779,9 @@ class CanonicalLogicalEvidenceProjector:
                     deleted = connection.execute(
                         """DELETE FROM canonical_evidence_document_queue
                             WHERE tenant_id=%s AND source_id=%s
-                              AND native_parent_id=%s AND generation=%s""",
+                              AND native_parent_id=%s AND generation=%s
+                            RETURNING EXISTS(SELECT 1 FROM schema_migrations WHERE version=79)
+                                      AS append_capability""",
                         (
                             candidate.tenant_id,
                             candidate.source_id,
@@ -1773,6 +1793,11 @@ class CanonicalLogicalEvidenceProjector:
                         raise LogicalEvidenceError(
                             "logical_evidence_queue_conflict"
                         )
+                    capability = deleted.fetchone()
+                    if capability and capability.get("append_capability"):
+                        from .logical_append_capability import record_frontier
+                        record_frontier(connection, candidate, getattr(upload, "body_locators", None),
+                                        restored_manifest["artifact_id"])
                     from .retirement_policy import enroll_published_parent
                     enroll_published_parent(self.store, connection,
                         (candidate.tenant_id, candidate.source_id, candidate.native_parent_id))
@@ -2025,7 +2050,9 @@ class CanonicalLogicalEvidenceProjector:
                 deleted = connection.execute(
                     """DELETE FROM canonical_evidence_document_queue
                         WHERE tenant_id=%s AND source_id=%s
-                          AND native_parent_id=%s AND generation=%s""",
+                          AND native_parent_id=%s AND generation=%s
+                        RETURNING EXISTS(SELECT 1 FROM schema_migrations WHERE version=79)
+                                  AS append_capability""",
                     (
                         candidate.tenant_id,
                         candidate.source_id,
@@ -2035,6 +2062,11 @@ class CanonicalLogicalEvidenceProjector:
                 )
                 if deleted.rowcount != 1:
                     raise LogicalEvidenceError("logical_evidence_queue_conflict")
+                capability = deleted.fetchone()
+                if capability and capability.get("append_capability"):
+                    from .logical_append_capability import record_frontier
+                    record_frontier(connection, candidate, getattr(upload, "body_locators", None),
+                                    manifest_reference["artifact_id"])
                 from .retirement_policy import enroll_published_parent
                 enroll_published_parent(self.store, connection,
                     (candidate.tenant_id, candidate.source_id, candidate.native_parent_id))

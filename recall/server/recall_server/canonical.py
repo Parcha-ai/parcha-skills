@@ -894,6 +894,7 @@ class CanonicalPlane:
                     source_id=source_id,
                     native_ids=affected_native_ids,
                     reason="ingest",
+                    new_native_ids=(native_id,) if revision == 1 and not is_tombstone else (),
                 )
                 if _notification:
                     mark_logical_notification_pending(
@@ -1628,6 +1629,8 @@ class CanonicalPlane:
                         source_id=source_id,
                         native_ids=affected_native_ids,
                         reason="ingest",
+                        new_native_ids=tuple(item["native_id"] for item in new_rows
+                                             if item["revision"] == 1 and not item["is_tombstone"]),
                     )
                 inserted_actor_links = attribute_canonical_events(
                     connection,
