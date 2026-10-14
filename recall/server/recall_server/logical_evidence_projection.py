@@ -606,7 +606,9 @@ class CanonicalLogicalEvidenceProjector:
 
         With a quiet period, a group is ready only once it has not changed for
         `quiet_seconds`, or has been waiting longer than `max_wait_seconds`
-        since it first entered the queue. Forget and backfill never wait.
+        since it first entered the queue. Metadata-bound appends become ready
+        after one quiet window in the queue even if still changing. Forget and
+        backfill never wait.
         Give each source's ready head a floor, then share residual admission
         by eligible backlog. Forget takes precedence and retains its existing
         ordering. Normal groups use oldest-first order unless this is a
@@ -616,13 +618,37 @@ class CanonicalLogicalEvidenceProjector:
         only after bounded admission.
         """
         with self.store.connect() as connection:
+            append_ready = ""
+            append_join = ""
+            append_values = ()
+            if (self.append_enabled and quiet_seconds > 0
+                    and self.excluded_structural_types == DEFAULT_EXCLUDED_STRUCTURAL_TYPES
+                    and connection.execute(
+                        "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=79) AS available"
+                    ).fetchone()["available"]):
+                # Reuse the quiet window as the maximum queue age for a bound
+                # append. Full rebuilds retain their longer coalescing limit.
+                # Preparation and the final publication CAS remain authoritative.
+                append_join = """
+                         LEFT JOIN canonical_evidence_documents append_base
+                           ON append_base.tenant_id=queue.tenant_id
+                          AND append_base.source_id=queue.source_id
+                          AND append_base.native_parent_id=queue.native_parent_id"""
+                append_ready = """
+                               OR (queue.reason='ingest'
+                                   AND queue.first_queued_at < clock_timestamp()-%s*interval '1 second'
+                                   AND queue.append_generation=queue.generation
+                                   AND queue.append_base_manifest_id=append_base.manifest_artifact_id
+                                   AND append_base.append_manifest_id=append_base.manifest_artifact_id
+                                   AND append_base.append_source_ordinal IS NOT NULL)"""
+                append_values = (quiet_seconds,)
             rows = connection.execute(
-                """WITH eligible AS MATERIALIZED (
+                f"""WITH eligible AS MATERIALIZED (
                        SELECT queue.*,
                               CASE WHEN queue.reason='forget' THEN 0
                                    WHEN %s AND queue.notification_queued_at IS NOT NULL THEN 1
                                    ELSE 2 END AS admission_priority
-                         FROM canonical_evidence_document_queue queue
+                         FROM canonical_evidence_document_queue queue{append_join}
                          WHERE (%s::text IS NULL OR queue.tenant_id=%s)
                            AND queue.attempts<%s
                            AND (
@@ -638,7 +664,7 @@ class CanonicalLogicalEvidenceProjector:
                                    %s::float8>0
                                    AND queue.first_queued_at
                                        < clock_timestamp()-%s*interval '1 second'
-                               )
+                               ){append_ready}
                            )
                    ), ranked AS (
                        SELECT eligible.*,
@@ -707,6 +733,7 @@ class CanonicalLogicalEvidenceProjector:
                     MAX_LOGICAL_ATTEMPTS,
                     quiet_seconds, quiet_seconds,
                     max_wait_seconds, max_wait_seconds,
+                    *append_values,
                     prefer_recent,
                     limit,
                 ),
