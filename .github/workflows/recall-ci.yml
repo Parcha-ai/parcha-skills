@@ -121,6 +121,7 @@ jobs:
             e2e_singleton_agent_receipts.py \
             e2e_singleton_time_clip.py \
             e2e_singleton_parent_receipts.py \
+            e2e_singleton_projection_membership.py \
             e2e_authority_covering_indexes.py \
             e2e_slack_passage_visibility.py \
             e2e_slack_visible_text_replay.py \
