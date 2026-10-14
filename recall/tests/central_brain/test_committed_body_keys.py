@@ -373,7 +373,10 @@ class PublicationTests(unittest.TestCase):
         ]
         budgets = []
 
-        def prepare(candidates, *, hint_limit, require_current_queue):
+        def prepare(candidates, *, hint_limit, require_current_queue, attempt_metrics):
+            self.assertEqual(attempt_metrics, dict(
+                input_capture_wall_ms=None, archive_prepare_wall_ms=None, commit_wall_ms=None,
+            ))
             self.assertTrue(require_current_queue)
             budgets.append((len(candidates), hint_limit))
             if candidates[0].native_parent_id == "130":
