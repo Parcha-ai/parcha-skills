@@ -187,6 +187,7 @@ jobs:
             e2e_located_public_reads.py \
             e2e_retirement_runner.py \
             e2e_retirement_capture_timing.py \
+            e2e_retirement_error_cause.py \
             e2e_retirement_query_pipeline.py \
             e2e_company_retirement_authority.py \
             e2e_deleted_chunk_bodies.py \
