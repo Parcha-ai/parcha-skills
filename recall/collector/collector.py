@@ -6,6 +6,7 @@ import json
 import os
 import re
 import sqlite3
+import stat
 import time
 import urllib.error
 import urllib.request
@@ -352,22 +353,41 @@ class Collector:
         self.db.execute("DELETE FROM meta WHERE key='running_started_epoch'")
 
     def discover(self) -> list[Path]:
-        pattern = "rollout-*.jsonl" if self.harness == "codex" else "*.jsonl"
-        roots = [self.root]
+        roots = [(self.root, "source_unavailable")]
         if self.harness == "codex" and self.archive_root is not None:
-            if not self.archive_root.is_dir():
-                raise CollectorRuntimeError("archive_unavailable")
-            roots.append(self.archive_root)
+            roots.append((self.archive_root, "archive_unavailable"))
         result: list[Path] = []
-        for root in roots:
-            if not root.exists():
-                continue
-            paths = [path for path in root.rglob(pattern) if path.is_file()]
-            result.extend(sorted(
-                paths,
-                key=lambda path: (path.stat().st_mtime_ns, str(path)),
-                reverse=True,
-            ))
+        for root, unavailable_code in roots:
+            try:
+                before = root.stat()
+                if not stat.S_ISDIR(before.st_mode):
+                    raise CollectorRuntimeError(unavailable_code)
+            except OSError:
+                raise CollectorRuntimeError(unavailable_code) from None
+            try:
+                pending = [root]
+                paths = []
+                while pending:
+                    with os.scandir(pending.pop()) as entries:
+                        for entry in entries:
+                            if entry.is_dir(follow_symlinks=False):
+                                pending.append(Path(entry.path))
+                            elif entry.name.endswith(".jsonl") and (
+                                self.harness != "codex" or entry.name.startswith("rollout-")
+                            ):
+                                metadata = entry.stat()
+                                if stat.S_ISREG(metadata.st_mode):
+                                    paths.append((Path(entry.path), metadata.st_mtime_ns))
+                after = root.stat()
+                if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
+                    raise CollectorRuntimeError("inventory_incomplete")
+                result.extend(path for path, _ in sorted(
+                    paths, key=lambda item: (item[1], str(item[0])), reverse=True,
+                ))
+            except OSError:
+                # pathlib.rglob suppresses traversal errors; absence then looks
+                # like authoritative deletion of previously captured history.
+                raise CollectorRuntimeError("inventory_incomplete") from None
         return result
 
     def _legacy_file_key(self, path: Path) -> str:
@@ -1171,10 +1191,12 @@ class Collector:
         try:
             summary = self._scan()
         except CollectorRuntimeError as error:
+            self._set_meta("last_scan_complete", "0")
             self._clear_running()
             self._record_error(error.error_code)
             raise
         except Exception:
+            self._set_meta("last_scan_complete", "0")
             self._clear_running()
             self._record_error("scan_failed")
             raise
@@ -1182,7 +1204,7 @@ class Collector:
         self._set_meta("last_scan_complete", "1" if summary["scan_complete"] else "0")
         self.db.execute(
             "DELETE FROM meta WHERE key='last_error_code' "
-            "AND value IN ('archive_unavailable','scan_failed')"
+            "AND value IN ('archive_unavailable','scan_failed','source_unavailable','inventory_incomplete')"
         )
         self.db.commit()
         return summary
@@ -2006,6 +2028,7 @@ class Collector:
         return maximum
 
     def doctor(self, *, include_dead_letters: bool = True) -> dict:
+        inventory_error = None
         if self.harness == "codex":
             active_disk = {
                 str(path) for path in self.root.rglob("rollout-*.jsonl")
@@ -2023,7 +2046,11 @@ class Collector:
             }
             disk = active_disk | archive_disk
         else:
-            disk = {str(path) for path in self.discover()}
+            try:
+                disk = {str(path) for path in self.discover()}
+            except CollectorRuntimeError as error:
+                disk = set()
+                inventory_error = error.error_code
         ledger = {row["path"] for row in self.db.execute("SELECT path FROM files WHERE status != 'tombstone'")}
         total_lines = self.db.execute("SELECT count(*) AS n FROM active_records").fetchone()["n"]
         parse_errors = self.db.execute("SELECT count(*) AS n FROM dead_letters").fetchone()["n"]
@@ -2040,7 +2067,9 @@ class Collector:
             "source_id": self.source_id,
             "disk_files": len(disk),
             "ledger_files": len(ledger),
-            "coverage_percent": 100.0 if not disk else 100.0 * len(disk & ledger) / len(disk),
+            "coverage_percent": 0.0 if inventory_error else (
+                100.0 if not disk else 100.0 * len(disk & ledger) / len(disk)
+            ),
             "records": total_lines,
             "collapsed_records": self.db.execute("SELECT COALESCE(sum(collapsed),0) AS n FROM record_repeats").fetchone()["n"],
             "parse_errors": parse_errors,
@@ -2054,9 +2083,9 @@ class Collector:
             "privacy_mode": self.privacy.mode,
             "privacy_policy_version": self.privacy.apply({}).policy_version,
             "last_success_epoch": int(metadata.get("last_success_epoch", "0")),
-            "last_error_code": metadata.get("last_error_code"),
+            "last_error_code": inventory_error or metadata.get("last_error_code"),
             "running": "running_started_epoch" in metadata,
-            "scan_complete": metadata.get("last_scan_complete") == "1",
+            "scan_complete": not inventory_error and metadata.get("last_scan_complete") == "1",
         }
         if self.harness == "codex":
             locations = {
