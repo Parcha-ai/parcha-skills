@@ -1,0 +1,124 @@
+"""Reclaim text from chunks that canonical deletion already made unreadable."""
+
+import math
+import time
+
+from .chunk_retirement import ChunkRetirementError, require_retirement_owner
+from .logical_evidence import IDENTITY_RE
+
+MAX_KEYS = 1000
+_SNAPSHOT = """SELECT chunk.chunk_id,chunk.document_id,document.native_id,
+        octet_length(chunk.text_redacted)::bigint AS body_bytes
+    FROM canonical_chunks chunk JOIN canonical_documents document
+      USING(tenant_id,source_id,document_id)
+    WHERE chunk.tenant_id=%s AND chunk.source_id=%s AND chunk.chunk_id=ANY(%s)
+      AND chunk.deleted_at IS NOT NULL AND document.deleted_at IS NOT NULL
+      AND NOT document.is_current
+    ORDER BY chunk.chunk_id"""
+
+
+def clear_deleted_chunk_bodies(
+    store,
+    *,
+    tenant_id,
+    source_id,
+    principal_id,
+    chunk_ids,
+    apply=False,
+    deadline_at=None,
+):
+    """Clear only reviewed exact keys; dry-run by default, no archive dependency.
+
+    Existing metadata remains authoritative for receipts, replay and forget.
+    Return counters only after COMMIT acknowledgment. An unknown commit can be
+    reconciled by inspecting the same keys; retrying never clears live bodies.
+    """
+    if (
+        any(
+            not isinstance(value, str) or not IDENTITY_RE.fullmatch(value)
+            for value in (tenant_id, source_id, principal_id)
+        )
+        or not isinstance(chunk_ids, tuple)
+        or not 1 <= len(chunk_ids) <= MAX_KEYS
+        or any(
+            not isinstance(value, str) or not IDENTITY_RE.fullmatch(value)
+            for value in chunk_ids
+        )
+        or len(set(chunk_ids)) != len(chunk_ids)
+        or type(apply) is not bool
+    ):
+        raise ChunkRetirementError("deleted_chunk_scope_invalid")
+    if deadline_at is None:
+        deadline_at = time.monotonic() + 5
+    if type(deadline_at) not in (int, float) or not math.isfinite(deadline_at):
+        raise ChunkRetirementError("deleted_chunk_deadline_invalid")
+    params = (tenant_id, source_id, list(chunk_ids))
+    with store.connect() as connection, connection.transaction():
+        if not apply:
+            connection.execute("SET TRANSACTION READ ONLY")
+        connection.execute("SET LOCAL lock_timeout='250ms'")
+        require_retirement_owner(
+            store,
+            connection,
+            (tenant_id, source_id),
+            principal_id,
+            deadline_at,
+            lock=apply,
+        )
+
+        def query(sql, args):
+            return store._execute_bounded(connection, sql, args, deadline_at)
+
+        rows = query(_SNAPSHOT, params).fetchall()
+        if apply and rows:
+            for native in sorted({row["native_id"] for row in rows}):
+                locked = query(
+                    "SELECT pg_try_advisory_xact_lock(hashtextextended(%s,0)) AS locked",
+                    (f"v2\x1f{tenant_id}\x1f{source_id}\x1f{native}",),
+                ).fetchone()["locked"]
+                if not locked:
+                    raise ChunkRetirementError("deleted_chunk_lock_busy")
+            documents = sorted({row["document_id"] for row in rows})
+            locked_docs = query(
+                """SELECT document_id FROM canonical_documents
+                WHERE tenant_id=%s AND source_id=%s AND document_id=ANY(%s)
+                  AND deleted_at IS NOT NULL AND NOT is_current
+                ORDER BY document_id FOR UPDATE NOWAIT""",
+                (tenant_id, source_id, documents),
+            ).fetchall()
+            if {row["document_id"] for row in locked_docs} != set(documents):
+                raise ChunkRetirementError("deleted_chunk_scope_changed")
+            locked_rows = query(
+                _SNAPSHOT + " FOR UPDATE OF chunk NOWAIT", params
+            ).fetchall()
+            if {(row["chunk_id"], row["document_id"]) for row in locked_rows} != {
+                (row["chunk_id"], row["document_id"]) for row in rows
+            }:
+                raise ChunkRetirementError("deleted_chunk_scope_changed")
+            rows = locked_rows
+        eligible = sum(row["body_bytes"] > 0 for row in rows)
+        body_bytes = sum(row["body_bytes"] for row in rows)
+        if apply and eligible:
+            changed = query(
+                """UPDATE canonical_chunks chunk SET text_redacted=''
+                FROM canonical_documents document
+                WHERE chunk.tenant_id=%s AND chunk.source_id=%s
+                  AND chunk.chunk_id=ANY(%s) AND chunk.text_redacted<>''
+                  AND document.tenant_id=chunk.tenant_id AND document.source_id=chunk.source_id
+                  AND document.document_id=chunk.document_id
+                  AND chunk.deleted_at IS NOT NULL AND document.deleted_at IS NOT NULL
+                  AND NOT document.is_current""",
+                params,
+            )
+            if changed.rowcount != eligible:
+                raise ChunkRetirementError("deleted_chunk_scope_changed")
+    return dict(
+        status="cleared" if apply else "planned",
+        requested_keys=len(chunk_ids),
+        deleted_chunks=len(rows),
+        eligible_chunks=eligible,
+        eligible_utf8_bytes=body_bytes,
+        cleared_chunks=eligible if apply else 0,
+        cleared_utf8_bytes=body_bytes if apply else 0,
+        physical_bytes_reclaimed=0,
+    )
