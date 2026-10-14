@@ -563,6 +563,8 @@ class CanonicalLogicalEvidenceProjector:
             if set(structural_types).intersection(
                 self.excluded_structural_types
             ):
+                if row.get('chunk_receipt_profile') is not None:
+                    raise LogicalEvidenceError('logical_evidence_admitted_record_excluded')
                 continue
             canonical_content_bytes = None
             if parsed and row["raw_media_type"] != OVERSIZED_MEDIA_TYPE:
@@ -1039,6 +1041,13 @@ class CanonicalLogicalEvidenceProjector:
                                 row["revision"],row["text_sha256"],None,None))
                 append_filter = " WHERE event.source_ordinal>%s" if append_ordinals else ""
                 append_values = (pins[0]["append_source_ordinal"],) if append_ordinals else ()
+                singleton_fields = ""
+                if getattr(self.store, 'verified_singleton_receipts', False):
+                    singleton_fields = """document.chunk_receipt_profile,
+                        EXISTS (SELECT 1 FROM canonical_chunks remaining
+                            WHERE remaining.tenant_id=document.tenant_id
+                              AND remaining.source_id=document.source_id
+                              AND remaining.document_id=document.document_id) AS physical_chunks_remain,"""
                 with connection.cursor(
                     name="logical_evidence_batch_stream",
                 ) as cursor:
@@ -1053,7 +1062,8 @@ class CanonicalLogicalEvidenceProjector:
                            ) AS {parent_materialization} (
                                {parent_selection}
                            )"""
-                        """SELECT selected.candidate_ordinal,
+                        f"""SELECT selected.candidate_ordinal,{singleton_fields}"""
+                        """
                               document.document_id,document.body_location,
                               document.body_record_ordinal,document.body_record_count,
                               event.tenant_id,event.source_id,
@@ -1229,6 +1239,14 @@ class CanonicalLogicalEvidenceProjector:
                         if checkpoint is not None:
                             checkpoint()
                         row = pickle.load(input_spool)
+                        if row.get('chunk_receipt_profile') is not None:
+                            from .receipt_membership import admitted_singleton_metadata
+
+                            member = admitted_singleton_metadata(dict(row,
+                                profile=row['chunk_receipt_profile'], revision=row['document_revision'],
+                                is_current=True, document_deleted_at=None))
+                            row.update(chunk_count=1, chunk_receipts=[member['receipt']], event_text='',
+                                source_chunks=[dict(ordinal=0, size_bytes=0, text_sha256=member['text_sha256'])])
                         try:
                             _validate_source_body(row)
                         except LogicalEvidenceError:
