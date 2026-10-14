@@ -267,12 +267,12 @@ class CodexPaginationTest(unittest.TestCase):
         scanned = resumed.scan()
         self.assertEqual(scanned["identity_conflicts"], 0)
         self.assertEqual(scanned["records_queued"], 1)
-        self.assertEqual(scanned["tombstones_queued"], 2)
+        self.assertEqual(scanned["tombstones_queued"], 0)
         resumed.flush()
         restored = self.archived / root.name
         restored.write_bytes(root_bytes)
         scanned = resumed.scan()
-        self.assertEqual(scanned["records_queued"], 2)
+        self.assertEqual(scanned["records_queued"], 0)
         self.assertEqual(scanned["tombstones_queued"], 0)
         self.assertEqual(
             resumed.db.execute("SELECT count(*) FROM active_records").fetchone()[0], 5
@@ -307,7 +307,7 @@ class CodexPaginationTest(unittest.TestCase):
         self.assertEqual(collector.scan()["records_queued"], 0)
         collector.close()
 
-    def test_deleted_segment_after_restart_queues_tombstones_without_reading_file(self):
+    def test_missing_segment_after_restart_retains_history_without_reading_file(self):
         root = self.root_file()
         segment = self.segment(root)
         collector = self.collector()
@@ -323,15 +323,15 @@ class CodexPaginationTest(unittest.TestCase):
         segment.unlink()
         resumed = self.collector()
         scanned = resumed.scan()
-        self.assertEqual(scanned["tombstones_queued"], 2)
+        self.assertEqual(scanned["tombstones_queued"], 0)
         pending = [
             json.loads(row[0])
             for row in resumed.db.execute(
                 "SELECT envelope_json FROM outbox WHERE state='pending'"
             )
         ]
-        self.assertEqual({row["native_id"] for row in pending}, before)
-        self.assertEqual({row["kind"] for row in pending}, {"tombstone"})
+        self.assertEqual(pending, [])
+        self.assertTrue(before <= {row[0] for row in resumed.db.execute("SELECT native_id FROM active_records")})
         resumed.close()
 
     def test_root_audit_does_not_call_distinct_segments_conflicting_copies(self):

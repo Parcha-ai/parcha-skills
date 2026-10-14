@@ -6,6 +6,20 @@ scan offset may move once the spool transaction is durable; the separate committ
 only after BrainStore returns a commit acknowledgement. A lost acknowledgement retries the same
 idempotency key.
 
+Captured history remains available when a local transcript disappears, moves, or is
+truncated. Delete captured history through explicit Recall forget. Filesystem cleanup
+is not deletion authority for Claude or Codex history.
+
+On upgrade, pending filesystem tombstones from older collectors move to the existing
+dead-letter state with `filesystem_deletion_forbidden`; their original envelopes stay
+in the spool without an acknowledgement. Ordinary records continue to flush, and
+payload recovery does not reactivate these markers. The server rejects these markers
+with HTTP 400 (`canonical_filesystem_deletion_forbidden`) before archive or canonical
+mutation. Older collectors do not automatically quarantine that response and may stall
+until upgraded; deploying the server alone does not complete the collector rollout.
+Previously committed deletions are not automatically restored. Slack deletion events
+and explicit Recall forget retain their existing behavior.
+
 One process and source-scoped credential serve each harness on Linux or macOS:
 
 ```bash
