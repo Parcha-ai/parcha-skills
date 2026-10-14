@@ -4238,29 +4238,9 @@ class BoundCanonicalRetrieval:
         require(isinstance(passage_ids, list) and 1 <= len(passage_ids) <= 2)
         require(all(isinstance(p, str) and re.fullmatch(r"psg_[0-9a-f]{32}", p) for p in passage_ids))
         require(len(set(passage_ids)) == len(passage_ids))
-        with self.store.connect() as connection:
-            rows = self.store._execute_bounded(
-                connection,
-                """SELECT passage.passage_id,passage.ordinal,passage.policy_fingerprint,
-                          passage.text_sha256,passage.spans,passage.receipts
-                     FROM canonical_passages passage
-                     JOIN canonical_passage_documents projected
-                       USING(tenant_id,source_id,logical_document_id,revision,policy_fingerprint)
-                     JOIN canonical_evidence_documents evidence
-                       USING(tenant_id,source_id,logical_document_id,revision)
-                    WHERE passage.tenant_id=%s AND passage.source_id=%s
-                      AND passage.logical_document_id=%s AND passage.revision=%s
-                      AND evidence.manifest_content_sha256=%s
-                      AND passage.passage_id=ANY(%s)
-                      AND projected.source_document_sha256=evidence.document_content_sha256
-                      AND NOT EXISTS (
-                          SELECT 1 FROM canonical_evidence_document_queue pending
-                          WHERE pending.tenant_id=evidence.tenant_id
-                            AND pending.source_id=evidence.source_id
-                            AND pending.native_parent_id=evidence.native_parent_id
-                            AND pending.reason='forget'
-                      )
-                      AND NOT EXISTS (
+        deadline_at = deadline_at if deadline_at is not None else time.monotonic() + 5.0
+        singleton_reads = getattr(self.store, "verified_singleton_receipts", False)
+        receipt_gate = """                      AND NOT EXISTS (
                           SELECT 1 FROM unnest(passage.receipts) AS wanted(receipt)
                           WHERE NOT EXISTS (
                               SELECT 1 FROM canonical_chunks chunk
@@ -4279,10 +4259,60 @@ class BoundCanonicalRetrieval:
                                       AND later.revision>document.revision AND later.is_tombstone
                                 )
                           )
-                      )""",
+                      )""" if not singleton_reads else ""
+        parent_column = ",evidence.native_parent_id" if singleton_reads else ""
+        with self.store.connect() as connection:
+            if singleton_reads:
+                connection.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            rows = self.store._execute_bounded(
+                connection,
+                f"""SELECT passage.passage_id,passage.ordinal,passage.policy_fingerprint,
+                          passage.text_sha256,passage.spans,passage.receipts{parent_column}
+                     FROM canonical_passages passage
+                     JOIN canonical_passage_documents projected
+                       USING(tenant_id,source_id,logical_document_id,revision,policy_fingerprint)
+                     JOIN canonical_evidence_documents evidence
+                       USING(tenant_id,source_id,logical_document_id,revision)
+                    WHERE passage.tenant_id=%s AND passage.source_id=%s
+                      AND passage.logical_document_id=%s AND passage.revision=%s
+                      AND evidence.manifest_content_sha256=%s
+                      AND passage.passage_id=ANY(%s)
+                      AND projected.source_document_sha256=evidence.document_content_sha256
+                      AND NOT EXISTS (
+                          SELECT 1 FROM canonical_evidence_document_queue pending
+                          WHERE pending.tenant_id=evidence.tenant_id
+                            AND pending.source_id=evidence.source_id
+                            AND pending.native_parent_id=evidence.native_parent_id
+                            AND pending.reason='forget'
+                      )
+{receipt_gate}""",
                 (self.tenant_id, source_id, logical_document_id, revision, manifest_content_sha256, passage_ids),
-                deadline_at if deadline_at is not None else time.monotonic() + 5.0,
+                deadline_at,
             ).fetchall()
+            if singleton_reads and rows:
+                from .receipt_membership import lookup_receipt_metadata
+
+                receipts = tuple(dict.fromkeys(receipt for row in rows for receipt in row["receipts"]))
+                members = lookup_receipt_metadata(
+                    self.store, tenant_id=self.tenant_id, authorized_sources=(source_id,),
+                    receipts=receipts, allow_verified_singletons=True,
+                    deadline_at=deadline_at, connection=connection,
+                )
+                require(set(members) == set(receipts))
+                parents = self.store._execute_bounded(connection,
+                    """SELECT document.document_id,COALESCE(event.native_parent_id,event.native_id) AS parent
+                         FROM canonical_documents document
+                         JOIN canonical_events event USING(tenant_id,source_id,event_id)
+                        WHERE document.tenant_id=%s AND document.source_id=%s
+                          AND document.document_id=ANY(%s)""",
+                    (self.tenant_id, source_id, list({member["document_id"] for member in members.values()})),
+                    deadline_at,
+                ).fetchall()
+                by_document = {row["document_id"]: row["parent"] for row in parents}
+                for row in rows:
+                    parent = row.pop("native_parent_id")
+                    require(all(by_document.get(members[receipt]["document_id"]) == parent
+                                for receipt in row["receipts"]))
         require(len(rows) == len(passage_ids) and {r['passage_id'] for r in rows} == set(passage_ids))
         ordered = [next(r for r in rows if r['passage_id'] == p) for p in passage_ids]
         return ordered
@@ -4381,6 +4411,9 @@ class BoundCanonicalRetrieval:
             receipts = metadata['receipts']
             require(isinstance(receipts, list) and bool(receipts))
             with self.store.connect() as connection:
+                singleton_reads = getattr(self.store, "verified_singleton_receipts", False)
+                if singleton_reads:
+                    connection.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
                 rows = self.store._execute_bounded(connection, """
                     WITH selected_events AS (
                         SELECT DISTINCT document_id FROM canonical_chunks
@@ -4418,6 +4451,47 @@ class BoundCanonicalRetrieval:
                     """, (self.tenant_id, target['source_id'], receipts,
                           self.tenant_id, target['source_id'], self.principal_id,
                           self.principal_id), deadline).fetchall()
+                retained_receipts = {row["receipt"] for row in rows}
+                missing = tuple(receipt for receipt in receipts if receipt not in retained_receipts)
+                if singleton_reads and missing:
+                    from .receipt_membership import lookup_receipt_metadata
+
+                    members = lookup_receipt_metadata(
+                        self.store, tenant_id=self.tenant_id, authorized_sources=(target["source_id"],),
+                        receipts=missing, allow_verified_singletons=True,
+                        deadline_at=deadline, connection=connection,
+                    )
+                    require(set(members) == set(missing) and self.chunk_body_archive is not None)
+                    documents = self.store._execute_bounded(connection,
+                        """SELECT document.document_id,document.native_id,document.revision,
+                                  event.kind,event.occurred_at,event.observed_at
+                             FROM canonical_documents document
+                             JOIN canonical_events event USING(tenant_id,source_id,event_id)
+                            WHERE document.tenant_id=%s AND document.source_id=%s
+                              AND document.document_id=ANY(%s)
+                              AND document.is_current AND document.deleted_at IS NULL
+                              AND NOT event.is_tombstone
+                              AND NOT EXISTS (SELECT 1 FROM canonical_chunks retained
+                                  WHERE retained.tenant_id=document.tenant_id
+                                    AND retained.source_id=document.source_id
+                                    AND retained.document_id=document.document_id)
+                              AND EXISTS (SELECT 1 FROM brain_access_grants
+                                  WHERE tenant_id=document.tenant_id AND principal_id=%s
+                                    AND permission IN ('owner','admin','read'))
+                              AND EXISTS (SELECT 1 FROM canonical_source_grants
+                                  WHERE tenant_id=document.tenant_id AND source_id=document.source_id
+                                    AND principal_id=%s AND permission IN ('owner','read'))""",
+                        (self.tenant_id, target["source_id"],
+                         list({member["document_id"] for member in members.values()}),
+                         self.principal_id, self.principal_id), deadline,
+                    ).fetchall()
+                    by_document = {row["document_id"]: row for row in documents}
+                    for receipt in dict.fromkeys(missing):
+                        member = members[receipt]
+                        require(member["document_id"] in by_document)
+                        rows.append({**by_document[member["document_id"]],
+                                     **{key: member[key] for key in
+                                        ("source_id", "ordinal", "receipt", "text_sha256")}})
             by_receipt = {r['receipt']: r for r in rows}
             require(len(by_receipt) == len(rows) and set(receipts) <= by_receipt.keys())
             event_order = list(dict.fromkeys(by_receipt[r]['document_id'] for r in receipts))
