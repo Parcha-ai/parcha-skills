@@ -57,6 +57,99 @@ class AuditRetirementTests(unittest.TestCase):
     def prepare(self, **kwargs):
         return self.owner.archive_page(tenant_id=self.tenant, source_id=self.source, cutoff=self.cutoff, **kwargs)
 
+    def test_single_copy_matches_old_csv_and_receipt_at_5k_and_50k(self):
+        import csv
+        import hashlib
+        import io
+        from contextlib import contextmanager
+        from unittest.mock import patch
+        from recall_server.audit_retirement import _copy, _select
+        from recall_server.retirement_campaign import digest
+        # Quoted identifiers and nullable CSV fields must remain byte-identical.
+        with self.store.connect() as c:
+            c.execute("""INSERT INTO canonical_audit_events
+                (tenant_id,source_id,audit_id,operation,status,subject_sha256,
+                 item_count,byte_count,duration_ms,created_at)
+                SELECT %s,%s,'audit:'||lpad(n::text,8,'0')||E',"\\n',
+                CASE WHEN n%%100=0 THEN 'forget.commit' ELSE 'ingest.commit' END,
+                CASE WHEN n%%101=0 THEN 'failed' ELSE 'success' END,
+                NULL,NULL,NULL,NULL,
+                CASE WHEN n%%103=0 THEN '2026-10-14'::timestamptz
+                     ELSE '2026-10-12'::timestamptz END
+                FROM generate_series(1,50000)n""", (self.tenant,self.source))
+        original_connection = self.owner._connection
+        for limit in (5000, 50000):
+            with self.subTest(limit=limit):
+                with original_connection(snapshot=True) as c:
+                    keys = [r['audit_id'] for r in c.execute(
+                        'SELECT audit_id FROM canonical_audit_events WHERE tenant_id=%s '
+                        'AND source_id=%s ORDER BY audit_id LIMIT %s',
+                        (self.tenant,self.source,limit)).fetchall()]
+                    eligible = [r['audit_id'] for r in c.execute(
+                        "SELECT audit_id FROM canonical_audit_events WHERE tenant_id=%s "
+                        "AND source_id=%s AND audit_id=ANY(%s) AND operation='ingest.commit' "
+                        "AND status='success' AND created_at<%s ORDER BY audit_id",
+                        (self.tenant,self.source,keys,self.cutoff)).fetchall()]
+                    q,params = _select(self.tenant,self.source,eligible)
+                    expected_raw = _copy(c,q,params)
+                queries = []
+                class Observed:
+                    def __init__(inner, connection): inner.connection = connection
+                    def execute(inner, query, params=()):
+                        queries.append(str(query)); return inner.connection.execute(query,params)
+                    def __getattr__(inner, key): return getattr(inner.connection,key)
+                @contextmanager
+                def observed(**kwargs):
+                    with original_connection(**kwargs) as c: yield Observed(c)
+                with patch.object(self.owner,'_connection',observed):
+                    receipt = self.prepare(limit=limit)
+                raw,actual_keys = self.owner._load(receipt)
+                self.assertEqual(raw,expected_raw)
+                self.assertEqual(actual_keys,eligible)
+                self.assertEqual(len(list(csv.reader(io.StringIO(raw.decode(),newline='')))),len(eligible))
+                expected = dict(contract='recall.ingest-audit-retirement.v1',
+                    tenant_id=self.tenant,source_id=self.source,cutoff=self.cutoff,after=None,
+                    next_after=keys[-1],scanned=limit,exhausted=False,row_count=len(eligible),
+                    raw_bytes=len(expected_raw),raw_sha256=hashlib.sha256(expected_raw).hexdigest(),
+                    artifact=receipt['artifact'])
+                self.assertEqual(receipt,dict(expected,sha256=digest(expected)))
+                self.assertEqual(sum('SELECT audit_id FROM canonical_audit_events' in q for q in queries),1,
+                                 'archive must not fetch eligibility rows before copying them again')
+
+    def test_single_copy_keeps_discovery_snapshot_across_concurrent_change(self):
+        from contextlib import contextmanager
+        from unittest.mock import patch
+        self.add('audit:01'); self.add('audit:02',status='failed')
+        expected = self.prepare()
+        expected_raw,_ = self.owner._load(expected)
+        original_connection = self.owner._connection
+        changed = []
+        class Observed:
+            def __init__(inner, connection): inner.connection = connection
+            def execute(inner, query, params=()):
+                cursor = inner.connection.execute(query,params)
+                if 'SELECT audit_id FROM canonical_audit_events WHERE' in str(query) and not changed:
+                    class Discovery:
+                        def fetchall(self_cursor):
+                            rows = cursor.fetchall()
+                            with self.store.connect() as writer:
+                                writer.execute("UPDATE canonical_audit_events SET duration_ms=9,status='success' "
+                                    "WHERE tenant_id=%s AND source_id=%s",(self.tenant,self.source))
+                            changed.append(True)
+                            return rows
+                    return Discovery()
+                return cursor
+            def __getattr__(inner,key): return getattr(inner.connection,key)
+        @contextmanager
+        def observed(**kwargs):
+            with original_connection(**kwargs) as c: yield Observed(c)
+        with patch.object(self.owner,'_connection',observed): receipt = self.prepare()
+        self.assertEqual(changed,[True])
+        self.assertEqual(self.owner._load(receipt)[0],expected_raw)
+        self.assertEqual(receipt['row_count'],1)
+        with self.assertRaisesRegex(ValueError,'audit_rows_changed_or_partial'):
+            self.owner.clear(receipt)
+
     def test_archive_clear_restore_preserves_all_other_rows(self):
         self.add('audit:ordinary')
         self.add('audit:null', duration=None)
