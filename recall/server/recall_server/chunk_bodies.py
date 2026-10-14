@@ -192,11 +192,34 @@ def chunk_catalog_snapshot(
     """One complete reader fence; an existing locked transaction may reuse it."""
     _check_deadline(deadline_at)
     params = (tenant_id, list(source_ids), list(document_ids), located_only)
+    singleton = getattr(store, 'verified_singleton_receipts', False)
+    statement = _CATALOG_SQL
+    if singleton:
+        statement = statement.replace('document.native_id,document.revision,document.text_sha256,',
+            'document.native_id,document.revision,document.text_sha256,document.chunk_receipt_profile,')
+    def read(opened):
+        rows = store._execute_bounded(opened, statement, params, deadline_at).fetchall()
+        if singleton:
+            from .receipt_membership import lookup_receipt_metadata
+            from .projectors import item_receipt
+
+            admitted = [row for row in rows if row['chunk_receipt_profile'] is not None]
+            receipts = tuple(item_receipt(row['source_id'], row['native_id'], row['revision'], 0)
+                             for row in admitted)
+            metadata = lookup_receipt_metadata(store, tenant_id=tenant_id,
+                authorized_sources=source_ids, receipts=receipts, allow_verified_singletons=True,
+                deadline_at=deadline_at, connection=opened)
+            for row, receipt in zip(admitted, receipts, strict=True):
+                member = metadata.get(receipt)
+                if member is None or member['document_id'] != row['document_id']:
+                    raise ChunkBodyError('archived_chunk_body_unavailable')
+                row['chunks'] = [{key: member[key] for key in ('ordinal', 'receipt', 'text_sha256')}]
+        return rows
     if connection is None:
         with store.connect() as opened:
-            rows = store._execute_bounded(opened, _CATALOG_SQL, params, deadline_at).fetchall()
+            rows = read(opened)
     else:
-        rows = store._execute_bounded(connection, _CATALOG_SQL, params, deadline_at).fetchall()
+        rows = read(connection)
     _check_deadline(deadline_at)
     result = {}
     for row in rows:

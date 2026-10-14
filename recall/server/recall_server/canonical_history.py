@@ -110,6 +110,8 @@ def prepare_history(store, archive, *, tenant_id: str, candidates: list[dict[str
             yield staged
             return
         encoded = orjson.dumps(candidates).decode()
+        profile = ('document.chunk_receipt_profile' if getattr(store, 'verified_singleton_receipts', False)
+                   else 'NULL::smallint')
         try:
             with store.connect() as connection:
                 owners = connection.execute('''
@@ -121,7 +123,7 @@ def prepare_history(store, archive, *, tenant_id: str, candidates: list[dict[str
                 if any(item['source_id'] in owners and owners[item['source_id']] != item['principal_id']
                        for item in candidates):
                     raise HistoryAuthorityError()
-                rows = connection.execute('''
+                rows = connection.execute(f'''
                     SELECT DISTINCT document.tenant_id,document.source_id,document.document_id,
                            document.revision,document.text_sha256,
                            COALESCE(event.native_parent_id,event.native_id) AS native_parent_id
@@ -135,10 +137,10 @@ def prepare_history(store, archive, *, tenant_id: str, candidates: list[dict[str
                        AND NOT EXISTS (SELECT 1 FROM canonical_events replay
                             WHERE replay.tenant_id=document.tenant_id AND replay.source_id=document.source_id
                               AND replay.native_id=document.native_id AND replay.content_sha256=incoming.content_sha256)
-                       AND EXISTS (SELECT 1 FROM canonical_chunks chunk
+                       AND ({profile} IS NOT NULL OR EXISTS (SELECT 1 FROM canonical_chunks chunk
                             WHERE chunk.tenant_id=document.tenant_id AND chunk.source_id=document.source_id
                               AND chunk.document_id=document.document_id AND chunk.deleted_at IS NULL
-                              AND chunk.text_redacted='' AND chunk.text_sha256<>%s)
+                              AND chunk.text_redacted='' AND chunk.text_sha256<>%s))
                      ORDER BY document.source_id,native_parent_id,document.document_id
                 ''', (encoded, tenant_id, EMPTY_SHA256)).fetchall()
             if rows and archive is None:
@@ -167,21 +169,49 @@ def prepare_history(store, archive, *, tenant_id: str, candidates: list[dict[str
         yield staged
 
 
-def restore_outgoing(connection, staged, *, tenant_id, source_id, native_ids):
+def restore_outgoing(connection, staged, *, tenant_id, source_id, native_ids, store=None):
     """Called after replay detection, under the writer's native advisory locks."""
-    rows = connection.execute('''
+    profile = ('document.chunk_receipt_profile' if getattr(store, 'verified_singleton_receipts', False)
+               else 'NULL::smallint')
+    rows = connection.execute(f'''
         SELECT document.tenant_id,document.source_id,document.document_id,
-               document.revision,document.text_sha256
+               document.revision,document.text_sha256,document.native_id,document.created_at,
+               {profile} AS chunk_receipt_profile
           FROM canonical_documents document
          WHERE document.tenant_id=%s AND document.source_id=%s AND document.native_id=ANY(%s)
            AND document.is_current AND document.deleted_at IS NULL
-           AND EXISTS (SELECT 1 FROM canonical_chunks chunk
+           AND ({profile} IS NOT NULL OR EXISTS (SELECT 1 FROM canonical_chunks chunk
                 WHERE chunk.tenant_id=document.tenant_id AND chunk.source_id=document.source_id
                   AND chunk.document_id=document.document_id AND chunk.deleted_at IS NULL
-                  AND chunk.text_redacted='' AND chunk.text_sha256<>%s)
+                  AND chunk.text_redacted='' AND chunk.text_sha256<>%s))
          ORDER BY document.document_id FOR UPDATE
     ''', (tenant_id, source_id, native_ids, EMPTY_SHA256)).fetchall()
     for row in rows:
+        if row['chunk_receipt_profile'] is not None:
+            from .receipt_membership import lookup_receipt_metadata
+            from .projectors import item_receipt
+
+            receipt = item_receipt(source_id, row['native_id'], row['revision'], 0)
+            member = lookup_receipt_metadata(store, tenant_id=tenant_id,
+                authorized_sources=(source_id,), receipts=(receipt,),
+                allow_verified_singletons=True, connection=connection).get(receipt)
+            if member is None or member['document_id'] != row['document_id'] or staged is None:
+                raise HistoryUnavailable()
+            restored = staged.read(row)
+            if (len(restored) != 1 or restored[0]['ordinal'] != 0
+                    or restored[0]['receipt'] != receipt
+                    or hashlib.sha256(restored[0]['text_redacted'].encode()).hexdigest() != member['text_sha256']):
+                raise HistoryUnavailable()
+            connection.execute('''INSERT INTO canonical_chunks(
+                tenant_id,source_id,chunk_id,document_id,ordinal,receipt,text_redacted,text_sha256,created_at)
+                VALUES (%s,%s,%s,%s,0,%s,%s,%s,%s)''',
+                (tenant_id, source_id, member['chunk_id'], row['document_id'], receipt,
+                 restored[0]['text_redacted'], member['text_sha256'], row['created_at']))
+            changed = connection.execute('''UPDATE canonical_documents SET chunk_receipt_profile=NULL
+                WHERE tenant_id=%s AND source_id=%s AND document_id=%s AND chunk_receipt_profile=1''',
+                (tenant_id, source_id, row['document_id']))
+            if changed.rowcount != 1:
+                raise HistoryUnavailable()
         chunks = connection.execute('''
             SELECT ordinal,receipt,text_sha256,
                    (text_redacted='' AND text_sha256<>%s) AS missing

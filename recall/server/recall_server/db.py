@@ -206,7 +206,12 @@ class BrainStore:
                  semantic_minimum_similarity: float | None = None,
                  pool_max_size: int | None = None,
                  audit_batch_rows: int | None = None,
-                 audit_batch_seconds: float | None = None):
+                 audit_batch_seconds: float | None = None,
+                 verified_singleton_receipts: bool = False):
+        if type(verified_singleton_receipts) is not bool:
+            raise ValueError("invalid singleton receipt capability")
+        # Explicit library capability only; production has no activation path.
+        self.verified_singleton_receipts = verified_singleton_receipts
         self.dsn = dsn
         self._pool: ConnectionPool | None = None
         self._pool_lock = threading.Lock()
@@ -3086,10 +3091,22 @@ class BrainStore:
             (event["occurred_at"], event["tenant_id"], source_id, event["event_id"]),
             deadline_at,
         ).fetchall()
-        return {
-            "event": event,
-            "items": items,
-        }
+        if self.verified_singleton_receipts:
+            from .receipt_membership import lookup_receipt_metadata, ReceiptMembershipError
+            from .projectors import item_receipt
+
+            receipt = item_receipt(source_id, native_id, revision, 0)
+            metadata = lookup_receipt_metadata(
+                self, tenant_id=event['tenant_id'], authorized_sources=(source_id,),
+                receipts=(receipt,), allow_verified_singletons=True,
+                current_only=False, deadline_at=deadline_at, connection=conn,
+            ).get(receipt)
+            if not items and metadata is not None:
+                if not metadata_only:
+                    raise ReceiptMembershipError('receipt_membership_archive_required')
+                items = [dict(metadata, occurred_at=event['occurred_at'],
+                              role=None, surface=None, text_redacted=None)]
+        return {"event": event, "items": items}
 
     @staticmethod
     def _read_filters(

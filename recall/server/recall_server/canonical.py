@@ -460,11 +460,10 @@ class CanonicalPlane:
         except HistoryUnavailable:
             raise CanonicalLifecycleError("canonical_history_unavailable") from None
 
-    @staticmethod
-    def _restore_history(connection, staged, *, tenant_id, source_id, native_ids):
+    def _restore_history(self, connection, staged, *, tenant_id, source_id, native_ids):
         try:
             restore_outgoing(connection, staged, tenant_id=tenant_id,
-                             source_id=source_id, native_ids=native_ids)
+                             source_id=source_id, native_ids=native_ids, store=self.store)
         except HistoryUnavailable:
             raise CanonicalLifecycleError("canonical_history_unavailable") from None
 
@@ -1799,6 +1798,13 @@ class CanonicalPlane:
                          AND chunk.receipt=%s""",
                     (tenant_id, source_id, value["target_receipt"]),
                 ).fetchone()
+                if target is None and getattr(self.store, 'verified_singleton_receipts', False):
+                    from .receipt_membership import lookup_receipt_metadata
+
+                    target = lookup_receipt_metadata(self.store, tenant_id=tenant_id,
+                        authorized_sources=(source_id,), receipts=(value['target_receipt'],),
+                        allow_verified_singletons=True, current_only=False,
+                        connection=conn, include_deleted=True).get(value['target_receipt'])
                 if target is None and native_id.startswith("slack:"):
                     target = conn.execute(
                         """SELECT event.native_id FROM canonical_events event
@@ -1874,6 +1880,18 @@ class CanonicalPlane:
                          AND document.native_id=ANY(%s) AND chunk.deleted_at IS NULL""",
                     (tenant_id, source_id, native_ids),
                 ).fetchone()["count"]
+                if getattr(self.store, 'verified_singleton_receipts', False):
+                    from .receipt_membership import lookup_receipt_metadata
+
+                    admitted = conn.execute('''SELECT native_id,revision FROM canonical_documents
+                        WHERE tenant_id=%s AND source_id=%s AND native_id=ANY(%s)
+                          AND chunk_receipt_profile IS NOT NULL AND deleted_at IS NULL''',
+                        (tenant_id, source_id, native_ids)).fetchall()
+                    receipts = tuple(item_receipt(source_id, row['native_id'], row['revision'], 0)
+                                     for row in admitted)
+                    projection_count += len(lookup_receipt_metadata(self.store, tenant_id=tenant_id,
+                        authorized_sources=(source_id,), receipts=receipts,
+                        allow_verified_singletons=True, current_only=False, connection=conn))
                 conn.execute(
                     """UPDATE canonical_chunks chunk
                        SET deleted_at=COALESCE(chunk.deleted_at,%s)
