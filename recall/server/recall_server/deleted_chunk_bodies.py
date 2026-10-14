@@ -15,6 +15,11 @@ _SNAPSHOT = """SELECT chunk.chunk_id,chunk.document_id,document.native_id,
       AND chunk.deleted_at IS NOT NULL AND document.deleted_at IS NOT NULL
       AND NOT document.is_current
     ORDER BY chunk.chunk_id"""
+_DOCUMENT_SNAPSHOT = """SELECT document_id,octet_length(text_redacted)::bigint AS body_bytes
+    FROM canonical_documents
+    WHERE tenant_id=%s AND source_id=%s AND document_id=ANY(%s)
+      AND deleted_at IS NOT NULL AND NOT is_current
+    ORDER BY document_id"""
 
 
 def clear_deleted_chunk_bodies(
@@ -25,11 +30,14 @@ def clear_deleted_chunk_bodies(
     principal_id,
     chunk_ids,
     apply=False,
+    include_document_bodies=False,
     deadline_at=None,
 ):
     """Clear only reviewed exact keys; dry-run by default, no archive dependency.
 
     Existing metadata remains authoritative for receipts, replay and forget.
+    Duplicate document bodies require explicit opt-in; their bytes are counted
+    separately once per document so chunk-only callers keep their budgets.
     Return counters only after COMMIT acknowledgment. An unknown commit can be
     reconciled by inspecting the same keys; retrying never clears live bodies.
     """
@@ -46,6 +54,7 @@ def clear_deleted_chunk_bodies(
         )
         or len(set(chunk_ids)) != len(chunk_ids)
         or type(apply) is not bool
+        or type(include_document_bodies) is not bool
     ):
         raise ChunkRetirementError("deleted_chunk_scope_invalid")
     if deadline_at is None:
@@ -98,6 +107,14 @@ def clear_deleted_chunk_bodies(
             rows = locked_rows
         eligible = sum(row["body_bytes"] > 0 for row in rows)
         body_bytes = sum(row["body_bytes"] for row in rows)
+        document_rows = []
+        if include_document_bodies and rows:
+            document_rows = query(
+                _DOCUMENT_SNAPSHOT,
+                (tenant_id, source_id, sorted({row["document_id"] for row in rows})),
+            ).fetchall()
+        eligible_documents = sum(row["body_bytes"] > 0 for row in document_rows)
+        document_bytes = sum(row["body_bytes"] for row in document_rows)
         if apply and eligible:
             changed = query(
                 """UPDATE canonical_chunks chunk SET text_redacted=''
@@ -112,6 +129,15 @@ def clear_deleted_chunk_bodies(
             )
             if changed.rowcount != eligible:
                 raise ChunkRetirementError("deleted_chunk_scope_changed")
+        if apply and eligible_documents:
+            changed = query(
+                """UPDATE canonical_documents SET text_redacted=''
+                WHERE tenant_id=%s AND source_id=%s AND document_id=ANY(%s)
+                  AND deleted_at IS NOT NULL AND NOT is_current AND text_redacted<>''""",
+                (tenant_id, source_id, [row["document_id"] for row in document_rows]),
+            )
+            if changed.rowcount != eligible_documents:
+                raise ChunkRetirementError("deleted_chunk_scope_changed")
     return dict(
         status="cleared" if apply else "planned",
         requested_keys=len(chunk_ids),
@@ -120,6 +146,10 @@ def clear_deleted_chunk_bodies(
         eligible_utf8_bytes=body_bytes,
         cleared_chunks=eligible if apply else 0,
         cleared_utf8_bytes=body_bytes if apply else 0,
+        eligible_documents=eligible_documents,
+        eligible_document_utf8_bytes=document_bytes,
+        cleared_documents=eligible_documents if apply else 0,
+        cleared_document_utf8_bytes=document_bytes if apply else 0,
         physical_bytes_reclaimed=0,
     )
 
@@ -133,6 +163,7 @@ def discover_deleted_chunk_bodies(
     after_chunk_id=None,
     through_chunk_id=None,
     limit=MAX_KEYS,
+    include_document_bodies=False,
     deadline_at=None,
 ):
     """Advance one source-key window, including pages with no eligible bodies.
@@ -148,6 +179,7 @@ def discover_deleted_chunk_bodies(
         )
         or type(limit) is not int
         or not 1 <= limit <= MAX_KEYS
+        or type(include_document_bodies) is not bool
         or any(
             value is not None
             and (not isinstance(value, str) or not IDENTITY_RE.fullmatch(value))
@@ -186,6 +218,7 @@ def discover_deleted_chunk_bodies(
             through_chunk_id = upper["chunk_id"] if upper else None
         keys = []
         candidates = []
+        documents = []
         if through_chunk_id is not None:
             lower = " AND chunk_id>%s" if after_chunk_id is not None else ""
             args = (
@@ -204,14 +237,27 @@ def discover_deleted_chunk_bodies(
                 candidates = query(
                     _SNAPSHOT, (tenant_id, source_id, [row["chunk_id"] for row in keys])
                 ).fetchall()
+                if include_document_bodies and candidates:
+                    documents = query(
+                        _DOCUMENT_SNAPSHOT,
+                        (
+                            tenant_id,
+                            source_id,
+                            sorted({row["document_id"] for row in candidates}),
+                        ),
+                    ).fetchall()
     next_key = keys[-1]["chunk_id"] if keys else after_chunk_id
+    document_ids = {row["document_id"] for row in documents if row["body_bytes"] > 0}
     return dict(
         candidate_chunk_ids=tuple(
-            row["chunk_id"] for row in candidates if row["body_bytes"] > 0
+            row["chunk_id"]
+            for row in candidates
+            if row["body_bytes"] > 0 or row["document_id"] in document_ids
         ),
         scanned_keys=len(keys),
         after_chunk_id=next_key,
         through_chunk_id=through_chunk_id,
         pass_complete=(len(keys) < limit or next_key == through_chunk_id),
         eligible_utf8_bytes=sum(row["body_bytes"] for row in candidates),
+        eligible_document_utf8_bytes=sum(row["body_bytes"] for row in documents),
     )
