@@ -15,6 +15,7 @@ from .canonical_history import (
 )
 from .db import BrainStore
 from .archive_ownership import admit_references
+from .canonical_thinning import _compact_event_expression
 from .identity_cache import REGISTRATION_CACHE, IdentityRegistrationCache
 from .canonical_text import (
     MAX_CANONICAL_CHUNK_BYTES as MAX_CANONICAL_CHUNK_BYTES,
@@ -618,6 +619,9 @@ class CanonicalPlane:
         document_id = _opaque("doc", tenant_id, source_id, event_id)
         text_sha256 = hashlib.sha256(text_redacted.encode()).hexdigest()
         chunk_texts = [] if is_tombstone else canonical_text_chunks(text_redacted)
+        # The live raw reference is checked below before INSERT. Keep original
+        # chunks in this same transaction; logical publication still reads them.
+        compact_body = not is_tombstone and artifact["storage_backend"] == "s3"
 
         connection_context = (
             self.store.connect() if _connection is None else nullcontext(_connection)
@@ -757,12 +761,15 @@ class CanonicalPlane:
                 _ensure_lineage_jobs(conn, tenant_id=tenant_id, source_id=source_id,
                                      connector_ids=[connector_id])
                 conn.execute(
-                    """INSERT INTO canonical_events(
+                    f"""INSERT INTO canonical_events(
                            tenant_id,source_id,event_id,native_id,native_parent_id,
                            artifact_id,job_id,kind,content_sha256,revision,
                            occurred_at,observed_at,is_tombstone,canonical_redacted,
-                           source_ordinal
-                       ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                           source_ordinal,body_location
+                       ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
+                           (SELECT CASE WHEN %s THEN {_compact_event_expression('input')}
+                                   ELSE input.canonical_redacted END
+                            FROM (VALUES (%s::jsonb)) input(canonical_redacted)),%s,%s)""",
                     (
                         tenant_id,
                         source_id,
@@ -777,8 +784,10 @@ class CanonicalPlane:
                         event["occurred_at"],
                         event["observed_at"],
                         is_tombstone,
+                        compact_body,
                         json.dumps(event),
                         _source_ordinal(event),
+                        "raw" if compact_body else "inline",
                     ),
                 )
                 attribute_canonical_events(
@@ -826,8 +835,8 @@ class CanonicalPlane:
                     conn.execute(
                         """INSERT INTO canonical_documents(
                                tenant_id,source_id,document_id,event_id,artifact_id,native_id,
-                               content_sha256,revision,is_current,text_redacted,text_sha256
-                           ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,true,%s,%s)""",
+                               content_sha256,revision,is_current,text_redacted,text_sha256,body_location
+                           ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,true,%s,%s,%s)""",
                         (
                             tenant_id,
                             source_id,
@@ -837,8 +846,9 @@ class CanonicalPlane:
                             native_id,
                             event_sha256,
                             revision,
-                            text_redacted,
+                            "" if compact_body else text_redacted,
                             text_sha256,
+                            "chunks" if compact_body else "inline",
                         ),
                     )
                     with conn.cursor() as cursor:
@@ -1484,28 +1494,33 @@ class CanonicalPlane:
                             "is_tombstone": item["is_tombstone"],
                             "canonical_redacted": item["event"],
                             "source_ordinal": _source_ordinal(item["event"]),
+                            "body_location": ("raw" if not item["is_tombstone"]
+                                and item["artifact"]["storage_backend"] == "s3" else "inline"),
                         }
                         for item in new_rows
                     ]
                     connection.execute(
-                        """INSERT INTO canonical_events(
+                        f"""INSERT INTO canonical_events(
                                tenant_id,source_id,event_id,native_id,native_parent_id,
                                artifact_id,job_id,kind,content_sha256,revision,
                                occurred_at,observed_at,is_tombstone,canonical_redacted,
-                               source_ordinal
+                               source_ordinal,body_location
                            )
                            SELECT %s,%s,row.event_id,row.native_id,
                                   row.native_parent_id,row.artifact_id,row.job_id,
                                   row.kind,row.content_sha256,row.revision,
                                   row.occurred_at,row.observed_at,row.is_tombstone,
-                                  row.canonical_redacted,row.source_ordinal
+                                  CASE WHEN row.body_location='raw'
+                                       THEN {_compact_event_expression('row')}
+                                       ELSE row.canonical_redacted END,
+                                  row.source_ordinal,row.body_location
                            FROM jsonb_to_recordset(%s::jsonb) AS row(
                                event_id text,native_id text,native_parent_id text,
                                artifact_id text,job_id text,kind text,
                                content_sha256 char(64),revision integer,
                                occurred_at timestamptz,observed_at timestamptz,
                                is_tombstone boolean,
-                               canonical_redacted jsonb,source_ordinal bigint
+                               canonical_redacted jsonb,source_ordinal bigint,body_location text
                            )""",
                         (
                             tenant_id,
@@ -1521,8 +1536,11 @@ class CanonicalPlane:
                             "native_id": item["native_id"],
                             "content_sha256": item["event_sha256"],
                             "revision": item["revision"],
-                            "text_redacted": item["text_redacted"],
+                            "text_redacted": ("" if item["artifact"]["storage_backend"] == "s3"
+                                              else item["text_redacted"]),
                             "text_sha256": item["text_sha256"],
+                            "body_location": ("chunks" if item["artifact"]["storage_backend"] == "s3"
+                                              else "inline"),
                         }
                         for item in new_rows
                         if not item["is_tombstone"]
@@ -1532,16 +1550,16 @@ class CanonicalPlane:
                             """INSERT INTO canonical_documents(
                                tenant_id,source_id,document_id,event_id,artifact_id,
                                native_id,content_sha256,revision,is_current,
-                               text_redacted,text_sha256
+                               text_redacted,text_sha256,body_location
                            )
                            SELECT %s,%s,row.document_id,row.event_id,row.artifact_id,
                                   row.native_id,row.content_sha256,row.revision,true,
-                                  row.text_redacted,row.text_sha256
+                                  row.text_redacted,row.text_sha256,row.body_location
                            FROM jsonb_to_recordset(%s::jsonb) AS row(
                                document_id text,event_id text,artifact_id text,
                                native_id text,content_sha256 char(64),
                                revision integer,text_redacted text,
-                               text_sha256 char(64)
+                               text_sha256 char(64),body_location text
                            )""",
                             (
                                 tenant_id,

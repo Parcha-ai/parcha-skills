@@ -277,5 +277,187 @@ class Thinning(unittest.TestCase):
         self.assertEqual(self.remaining(), 3)
 
 
+class ScheduledThinning(unittest.TestCase):
+    setUpClass = classmethod(Thinning.setUpClass.__func__)
+    tearDownClass = classmethod(Thinning.tearDownClass.__func__)
+    setUp = Thinning.setUp
+    insert = Thinning.insert
+    remaining = Thinning.remaining
+
+    def collect(self, scheduler):
+        import time
+
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            result = scheduler.tick(True)
+            if result is not None:
+                return result
+            time.sleep(0.005)
+        self.fail("bounded background owner did not complete")
+
+    def test_shared_pool_progress_during_blocked_sql_and_cursor_survives_next_tick(
+        self,
+    ):
+        import threading
+        from functools import partial
+        from recall_server.projection_worker import BackgroundBodyThinner
+
+        documents = sorted(self.insert(str(i))[1] for i in range(2))
+        owner, entered = self, threading.Event()
+        calls, prepared_threads, now = [], [], [0.0]
+        lock_key = int(uuid.uuid4().hex[:12], 16)
+
+        class Connection:
+            def __init__(self, connection):
+                self.connection = connection
+
+            def __getattr__(self, name):
+                return getattr(self.connection, name)
+
+            def execute(self, query, params):
+                result = self.connection.execute(query, params)
+                if query.startswith("SET LOCAL statement_timeout") and not calls:
+                    calls.append(threading.get_ident())
+                    entered.set()
+                    self.connection.execute(
+                        "SELECT pg_advisory_xact_lock(%s)", (lock_key,)
+                    )
+                return result
+
+        class SharedStore:
+            @contextmanager
+            def connect(self):
+                with owner.store.connect() as connection:
+                    yield Connection(connection)
+
+        thinner = CanonicalBodyThinner(SharedStore(), tenant_id=self.tenant)
+
+        def prepare(busy):
+            prepared_threads.append(threading.get_ident())
+            return partial(thinner.thin, batch_size=1)
+
+        with BackgroundBodyThinner(prepare, clock=lambda: now[0]) as scheduler:
+            with self.store.connect() as held:
+                held.execute("SELECT pg_advisory_xact_lock(%s)", (lock_key,))
+                scheduler.tick(True)
+                self.assertTrue(entered.wait(1))
+                # Same production pool serves the coordinator while its retained
+                # owner is blocked inside an actual PostgreSQL statement.
+                with self.store.connect() as foreground:
+                    self.assertEqual(
+                        foreground.execute("SELECT 123 AS n").fetchone()["n"], 123
+                    )
+                for _ in range(12):
+                    now[0] += 5
+                    self.assertIsNone(scheduler.tick(True))
+                self.assertEqual(prepared_threads, [threading.get_ident()])
+                self.assertNotEqual(calls[0], threading.get_ident())
+            self.assertEqual(self.collect(scheduler)["documents"], 1)
+            self.assertEqual(thinner._after, (self.source, documents[0]))
+            self.assertEqual(self.remaining(), 1)
+            now[0] += 30
+            scheduler.tick(True)
+            self.assertEqual(self.collect(scheduler)["documents"], 1)
+            self.assertEqual(self.remaining(), 0)
+            self.assertIsNone(thinner._after)
+        print(
+            "background_pg: shared pool foreground completed while SQL blocked; two acknowledged cursor steps"
+        )
+
+    def test_statement_deadline_survives_background_execution_and_retry(self):
+        import threading
+        import time
+        from functools import partial
+        from psycopg.errors import QueryCanceled
+        from recall_server.projection_worker import BackgroundBodyThinner
+
+        self.insert("deadline")
+        owner, entered = self, threading.Event()
+        injected, now = [], [0.0]
+
+        class Connection:
+            def __init__(self, connection):
+                self.connection = connection
+
+            def __getattr__(self, name):
+                return getattr(self.connection, name)
+
+            def execute(self, query, params):
+                result = self.connection.execute(query, params)
+                if query.startswith("SET LOCAL statement_timeout") and not injected:
+                    injected.append(True)
+                    entered.set()
+                    self.connection.execute("SELECT pg_sleep(10)")
+                return result
+
+        class SharedStore:
+            @contextmanager
+            def connect(self):
+                with owner.store.connect() as connection:
+                    yield Connection(connection)
+
+        thinner = CanonicalBodyThinner(SharedStore(), tenant_id=self.tenant)
+        with BackgroundBodyThinner(
+            lambda busy: partial(thinner.thin, batch_size=1), clock=lambda: now[0]
+        ) as scheduler:
+            started = time.monotonic()
+            scheduler.tick(True)
+            self.assertTrue(entered.wait(1))
+            with self.store.connect() as foreground:
+                self.assertEqual(
+                    foreground.execute("SELECT 456 AS n").fetchone()["n"], 456
+                )
+            with self.assertRaises(QueryCanceled):
+                self.collect(scheduler)
+            elapsed = time.monotonic() - started
+            self.assertLess(elapsed, 5)
+            self.assertIsNone(thinner._after)
+            self.assertEqual(self.remaining(), 1)
+            now[0] += 30
+            scheduler.tick(True)
+            self.assertEqual(self.collect(scheduler)["documents"], 1)
+        print(
+            f"background_pg: actual statement timeout {elapsed:.3f}s; cursor unchanged; retry acknowledged"
+        )
+
+    def test_lost_commit_ack_remains_unknown_and_is_not_counted_as_success(self):
+        from functools import partial
+        from recall_server.projection_worker import (
+            BackgroundBodyThinner,
+            projection_totals,
+        )
+
+        self.insert("unknown")
+        owner, now = self, [0.0]
+
+        class FaultStore:
+            fail = True
+
+            @contextmanager
+            def connect(self):
+                with owner.store.connect() as connection:
+                    yield connection
+                if self.fail:
+                    raise ConnectionError("lost commit acknowledgment")
+
+        fault = FaultStore()
+        thinner = CanonicalBodyThinner(fault, tenant_id=self.tenant)
+        before = projection_totals()["bodies_thinned"]
+        with BackgroundBodyThinner(
+            lambda busy: partial(thinner.thin, batch_size=1), clock=lambda: now[0]
+        ) as scheduler:
+            scheduler.tick(True)
+            with self.assertRaisesRegex(ConnectionError, "lost commit acknowledgment"):
+                self.collect(scheduler)
+            self.assertEqual(self.remaining(), 0)
+            self.assertIsNone(thinner._after)
+            self.assertEqual(projection_totals()["bodies_thinned"], before)
+            fault.fail = False
+            now[0] += 30
+            scheduler.tick(True)
+            self.assertEqual(self.collect(scheduler)["documents"], 0)
+        self.assertEqual(projection_totals()["bodies_thinned"], before)
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

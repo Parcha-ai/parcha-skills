@@ -1263,3 +1263,361 @@ class RetirementWorkerTests(unittest.TestCase):
         self.assertEqual(invocations, [(110.0, True), (140.0, True)])
         self.assertEqual(calls.count('logical'), 5)
         self.assertEqual(result['status'], 'pending')
+
+
+class RetirementHeartbeatTests(unittest.TestCase):
+    def test_long_logical_batch_services_retirement_and_keeps_all_results(self):
+        calls, invocations = [], []
+        clock = _FakeClock()
+        class Logical(_Logical):
+            def project_pending(inner, **kwargs):
+                heartbeat = kwargs['on_heartbeat']
+                for _ in range(10):
+                    clock.advance(10)
+                    heartbeat()
+                    calls.append('foreground')
+                self.assertEqual(len(invocations), 4)
+                return super().project_pending(**kwargs)
+        def retire(busy):
+            self.assertTrue(busy)
+            invocations.append(clock())
+            return dict(status='running' if len(invocations) % 2 else 'bounded',
+                cleared_documents=0 if len(invocations) % 2 else 3,
+                cleared_utf8_bytes=0 if len(invocations) % 2 else 321,
+                archive_bytes=0 if len(invocations) % 2 else 1000,
+                commit_outcome_unknown=len(invocations)==2)
+        result=run_projection_worker(Logical(calls,pending=100),_Passages(calls),
+            tenant_id='tenant:company:test',logical_batch_size=5,passage_batch_size=5,
+            embedding_batch_size=64,max_batches_per_cycle=1,upload_concurrency=1,
+            passage_concurrency=1,interval_seconds=5,retirement_maintainer=retire,
+            clock=clock,once=True)
+        self.assertEqual(invocations,[110,140,170,200])
+        self.assertEqual(calls.count('foreground'),10)
+        self.assertEqual(result['retirement_cleared_documents'],6)
+        self.assertEqual(result['retirement_cleared_utf8_bytes'],642)
+        self.assertEqual(result['retirement_archive_bytes'],2000)
+        self.assertEqual(result['retirement_unknown'],1)
+
+    def test_completed_child_counters_survive_later_publication_failure(self):
+        calls=[]
+        clock=_FakeClock()
+        class Logical(_Logical):
+            def project_pending(inner, **kwargs):
+                kwargs['on_heartbeat']()
+                if not calls:
+                    calls.append('failed')
+                    raise RuntimeError('synthetic publication failure')
+                return super().project_pending(**kwargs)
+        def retire(busy):
+            return dict(status='bounded',cleared_documents=3,cleared_utf8_bytes=321)
+        result=run_projection_worker(Logical(calls,pending=100),_Passages([]),
+            tenant_id='tenant:company:test',logical_batch_size=5,passage_batch_size=5,
+            embedding_batch_size=64,max_batches_per_cycle=1,upload_concurrency=1,
+            passage_concurrency=1,interval_seconds=5,retirement_maintainer=retire,
+            clock=clock,max_cycles=2,sleep=lambda _:None)
+        self.assertEqual(result['retirement_cleared_documents'],3)
+
+
+    def test_existing_heartbeat_launches_and_reaps_supervisor_before_logical_return(self):
+        import io
+        import json
+        from recall_server.retirement_supervisor import RetirementSupervisor
+        calls,children=[],[]
+        clock=_FakeClock()
+        class Child:
+            stdin=None
+            returncode=0
+            def __init__(self):
+                self.done=False
+                self.stdout=io.BytesIO(json.dumps(dict(status='bounded',cleared_documents=2,
+                    cleared_utf8_bytes=456)).encode())
+            def poll(self):
+                return 0 if self.done else None
+        def launch(_configuration):
+            child = Child()
+            children.append(child)
+            return child
+        supervisor=RetirementSupervisor('synthetic',tenant_id='tenant:company:test',launch=launch)
+        class Logical(_Logical):
+            def project_pending(inner,**kwargs):
+                heartbeat=kwargs['on_heartbeat']
+                heartbeat()
+                self.assertEqual(len(children),1)
+                for _ in range(5):
+                    clock.advance(1)
+                    heartbeat()
+                self.assertEqual(len(children),1)
+                children[0].done=True
+                clock.advance(25)
+                heartbeat()
+                self.assertIsNone(supervisor.child)
+                self.assertTrue(children[0].stdout.closed)
+                return super().project_pending(**kwargs)
+        result=run_projection_worker(Logical(calls,pending=100),_Passages(calls),
+            tenant_id='tenant:company:test',logical_batch_size=5,passage_batch_size=5,
+            embedding_batch_size=64,max_batches_per_cycle=1,upload_concurrency=1,
+            passage_concurrency=1,interval_seconds=5,
+            retirement_maintainer=lambda busy:supervisor.cycle(busy=busy),
+            clock=clock,once=True)
+        self.assertEqual(result['retirement_cleared_documents'],2)
+        self.assertEqual(len(children),1)
+        supervisor.close()
+
+
+class BackgroundThinningTests(unittest.TestCase):
+    def poll_result(self, thinner):
+        import time
+
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            result = thinner.tick(True)
+            if result is not None:
+                return result
+            time.sleep(0.005)
+        self.fail("background result did not arrive")
+
+    def test_heartbeat_preserves_publication_while_thinning_is_blocked_and_never_overlaps(
+        self,
+    ):
+        import threading
+        from recall_server.projection_worker import BackgroundBodyThinner
+
+        calls, starts, prepared_on = [], [], []
+        entered, release = threading.Event(), threading.Event()
+        clock = _FakeClock()
+        coordinator = threading.get_ident()
+
+        def prepare(busy):
+            prepared_on.append(threading.get_ident())
+
+            def thin():
+                starts.append((threading.get_ident(), busy))
+                entered.set()
+                self.assertTrue(release.wait(3))
+                return dict(
+                    status="pending",
+                    documents=3,
+                    refused=0,
+                    document_bytes_removed=123,
+                    event_bytes_replaced=456,
+                )
+
+            return thin
+
+        with BackgroundBodyThinner(prepare, clock=clock) as thinner:
+
+            class Logical(_Logical):
+                def project_pending(inner, **kwargs):
+                    heartbeat = kwargs["on_heartbeat"]
+                    heartbeat()
+                    self.assertTrue(entered.wait(2))
+                    for _ in range(12):
+                        clock.advance(5)
+                        heartbeat()
+                    self.assertEqual(len(starts), 1)
+                    self.assertGreaterEqual(calls.count("search"), 12)
+                    release.set()
+                    import time
+
+                    deadline = time.monotonic() + 2
+                    while time.monotonic() < deadline:
+                        heartbeat()
+                        if thinner.completed_attempts:
+                            break
+                        time.sleep(0.005)
+                    self.assertEqual(thinner.completed_attempts, 1)
+                    return super().project_pending(**kwargs)
+
+            result = run_projection_worker(
+                Logical(calls, pending=100),
+                _Passages(calls),
+                tenant_id="tenant:company:test",
+                logical_batch_size=5,
+                passage_batch_size=5,
+                embedding_batch_size=64,
+                max_batches_per_cycle=1,
+                upload_concurrency=1,
+                passage_concurrency=1,
+                interval_seconds=5,
+                clock=clock,
+                once=True,
+                background_thinner=thinner,
+                search_plane=lambda: (
+                    calls.append("search")
+                    or dict(status="complete", months=0, rows=0, deleted=0, failed=0)
+                ),
+            )
+        self.assertEqual(result["canonical_bodies_thinned"], 3)
+        self.assertEqual(prepared_on, [coordinator, coordinator])
+        self.assertNotEqual(starts[0][0], coordinator)
+
+    def test_failed_background_attempt_surfaces_once_and_keeps_same_owner_for_retry(
+        self,
+    ):
+        from recall_server.projection_worker import BackgroundBodyThinner
+
+        clock = _FakeClock()
+        history = []
+
+        def prepare(busy):
+            def thin():
+                history.append(len(history))
+                if len(history) == 1:
+                    raise ConnectionError("lost_commit_ack")
+                return dict(
+                    status="pending",
+                    documents=0,
+                    refused=0,
+                    document_bytes_removed=0,
+                    event_bytes_replaced=0,
+                )
+
+            return thin
+
+        with BackgroundBodyThinner(prepare, clock=clock) as thinner:
+            self.assertIsNone(thinner.tick(True))
+            with self.assertRaises(ConnectionError):
+                self.poll_result(thinner)
+            self.assertIsNone(thinner.tick(True))
+            self.assertEqual(history, [0])
+            clock.advance(30)
+            thinner.tick(True)
+            self.assertEqual(self.poll_result(thinner)["documents"], 0)
+            self.assertIsNone(thinner.tick(True))
+        self.assertEqual(history, [0, 1])
+
+    def test_shutdown_waits_for_inflight_completion_and_records_it_exactly_once(self):
+        import threading
+        from recall_server.projection_worker import (
+            BackgroundBodyThinner,
+            projection_totals,
+        )
+
+        entered, release, closed = (
+            threading.Event(),
+            threading.Event(),
+            threading.Event(),
+        )
+        starts = []
+
+        def prepare(busy):
+            def thin():
+                starts.append(busy)
+                entered.set()
+                self.assertTrue(release.wait(2))
+                return dict(
+                    status="pending",
+                    documents=7,
+                    refused=0,
+                    document_bytes_removed=10,
+                    event_bytes_replaced=20,
+                )
+
+            return thin
+
+        before = projection_totals()["bodies_thinned"]
+        thinner = BackgroundBodyThinner(prepare)
+        thinner.tick(True)
+        self.assertTrue(entered.wait(2))
+        closer = threading.Thread(target=lambda: (thinner.close(), closed.set()))
+        closer.start()
+        self.assertFalse(closed.wait(0.05))
+        release.set()
+        closer.join(2)
+        self.assertFalse(closer.is_alive())
+        self.assertIsNone(thinner.tick(True))
+        thinner.close()
+        self.assertEqual(starts, [True])
+        self.assertEqual(projection_totals()["bodies_thinned"] - before, 7)
+
+    def test_reaped_work_survives_later_projection_failure_without_double_counting(
+        self,
+    ):
+        import time
+        from recall_server.projection_worker import (
+            BackgroundBodyThinner,
+            projection_totals,
+        )
+
+        calls, attempts = [], []
+        clock = _FakeClock()
+        before = projection_totals()["bodies_thinned"]
+
+        def prepare(busy):
+            return lambda: dict(
+                status="pending",
+                documents=4,
+                refused=0,
+                document_bytes_removed=10,
+                event_bytes_replaced=20,
+            )
+
+        with BackgroundBodyThinner(prepare, clock=clock) as thinner:
+
+            class Logical(_Logical):
+                def project_pending(inner, **kwargs):
+                    attempts.append(True)
+                    if len(attempts) == 1:
+                        deadline = time.monotonic() + 2
+                        while (
+                            thinner.completed_attempts == 0
+                            and time.monotonic() < deadline
+                        ):
+                            kwargs["on_heartbeat"]()
+                            time.sleep(0.005)
+                        self.assertEqual(thinner.completed_attempts, 1)
+                        raise RuntimeError("later projection failure")
+                    return super().project_pending(**kwargs)
+
+            result = run_projection_worker(
+                Logical(calls),
+                _Passages(calls),
+                tenant_id="tenant:company:test",
+                logical_batch_size=5,
+                passage_batch_size=5,
+                embedding_batch_size=64,
+                max_batches_per_cycle=1,
+                upload_concurrency=1,
+                passage_concurrency=1,
+                interval_seconds=5,
+                clock=clock,
+                max_cycles=2,
+                sleep=lambda _: None,
+                background_thinner=thinner,
+            )
+        self.assertEqual(result["canonical_bodies_thinned"], 4)
+        self.assertEqual(projection_totals()["bodies_thinned"] - before, 4)
+
+    def test_fast_idle_cycle_prepares_existing_idle_budget_without_busy_presumption(
+        self,
+    ):
+        from recall_server.projection_worker import BackgroundBodyThinner
+
+        calls, prepared = [], []
+
+        def prepare(busy):
+            prepared.append(busy)
+            return lambda: dict(
+                status="complete",
+                documents=0,
+                refused=0,
+                document_bytes_removed=0,
+                event_bytes_replaced=0,
+            )
+
+        with BackgroundBodyThinner(prepare) as thinner:
+            run_projection_worker(
+                _Logical(calls, work=0),
+                _Passages(calls, work=0),
+                tenant_id="tenant:company:test",
+                logical_batch_size=5,
+                passage_batch_size=5,
+                embedding_batch_size=64,
+                max_batches_per_cycle=1,
+                upload_concurrency=1,
+                passage_concurrency=1,
+                interval_seconds=5,
+                once=True,
+                background_thinner=thinner,
+            )
+        self.assertEqual(prepared, [False])
