@@ -708,6 +708,9 @@ class DeepInspectionContractTests(unittest.TestCase):
             def fetchall(self):
                 return self.values
 
+            def fetchone(self):
+                return self.values[0] if self.values else None
+
         class Cursor:
             def __init__(self, store):
                 self.store = store
@@ -740,7 +743,17 @@ class DeepInspectionContractTests(unittest.TestCase):
             def __init__(self, store):
                 self.store = store
 
-            def execute(self, sql, _params):
+            def execute(self, sql, _params=()):
+                if "pg_advisory_xact_lock" in sql:
+                    return Rows([])
+                if "to_regclass('public.canonical_artifact_forget_tombstones')" in sql:
+                    return Rows([{"present": True}])
+                if "FROM canonical_artifact_forget_tombstones" in sql:
+                    return Rows([])
+                if "WITH targets AS" in sql:
+                    return Rows([])  # These uploads have no committed catalogue yet.
+                if "FROM canonical_documents document" in sql and "JOIN unnest" in sql:
+                    return Rows(documents)
                 if "FROM canonical_documents document" in sql:
                     self.store.pending_sql = sql
                     self.store.pending_reads += 1
@@ -781,6 +794,12 @@ class DeepInspectionContractTests(unittest.TestCase):
                 self.active = 0
                 self.max_active = 0
                 self.deleted = []
+                self.archive = self
+                self.uploaded = {}
+
+            def verify_raw_bounded(self, reference, *, deadline_at):
+                assert time.monotonic() < deadline_at
+                assert self.uploaded[reference["artifact_id"]] == reference
 
             def put(self, *, tenant_id, source_id, document_id, bundle):
                 with self.lock:
@@ -789,7 +808,7 @@ class DeepInspectionContractTests(unittest.TestCase):
                 time.sleep(0.02)
                 with self.lock:
                     self.active -= 1
-                return {
+                reference = {
                     "tenant_id": tenant_id,
                     "source_id": source_id,
                     "artifact_id": "art_" + document_id.removeprefix("doc_"),
@@ -802,6 +821,8 @@ class DeepInspectionContractTests(unittest.TestCase):
                     "version_id": "s3-sha256-" + bundle.text_sha256,
                     "created_at": bundle.occurred_at,
                 }
+                self.uploaded[reference["artifact_id"]] = reference
+                return reference
 
             def delete(self, reference):
                 self.deleted.append(reference["artifact_id"])

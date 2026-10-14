@@ -1140,6 +1140,7 @@ class CanonicalLogicalEvidenceProjector:
                     records=records(),
                     retention_profile=self.retention_profile,
                     existing_part_references=tuple(existing_parts.get(ordinal, ())),
+                    on_failed_upload=self._schedule_cleanup,
                 )
                 upload = _LocatedUpload(
                     **vars(upload), body_locators=body_locators[ordinal],
@@ -1604,6 +1605,8 @@ class CanonicalLogicalEvidenceProjector:
         manifest_reference = upload.manifest_reference
         with self.store.connect() as connection:
             with connection.transaction():
+                from .archive_ownership import admit_references
+                admit_references(connection, self.projection.archive, upload.all_references)
                 connection.execute(
                     "SELECT pg_advisory_xact_lock(hashtextextended(%s,0))",
                     ("logical-evidence\x1f" + prepared.logical_document_id,),

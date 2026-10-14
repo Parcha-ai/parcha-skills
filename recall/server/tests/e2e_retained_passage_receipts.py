@@ -171,7 +171,7 @@ class RetainedPassageReceipts(unittest.TestCase):
             tenant_id=self.tenant, principal_id=self.principal, source_id=self.source,
             target_receipt=receipt, mode='explicit_forget', reason='owner_requested',
             requested_at='2026-10-13T00:00:00Z', idempotency_key='forget-one')
-        with patch.object(self.plane.archive, 'delete_raw', side_effect=RuntimeError('offline')):
+        with patch.object(self.plane.archive, 'delete_internal_raw_bounded', side_effect=RuntimeError('offline')):
             with self.assertRaises(CanonicalLifecycleError):
                 self.plane.forget(request)
         self.assertEqual(self.search()['results'], [])

@@ -40,6 +40,16 @@ class LoseDeleteAcknowledgementOnce:
     def put_raw(self, **kwargs):
         return self.archive.put_raw(**kwargs)
 
+    def verify_raw_bounded(self, reference, *, deadline_at):
+        return self.archive.verify_raw_bounded(reference, deadline_at=deadline_at)
+
+    def delete_internal_raw_bounded(self, reference, *, deadline_at):
+        removed = self.archive.delete_internal_raw_bounded(reference, deadline_at=deadline_at)
+        if self.lose_once:
+            self.lose_once = False
+            raise OSError("synthetic lost archive acknowledgement")
+        return removed
+
     def delete_raw(self, reference):
         removed = self.archive.delete_raw(reference)
         if self.lose_once:
