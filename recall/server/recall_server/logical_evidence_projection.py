@@ -11,7 +11,7 @@ import threading
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from contextlib import contextmanager, nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from itertools import groupby
 from time import perf_counter as _phase_clock
@@ -909,6 +909,37 @@ class CanonicalLogicalEvidenceProjector:
         if (queued is None or queued["generation"] != candidate.generation
                 or queued["changed_at"] != candidate.source_updated_at):
             raise _LogicalWorkSuperseded
+
+    def _candidate_at_dispatch(self, candidate: LogicalGroupCandidate) -> LogicalGroupCandidate:
+        """Refresh only an already admitted parent's proved append successor."""
+        if (not self.append_enabled
+                or self.excluded_structural_types != DEFAULT_EXCLUDED_STRUCTURAL_TYPES):
+            self._check_candidate_current(candidate)
+            return candidate
+        with self.store.connect() as connection:
+            row = connection.execute(
+                """SELECT to_jsonb(queue) AS queued,to_jsonb(evidence) AS catalog,
+                          queue.changed_at,queue.generation,
+                          queue.attempts<%s AND (queue.next_attempt_at IS NULL
+                              OR queue.next_attempt_at<=clock_timestamp()) AS retry_ready,
+                          EXISTS(SELECT 1 FROM schema_migrations WHERE version=79) AS capability
+                     FROM canonical_evidence_document_queue queue
+                     LEFT JOIN canonical_evidence_documents evidence
+                       USING(tenant_id,source_id,native_parent_id)
+                    WHERE queue.tenant_id=%s AND queue.source_id=%s AND queue.native_parent_id=%s""",
+                (MAX_LOGICAL_ATTEMPTS, candidate.tenant_id,
+                 candidate.source_id, candidate.native_parent_id),
+            ).fetchone()
+        if row is None or not row["retry_ready"]:
+            raise _LogicalWorkSuperseded
+        if (row["generation"] == candidate.generation
+                and row["changed_at"] == candidate.source_updated_at):
+            return candidate
+        from .logical_append_reader import continues_snapshot
+        if row["capability"] and continues_snapshot(candidate, row["catalog"], row["queued"]):
+            return replace(candidate, generation=row["generation"],
+                           source_updated_at=row["changed_at"])
+        raise _LogicalWorkSuperseded
 
     def _prepare_batch_and_upload(
         self,
@@ -2596,7 +2627,7 @@ class CanonicalLogicalEvidenceProjector:
 
         def prepare_parent(candidate):
             try:
-                self._check_candidate_current(candidate)
+                candidate = self._candidate_at_dispatch(candidate)
                 (upload,) = self._prepare_batch_and_upload(
                     (candidate,), hint_limit=hint_limit, require_current_queue=True,
                 )
