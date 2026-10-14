@@ -32,10 +32,14 @@ def _launch(_configuration):
 
 
 class RetirementSupervisor:
-    def __init__(self, dsn, *, tenant_id=None, seconds=180, launch=_launch):
+    def __init__(self, dsn, *, tenant_id=None, seconds=180, launch=_launch, metadata_mode="keep"):
+        if metadata_mode not in ("keep", "singleton"):
+            raise ValueError("invalid retirement metadata mode")
         if type(seconds) not in (int, float) or not 0 < seconds <= 300:
             raise ValueError("invalid retirement work budget")
         self.configuration = dict(dsn=dsn, tenant_id=tenant_id, seconds=seconds)
+        if metadata_mode != "keep":
+            self.configuration["metadata_mode"] = metadata_mode
         self.launch, self.seconds = launch, seconds
         self.child = None
         self.started_at = 0.0
@@ -100,7 +104,7 @@ class RetirementSupervisor:
                 "retirement_child status=%s elapsed_ms=%s cpu_seconds=%s peak_rss_kib=%s "
                 "archive_bytes=%s cleared_utf8_bytes=%s unknown=%s error_class=%s phase=%s cause_error_code=%s "
                 "committed_sql_ms=%s committed_hash_ms=%s archive_read_ms=%s "
-                "claim_wall_ms=%s parent_wall_ms=%s metadata_capture_ms=%s",
+                "claim_wall_ms=%s parent_wall_ms=%s metadata_capture_ms=%s retired_metadata_chunks=%s",
                 result["status"],
                 result.get("elapsed_ms"),
                 result.get("cpu_seconds"),
@@ -117,6 +121,7 @@ class RetirementSupervisor:
                 result.get("claim_wall_ms"),
                 result.get("parent_wall_ms"),
                 result.get("metadata_capture_ms"),
+                result.get("retired_metadata_chunks"),
             )
             return result
         except (ValueError, OSError):

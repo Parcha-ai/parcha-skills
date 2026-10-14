@@ -1869,6 +1869,10 @@ def main() -> None:
         "--retirement-seconds", type=float, default=180,
         help="work budget per retirement invocation; once mode uses at most five seconds while busy",
     )
+    projection_worker.add_argument(
+        "--retirement-metadata", choices=("keep", "singleton"), default="keep",
+        help="explicitly retire verified singleton chunk metadata after body proof; requires compatible archive readers",
+    )
     projection_worker.add_argument("--once", action="store_true")
     search_plane_project = sub.add_parser(
         "search-plane-project",
@@ -1997,6 +2001,8 @@ def main() -> None:
         choices=("production", "local-fixture"),
     )
     args = ap.parse_args()
+    if args.command == "projection-worker" and args.retirement_metadata != "keep" and args.retirement != "on":
+        ap.error("--retirement-metadata requires --retirement on")
     if args.command == "deployment-preview":
         try:
             print(json.dumps(preview(load_manifest(args.manifest)), sort_keys=True))
@@ -2599,13 +2605,14 @@ def main() -> None:
         body_thinner = CanonicalBodyThinner(store, tenant_id=args.tenant)
         retirement = None
         if args.retirement == "on":
+            metadata_options = {"metadata_mode": args.retirement_metadata} if args.retirement_metadata != "keep" else {}
             if args.once:
                 retirement = RetirementMaintenance(store,
                     build_evidence_archive_store(deadline_reads=True),
-                    tenant_id=args.tenant, enabled=True, seconds=args.retirement_seconds)
+                    tenant_id=args.tenant, enabled=True, seconds=args.retirement_seconds, **metadata_options)
             else:
                 retirement = RetirementSupervisor(store.dsn,
-                    tenant_id=args.tenant, seconds=args.retirement_seconds)
+                    tenant_id=args.tenant, seconds=args.retirement_seconds, **metadata_options)
         # H3-b: one client for the life of the process; the phase is skipped
         # entirely (search_plane=None) when turbopuffer is not configured.
         search_settings = _search_plane_settings(args.search_plane)
