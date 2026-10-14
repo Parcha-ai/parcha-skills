@@ -159,9 +159,18 @@ def main() -> None:
 
                 path.unlink()
                 deletion_scan = online.scan()
-                assert deletion_scan["tombstones_queued"] == 1
-                deletion = online.flush()
-                assert deletion["acked"] == 1
+                assert deletion_scan["tombstones_queued"] == 0
+                assert online.flush()["acked"] == 0
+                central = client.doctor()
+                assert central["source_events"] == 1 and central["live_items"] == 1
+                assert rank_for(client.search(marker, limit=5), receipt) == 1
+                assert marker in json.dumps(client.resolve(receipt))
+                # Explicit owner deletion remains supported after local cleanup.
+                deletion = MemoryClient(
+                    endpoint=args.endpoint, token=tokens[harness],
+                    source_id=sources[harness], principal_id="owner", visibility="private",
+                ).delete(receipt)
+                assert deletion["acknowledgement"]["status"] == "committed"
                 tombstoned.add(harness)
                 central = client.doctor()
                 assert central["source_events"] == 2 and central["live_items"] == 0
@@ -171,7 +180,7 @@ def main() -> None:
                 except urllib.error.HTTPError as error:
                     assert error.code == 404
                 else:
-                    raise AssertionError("collector tombstone did not hide old receipt")
+                    raise AssertionError("explicit deletion did not hide old receipt")
             finally:
                 online.close()
 
@@ -188,6 +197,7 @@ def main() -> None:
                 "receipts_exact": 2,
                 "replay_added_events": 0,
                 "tombstones": 2,
+                "local_cleanup_retained_records": 2,
                 "live_items_after_rollback": 0,
                 "credential_bytes_rendered": False,
             },

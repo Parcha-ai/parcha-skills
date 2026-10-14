@@ -13,6 +13,8 @@ from pathlib import Path
 
 import psycopg
 
+from client.mac import MemoryClient
+
 
 SAMPLES = 20
 
@@ -141,16 +143,30 @@ def main() -> None:
             if harness_paths:
                 harness_paths[0].parent.rmdir()
 
+    cleanup_at = time.time()
     for harness, config in configurations.items():
-        wait_for(
-            lambda c=config, p=prefixes[harness]: (rows if len(rows := query_spool(c["spool"], p, "acked")) >= SAMPLES * 2 else None),
-            150,
-            f"{harness} tombstone acknowledgements",
-        )
+        def scanned_after_cleanup():
+            with sqlite3.connect(f"file:{config['spool']}?mode=ro", uri=True) as local:
+                row = local.execute("SELECT value FROM meta WHERE key='last_scan_at'").fetchone()
+                return row is not None and float(row[0]) > cleanup_at
+        wait_for(scanned_after_cleanup, 150, f"{harness} post-cleanup scan")
+        native_ids = [row["native_id"] for row in acked[harness]]
         with psycopg.connect(dsn) as database:
             tombstones = database.execute(
-                "SELECT count(*) FROM source_events WHERE source_id=%s AND envelope->'provenance'->>'original_path' LIKE %s AND is_tombstone",
-                (config["source"], prefixes[harness] + "%"),
+                "SELECT count(*) FROM source_events WHERE source_id=%s AND native_id=ANY(%s) AND is_tombstone",
+                (config["source"], native_ids),
+            ).fetchone()[0]
+        assert tombstones == 0, tombstones
+        assert len(query_spool(config["spool"], prefixes[harness], "acked")) == SAMPLES
+        assert resolve(endpoint, acked[harness][-1]["receipt"], config["token"])
+        evidence["harnesses"][harness]["local_cleanup_retained_records"] = SAMPLES
+        MemoryClient(endpoint=endpoint, token=config["token"], source_id=config["source"],
+                     principal_id="owner", visibility="private").delete_many(
+                         [row["receipt"] for row in acked[harness]])
+        with psycopg.connect(dsn) as database:
+            tombstones = database.execute(
+                "SELECT count(*) FROM source_events WHERE source_id=%s AND native_id=ANY(%s) AND is_tombstone",
+                (config["source"], native_ids),
             ).fetchone()[0]
         assert tombstones == SAMPLES, tombstones
         evidence["harnesses"][harness]["tombstones_committed"] = tombstones
