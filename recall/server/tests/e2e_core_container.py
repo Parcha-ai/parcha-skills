@@ -150,6 +150,22 @@ def main() -> None:
         )
         if composio_import.stdout or composio_import.stderr:
             raise RuntimeError("Composio container import was not content-free")
+        # Exercise the packaged psycopg/libpq pipeline, not only its import.
+        run(
+            "docker", "run", "--rm", "--read-only", "--network", "host",
+            "-e", "RECALL_DATABASE_URL", "--entrypoint", "python", image, "-c",
+            "import os,time\n"
+            "from recall_server.retirement_process import RetirementStore\n"
+            "store=RetirementStore(os.environ['RECALL_DATABASE_URL'])\n"
+            "try:\n"
+            "    with store.connect() as connection:\n"
+            "        result=store._execute_bounded(connection, 'SELECT %s::integer AS n', "
+            "(42,), time.monotonic()+5).fetchone()\n"
+            "        assert result == {'n': 42}\n"
+            "finally:\n"
+            "    store.close()\n",
+            env=child_env,
+        )
         production_start = subprocess.run(
             ["docker", "run", "--rm", "--read-only", "--network", "host",
              "-e", "RECALL_DATABASE_URL", image],
