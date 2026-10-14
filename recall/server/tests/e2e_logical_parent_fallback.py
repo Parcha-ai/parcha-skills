@@ -56,7 +56,9 @@ def queries():
     # Hints add metadata to the current projection, not the frozen legacy SQL.
     added = 'document.document_id,document.body_location,'
     assert current.count(added) == 1
-    legacy = ROOT.sub('', current.replace(added, 'document.document_id,'))
+    locators = 'document.body_record_ordinal,document.body_record_count,'
+    assert current.count(locators) == 1
+    legacy = ROOT.sub('', current.replace(added, 'document.document_id,').replace(locators, ''))
     for field in ('role', 'type'):
         for nested in ('message', 'payload'):
             legacy = re.sub(r"root_fields\.content\s*#>>\s*'\{" + nested + ',' + field + r"\}'",
@@ -144,9 +146,10 @@ def main():
                     all_rows.append(list(cursor))
             assert len(all_rows[0]) == len(all_rows[1]) == 264
             for old, new in zip(*all_rows, strict=True):
-                assert set(new) == set(old) | {'body_location'}
+                assert set(new) == set(old) | {'body_location', 'body_record_ordinal', 'body_record_count'}
                 assert new['body_location'] == 'inline'
-            common_rows = [{key: value for key, value in row.items() if key != 'body_location'}
+                assert new['body_record_ordinal'] is None and new['body_record_count'] is None
+            common_rows = [{key: value for key, value in row.items() if key not in {'body_location', 'body_record_ordinal', 'body_record_count'}}
                            for row in all_rows[1]]
             assert digest_rows(all_rows[0]) == digest_rows(common_rows)
             assert {row['source_id'] for row in all_rows[1]} == {source}
