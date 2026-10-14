@@ -200,10 +200,16 @@ class TruthBoundaryProbe:
                 "recall_search", {"query": case["question"], "limit": CANDIDATE_LIMIT, "snippet_chars": 256},
             )
             latency = (time.monotonic() - started) * 1000.0
+            error = ""
+            if not outcome.ok or not outcome.result:
+                error = (outcome.error or "unknown_error")[:160]
+            elif outcome.result.get("diagnostics", {}).get("authority_status") == "unavailable":
+                # HTTP success can contain a fail-closed authority timeout.
+                error = "authority_unavailable"
             capture = context.options.get("_candidate_capture")
             if capture is not None:
                 capture.capture_case(case["id"], case["question"], outcome.result if outcome.ok else None,
-                                     search_error=None if outcome.ok else "search_unavailable")
+                                     search_error=error or None)
             if outcome.ok and outcome.result:
                 candidates = candidates_from_search(outcome.result)
                 arm_scores[case["id"]] = arm_scores_from_search(outcome.result)
@@ -222,7 +228,6 @@ class TruthBoundaryProbe:
                     rerank_model = diagnostics["rerank_model"]
                 if search_plane is None and isinstance(diagnostics.get("search_plane"), str):
                     search_plane = diagnostics["search_plane"]
-                error = ""
                 receipt = first_receipt(outcome.result)
                 if receipt and resolution_checked < pointer_checks:
                     resolution_checked += 1
@@ -230,7 +235,6 @@ class TruthBoundaryProbe:
                     resolution_ok += 1 if check.ok else 0
             else:
                 candidates = []
-                error = (outcome.error or "unknown_error")[:160]
             rows.append({
                 "id": case["id"],
                 "candidates": candidates,
