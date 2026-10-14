@@ -1120,6 +1120,30 @@ class Collector:
         )
         return {**clean, "_recall_collector_generation": generation}
 
+    def _acked_record_unchanged(self, path: str, native_id: str, content: dict,
+                                active, start: int, end: int) -> bool:
+        """Prove a full record already has an ACK before repeating its archive write."""
+        if active is None or active["start_offset"] != start or active["end_offset"] != end:
+            return False
+        row = self.db.execute(
+            "SELECT generation,base_content_sha256 FROM record_generations WHERE native_id=?",
+            (native_id,),
+        ).fetchone()
+        clean = sanitize(content)
+        if row is None or row["base_content_sha256"] != hashlib.sha256(canonical_json(clean)).hexdigest():
+            return False
+        versioned = {**clean, "_recall_collector_generation": int(row["generation"])}
+        digest = hashlib.sha256(canonical_json(sanitize(versioned))).hexdigest()
+        # Oversized projections have a different hash; retain their existing path.
+        if digest != active["content_sha256"]:
+            return False
+        return self.db.execute(
+            "SELECT 1 FROM outbox WHERE native_id=? AND content_sha256=? "
+            "AND path=? AND start_offset=? AND end_offset=? "
+            "AND state='acked' AND receipt IS NOT NULL",
+            (native_id, digest, path, start, end),
+        ).fetchone() is not None
+
     def _queue(self, path: Path, envelope: dict, end_offset: int) -> bool:
         cursor = self.db.execute(
             "INSERT OR IGNORE INTO outbox(path,native_id,content_sha256,start_offset,end_offset,shard_key,envelope_json,queued_at) VALUES (?,?,?,?,?,?,?,?)",
@@ -1418,6 +1442,17 @@ class Collector:
                                 self.db.execute("INSERT OR IGNORE INTO scan_members(path,native_id) VALUES (?,?)", (path_text, native_id))
                             continue
                         content = privacy.value
+                        if not restoring_tombstone and self._acked_record_unchanged(
+                            path_text, native_id, content, old_active.get(native_id),
+                            line_start, complete_end,
+                        ):
+                            seen_native.add(native_id)
+                            if not append:
+                                self.db.execute(
+                                    "INSERT OR IGNORE INTO scan_members(path,native_id) VALUES (?,?)",
+                                    (path_text, native_id),
+                                )
+                            continue
                         if self.bulk_manifest_archive:
                             future = None
                             artifact_ref = None
