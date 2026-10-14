@@ -1811,6 +1811,8 @@ def main() -> None:
     projection_worker.add_argument("--target-tokens", type=int, default=1024)
     projection_worker.add_argument("--overlap-tokens", type=int, default=128)
     projection_worker.add_argument("--logical-batch-size", type=int, default=25)
+    projection_worker.add_argument("--logical-append", action="store_true",
+        help="reuse verified archive prefixes for proven append-only inputs; requires schema79 and compatible publishers")
     projection_worker.add_argument("--passage-batch-size", type=int, default=100)
     projection_worker.add_argument("--embedding-batch-size", type=int, default=128)
     projection_worker.add_argument("--max-batches-per-cycle", type=int, default=10)
@@ -2579,6 +2581,7 @@ def main() -> None:
             bound_tenant_id=args.tenant,
             raw_archive=build_archive_store(),
             cursor_fetch_rows=args.cursor_fetch_rows,
+            append_enabled=args.logical_append,
         )
         passages = CanonicalPassageProjector(
             store,

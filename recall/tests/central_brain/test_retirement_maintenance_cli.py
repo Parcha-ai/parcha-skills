@@ -28,6 +28,12 @@ class RetirementCliTests(unittest.TestCase):
                 callback(True)
         return mocked, run
 
+    def test_logical_append_is_explicit_and_default_off(self):
+        for arguments, enabled in (([], False), (["--logical-append"], True)):
+            with self.subTest(enabled=enabled):
+                mocked, _ = self.invoke(arguments)
+                self.assertIs(mocked["CanonicalLogicalEvidenceProjector"].call_args.kwargs["append_enabled"], enabled)
+
     def test_default_off_does_not_construct_a_retirement_archive(self):
         mocked, run = self.invoke([])
         mocked['RetirementMaintenance'].assert_not_called()
