@@ -382,15 +382,15 @@ class SlackDeletionOrdering(unittest.TestCase):
                     tenant_id=self.tenant, principal_id=self.principal, source_id=self.source,
                     target_receipt=first['receipt'], mode='explicit_forget', reason='owner_requested',
                     requested_at='2026-10-13T05:00:00Z', idempotency_key=uuid.uuid4().hex)
-                delete_raw = self.archive.delete_raw
+                delete_raw = self.archive.delete_internal_raw_bounded
                 failed = []
-                def lose_suppressed_delete_ack(reference):
-                    result = delete_raw(reference)
+                def lose_suppressed_delete_ack(reference, *, deadline_at):
+                    result = delete_raw(reference, deadline_at=deadline_at)
                     if reference['artifact_id'] == stale['artifact_ref']['artifact_id'] and not failed:
                         failed.append(True)
                         raise OSError('synthetic lost suppression delete acknowledgement')
                     return result
-                with patch.object(self.archive, 'delete_raw', side_effect=lose_suppressed_delete_ack):
+                with patch.object(self.archive, 'delete_internal_raw_bounded', side_effect=lose_suppressed_delete_ack):
                     with self.assertRaises(CanonicalLifecycleError) as error:
                         self.plane.forget(request)
                     self.assertEqual(error.exception.error_code, 'archive_delete_failed')
