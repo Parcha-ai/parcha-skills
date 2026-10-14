@@ -14,7 +14,10 @@ from .retirement_runner import RetirementScope, RunnerLimits, _authorize, _cohor
 class RetirementMaintenance:
     def __init__(self, store, archive, *, tenant_id=None, enabled=False, seconds=10,
                  reconcile_parents=25, max_parents=10, max_clear_bytes=64*1024**2,
-                 max_archive_bytes=256*1024**2, catalog_archive_budget=False):
+                 max_archive_bytes=256*1024**2, catalog_archive_budget=False, metadata_mode="keep"):
+        if metadata_mode not in ('keep', 'singleton'):
+            raise ValueError('invalid retirement metadata mode')
+        self.metadata_mode = metadata_mode
         if (type(catalog_archive_budget) is not bool or type(enabled) is not bool or type(seconds) not in (int, float)
                 or not 0 < seconds <= 300 or type(reconcile_parents) is not int
                 or not 1 <= reconcile_parents <= 100):
@@ -159,7 +162,8 @@ class RetirementMaintenance:
                 should_stop=lambda: time.monotonic() >= stop_admitting_at,
                 before_parent=lambda candidate: self._record_intent(source, candidate),
                 parent_limits_for=(lambda candidate: self._parent_limits(source, candidate))
-                    if self.catalog_archive_budget else None)
+                    if self.catalog_archive_budget else None,
+                **({"metadata_mode": self.metadata_mode} if self.metadata_mode != "keep" else {}))
             report.update(result)
             if not result['commit_outcome_unknown']:
                 with self.store.connect() as c, c.transaction():

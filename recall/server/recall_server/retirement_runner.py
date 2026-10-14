@@ -468,6 +468,7 @@ def run_retirement(
     should_stop=None,
     before_parent=None,
     parent_limits_for=None,
+    metadata_mode="keep",
 ):
     """Sequential enabled-only maintenance; fresh whole-parent proof once per claim."""
     limits = RunnerLimits() if limits is None else limits
@@ -477,6 +478,7 @@ def run_retirement(
         or not isinstance(limits, RunnerLimits)
         or not isinstance(parent_limits, ParentRetirementLimits)
         or type(apply) is not bool
+        or metadata_mode not in ("keep", "singleton")
         or should_stop is not None
         and not callable(should_stop)
         or before_parent is not None
@@ -501,6 +503,7 @@ def run_retirement(
         batches=0,
         cleared_documents=0,
         cleared_chunks=0,
+        retired_metadata_chunks=0,
         cleared_utf8_bytes=0,
         eligible_documents=0,
         committed_sql_ms=0.0,
@@ -579,6 +582,7 @@ def run_retirement(
                 required_scope_epoch=candidate["scope_epoch"],
                 owner_principal_id=scope.principal_id,
                 should_stop=should_stop,
+                metadata_mode=metadata_mode,
             )
             report["metadata_capture_ms"] += result.get("metadata_capture_ms", 0.0)
             report["completed_parent_proofs"] += int(result["complete"])
@@ -607,6 +611,7 @@ def run_retirement(
             "batches",
             "cleared_documents",
             "cleared_chunks",
+            "retired_metadata_chunks",
             "cleared_utf8_bytes",
         ):
             report[field] += result.get(field, 0)

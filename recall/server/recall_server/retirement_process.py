@@ -109,8 +109,11 @@ def main():
         if len(raw) > 16384:
             raise ValueError("retirement configuration too large")
         configuration = json.loads(raw)
-        if set(configuration) != {"dsn", "tenant_id", "seconds"}:
+        if set(configuration) not in ({"dsn", "tenant_id", "seconds"}, {"dsn", "tenant_id", "seconds", "metadata_mode"}):
             raise ValueError("retirement configuration invalid")
+        metadata_mode = configuration.get("metadata_mode", "keep")
+        if metadata_mode not in ("keep", "singleton"):
+            raise ValueError("invalid retirement metadata mode")
         seconds = configuration["seconds"]
         if type(seconds) not in (int, float) or not 0 < seconds <= 300:
             raise ValueError("retirement work budget invalid")
@@ -139,6 +142,7 @@ def main():
             max_clear_bytes=512 * 1024**2,
             max_archive_bytes=64 * 1024**3,
             catalog_archive_budget=True,
+            **({"metadata_mode": metadata_mode} if metadata_mode != "keep" else {}),
         )
         result = owner.cycle(busy=False)
     except Exception as error:

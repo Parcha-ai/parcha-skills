@@ -85,6 +85,38 @@ Long projection phases still delay the next reachable maintenance boundary.
 Historical revision hydration and physical database downsizing remain separate
 work; this change makes no claim that either is complete.
 
+## Optional singleton metadata retirement
+
+`--retirement-metadata singleton` explicitly extends an enabled retirement round;
+the default `keep` retains chunk rows even when singleton readers are enabled.
+The selected mode travels through the existing supervisor, child and source
+policy owner. It requires the compatible singleton readers, optional migration
+080, archive body reads and the turbopuffer search plane. Deploying this code or
+enabling reader capability does not select the metadata operation.
+
+One unchanged whole-parent archive proof covers both body clearing and metadata
+retirement. In each existing locked transaction, the worker clears proved bodies
+and admits only canonical, current, empty singleton rows with exact receipt,
+hash and timestamp identity and no legacy embedding dependencies. Pending
+publication prevents metadata admission. Multi-chunk and other ineligible rows
+stay physical. Profile admission and exact chunk deletion share the existing
+progress commit; there is no second proof per small group or new progress table.
+
+`retired_metadata_chunks` reports only this attempt's acknowledged committed
+prefix, including when a later commit outcome is unknown. It is separate from
+body-byte counters and is not a durable cumulative count or physical-space
+measurement. Recovery preserves the old unknown outcome, reads existing progress
+and membership, then uses the original claim/proof path for subsequent work.
+
+An already complete body-only parent needs an explicit existing parent reset to
+be reconsidered. Metadata-only reversal restores exact empty chunk rows and
+preserves progress, so it does not immediately trigger re-deletion. Turning this
+operation back to `keep` stops new metadata retirement; disabling compatible
+readers or reverting to a legacy SQL read plane additionally requires restoring
+every admitted row first. Production activation still requires a successful
+isolated round trip, a measured finite real cohort and review of sustained
+latency, ingestion and storage effects.
+
 ## Large-parent admission remains open
 
 The default 256 MiB archive budget cannot prove a parent whose committed parts
