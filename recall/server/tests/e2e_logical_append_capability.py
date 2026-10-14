@@ -284,6 +284,7 @@ class AppendCapability(unittest.TestCase):
                 "ALTER TABLE canonical_evidence_document_queue DROP COLUMN append_generation,DROP COLUMN append_base_manifest_id"
             )
         standalone_probes = []
+        dispatch_probes = []
         original_execute = Connection.execute
 
         def observe(connection, query, *args, **kwargs):
@@ -292,7 +293,11 @@ class AppendCapability(unittest.TestCase):
                 normalized.startswith("SELECT")
                 and "schema_migrations WHERE version=79" in normalized
             ):
-                standalone_probes.append(normalized)
+                if ("FROM canonical_evidence_document_queue queue" in normalized
+                        and "WHERE queue.tenant_id=%s AND queue.source_id=%s AND queue.native_parent_id=%s" in normalized):
+                    dispatch_probes.append(normalized)
+                else:
+                    standalone_probes.append(normalized)
             return original_execute(connection, query, *args, **kwargs)
 
         try:
@@ -301,6 +306,7 @@ class AppendCapability(unittest.TestCase):
                 self.assertEqual(self.publish()["documents"], 1)
                 self.ingest("second", 20)
                 self.assertEqual(self.publish()["documents"], 1)
+            self.assertEqual(len(dispatch_probes), 2 if self.logical.append_enabled else 0)
             self.assertEqual(
                 standalone_probes,
                 [],

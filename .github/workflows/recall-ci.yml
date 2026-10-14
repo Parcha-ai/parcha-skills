@@ -84,6 +84,7 @@ jobs:
             e2e_logical_admission_sharing.py \
             e2e_logical_small_work_progress.py \
             e2e_logical_early_supersession.py \
+            e2e_logical_dispatch_refresh.py \
             e2e_logical_periodic_supersession.py \
             e2e_logical_stream_supersession.py \
             e2e_pool_warmup.py \
@@ -116,6 +117,13 @@ jobs:
             e2e_retained_passage_receipts.py \
             e2e_passage_receipt_repair.py \
             e2e_turbopuffer_quantum.py \
+            e2e_singleton_search_publication.py \
+            e2e_singleton_parquet_receipts.py \
+            e2e_singleton_agent_receipts.py \
+            e2e_singleton_time_clip.py \
+            e2e_singleton_parent_receipts.py \
+            e2e_singleton_projection_membership.py \
+            e2e_singleton_maintenance_membership.py \
             e2e_authority_covering_indexes.py \
             e2e_slack_passage_visibility.py \
             e2e_slack_visible_text_replay.py \
@@ -148,6 +156,10 @@ jobs:
             e2e_archived_chunk_reads.py \
             e2e_receipt_membership.py \
             e2e_singleton_receipt_integration.py \
+            e2e_singleton_search_authority.py \
+            e2e_singleton_public_reads.py \
+            e2e_singleton_passage_reads.py \
+            e2e_singleton_related_reads.py \
             e2e_context_neighbor_work.py \
             e2e_pending_archived_chunks.py \
             e2e_chunk_body_locators.py \
@@ -172,6 +184,7 @@ jobs:
             e2e_context_neighbor_plan.py \
             e2e_located_public_reads.py \
             e2e_retirement_runner.py \
+            e2e_retirement_capture_timing.py \
             e2e_retirement_query_pipeline.py \
             e2e_company_retirement_authority.py \
             e2e_deleted_chunk_bodies.py \

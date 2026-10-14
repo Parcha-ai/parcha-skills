@@ -77,9 +77,23 @@ def parent_scoped_receipts(
         if not candidates:
             return ()
         with store.connect() as connection:
+            chunk_relation = "canonical_chunks chunk"
+            member_parameters = ()
+            if getattr(store, "verified_singleton_receipts", False):
+                from .receipt_membership import verified_receipt_relation
+
+                connection.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+                selected = store._execute_bounded(connection, """SELECT receipts
+                    FROM canonical_passages WHERE tenant_id=%s AND source_id=%s
+                      AND logical_document_id=%s AND policy_fingerprint=%s
+                      AND passage_id=ANY(%s)""", (tenant_id, source_id,
+                    document["logical_document_id"], policy_fingerprint, list(candidates)), deadline_at).fetchall()
+                receipts = tuple(dict.fromkeys(receipt for row in selected for receipt in row["receipts"]))
+                chunk_relation, member_parameters = verified_receipt_relation(store, connection,
+                    tenant_id=tenant_id, receipts=receipts, sources=(source_id,), deadline_at=deadline_at)
             rows = store._execute_bounded(
                 connection,
-                """SELECT passage.passage_id,passage.text_sha256,
+                f"""SELECT passage.passage_id,passage.text_sha256,
                           passage.revision,evidence.manifest_content_sha256,
                           chunk.receipt
                      FROM canonical_passages passage
@@ -87,7 +101,7 @@ def parent_scoped_receipts(
                        USING(tenant_id,source_id,logical_document_id,revision)
                      JOIN LATERAL unnest(passage.receipts) WITH ORDINALITY
                        AS wanted(receipt,ordinal) ON true
-                     JOIN canonical_chunks chunk
+                     JOIN {chunk_relation}
                        ON chunk.tenant_id=passage.tenant_id
                       AND chunk.source_id=passage.source_id
                       AND chunk.receipt=wanted.receipt
@@ -119,7 +133,7 @@ def parent_scoped_receipts(
                       AND (%s::timestamptz IS NULL OR event.occurred_at<=%s)
                     ORDER BY array_position(%s::text[],passage.passage_id),wanted.ordinal
                     LIMIT 5000""",
-                (tenant_id, source_id, document["logical_document_id"],
+                member_parameters + (tenant_id, source_id, document["logical_document_id"],
                  policy_fingerprint, list(candidates), parent_id, parent_id,
                  since, since, until, until, list(candidates)), deadline_at,
             ).fetchall()

@@ -194,9 +194,10 @@ class RunnerTests(unittest.TestCase):
             if kwargs['native_parent_id'] == 'unknown':
                 error = ChunkRetirementError('parent_retirement_unavailable')
                 error.committed = dict(cleared_utf8_bytes=3, sql_ms=200., hash_ms=50.)
+                error.attempt_metrics = dict(metadata_capture_ms=600.)
                 raise error
             return dict(complete=True, batches=1, cleared_utf8_bytes=10,
-                        sql_ms=500., hash_ms=100.)
+                        sql_ms=500., hash_ms=100., metadata_capture_ms=800.)
         with patch.object(runner.time, 'monotonic', side_effect=lambda:clock[0]), \
              patch.object(runner, '_claim', side_effect=claim), \
              patch.object(runner, 'retire_parent_chunks', side_effect=retire):
@@ -208,6 +209,7 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(result['committed_hash_ms'], 150.)
         self.assertEqual(result['parent_wall_ms'], 4000.)
         self.assertEqual(result['claim_wall_ms'], 500.)
+        self.assertEqual(result['metadata_capture_ms'], 1400.)
 
     def test_archive_wall_includes_failed_reads_but_not_budget_refusal(self):
         clock = [100.0]

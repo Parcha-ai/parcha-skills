@@ -193,6 +193,15 @@ def _publish_batch(
                 ORDER BY document_id,ordinal LIMIT %s FOR SHARE NOWAIT""",
                 (*scope[:2], ids, sum(len(row["chunks"]) for row in rows) + 1),
             ).fetchall()
+            if getattr(store, 'verified_singleton_receipts', False):
+                from .receipt_membership import verified_document_chunks
+                by_document = {row['document_id']: [] for row in current}
+                for chunk in chunks:
+                    by_document[chunk['document_id']].append(chunk)
+                proven = verified_document_chunks(store, connection, tenant_id=scope[0], source_id=scope[1],
+                    documents=[dict(row, chunks=by_document[row['document_id']]) for row in current],
+                    deadline_at=deadline_at)
+                chunks = [dict(chunk, document_id=document) for document, values in proven.items() for chunk in values]
             expected_chunks = {
                 (row["document_id"], chunk["ordinal"]): chunk
                 for row in rows

@@ -614,7 +614,7 @@ class SearchPlaneReconcileTest(unittest.TestCase):
     """Observed drift is not deletion authority; repairs reread current rows."""
 
     def _store(self, live_ids: list[str]) -> mock.MagicMock:
-        store = mock.MagicMock(search_plane="turbopuffer")
+        store = mock.MagicMock(search_plane="turbopuffer", verified_singleton_receipts=False)
         connection = mock.MagicMock()
 
         def execute(sql: str, params=()):

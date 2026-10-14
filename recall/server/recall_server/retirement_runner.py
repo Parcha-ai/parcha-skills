@@ -507,6 +507,7 @@ def run_retirement(
         committed_hash_ms=0.0,
         claim_wall_ms=0.0,
         parent_wall_ms=0.0,
+        metadata_capture_ms=0.0,
         commit_outcome_unknown=False,
     )
     errors, excluded, attempted = Counter(), Counter(), []
@@ -579,6 +580,7 @@ def run_retirement(
                 owner_principal_id=scope.principal_id,
                 should_stop=should_stop,
             )
+            report["metadata_capture_ms"] += result.get("metadata_capture_ms", 0.0)
             report["completed_parent_proofs"] += int(result["complete"])
             report["partial_parents"] += int(not result["complete"])
             report["eligible_documents"] += result.get("eligible_documents", 0)
@@ -587,6 +589,7 @@ def run_retirement(
             report["failed_parents"] += 1
             errors[error.error_code] += 1
             result = getattr(error, "committed", {})
+            report["metadata_capture_ms"] += getattr(error, "attempt_metrics", {}).get("metadata_capture_ms", 0.0)
             if error.error_code == "parent_retirement_unavailable":
                 # COMMIT may have succeeded before Python observed its counters.
                 # Stop; a later explicit invocation resumes from the durable ledger.
