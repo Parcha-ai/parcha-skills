@@ -27,7 +27,7 @@ from .logical_evidence_projection import (
     mark_logical_evidence_dirty,
     mark_logical_notification_pending,
 )
-from .projectors import item_receipt, validate_envelope
+from .projectors import canonical_json, item_receipt, validate_envelope
 
 MAX_LINKED_IDENTITIES = 10_000
 MAX_CANONICAL_BATCH_EVENTS = 1_000
@@ -307,6 +307,7 @@ class CanonicalArchiveGateway:
         payload: bytes,
         media_type: str,
         created_at: str,
+        require_existing_owner: bool = False,
     ) -> dict[str, Any]:
         if tenant_id != self.tenant_id:
             raise CanonicalLifecycleError("archive_authority_forbidden")
@@ -320,12 +321,14 @@ class CanonicalArchiveGateway:
         identity_sha256 = _identity_sha256(tenant_id, source_id, native_id)
         with self.store.connect() as conn:
             with conn.transaction():
-                CanonicalPlane.register_source(
-                    conn,
-                    tenant_id=tenant_id,
-                    principal_id=self.principal_id,
-                    source_id=source_id,
-                )
+                if require_existing_owner:
+                    CanonicalPlane._require_existing_source_owner(
+                        conn, tenant_id=tenant_id, principal_id=self.principal_id,
+                        source_id=source_id)
+                else:
+                    CanonicalPlane.register_source(
+                        conn, tenant_id=tenant_id, principal_id=self.principal_id,
+                        source_id=source_id)
                 conn.execute(
                     """SELECT pg_advisory_xact_lock(hashtextextended(%s,0))""",
                     (f"v2\x1f{tenant_id}\x1f{source_id}\x1f{native_id}",),
@@ -418,14 +421,20 @@ def _audit_slack_suppression(connection, *, tenant_id, source_id, rows):
         ])))
 
 
-def _reject_filesystem_deletion(event, connector_id=None):
-    """Transcript cleanup is not authority to forget captured history."""
+def _filesystem_cleanup(event, connector_id=None):
+    """Recognize the two transcript connectors, never an explicit forget."""
+    if not isinstance(event, dict):
+        return False
     provenance = event.get("provenance")
-    if event.get("kind") == "tombstone" and (
+    return event.get("kind") == "tombstone" and (
         connector_id in ("claude.jsonl", "codex.jsonl")
         or (isinstance(provenance, dict)
             and provenance.get("connector_id") in ("claude.jsonl", "codex.jsonl"))
-    ):
+    )
+
+
+def _reject_filesystem_deletion(event, connector_id=None):
+    if _filesystem_cleanup(event, connector_id):
         raise CanonicalLifecycleError("canonical_filesystem_deletion_forbidden")
 
 
@@ -459,7 +468,6 @@ class CanonicalPlane:
             self._validate_host_identity(tenant_id, owner, event["source_id"])
             if owner != event["principal_id"]:
                 raise CanonicalLifecycleError("canonical_lineage_invalid")
-            _reject_filesystem_deletion(event)
             if event["kind"] != "tombstone":
                 candidates.append({key: event[key] for key in
                                    ("source_id", "native_id", "content_sha256", "principal_id")})
@@ -478,6 +486,68 @@ class CanonicalPlane:
                              source_id=source_id, native_ids=native_ids, store=self.store)
         except HistoryUnavailable:
             raise CanonicalLifecycleError("canonical_history_unavailable") from None
+
+    def authorize_filesystem_cleanup(self, connection, *, tenant_id, principal_id,
+                                     event, connector_id=None):
+        """Validate the marker and lock its existing owner grant without creating it."""
+        try:
+            event = validate_envelope(event)
+        except ValueError:
+            raise CanonicalLifecycleError('canonical_contract_invalid') from None
+        self._validate_host_identity(tenant_id, principal_id, event.get('source_id'))
+        if event['principal_id'] != principal_id or not _filesystem_cleanup(event, connector_id):
+            raise CanonicalLifecycleError('canonical_lineage_invalid')
+        self._require_existing_source_owner(connection, tenant_id=tenant_id,
+            principal_id=principal_id, source_id=event['source_id'])
+        return event
+
+    @staticmethod
+    def _require_existing_source_owner(connection, *, tenant_id, principal_id, source_id):
+        owner = connection.execute('''SELECT source.owner_principal_id
+            FROM canonical_sources source JOIN canonical_source_grants grant_row
+              USING(tenant_id,source_id)
+            WHERE source.tenant_id=%s AND source.source_id=%s
+              AND source.owner_principal_id=%s AND grant_row.principal_id=%s
+              AND grant_row.permission='owner'
+            FOR SHARE OF source,grant_row''',
+            (tenant_id, source_id, principal_id, principal_id)).fetchone()
+        if owner is None:
+            raise CanonicalLifecycleError('canonical_authority_forbidden')
+
+    def suppress_filesystem_cleanup(self, connection, *, tenant_id, principal_id,
+                                    event, connector_id=None, artifact=None):
+        """Record a policy audit, not a document or deletion receipt.
+
+        The legacy bridge uses this before upload, including after explicit forget.
+        Canonical requests call it after their existing artifact/forget checks.
+        The caller owns the transaction; returning here is not a COMMIT ACK.
+        """
+        event = self.authorize_filesystem_cleanup(connection, tenant_id=tenant_id,
+            principal_id=principal_id, event=event, connector_id=connector_id)
+        source_id, native_id = event['source_id'], event['native_id']
+        connection.execute('SELECT pg_advisory_xact_lock(hashtextextended(%s,0))',
+                           (f'v2\x1f{tenant_id}\x1f{source_id}\x1f{native_id}',))
+        audit_event = {**event, 'provenance': {
+            key: value for key, value in event.get('provenance', {}).items()
+            if key != 'artifact_ref'}}
+        encoded = canonical_json(audit_event)
+        audit_id = _opaque('audit', tenant_id, source_id, hashlib.sha256(encoded).hexdigest(),
+                           'filesystem-cleanup-suppressed')
+        identity = _identity_sha256(tenant_id, source_id, native_id)
+        if artifact is not None:
+            if not _suppressed_ownership_available(connection):
+                raise CanonicalLifecycleError('canonical_suppression_schema_required')
+            connection.execute('''INSERT INTO canonical_suppressed_artifact_owners(
+                tenant_id,source_id,identity_sha256,artifact_id) VALUES (%s,%s,%s,%s)
+                ON CONFLICT DO NOTHING''', (tenant_id, source_id, identity, artifact['artifact_id']))
+        inserted = connection.execute('''INSERT INTO canonical_audit_events(
+            tenant_id,source_id,audit_id,operation,status,subject_sha256,item_count,byte_count)
+            VALUES (%s,%s,%s,'ingest.filesystem_cleanup_suppressed','success',%s,1,%s)
+            ON CONFLICT(tenant_id,source_id,audit_id) DO NOTHING RETURNING audit_id''',
+            (tenant_id, source_id, audit_id, identity, len(encoded))).fetchone()
+        return dict(status='committed', inserted=0, duplicate_events=int(inserted is None),
+                    suppressed_filesystem_events=1, receipt_kind='policy_audit',
+                    receipt=f'recall-audit://{source_id}/{audit_id}', replay=inserted is None)
 
     @staticmethod
     def _validate_host_identity(
@@ -621,7 +691,6 @@ class CanonicalPlane:
             or event.get("provenance", {}).get("artifact_ref") != artifact
         ):
             raise CanonicalLifecycleError("canonical_lineage_invalid")
-        _reject_filesystem_deletion(event, connector_id)
         _validate_oversized_pointer(event, artifact)
         connection_context = (
             self.store.connect() if _connection is None else nullcontext(_connection)
@@ -636,6 +705,13 @@ class CanonicalPlane:
                 conn.transaction() if _connection is None else nullcontext()
             )
             with transaction_context:
+                if _filesystem_cleanup(event, connector_id):
+                    # Do not let register_source recreate a revoked owner grant.
+                    self.authorize_filesystem_cleanup(conn, tenant_id=tenant_id,
+                        principal_id=principal_id, event=event, connector_id=connector_id)
+                    return self._write_authorized_document(
+                        conn, tenant_id=tenant_id, connector_id=connector_id,
+                        artifact=artifact, event=event, text_redacted=text_redacted)
                 self.register_source(
                     conn,
                     tenant_id=tenant_id,
@@ -733,6 +809,10 @@ class CanonicalPlane:
             )
         ):
             raise CanonicalLifecycleError("canonical_artifact_conflict")
+        if _filesystem_cleanup(event, connector_id):
+            return self.suppress_filesystem_cleanup(
+                conn, tenant_id=tenant_id, principal_id=event['principal_id'],
+                event=event, connector_id=connector_id, artifact=artifact)
         existing = conn.execute(
             """SELECT revision FROM canonical_events
                        WHERE tenant_id=%s AND source_id=%s
@@ -951,6 +1031,7 @@ class CanonicalPlane:
             raise CanonicalLifecycleError("canonical_batch_invalid")
         if (
             len({event.get("kind") == "tombstone" for event in events}) == 1
+            and not any(_filesystem_cleanup(event) for event in events)
             and len({event.get("native_id") for event in events}) == len(events)
             and len({event.get("source_id") for event in events}) == 1
         ):
@@ -965,6 +1046,12 @@ class CanonicalPlane:
                 tenant_id=tenant_id, principal_id=principal_id, events=events))
             connection = stack.enter_context(self.store.connect())
             with connection.transaction():
+                # Lock cleanup authority before any ordinary member can register
+                # a source, regardless of input order or registration-cache state.
+                for envelope in events:
+                    if _filesystem_cleanup(envelope):
+                        self.authorize_filesystem_cleanup(connection, tenant_id=tenant_id,
+                            principal_id=principal_id, event=envelope)
                 for envelope in events:
                     provenance = envelope.get("provenance", {})
                     connector_id = provenance.get("connector_id")
@@ -998,6 +1085,8 @@ class CanonicalPlane:
             "duplicate_events": sum(result["duplicate_events"] for result in results),
             "receipts": [result["receipt"] for result in results],
             "replay": all(result["replay"] for result in results),
+            **({"suppressed_filesystem_events": sum(result.get("suppressed_filesystem_events", 0) for result in results)}
+               if any(result.get("suppressed_filesystem_events") for result in results) else {}),
             **({"suppressed_deleted_events": sum(result.get("suppressed_deleted_events", 0) for result in results)}
                if any(result.get("suppressed_deleted_events") for result in results) else {}),
         }

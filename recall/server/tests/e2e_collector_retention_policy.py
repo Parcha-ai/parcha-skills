@@ -3,7 +3,6 @@
 import unittest
 import json
 import threading
-import urllib.error
 import urllib.request
 from http.server import ThreadingHTTPServer
 from unittest.mock import patch
@@ -19,40 +18,39 @@ class CollectorRetentionPolicy(unittest.TestCase):
     delete = fixture.SlackDeletionOrdering.delete
     current = fixture.SlackDeletionOrdering.current
 
-    def test_scalar_and_set_batch_refuse_collector_deletion_without_history_io(self):
+    def test_scalar_and_set_batch_suppress_collector_deletion_without_history_io(self):
         for connector in ('claude.jsonl', 'codex.jsonl'):
             for path in ('document', 'batch'):
                 with self.subTest(connector=connector, path=path):
                     first = self.ingest(self.root, path='document', connector_id=connector)
-                    with patch.object(self.plane, 'prepare_history', wraps=self.plane.prepare_history) as history:
-                        with self.assertRaisesRegex(fixture.CanonicalLifecycleError, 'canonical_filesystem_deletion_forbidden'):
-                            self.ingest(self.delete(self.root), path=path, connector_id=connector)
+                    with patch('recall_server.canonical_history.read_archived_chunks') as history:
+                        result = self.ingest(self.delete(self.root), path=path, connector_id=connector)
+                        self.assertEqual(result['suppressed_filesystem_events'], 1)
+                        self.assertEqual(result['inserted'], 0)
                         history.assert_not_called()
                     self.assertEqual(self.current(self.root), 1)
                     self.assertEqual(self.ingest(self.root, path='document', connector_id=connector)['receipt'], first['receipt'])
 
-    def test_mixed_batch_refuses_before_any_history_staging_or_event_mutation(self):
+    def test_mixed_batch_preserves_history_and_commits_live_member(self):
         self.ingest(self.root, path='document', connector_id='claude.jsonl')
         live = self.ingest(self.reply, path='prepare', connector_id='claude.jsonl')['envelope']
         deleted = self.ingest(self.delete(self.root), path='prepare', connector_id='claude.jsonl')['envelope']
-        with patch('recall_server.canonical.prepare_history') as history:
-            with self.assertRaisesRegex(fixture.CanonicalLifecycleError, 'canonical_filesystem_deletion_forbidden'):
-                self.plane.ingest_batch(tenant_id=self.tenant, principal_id=self.principal, events=[live, deleted])
-            history.assert_not_called()
+        result = self.plane.ingest_batch(tenant_id=self.tenant, principal_id=self.principal, events=[live, deleted])
+        self.assertEqual(result['suppressed_filesystem_events'], 1)
         self.assertEqual(self.current(self.root), 1)
-        self.assertEqual(self.current(self.reply), 0)
+        self.assertEqual(self.current(self.reply), 1)
 
-    def test_legacy_route_refuses_before_raw_archive_in_both_compatibility_modes(self):
+    def test_legacy_route_suppresses_before_raw_archive_in_both_compatibility_modes(self):
         self.ingest(self.root, path='document', connector_id='claude.jsonl')
         for enabled in ('0', '1'):
             self.bridge.environment = {'RECALL_LEGACY_WRITES': enabled}
             with patch.object(self.archive, 'put_raw', wraps=self.archive.put_raw) as upload:
-                with self.assertRaisesRegex(fixture.CanonicalLifecycleError, 'canonical_filesystem_deletion_forbidden'):
-                    self.ingest(self.delete(self.root), path='legacy', connector_id='claude.jsonl')
+                result = self.ingest(self.delete(self.root), path='legacy', connector_id='claude.jsonl')
+                self.assertEqual(result['suppressed_filesystem_events'], 1)
                 upload.assert_not_called()
             self.assertEqual(self.current(self.root), 1)
 
-    def test_old_collector_http_gets_permanent_error_without_false_ack(self):
+    def test_old_collector_http_gets_committed_audit_ack_without_document_receipt(self):
         from recall_server.app import Handler
         first = self.ingest(self.root, path='document', connector_id='claude.jsonl')
         marker = self.ingest(self.delete(self.root), path='prepare', connector_id='claude.jsonl')['envelope']
@@ -66,10 +64,13 @@ class CollectorRetentionPolicy(unittest.TestCase):
                 request = urllib.request.Request(f'http://127.0.0.1:{server.server_port}/v1/ingest/batches',
                     data=json.dumps({'events': [marker]}).encode(),
                     headers={'Content-Type': 'application/json', 'Idempotency-Key': 'obsolete-marker'})
-                with self.assertRaises(urllib.error.HTTPError) as error:
-                    urllib.request.urlopen(request, timeout=3)
-                self.assertEqual(error.exception.code, 400)
-                self.assertEqual(json.loads(error.exception.read()), {'error': 'canonical_filesystem_deletion_forbidden'})
+                with urllib.request.urlopen(request, timeout=3) as response:
+                    self.assertEqual(response.status, 201)
+                    result = json.loads(response.read())
+                self.assertEqual(result['status'], 'committed')
+                self.assertEqual(result['inserted'], 0)
+                self.assertEqual(result['suppressed_filesystem_events'], 1)
+                self.assertTrue(result['receipts'][0].startswith('recall-audit://'))
                 self.assertEqual(self.current(self.root), 1)
                 self.assertEqual(self.ingest(self.root, path='document', connector_id='claude.jsonl')['receipt'], first['receipt'])
             finally:
