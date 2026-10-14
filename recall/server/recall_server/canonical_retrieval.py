@@ -3022,6 +3022,36 @@ class BoundCanonicalRetrieval:
             (self.tenant_id, list(self.authorized_sources), target),
             deadline_at,
         ).fetchone()
+        if row is None and getattr(self.store, 'verified_singleton_receipts', False):
+            from .receipt_membership import lookup_receipt_metadata
+
+            member = lookup_receipt_metadata(self.store, tenant_id=self.tenant_id,
+                authorized_sources=self.authorized_sources, receipts=(target,),
+                allow_verified_singletons=True, deadline_at=deadline_at,
+                connection=connection).get(target)
+            if member is not None:
+                if self.chunk_body_archive is None:
+                    raise ChunkBodyError('archived_chunk_body_unavailable')
+                row = self.store._execute_bounded(connection,
+                    """SELECT document.source_id,document.document_id,%s::integer AS anchor_ordinal,
+                              document.native_id,document.revision,event.event_id,event.native_parent_id,
+                              event.kind,event.occurred_at,event.observed_at,event.created_at,
+                              event.canonical_redacted
+                         FROM canonical_documents document
+                         JOIN canonical_events event USING(tenant_id,source_id,event_id)
+                        WHERE document.tenant_id=%s AND document.source_id=%s
+                          AND document.document_id=%s AND document.is_current
+                          AND document.deleted_at IS NULL
+                          AND NOT EXISTS (SELECT 1 FROM canonical_events later
+                              WHERE later.tenant_id=document.tenant_id
+                                AND later.source_id=document.source_id
+                                AND later.native_id=document.native_id
+                                AND later.revision>document.revision AND later.is_tombstone)""",
+                    (member['ordinal'], self.tenant_id, member['source_id'], member['document_id']),
+                    deadline_at).fetchone()
+                if row is not None:
+                    row['_admitted_chunk'] = dict(ordinal=member['ordinal'], text=None,
+                                                  receipt=member['receipt'])
         if row is not None:
             row["resolved_receipt"] = target
         return row
@@ -3094,11 +3124,17 @@ class BoundCanonicalRetrieval:
                 # Keep event ordering ahead of the correlated eligibility work.
                 # The two OFFSET fences let LIMIT stop document/chunk/tombstone
                 # probes after enough live neighbors, without capping candidates.
-                return self.store._execute_bounded(
+                singleton_reads = getattr(self.store, "verified_singleton_receipts", False)
+                profile_column = ",document.chunk_receipt_profile AS receipt_profile" if singleton_reads else ""
+                profile_event = ",event.receipt_profile" if singleton_reads else ""
+                profile_document = ",document.receipt_profile" if singleton_reads else ""
+                profile_eligible = " OR document.chunk_receipt_profile IS NOT NULL" if singleton_reads else ""
+                chunk_join = "LEFT JOIN" if singleton_reads else "JOIN"
+                rows = self.store._execute_bounded(
                     connection,
                     f"""SELECT event.source_id,event.native_id,event.document_id,
                                event.native_parent_id,event.revision,event.kind,
-                               event.occurred_at,event.observed_at,event.created_at,
+                               event.occurred_at,event.observed_at,event.created_at{profile_event},
                                jsonb_agg(
                                  jsonb_build_object(
                                    'ordinal',chunk.ordinal,
@@ -3110,7 +3146,7 @@ class BoundCanonicalRetrieval:
                           SELECT event.tenant_id,event.source_id,event.native_id,
                                  document.document_id,event.native_parent_id,
                                  document.revision,event.kind,event.occurred_at,
-                                 event.observed_at,event.created_at
+                                 event.observed_at,event.created_at{profile_document}
                           FROM (
                             SELECT tenant_id,source_id,event_id,native_id,
                                    native_parent_id,kind,occurred_at,observed_at,created_at
@@ -3123,7 +3159,7 @@ class BoundCanonicalRetrieval:
                             OFFSET 0
                           ) event
                           JOIN LATERAL (
-                            SELECT document.document_id,document.revision
+                            SELECT document.document_id,document.revision{profile_column}
                             FROM canonical_documents document
                             WHERE document.tenant_id=event.tenant_id
                               AND document.source_id=event.source_id
@@ -3138,19 +3174,19 @@ class BoundCanonicalRetrieval:
                                    AND later.revision>document.revision
                                    AND later.is_tombstone
                               )
-                              AND EXISTS (
+                              AND (EXISTS (
                                 SELECT 1 FROM canonical_chunks live
                                  WHERE live.tenant_id=document.tenant_id
                                    AND live.source_id=document.source_id
                                    AND live.document_id=document.document_id
                                    AND live.deleted_at IS NULL
-                              )
+                              ){profile_eligible})
                             OFFSET 0
                           ) document ON true
                           ORDER BY event.occurred_at {ordering},event.native_id {ordering}
                           LIMIT %s
                         ) event
-                        JOIN LATERAL (
+                        {chunk_join} LATERAL (
                           SELECT bounded.ordinal,{body_sql} AS text_redacted,bounded.receipt
                           FROM canonical_chunks bounded
                           WHERE bounded.tenant_id=event.tenant_id
@@ -3162,7 +3198,7 @@ class BoundCanonicalRetrieval:
                         ) chunk ON true
                         GROUP BY event.source_id,event.native_id,event.document_id,
                                  event.native_parent_id,event.revision,event.kind,
-                                 event.occurred_at,event.observed_at,event.created_at
+                                 event.occurred_at,event.observed_at,event.created_at{profile_event}
                         ORDER BY event.occurred_at {ordering},
                                  event.native_id {ordering}""",
                     (
@@ -3175,6 +3211,29 @@ class BoundCanonicalRetrieval:
                     ),
                     _deadline_at,
                 ).fetchall()
+
+                profiled = [row for row in rows if row.get("receipt_profile") is not None]
+                if profiled:
+                    from .projectors import item_receipt
+                    from .receipt_membership import lookup_receipt_metadata
+
+                    if self.chunk_body_archive is None:
+                        raise ChunkBodyError("archived_chunk_body_unavailable")
+                    receipts = [item_receipt(row["source_id"], row["native_id"], row["revision"], 0)
+                                for row in profiled]
+                    members = lookup_receipt_metadata(
+                        self.store, tenant_id=self.tenant_id,
+                        authorized_sources=self.authorized_sources, receipts=tuple(receipts),
+                        allow_verified_singletons=True, deadline_at=_deadline_at,
+                        connection=connection,
+                    )
+                    for row, receipt in zip(profiled, receipts):
+                        member = members.get(receipt)
+                        if member is None or member["document_id"] != row["document_id"]:
+                            raise ChunkBodyError("archived_chunk_body_unavailable")
+                        row["chunks"] = [{"ordinal": member["ordinal"], "text": None,
+                                          "receipt": receipt}]
+                return rows
 
             previous = list(reversed(neighbors("before", before)))
             following = neighbors("after", after)
@@ -3199,6 +3258,8 @@ class BoundCanonicalRetrieval:
                 ),
                 _deadline_at,
             ).fetchall()
+            if not anchor_chunks and "_admitted_chunk" in anchor:
+                anchor_chunks = [dict(anchor["_admitted_chunk"])]
             anchor["chunks"] = anchor_chunks
         if self.chunk_body_archive is not None:
             selected_chunks = []
@@ -4501,6 +4562,8 @@ class BoundCanonicalRetrieval:
                 (self.tenant_id, row["source_id"], row["document_id"]),
                 deadline_at,
             ).fetchall()
+            if not chunks and '_admitted_chunk' in row:
+                chunks = [dict(row['_admitted_chunk'])]
         if self.chunk_body_archive is not None:
             for chunk in chunks:
                 chunk["source_id"] = row["source_id"]
