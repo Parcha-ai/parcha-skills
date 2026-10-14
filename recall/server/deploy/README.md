@@ -285,7 +285,7 @@ are supported: versions through 69 are required except optional migration 67,
 which retires the Postgres vector plane and is applied explicitly from the
 turbopuffer plane. Migration 70 adds only a reconciliation performance index;
 serving accepts both schema 69 and 70 and reports the actual recorded version.
-The latest shipped migration is 78; migration 71 remains optional and reserved
+The latest shipped migration is 79; migration 71 remains optional and reserved
 for native-conversation metadata. Migration 72 adds nullable
 `canonical_evidence_document_queue.notification_queued_at`, with no default,
 index, or historical reclassification. Apply it before deploying the notification
@@ -1700,3 +1700,17 @@ full-event verification, and excess retained output fails explicitly.
 
 This migration does not authorize body thinning. Historical receipt recovery, measured
 locator coverage, and both ingest writer paths remain separate retirement gates.
+
+Schema 079 adds nullable logical append classification metadata only. Keep it unapplied
+until the dependent append reader and its measured rollout are ready. Deploy compatible
+MCP, managed ingestion and projection worker code before applying it. The logical
+reader still performs full publication; this migration enables no append fast path.
+Unknown queue writers invalidate annotations by advancing generation. Older publishers
+can leave stale frontier metadata, so any future append reader must require a compatible
+fleet and must be disabled before rolling publishers back.
+
+The existing queue upsert/delete statements return the capability check; an absent
+079 adds no SQL round trips or classification writes. After activation, new-native
+ingest performs one additional indexed classification statement and full publication
+performs one frontier-binding statement. This preparatory change alone does not reduce
+full-parent reads, and that overhead must be included in the append-reader acceptance.

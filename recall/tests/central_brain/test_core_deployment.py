@@ -210,11 +210,26 @@ class DatabaseCapabilityContractTest(unittest.TestCase):
                     self.assertEqual(result["status"], "ready")
                     self.assertEqual(result["schema_version"], 71)
 
+    def test_append_capability_is_optional_and_does_not_accept_future_versions(self) -> None:
+        for retired in (False, True):
+            for marker in (False, True):
+                with self.subTest(retired=retired, marker=marker):
+                    snapshot = healthy_snapshot()
+                    snapshot["migration_versions"] = [n for n in range(1, 70) if retired or n != 67]
+                    if marker:
+                        snapshot["migration_versions"].append(79)
+                    snapshot["postgres_vector_plane_present"] = not retired
+                    result = assess_snapshot(snapshot)
+                    self.assertEqual(result["schema_version"], 79 if marker else 69)
+                    snapshot["migration_versions"].append(80)
+                    with self.assertRaisesRegex(CapabilityError, "schema_drift"):
+                        assess_snapshot(snapshot)
+
     def test_native_conversation_marker_cannot_hide_gaps_or_unknown_versions(self) -> None:
         complete = list(range(1, 72))
         for versions in ([n for n in complete if n != 69],
                          [n for n in complete if n != 68],
-                         complete + [79], complete + [71],
+                         complete + [80], complete + [71],
                          complete[:-2] + [71, 70]):
             with self.subTest(versions=versions):
                 snapshot = healthy_snapshot()
@@ -227,7 +242,7 @@ class DatabaseCapabilityContractTest(unittest.TestCase):
         complete = list(range(1, 71))
         for versions in ([n for n in complete if n != 68],
                          [n for n in complete if n != 69],
-                         complete + [79], complete + [70],
+                         complete + [80], complete + [70],
                          complete[:-2] + [70, 69]):
             with self.subTest(versions=versions):
                 snapshot = healthy_snapshot()
