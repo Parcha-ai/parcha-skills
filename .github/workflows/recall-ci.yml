@@ -117,6 +117,7 @@ jobs:
             e2e_passage_receipt_repair.py \
             e2e_turbopuffer_quantum.py \
             e2e_singleton_search_publication.py \
+            e2e_singleton_parquet_receipts.py \
             e2e_authority_covering_indexes.py \
             e2e_slack_passage_visibility.py \
             e2e_slack_visible_text_replay.py \
