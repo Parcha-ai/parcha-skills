@@ -51,3 +51,32 @@ A failed job or missing completion log can leave a committed clear unresolved. R
 ## Disposable pilot evidence
 
 The first PostgreSQL 17 pilot archived and cleared 29,700 ordinary rows out of 30,000. All 300 retained exceptional rows matched before and after. Relation size stayed at 12,066,816 bytes after deletion and became 155,648 bytes after the isolated rewrite. The complete backup was 793,122 compressed bytes for 7,246,800 COPY bytes. Archive plus clear took 1.34 seconds; the observed WAL delta was 3,336,544 bytes. Restore recovered all 30,000 rows. These local fixture values demonstrate behavior and sizing mechanics; they do not predict production throughput or lock duration.
+
+## Finite batches
+
+The same host operator accepts `archive_batch` with `after`, `limit` (1–50,000)
+and `max_pages` (1–10). Each page uses the deployed owner and existing immutable
+archive. The job stops at the page cap or the first exhausted page; a capped
+result does not mean the source is complete. The 295-second process deadline,
+32 MiB page cap, and SQL deadlines remain unchanged. Measure one 50,000-key page
+before choosing a larger batch; ten pages are a ceiling, not a throughput claim.
+
+`clear_batch` accepts the exact ordered `receipts` and the local
+`archive_operation` journal directory. Before launching, the host requires the
+complete archived result and its verified-result event, both bound to the
+original archive intent. GET-only reconciliation results can supply that proof.
+The complete receipt list is written durably into the separate clear intent
+before any request. Each page clears in its own transaction. The operator
+rejects duplicate receipts, broken cursor chains, mixed scopes and excess pages.
+
+An interrupted archive produces no complete receipt list eligible for clearing;
+its objects remain preserved. An interrupted clear may have committed a prefix.
+GET-reconcile the original job, then use `inspect_batch` with the frozen receipt
+list to distinguish present, absent and changed pages. Never infer success from
+a timeout, automatically replay, or manufacture a completion receipt. Restore
+individual pages through the existing `restore` operation when required.
+
+Batching removes transport overhead. DELETE still does not shrink this global
+relation; physical reclamation requires a separately reviewed maintenance step
+with current lock, headroom and retained-row evidence. This adapter performs no
+DDL, rewrite, vacuum or provider allocation change.
