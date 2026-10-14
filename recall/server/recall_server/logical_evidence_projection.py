@@ -75,6 +75,17 @@ def _phase_timing(phase: str):
             pass
 
 
+@contextmanager
+def _attempt_stage(metrics, field):
+    """Attempt wall time, including failures; not SQL or archive service time."""
+    started = time.monotonic()
+    try:
+        yield
+    finally:
+        if metrics is not None:
+            metrics[field] = max(0, round((time.monotonic() - started) * 1000))
+
+
 @dataclass(frozen=True)
 class LogicalGroupCandidate:
     tenant_id: str
@@ -945,6 +956,7 @@ class CanonicalLogicalEvidenceProjector:
         self,
         candidates: tuple[LogicalGroupCandidate, ...],
         *, hint_limit: int = 32, require_current_queue: bool = False,
+        attempt_metrics: dict[str, int | None] | None = None,
     ) -> list[LogicalEvidenceUpload | None]:
         if not candidates:
             return []
@@ -959,6 +971,7 @@ class CanonicalLogicalEvidenceProjector:
         body_locators: dict[int, _LocatorSpool] = {}
         inline_document_ids: dict[int, tuple[str, ...]] = {}
         transferred = False
+        archive_started = None
         try:
             input_spool = tempfile.TemporaryFile(mode="w+b")
             input_ranges: list[tuple[int, int, int]] = []
@@ -968,7 +981,7 @@ class CanonicalLogicalEvidenceProjector:
             append_ordinals: set[int] = set()
             append_candidate = (self.append_enabled and len(candidates) == 1
                                 and self.excluded_structural_types == DEFAULT_EXCLUDED_STRUCTURAL_TYPES)
-            with self.store.connect() as connection:
+            with _attempt_stage(attempt_metrics, "input_capture_wall_ms"), self.store.connect() as connection:
                 existing_parts: dict[int, list[dict[str, Any]]] = {}
                 append_columns = (",to_jsonb(append_queue) AS append_queue,"
                     "EXISTS(SELECT 1 FROM schema_migrations WHERE version=79) AS append_capability"
@@ -1240,6 +1253,7 @@ class CanonicalLogicalEvidenceProjector:
                         input_ranges.append((ordinal, start, input_spool.tell()))
                 if append_ordinals and not input_ranges:
                     input_ranges.append((0, input_spool.tell(), input_spool.tell()))
+            archive_started = time.monotonic()
             # Worker-only checkpoint: direct corpus audits can prepare groups
             # without queued work. Stop obsolete workers before archive reads,
             # re-encoding or uploads; the final commit CAS remains authoritative.
@@ -1384,6 +1398,11 @@ class CanonicalLogicalEvidenceProjector:
             )
             raise
         finally:
+            if archive_started is not None and attempt_metrics is not None:
+                # Includes source recovery/checkpoints and failure cleanup, not
+                # only object reads. Commit is measured separately by the caller.
+                attempt_metrics["archive_prepare_wall_ms"] = max(0, round(
+                    (time.monotonic() - archive_started) * 1000))
             if not transferred:
                 for locators in body_locators.values():
                     locators.close()
@@ -2625,11 +2644,12 @@ class CanonicalLogicalEvidenceProjector:
         def parent_key(candidate):
             return candidate.tenant_id, candidate.source_id, candidate.native_parent_id
 
-        def prepare_parent(candidate):
+        def prepare_parent(candidate, attempt_metrics):
             try:
                 candidate = self._candidate_at_dispatch(candidate)
                 (upload,) = self._prepare_batch_and_upload(
                     (candidate,), hint_limit=hint_limit, require_current_queue=True,
+                    attempt_metrics=attempt_metrics,
                 )
             except _LogicalWorkSuperseded:
                 return None, "stale"
@@ -2641,7 +2661,8 @@ class CanonicalLogicalEvidenceProjector:
                     self._schedule_upload_cleanup([upload])
                 return None, "cancelled"
             try:
-                return upload, self._commit_upload(candidate, upload)
+                with _attempt_stage(attempt_metrics, "commit_wall_ms"):
+                    return upload, self._commit_upload(candidate, upload)
             except Exception:
                 # _commit_upload owns cleanup on ordinary commit failure.
                 raise
@@ -2658,6 +2679,7 @@ class CanonicalLogicalEvidenceProjector:
                 pass
 
         def project_parent(candidate):
+            attempt_metrics = dict(input_capture_wall_ms=None, archive_prepare_wall_ms=None, commit_wall_ms=None)
             started = time.monotonic()
             identity = hashlib.sha256(json.dumps(parent_key(candidate)).encode()).hexdigest()
             status = "error"
@@ -2665,17 +2687,21 @@ class CanonicalLogicalEvidenceProjector:
             owner_log("logical owner started parent_sha256=%s estimated_bytes=%s estimated_records=%s",
                       identity, candidate.estimated_bytes, candidate.estimated_records)
             try:
-                result = prepare_parent(candidate)
+                result = prepare_parent(candidate, attempt_metrics)
                 upload, status = result
                 return result
             finally:
                 owner_log("logical owner completed parent_sha256=%s estimated_bytes=%s "
-                          "estimated_records=%s elapsed_ms=%s status=%s append_used=%s input_sql_rows=%s",
+                          "estimated_records=%s elapsed_ms=%s status=%s append_used=%s input_sql_rows=%s "
+                          "input_capture_wall_ms=%s archive_prepare_wall_ms=%s commit_wall_ms=%s",
                           identity, candidate.estimated_bytes, candidate.estimated_records,
                           max(0, round((time.monotonic() - started) * 1000)), status,
                           (getattr(upload, "append_base_manifest_id", None) is not None
                            if upload is not None else None),
-                          getattr(upload, "input_sql_rows", None))
+                          getattr(upload, "input_sql_rows", None),
+                          attempt_metrics["input_capture_wall_ms"],
+                          attempt_metrics["archive_prepare_wall_ms"],
+                          attempt_metrics["commit_wall_ms"])
 
         def fill_slots(executor):
             nonlocal batches
