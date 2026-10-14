@@ -276,6 +276,19 @@ _JOIN = """FROM canonical_chunk_retirement_progress progress JOIN canonical_evid
     USING(tenant_id,source_id,native_parent_id,logical_document_id)"""
 
 
+# A claim needs catalog rows only for scheduled parents. Keep the identity
+# lookup correlated so a generic plan cannot merge-scan the whole source catalog.
+_CLAIM_JOIN = """FROM canonical_chunk_retirement_progress progress
+    CROSS JOIN LATERAL (
+        SELECT current.* FROM canonical_evidence_documents current
+        WHERE current.tenant_id=progress.tenant_id
+          AND current.source_id=progress.source_id
+          AND current.native_parent_id=progress.native_parent_id
+          AND current.logical_document_id=progress.logical_document_id
+        OFFSET 0
+    ) evidence"""
+
+
 def inspect_enabled(store, *, scope, limits, deadline_at):
     deadline_at = min(deadline_at, time.monotonic() + 5)
     with store.connect() as connection, connection.transaction():
@@ -381,7 +394,7 @@ def _claim(store, *, scope, limits, deadline_at, attempted, diagnostic=None):
             progress.scope_epoch,progress.cumulative_cleared_documents,
             progress.cumulative_cleared_chunks,progress.cumulative_cleared_utf8_bytes,
             to_jsonb(evidence) AS manifest """
-            + _JOIN
+            + _CLAIM_JOIN
             + " WHERE "
             + _ELIGIBLE
             + """
