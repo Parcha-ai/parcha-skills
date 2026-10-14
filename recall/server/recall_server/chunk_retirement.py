@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import hashlib
 import math
 import os
+import re
 from pathlib import Path
 import stat
 import time
@@ -17,7 +18,8 @@ from .chunk_bodies import chunk_catalog_snapshot, read_archived_chunks
 from .canonical_text import MAX_CANONICAL_TEXT_BYTES
 from .db import SearchDeadlineExceeded
 from .evidence_projection import DOCUMENT_ID_RE
-from .logical_evidence import IDENTITY_RE
+from .logical_evidence import IDENTITY_RE, LogicalEvidenceError
+from .logical_body_proof import LogicalBodyProofError
 
 MAX_DOCUMENTS = 8
 MAX_PLAN_BYTES = 8 * 1024 * 1024
@@ -590,6 +592,13 @@ def retire_parent_chunks(store, archive, *, tenant_id, source_id, native_parent_
             failure = ChunkRetirementError('parent_retirement_lock_busy')
         else:
             failure = ChunkRetirementError('parent_retirement_unavailable')
+        # Preserve only bounded identifiers, never arbitrary exception text.
+        error_class = type(error).__name__
+        cause_code = error.args[0] if isinstance(error, (LogicalEvidenceError, LogicalBodyProofError)) and error.args else None
+        if not isinstance(cause_code, str) or not re.fullmatch(r'logical_(?:evidence|body)_[a-z0-9_]{1,64}', cause_code):
+            cause_code = None
+        failure.cause_details = dict(error_class=error_class if len(error_class) <= 80 and error_class.isidentifier() else 'UnknownError',
+                                     cause_error_code=cause_code, phase='maintenance')
         failure.committed = totals
         failure.attempt_metrics = attempt_metrics
         raise failure from None
