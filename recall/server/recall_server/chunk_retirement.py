@@ -343,14 +343,26 @@ def _parent_deadline(deadline_at):
 
 
 def require_retirement_owner(store, connection, scope, principal_id, deadline_at):
-    """Lock the current source/grant through a bounded body transaction."""
-    found = store._execute_bounded(connection, """SELECT source.source_id
+    """Lock source-owner or company-admin authority through the body transaction."""
+    from .control import ControlError, ControlPlane
+
+    found = store._execute_bounded(connection, """SELECT source.owner_principal_id,grant_row.permission
         FROM canonical_sources source JOIN canonical_source_grants grant_row USING(tenant_id,source_id)
-        WHERE source.tenant_id=%s AND source.source_id=%s AND source.owner_principal_id=%s
-          AND grant_row.principal_id=%s AND grant_row.permission='owner'
-        FOR SHARE OF source,grant_row NOWAIT""", (*scope, principal_id, principal_id), deadline_at).fetchone()
+        WHERE source.tenant_id=%s AND source.source_id=%s
+          AND grant_row.principal_id=%s AND grant_row.permission IN ('owner','read')
+        FOR SHARE OF source,grant_row NOWAIT""", (*scope, principal_id), deadline_at).fetchone()
     if found is None:
         raise ChunkRetirementError('retirement_owner_required')
+    if found['owner_principal_id'] == principal_id and found['permission'] == 'owner':
+        return
+    # The explicit source grant is necessary but not sufficient. Recheck and
+    # lock the existing company-admin predicate for each bounded mutation.
+    store._set_statement_deadline(connection, deadline_at)
+    try:
+        ControlPlane._brain_admin(connection, principal_id=principal_id,
+                                  tenant_id=scope[0], lock=True)
+    except ControlError as error:
+        raise ChunkRetirementError('retirement_owner_required') from error
 
 
 def _parent_progress(store, connection, scope, deadline_at, *, lock=False):
