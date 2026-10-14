@@ -1059,34 +1059,6 @@ class CanonicalLogicalEvidenceProjector:
                         [candidate.source_id for candidate in candidates],
                         [candidate.native_parent_id for candidate in candidates],
                     )
-                if append_ordinals:
-                    # Preserve the original NULL-position race guards without
-                    # hydrating prefix bodies, chunks or raw event payloads.
-                    prefix_locations = body_locators[0] = _LocatorSpool(complete_metadata=True)
-                    prefix_locations.capture_all_inputs = True
-                    with connection.cursor(name="logical_append_null_locator_stream") as null_cursor:
-                        null_cursor.itersize = self.cursor_fetch_rows
-                        null_cursor.execute("""SELECT document.document_id,document.event_id,document.native_id,
-                                document.revision,document.text_sha256
-                            FROM canonical_events event JOIN canonical_documents document
-                              ON document.tenant_id=event.tenant_id AND document.source_id=event.source_id
-                             AND document.event_id=event.event_id
-                            WHERE event.tenant_id=%s AND event.source_id=%s
-                              AND COALESCE(event.native_parent_id,event.native_id)=%s
-                              AND event.source_ordinal<=%s AND document.is_current
-                              AND document.deleted_at IS NULL
-                              AND document.body_record_ordinal IS NULL AND document.body_record_count IS NULL
-                            ORDER BY event.source_ordinal,event.occurred_at,event.native_id""",
-                            (candidates[0].tenant_id, candidates[0].source_id, candidates[0].native_parent_id,
-                             pins[0]["append_source_ordinal"]))
-                        next_null_check = time.monotonic() + PROJECTION_PROGRESS_INTERVAL_SECONDS
-                        for row in null_cursor:
-                            if require_current_queue and time.monotonic() >= next_null_check:
-                                self._check_candidate_current(candidates[0], connection=connection,
-                                    append_catalog=pins.get(0) if 0 in append_ordinals and 0 not in recovered else None)
-                                next_null_check = time.monotonic() + PROJECTION_PROGRESS_INTERVAL_SECONDS
-                            prefix_locations.append((row["document_id"],row["event_id"],row["native_id"],
-                                row["revision"],row["text_sha256"],None,None))
                 append_filter = " WHERE event.source_ordinal>%s" if append_ordinals else ""
                 append_values = (pins[0]["append_source_ordinal"],) if append_ordinals else ()
                 singleton_fields = ""
@@ -1326,6 +1298,12 @@ class CanonicalLogicalEvidenceProjector:
                 if locations is None:
                     locations = body_locators[ordinal] = _LocatorSpool(complete_metadata=True)
                 if ordinal in append_ordinals:
+                    # The exact base manifest preserves prefix positions. Both
+                    # repair owners bind that catalog and only fill positions
+                    # proved by its archive, so retain their prefix repairs.
+                    # Capture every suffix identity for the late-arrival fence,
+                    # including inputs excluded from the published records.
+                    locations.capture_all_inputs = True
                     locations.append_source_ordinal = pins[ordinal]["append_source_ordinal"]
                 try:
                     for record in self._record_stream(

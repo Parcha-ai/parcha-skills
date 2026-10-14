@@ -101,7 +101,13 @@ class AppendReader(unittest.TestCase):
                 self.assertEqual(append.manifest.encode(), full.manifest.encode())
                 self.assertEqual(append.part_references, full.part_references)
                 self.assertEqual(append.manifest_reference, full.manifest_reference)
-                self.assertEqual(list(append.body_locators), list(full.body_locators))
+                # Append owns suffix positions only. The full rebuild also
+                # carries the excluded prefix NULL reset; final positions agree.
+                full_locations = list(full.body_locators)
+                self.assertEqual(list(append.body_locators),
+                    [row for row in full_locations if row[2] in {"new-1", "new-2"}])
+                self.assertEqual([row[-2:] for row in full_locations if row[2] == "old-excluded"],
+                    [(None, None)])
                 self.assertEqual(
                     self.logical._commit_upload(candidate, append), "committed"
                 )
@@ -282,8 +288,11 @@ class AppendReader(unittest.TestCase):
         finally:
             upload.body_locators.close()
 
-    def test_excluded_prefix_null_guard_retains_original_reset_behavior(self):
-        candidate, upload = self.prepare(structural=True)
+    def test_full_rebuild_excluded_null_guard_retains_original_reset_behavior(self):
+        candidate, append = self.prepare(structural=True)
+        append.body_locators.close()
+        self.logical.append_enabled = False
+        upload = self.logical._prepare_batch_and_upload((candidate,))[0]
         try:
             with self.store.connect() as c:
                 c.execute(
