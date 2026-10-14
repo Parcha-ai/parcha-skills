@@ -183,6 +183,53 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual((meter.gets, meter.bytes), (1, 6))
         self.assertEqual(archive.read_raw.call_count, 1)
 
+    def test_timers_keep_acknowledged_prefix_separate_from_unknown_parent_wall(self):
+        clock = [100.0]
+        candidates = iter((self.candidate('first'), self.candidate('unknown')))
+        def claim(*args, **kwargs):
+            clock[0] += .25
+            return next(candidates)
+        def retire(*args, **kwargs):
+            clock[0] += 2
+            if kwargs['native_parent_id'] == 'unknown':
+                error = ChunkRetirementError('parent_retirement_unavailable')
+                error.committed = dict(cleared_utf8_bytes=3, sql_ms=200., hash_ms=50.)
+                raise error
+            return dict(complete=True, batches=1, cleared_utf8_bytes=10,
+                        sql_ms=500., hash_ms=100.)
+        with patch.object(runner.time, 'monotonic', side_effect=lambda:clock[0]), \
+             patch.object(runner, '_claim', side_effect=claim), \
+             patch.object(runner, 'retire_parent_chunks', side_effect=retire):
+            result = runner.run_retirement(Mock(), Mock(), scope=self.scope(), apply=True,
+                                           deadline_at=200.)
+        self.assertTrue(result['commit_outcome_unknown'])
+        self.assertEqual(result['cleared_utf8_bytes'], 13)
+        self.assertEqual(result['committed_sql_ms'], 700.)
+        self.assertEqual(result['committed_hash_ms'], 150.)
+        self.assertEqual(result['parent_wall_ms'], 4000.)
+        self.assertEqual(result['claim_wall_ms'], 500.)
+
+    def test_archive_wall_includes_failed_reads_but_not_budget_refusal(self):
+        clock = [100.0]
+        def failed(*args, **kwargs):
+            clock[0] += .5
+            raise ValueError('transport')
+        for bounded in (False, True):
+            archive = Mock()
+            archive.read_raw.side_effect = failed
+            archive.read_raw_bounded.side_effect = failed
+            meter = runner.RunArchive(archive, max_bytes=10)
+            with patch.object(runner.time, 'monotonic', side_effect=lambda:clock[0]):
+                with self.assertRaises(ValueError):
+                    if bounded:
+                        meter.read_raw_bounded({'size_bytes':6}, deadline_at=200.)
+                    else:
+                        meter.read_raw({'size_bytes':6})
+                with self.assertRaises(ChunkRetirementError):
+                    meter.read_raw({'size_bytes':5})
+            self.assertEqual(meter.read_ms, 500.)
+            self.assertEqual((meter.gets,meter.bytes),(1,6))
+
     def test_expired_already_empty_prefix_stops_before_another_commit(self):
         import os
         from contextlib import contextmanager
