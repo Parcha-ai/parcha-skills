@@ -130,28 +130,38 @@ class MaintenanceTests(unittest.TestCase):
         self.assertEqual(result['archive_gets'], 0)
         self.assertFalse(self.state()['enabled'])
 
-    def child(self, seconds=60):
+    def child(self, seconds=60, *, stop_after_archive_reads=0):
         root = Path(self.root.name)
         script = """import sys,time
 from pathlib import Path
-from recall_server import retirement_process as process
+from recall_server import retirement_process as process, retirement_maintenance as maintenance
+from types import SimpleNamespace
 from recall_server.archive import FilesystemArchiveStore
 root,objects=map(Path,sys.argv[1:3])
+stop_after,budget=int(sys.argv[3]),float(sys.argv[4])
 class PausedArchive:
     def __init__(self):
         self.archive=FilesystemArchiveStore(objects,namespace_key=b'r'*32)
         self.first=True
+        self.reads=0
     def read_raw(self,reference):
         if self.first:
             self.first=False;(root/'proof-ready').touch()
             while not (root/'proof-release').exists():time.sleep(.005)
-        return self.archive.read_raw(reference)
+        value=self.archive.read_raw(reference)
+        self.reads+=1
+        if self.reads==stop_after:
+            # Exhaust only the scheduler admission clock. The actual proof,
+            # SQL deadlines, and archive reader remain unchanged.
+            maintenance.time=SimpleNamespace(monotonic=lambda:time.monotonic()+budget)
+        return value
 process.build_evidence_archive_store=lambda **kw:PausedArchive()
 process.main()
 """
         def launch(configuration):
             child = subprocess.Popen([sys.executable, '-c', script, str(root),
-                str(self.archive.delegate.root)], stdin=subprocess.PIPE,
+                str(self.archive.delegate.root), str(stop_after_archive_reads),
+                str(seconds)], stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                 env=dict(os.environ, PYTHONPATH=os.pathsep.join((
                     str(SERVER.parent), str(SERVER), os.environ.get('PYTHONPATH', '')))))
@@ -192,6 +202,39 @@ process.main()
         report=self.finish_child(supervisor)
         self.assertEqual(report['cleared_documents'],2)
         self.assertGreater(report['peak_rss_kib'],0)
+
+    def test_child_drains_more_than_ten_small_parents_in_one_round(self):
+        self.activate()
+        set_parent_retirement_enabled(self.store, **self.target, enabled=False)
+        for number in range(12):
+            self.publish(f'small-event-{number:02d}', f'small-parent-{number:02d}')
+        self.ready()
+        report = self.finish_child(self.child())
+        self.assertFalse(report['commit_outcome_unknown'], report)
+        self.assertEqual(report['failed_parents'], 0, report)
+        self.assertEqual(report['attempted_parents'], 12, report)
+        self.assertEqual(report['completed_parent_proofs'], 12, report)
+        self.assertEqual(report['cleared_documents'], 12, report)
+        self.assertEqual(report['status'], 'no_ready_parents', report)
+        self.assertLess(len(json.dumps(report)), 65536)
+        for number in range(12):
+            self.assertEqual(self.parent_state(f'small-parent-{number:02d}')['status'], 'complete')
+        print(json.dumps(dict(measurement='small_parent_round', **report)), flush=True)
+
+    def test_child_stops_admitting_small_parents_at_existing_budget(self):
+        self.activate()
+        set_parent_retirement_enabled(self.store, **self.target, enabled=False)
+        for number in range(12):
+            self.publish(f'budget-event-{number:02d}', f'budget-parent-{number:02d}')
+        self.ready()
+        report = self.finish_child(self.child(stop_after_archive_reads=11))
+        self.assertFalse(report['commit_outcome_unknown'], report)
+        self.assertEqual(report['status'], 'stopped', report)
+        self.assertEqual(report['attempted_parents'], 11, report)
+        self.assertEqual(report['cleared_documents'], 10, report)
+        self.assertIsNone(self.policy_state()['maintenance_intent'])
+        self.assertEqual(sum(self.parent_state(f'budget-parent-{number:02d}')['status']=='complete'
+                             for number in range(12)),10)
 
     def test_child_owner_revocation_during_proof_cannot_clear(self):
         self.activate()
