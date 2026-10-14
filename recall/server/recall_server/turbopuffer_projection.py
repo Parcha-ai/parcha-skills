@@ -419,9 +419,20 @@ class TurbopufferProjector:
         *,
         since: datetime | None,
         after: tuple[datetime, str] | None,
+        deadline_at: float | None = None,
     ) -> list[dict[str, Any]]:
         start, end = _month_bounds(claim["month"])
         cursor_time, cursor_id = after or (datetime(1, 1, 1, tzinfo=timezone.utc), "")
+        if getattr(self.store, "verified_singleton_receipts", False):
+            # The caller advances over all examined rows, including a page
+            # whose receipt proof rejects every row. Filtering cannot hide the
+            # cursor or make an intermediate empty page look like exhaustion.
+            return self.store._execute_bounded(connection,
+                _PASSAGE_PAGE_SQL.replace(_LIVE_PASSAGE_PREDICATE, "true"),
+                (claim["tenant_id"], claim["source_id"], start, end,
+                 since, since, cursor_time, cursor_id, self.page_rows),
+                deadline_at,
+            ).fetchall()
         return [
             dict(row)
             for row in connection.execute(
@@ -433,9 +444,28 @@ class TurbopufferProjector:
             ).fetchall()
         ]
 
+    def _authorized_publication_rows(self, connection, tenant_id, rows, *, deadline_at):
+        """Reuse current receipt authority before writing an examined page."""
+        from .receipt_membership import lookup_current_search_membership
+
+        members = lookup_current_search_membership(
+            self.store, tenant_id=tenant_id,
+            authorized_sources=tuple(sorted({row["source_id"] for row in rows})),
+            receipts=tuple(dict.fromkeys(receipt for row in rows for receipt in row["receipts"])),
+            connection=connection, deadline_at=deadline_at,
+        )
+        return [row for row in rows if all((row["source_id"], receipt) in members
+                                          for receipt in row["receipts"])]
+
     def passages_by_id(self, connection: Any, tenant_id: str, passage_ids: list[str]) -> list[dict[str, Any]]:
         """The live passages among ``passage_ids``, in page order."""
-
+        if getattr(self.store, "verified_singleton_receipts", False):
+            deadline = time.monotonic() + self.store.search_deadline_ms / 1000
+            rows = self.store._execute_bounded(connection,
+                _PASSAGE_BY_ID_SQL.replace(_LIVE_PASSAGE_PREDICATE, "true"),
+                (tenant_id, list(passage_ids)), deadline,
+            ).fetchall()
+            return self._authorized_publication_rows(connection, tenant_id, rows, deadline_at=deadline)
         return [
             dict(row)
             for row in connection.execute(_PASSAGE_BY_ID_SQL, (tenant_id, list(passage_ids))).fetchall()
@@ -458,6 +488,8 @@ class TurbopufferProjector:
         for start in range(0, len(passage_ids), self.page_rows):
             chunk = passage_ids[start:start + self.page_rows]
             with self.store.connect() as connection:
+                if getattr(self.store, "verified_singleton_receipts", False):
+                    connection.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
                 page = self.passages_by_id(connection, tenant_id, chunk)
                 connection.commit()
             rows = [
@@ -645,14 +677,25 @@ class TurbopufferProjector:
             last_rows = 0
             while True:
                 with timing.measure("page"), self.store.connect() as connection:
-                    page = self.passage_page(connection, claim, since=since, after=after)
+                    if getattr(self.store, "verified_singleton_receipts", False):
+                        connection.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+                        deadline = time.monotonic() + self.store.search_deadline_ms / 1000
+                        page = self.passage_page(connection, claim, since=since, after=after,
+                                                 deadline_at=deadline)
+                    else:
+                        page = self.passage_page(connection, claim, since=since, after=after)
+                    examined = len(page)
+                    if page:
+                        after = (page[-1]["first_occurred_at"], page[-1]["passage_id"])
+                    if getattr(self.store, "verified_singleton_receipts", False):
+                        page = self._authorized_publication_rows(connection, tenant_id, page,
+                                                                 deadline_at=deadline)
                     connection.commit()
-                if not page:
+                if not examined:
                     break
                 last_rows = self._write_page(namespace, budget, page, timing)
                 written += last_rows
-                after = (page[-1]["first_occurred_at"], page[-1]["passage_id"])
-                exhausted = len(page) < self.page_rows
+                exhausted = examined < self.page_rows
                 page = []
                 if exhausted:
                     break
