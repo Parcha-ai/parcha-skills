@@ -97,19 +97,19 @@ class AuditRetirement:
                 ' ORDER BY audit_id LIMIT %s', params).fetchall()
             keys = [row['audit_id'] for row in rows]
             # Bound discovery first. Filtering before LIMIT can scan an entire sparse source.
-            eligible = connection.execute('''SELECT audit_id FROM canonical_audit_events
+            # Filter while copying, avoiding a second heap pass over the same rows.
+            query = sql.SQL('''SELECT {} FROM canonical_audit_events
                 WHERE tenant_id=%s AND source_id=%s AND audit_id=ANY(%s)
                 AND operation='ingest.commit' AND status='success' AND created_at<%s
-                ORDER BY audit_id''', (tenant_id, source_id, keys, cutoff)).fetchall()
-            selected = [row['audit_id'] for row in eligible]
-            query, params = _select(tenant_id, source_id, selected)
-            raw = _copy(connection, query, params)
+                ORDER BY audit_id''').format(COLUMN_SQL)
+            raw = _copy(connection, query, (tenant_id, source_id, keys, cutoff))
+        row_count = sum(1 for _ in csv.reader(io.StringIO(raw.decode('utf-8'), newline='')))
         # No database transaction remains open across object I/O.
         receipt = dict(contract=CONTRACT, tenant_id=tenant_id, source_id=source_id,
                        cutoff=cutoff, after=after, next_after=keys[-1] if keys else after,
-                       scanned=len(keys), exhausted=len(keys) < limit, row_count=len(selected),
+                       scanned=len(keys), exhausted=len(keys) < limit, row_count=row_count,
                        raw_bytes=len(raw), raw_sha256=_hash(raw), artifact=None)
-        if selected:
+        if row_count:
             request = ArchiveRequest(tenant_id, source_id, 'ingest-audits:' + _hash(raw),
                                      'application/gzip', gzip.compress(raw, mtime=0))
             reference = self.archive.put(request)
