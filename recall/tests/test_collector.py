@@ -96,6 +96,96 @@ class CollectorTest(unittest.TestCase):
             token="test-token-not-a-secret",
         )
 
+    def test_unavailable_claude_root_preserves_history_and_reports_incomplete_scan(self) -> None:
+        transcript = self.root / "session.jsonl"
+        transcript.write_text(claude_line("retain captured history"))
+        collector = self.collector()
+        self.addCleanup(collector.close)
+        collector.scan()
+        collector.flush()
+        self.root.rename(self.root.with_name("temporarily-unavailable"))
+
+        with self.assertRaisesRegex(CollectorRuntimeError, "source_unavailable"):
+            collector.scan()
+        self.assertEqual(collector.pending_envelopes(), [])
+        doctor = collector.doctor(include_dead_letters=False)
+        self.assertEqual(doctor["records"], 1)
+        self.assertFalse(doctor["scan_complete"])
+        self.assertEqual(doctor["last_error_code"], "source_unavailable")
+        self.assertEqual(doctor["coverage_percent"], 0.0)
+
+    def test_incomplete_claude_traversal_preserves_history_and_recovers(self) -> None:
+        nested = self.root / "project"
+        nested.mkdir()
+        (nested / "session.jsonl").write_text(claude_line("retained nested history"))
+        collector = self.collector()
+        self.addCleanup(collector.close)
+        collector.scan()
+        collector.flush()
+        scandir = os.scandir
+
+        def unreadable(path):
+            if os.fspath(path) == str(nested):
+                raise PermissionError("synthetic unavailable directory")
+            return scandir(path)
+
+        with mock.patch("os.scandir", side_effect=unreadable):
+            with self.assertRaisesRegex(CollectorRuntimeError, "inventory_incomplete"):
+                collector.scan()
+            doctor = collector.doctor(include_dead_letters=False)
+            self.assertEqual(doctor["last_error_code"], "inventory_incomplete")
+            self.assertFalse(doctor["scan_complete"])
+        self.assertEqual(collector.pending_envelopes(), [])
+        self.assertEqual(collector.doctor(include_dead_letters=False)["records"], 1)
+        recovered = collector.scan()
+        self.assertEqual(recovered["tombstones_queued"], 0)
+        self.assertEqual(recovered["records_queued"], 0)
+        self.assertIsNone(collector.doctor(include_dead_letters=False)["last_error_code"])
+
+    def test_root_replaced_during_inventory_cannot_authorize_deletion(self) -> None:
+        (self.root / "session.jsonl").write_text(claude_line("history before root swap"))
+        collector = self.collector()
+        self.addCleanup(collector.close)
+        collector.scan()
+        collector.flush()
+        scandir = os.scandir
+        replaced = False
+
+        def replace_root(path):
+            nonlocal replaced
+            if not replaced and os.fspath(path) == str(self.root):
+                replaced = True
+                self.root.rename(self.root.with_name("old-root"))
+                self.root.mkdir()
+            return scandir(path)
+
+        with mock.patch("os.scandir", side_effect=replace_root):
+            with self.assertRaisesRegex(CollectorRuntimeError, "inventory_incomplete"):
+                collector.scan()
+        self.assertEqual(collector.pending_envelopes(), [])
+        self.assertEqual(collector.doctor(include_dead_letters=False)["records"], 1)
+
+    def test_root_stat_permission_failure_is_content_free_health_error(self) -> None:
+        (self.root / "session.jsonl").write_text(claude_line("history"))
+        collector = self.collector()
+        self.addCleanup(collector.close)
+        collector.scan()
+        collector.flush()
+        original = Path.stat
+
+        def denied(path, *args, **kwargs):
+            if path == self.root:
+                raise PermissionError("sensitive filesystem path")
+            return original(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "stat", denied):
+            with self.assertRaisesRegex(CollectorRuntimeError, "source_unavailable"):
+                collector.scan()
+            doctor = collector.doctor(include_dead_letters=False)
+            self.assertEqual(doctor["last_error_code"], "source_unavailable")
+            self.assertFalse(doctor["scan_complete"])
+        self.assertEqual(collector.pending_envelopes(), [])
+
     def test_default_archive_concurrency_leaves_capacity_for_ingest(self) -> None:
         collector = self.collector()
         self.assertEqual(collector.archive_workers, 2)
