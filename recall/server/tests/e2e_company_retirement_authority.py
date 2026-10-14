@@ -332,6 +332,94 @@ class CompanyAuthorityTests(fixture.DetachmentTests):
             )
         self.assertEqual(self.state(), before)
 
+    def test_company_admin_observes_finite_enrollment_read_only(self):
+        import time
+        from recall_server.retirement_enrollment import observe_enrollment
+
+        plan = runner.plan_cohort(self.store, scope=self.admin_scope, limit=1)
+        before = self.state()
+        reads = dict(self.archive.reads)
+        result = observe_enrollment(
+            self.store, [plan], deadline_at=time.monotonic() + 5
+        )
+        self.assertEqual(result["parents"][0]["ledger"]["status"], "pending")
+        self.assertEqual(result["archive_calls"], 0)
+        self.assertEqual(self.state(), before)
+        self.assertEqual(dict(self.archive.reads), reads)
+
+    def test_finite_enrollment_observation_refuses_revoked_company_admin(self):
+        import time
+        from recall_server.retirement_enrollment import observe_enrollment
+
+        plan = runner.plan_cohort(self.store, scope=self.admin_scope, limit=1)
+        self.update(*self.revoke("membership"))
+        before = self.state()
+        with self.assertRaisesRegex(ValueError, "observation_owner_required"):
+            observe_enrollment(self.store, [plan], deadline_at=time.monotonic() + 5)
+        self.assertEqual(self.state(), before)
+
+    def test_finite_owner_and_read_only_observer_share_company_admin_authority(self):
+        import time
+        from recall_server.retirement_enrollment import (
+            EnrollmentOwner,
+            observe_enrollment,
+        )
+
+        self.update(
+            "DELETE FROM canonical_chunk_retirement_progress WHERE tenant_id=%s AND source_id=%s",
+            self.key[:2],
+        )
+        plan = runner.plan_cohort(self.store, scope=self.admin_scope, limit=1)
+        result = EnrollmentOwner(self.store, self.archive)(plan, lambda *args: None)
+        self.assertEqual(result["status"], "enrolled")
+        self.assertEqual(result["owner_result"]["archive_gets"], 0)
+        observed = observe_enrollment(
+            self.store, [plan], deadline_at=time.monotonic() + 5
+        )
+        self.assertEqual(observed["parents"][0]["ledger"]["status"], "pending")
+        self.assertFalse(self.archive.reads)
+
+    def test_company_admin_locator_publication_keeps_disabled_hold(self):
+        from recall_server.streaming_locators import publish_parent_locators
+
+        set_parent_retirement_enabled(self.store, **self.target, enabled=False)
+        before = self.state()
+        self.update(
+            "UPDATE canonical_documents SET body_record_ordinal=NULL,body_record_count=NULL WHERE tenant_id=%s AND source_id=%s",
+            self.key[:2],
+        )
+        report = publish_parent_locators(
+            self.store,
+            self.archive,
+            **self.target,
+            owner_principal_id=self.admin_principal,
+            apply=True,
+        )
+        self.assertEqual(report["published_documents"], 2)
+        self.assertTrue(report["complete"])
+        self.assertEqual(self.state(), before)
+        self.assertEqual(self.acl()[0]["owner_principal_id"], self.scope.principal_id)
+
+    def test_company_admin_locator_publication_refuses_enabled_retirement(self):
+        from recall_server.streaming_locators import (
+            LocatorPublicationError,
+            publish_parent_locators,
+        )
+
+        before = self.state()
+        with self.assertRaisesRegex(
+            LocatorPublicationError, "locator_publication_retirement_enabled"
+        ):
+            publish_parent_locators(
+                self.store,
+                self.archive,
+                **self.target,
+                owner_principal_id=self.admin_principal,
+                apply=True,
+            )
+        self.assertEqual(self.state(), before)
+        self.assertFalse(self.archive.reads)
+
 
 for name in dir(fixture.DetachmentTests):
     if name.startswith("test_") and name not in CompanyAuthorityTests.__dict__:
