@@ -33,7 +33,7 @@ class SingletonMaintenance(ReceiptMembershipTests):
         doc = self.prepare()
         self.admit_fixture(doc)
         with self.store.connect() as connection:
-            original = connection.execute('UPDATE canonical_documents SET body_record_ordinal=NULL,body_record_count=NULL WHERE tenant_id=%s AND document_id=%s RETURNING document_id',
+            connection.execute('UPDATE canonical_documents SET body_record_ordinal=NULL,body_record_count=NULL WHERE tenant_id=%s AND document_id=%s RETURNING document_id',
                                           (self.tenant,doc)).fetchone()
         with patch.object(self.store,'verified_singleton_receipts',True):
             preview = publish_parent_locators(self.store,self.archive,**self.scope,owner_principal_id=self.principal)
