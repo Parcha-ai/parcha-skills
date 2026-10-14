@@ -122,6 +122,15 @@ def _snapshot_on_connection(store, connection, tenant, source, parent, limits, d
         row = by_id[chunk['document_id']]
         row['pg_body_bytes'] += chunk['pg_bytes']
         row['chunks'].append({key: chunk[key] for key in ('ordinal', 'receipt', 'text_sha256')})
+    if getattr(store, 'verified_singleton_receipts', False):
+        from .receipt_membership import verified_document_chunks
+        proven = verified_document_chunks(store, connection, tenant_id=tenant, source_id=source,
+            documents=documents, deadline_at=deadline_at)
+        if sum(map(len, proven.values())) > limits.max_chunks:
+            raise LocatorPlanError('locator_plan_metadata_budget_exceeded')
+        for row in documents:
+            row['chunks'] = [{key: chunk[key] for key in ('ordinal', 'receipt', 'text_sha256')}
+                             for chunk in proven[row['document_id']]]
     _check_deadline(deadline_at)
     return dict(manifest=manifest, queue=catalog['queue'], parts=parts, documents=documents)
 

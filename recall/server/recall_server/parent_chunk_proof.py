@@ -170,6 +170,12 @@ def _capture(store, spool, scope, limits, deadline_at):
                             raise _error('parent_retirement_metadata_invalid')
                 if not rows:
                     break
+                if getattr(store, 'verified_singleton_receipts', False):
+                    from .receipt_membership import verified_document_chunks
+                    proven = verified_document_chunks(store, connection, tenant_id=scope[0], source_id=scope[1],
+                        documents=rows, deadline_at=deadline_at)
+                    for row in rows:
+                        row['chunks'] = proven[row['document_id']]
                 for row in rows:
                     count += 1
                     chunk_count += len(row['chunks'])

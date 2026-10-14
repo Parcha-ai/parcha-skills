@@ -464,6 +464,15 @@ def _retire_parent_batch(store, *, proof, rows, scope, limits, deadline_at, comp
         chunks = query('''SELECT document_id,ordinal,receipt,text_sha256,octet_length(text_redacted) AS pg_bytes
             FROM canonical_chunks WHERE tenant_id=%s AND source_id=%s AND document_id=ANY(%s)
               AND deleted_at IS NULL ORDER BY document_id,ordinal FOR UPDATE NOWAIT''', (*scope[:2], document_ids)).fetchall()
+        if getattr(store, 'verified_singleton_receipts', False):
+            from .receipt_membership import verified_document_chunks
+            by_document = {row['document_id']: [] for row in locked}
+            for chunk in chunks:
+                by_document[chunk['document_id']].append(chunk)
+            proven = verified_document_chunks(store, connection, tenant_id=scope[0], source_id=scope[1],
+                documents=[dict(row, chunks=by_document[row['document_id']]) for row in locked],
+                deadline_at=deadline_at)
+            chunks = [dict(chunk, document_id=document) for document, values in proven.items() for chunk in values]
         expected = {(row['document_id'], chunk['ordinal']): chunk for row in rows for chunk in row['chunks']}
         if len(chunks) != len(expected) or any(
             (chunk['document_id'], chunk['ordinal']) not in expected

@@ -232,3 +232,38 @@ def verified_receipt_relation(
         [m["document_id"] for m in members.values()],
         [m["ordinal"] for m in members.values()], list(members))
     return relation, parameters
+
+
+def verified_document_chunks(store, connection, *, tenant_id, source_id, documents, deadline_at):
+    """Supply complete chunk metadata to an existing bounded proof or lock owner.
+
+    Callers retain their physical row locks and byte measurements. Only the full
+    membership owner may supply an absent admitted singleton; derived metadata
+    contributes zero physical body bytes.
+    """
+    requested = {}
+    for row in documents:
+        requested[row['document_id']] = tuple(chunk['receipt'] for chunk in row['chunks']) or (
+            item_receipt(source_id, row['native_id'], row['revision'], 0),)
+    members = lookup_receipt_metadata(store, tenant_id=tenant_id,
+        authorized_sources=(source_id,),
+        receipts=tuple(dict.fromkeys(receipt for receipts in requested.values() for receipt in receipts)),
+        allow_verified_singletons=True, connection=connection, deadline_at=deadline_at)
+    result = {}
+    for row in documents:
+        physical = {chunk['receipt']: chunk for chunk in row['chunks']}
+        proven = []
+        for receipt in requested[row['document_id']]:
+            member = members.get(receipt)
+            if member is None:
+                if receipt in physical:
+                    raise ReceiptMembershipError('receipt_membership_identity_invalid')
+                continue
+            captured = physical.get(receipt)
+            if (member['document_id'] != row['document_id'] or captured is not None and any(
+                    captured[key] != member[key] for key in ('ordinal', 'receipt', 'text_sha256'))):
+                raise ReceiptMembershipError('receipt_membership_identity_invalid')
+            proven.append({key: member[key] for key in ('ordinal', 'receipt', 'text_sha256')} |
+                          {'pg_bytes': 0 if captured is None else captured.get('pg_bytes', 0)})
+        result[row['document_id']] = proven
+    return result
