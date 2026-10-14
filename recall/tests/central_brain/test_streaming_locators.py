@@ -152,10 +152,15 @@ class LocatorStatementDiagnosticsTests(unittest.TestCase):
     def test_advisory_refusal_is_separate_from_sql_lock_error(self):
         from recall_server import streaming_locators as locators
 
+        store = MagicMock()
+        store._execute_bounded.return_value.fetchone.return_value = {
+            "owner_principal_id": "owner",
+            "permission": "owner",
+        }
         with patch.object(locators, "_try_parent_native_locks", return_value=False):
             with self.assertRaises(LocatorPublicationError) as raised:
                 locators._publish_batch(
-                    MagicMock(),
+                    store,
                     proof={},
                     rows=[],
                     scope=("tenant", "source", "parent"),

@@ -164,6 +164,7 @@ jobs:
             e2e_context_neighbor_plan.py \
             e2e_located_public_reads.py \
             e2e_retirement_runner.py \
+            e2e_company_retirement_authority.py \
             e2e_retirement_detachment.py \
             e2e_retirement_policy.py \
             e2e_retirement_maintenance.py \

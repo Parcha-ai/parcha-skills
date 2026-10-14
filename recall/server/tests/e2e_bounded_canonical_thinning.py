@@ -283,6 +283,7 @@ class ScheduledThinning(unittest.TestCase):
     setUp = Thinning.setUp
     insert = Thinning.insert
     remaining = Thinning.remaining
+    queue = Thinning.queue
 
     def collect(self, scheduler):
         import time
@@ -368,7 +369,6 @@ class ScheduledThinning(unittest.TestCase):
         import threading
         import time
         from functools import partial
-        from psycopg.errors import QueryCanceled
         from recall_server.projection_worker import BackgroundBodyThinner
 
         self.insert("deadline")
@@ -407,8 +407,36 @@ class ScheduledThinning(unittest.TestCase):
                 self.assertEqual(
                     foreground.execute("SELECT 456 AS n").fetchone()["n"], 456
                 )
-            with self.assertRaises(QueryCanceled):
-                self.collect(scheduler)
+            from recall_server.projection_worker import run_projection_worker
+            from tests.central_brain.test_projection_worker import _Logical, _Passages
+            class Logical(_Logical):
+                def project_pending(inner, **kwargs):
+                    deadline = time.monotonic() + 5
+                    while not getattr(scheduler, "failed_attempts", 0):
+                        owner.assertLess(time.monotonic(), deadline)
+                        kwargs["on_heartbeat"]()
+                        time.sleep(0.005)
+                    owner.queue("foreground-published")
+                    return super().project_pending(**kwargs)
+            with self.assertLogs("recall_server.projection_worker", level="WARNING") as logs:
+                result = run_projection_worker(
+                    Logical([]), _Passages([]), tenant_id=self.tenant, once=True,
+                    logical_batch_size=5, passage_batch_size=5, embedding_batch_size=64,
+                    max_batches_per_cycle=1, upload_concurrency=1, passage_concurrency=1,
+                    interval_seconds=5, background_thinner=scheduler,
+                )
+            self.assertEqual(result["documents"], 2)
+            self.assertEqual(result["canonical_bodies_thinned"], 0)
+            self.assertEqual(scheduler.failed_attempts, 1)
+            self.assertIn("type=QueryCanceled failed_attempts=1", logs.output[0])
+            self.assertIn("canonical_thinning.py", logs.output[0])
+            self.assertIn("in thin", logs.output[0])
+            self.assertIn("canceling statement due to statement timeout", logs.output[0])
+            with self.store.connect() as foreground:
+                self.assertEqual(foreground.execute(
+                    "SELECT count(*) AS n FROM canonical_evidence_document_queue WHERE tenant_id=%s",
+                    (self.tenant,),
+                ).fetchone()["n"], 1)
             elapsed = time.monotonic() - started
             self.assertLess(elapsed, 5)
             self.assertIsNone(thinner._after)
@@ -447,8 +475,17 @@ class ScheduledThinning(unittest.TestCase):
             lambda busy: partial(thinner.thin, batch_size=1), clock=lambda: now[0]
         ) as scheduler:
             scheduler.tick(True)
-            with self.assertRaisesRegex(ConnectionError, "lost commit acknowledgment"):
-                self.collect(scheduler)
+            import time
+            with self.assertLogs("recall_server.projection_worker", level="WARNING") as logs:
+                deadline = time.monotonic() + 5
+                while not getattr(scheduler, "failed_attempts", 0):
+                    self.assertLess(time.monotonic(), deadline)
+                    scheduler.tick(True)
+                    time.sleep(0.005)
+            self.assertIn("type=ConnectionError failed_attempts=1", logs.output[0])
+            self.assertIn("canonical_thinning.py", logs.output[0])
+            self.assertIn("lost commit acknowledgment", logs.output[0])
+            self.assertEqual(scheduler.failed_attempts, 1)
             self.assertEqual(self.remaining(), 0)
             self.assertIsNone(thinner._after)
             self.assertEqual(projection_totals()["bodies_thinned"], before)
