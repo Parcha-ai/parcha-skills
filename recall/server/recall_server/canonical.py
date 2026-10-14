@@ -614,8 +614,6 @@ class CanonicalPlane:
         except (ContractError, ValueError):
             raise CanonicalLifecycleError("canonical_contract_invalid") from None
         source_id = event["source_id"]
-        native_id = event["native_id"]
-        is_tombstone = event["kind"] == "tombstone"
         if (
             artifact["tenant_id"] != tenant_id
             or artifact["source_id"] != source_id
@@ -625,18 +623,6 @@ class CanonicalPlane:
             raise CanonicalLifecycleError("canonical_lineage_invalid")
         _reject_filesystem_deletion(event, connector_id)
         _validate_oversized_pointer(event, artifact)
-        raw_sha256 = artifact["content_sha256"]
-        event_sha256 = event["content_sha256"]
-        identity_sha256 = _identity_sha256(tenant_id, source_id, native_id)
-        event_id = _opaque("evt", tenant_id, source_id, native_id, event_sha256)
-        job_id = _lineage_job_id(tenant_id, source_id, connector_id)
-        document_id = _opaque("doc", tenant_id, source_id, event_id)
-        text_sha256 = hashlib.sha256(text_redacted.encode()).hexdigest()
-        chunk_texts = [] if is_tombstone else canonical_text_chunks(text_redacted)
-        # The live raw reference is checked below before INSERT. Keep original
-        # chunks in this same transaction; logical publication still reads them.
-        compact_body = not is_tombstone and artifact["storage_backend"] == "s3"
-
         connection_context = (
             self.store.connect() if _connection is None else nullcontext(_connection)
         )
@@ -656,126 +642,156 @@ class CanonicalPlane:
                     principal_id=principal_id,
                     source_id=source_id,
                 )
-                conn.execute(
-                    """SELECT pg_advisory_xact_lock(hashtextextended(%s,0))""",
-                    (f"v2\x1f{tenant_id}\x1f{source_id}\x1f{native_id}",),
+                return self._write_authorized_document(
+                    conn, tenant_id=tenant_id, connector_id=connector_id,
+                    artifact=artifact, event=event, text_redacted=text_redacted,
+                    history=history, notification=_notification,
                 )
-                forgotten = conn.execute(
-                    """SELECT 1 FROM forget_tombstones
+
+    def _write_authorized_document(
+        self, conn, *, tenant_id, connector_id, artifact, event,
+        text_redacted, history=None, notification=False,
+    ):
+        """Write inside a caller-owned authorized transaction; never commits.
+
+        Public ingestion validates caller attribution and registers the source.
+        The explicit historical correction owner independently locks company
+        admin/source authority and exact obsolete history before entering here.
+        """
+        source_id, native_id = event["source_id"], event["native_id"]
+        is_tombstone = event["kind"] == "tombstone"
+        raw_sha256 = artifact["content_sha256"]
+        event_sha256 = event["content_sha256"]
+        identity_sha256 = _identity_sha256(tenant_id, source_id, native_id)
+        event_id = _opaque("evt", tenant_id, source_id, native_id, event_sha256)
+        job_id = _lineage_job_id(tenant_id, source_id, connector_id)
+        document_id = _opaque("doc", tenant_id, source_id, event_id)
+        text_sha256 = hashlib.sha256(text_redacted.encode()).hexdigest()
+        chunk_texts = [] if is_tombstone else canonical_text_chunks(text_redacted)
+        # The live raw reference is checked below before INSERT. Keep original
+        # chunks in this same transaction; logical publication still reads them.
+        compact_body = not is_tombstone and artifact["storage_backend"] == "s3"
+
+        conn.execute(
+            """SELECT pg_advisory_xact_lock(hashtextextended(%s,0))""",
+            (f"v2\x1f{tenant_id}\x1f{source_id}\x1f{native_id}",),
+        )
+        forgotten = conn.execute(
+            """SELECT 1 FROM forget_tombstones
                        WHERE tenant_id=%s AND source_id=%s
                          AND target_identity_sha256=%s""",
-                    (tenant_id, source_id, identity_sha256),
-                ).fetchone()
-                if forgotten:
-                    raise CanonicalLifecycleError("canonical_identity_forgotten")
-                admit_references(conn, self.archive, [artifact])
-                conn.execute(
-                    """INSERT INTO raw_artifacts(
+            (tenant_id, source_id, identity_sha256),
+        ).fetchone()
+        if forgotten:
+            raise CanonicalLifecycleError("canonical_identity_forgotten")
+        admit_references(conn, self.archive, [artifact])
+        conn.execute(
+            """INSERT INTO raw_artifacts(
                            tenant_id,source_id,artifact_id,storage_backend,object_key,
                            content_sha256,size_bytes,media_type,encryption,version_id,created_at
                        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                        ON CONFLICT(tenant_id,source_id,artifact_id) DO NOTHING""",
-                    (
-                        tenant_id,
-                        source_id,
-                        artifact["artifact_id"],
-                        artifact["storage_backend"],
-                        artifact["object_key"],
-                        raw_sha256,
-                        artifact["size_bytes"],
-                        artifact["media_type"],
-                        artifact["encryption"],
-                        artifact["version_id"],
-                        artifact["created_at"],
-                    ),
-                )
-                stored_artifact = conn.execute(
-                    """SELECT storage_backend,object_key,content_sha256,size_bytes,
+            (
+                tenant_id,
+                source_id,
+                artifact["artifact_id"],
+                artifact["storage_backend"],
+                artifact["object_key"],
+                raw_sha256,
+                artifact["size_bytes"],
+                artifact["media_type"],
+                artifact["encryption"],
+                artifact["version_id"],
+                artifact["created_at"],
+            ),
+        )
+        stored_artifact = conn.execute(
+            """SELECT storage_backend,object_key,content_sha256,size_bytes,
                               media_type,encryption,version_id,state
                        FROM raw_artifacts
                        WHERE tenant_id=%s AND source_id=%s AND artifact_id=%s""",
-                    (tenant_id, source_id, artifact["artifact_id"]),
-                ).fetchone()
-                expected_artifact = {
-                    key: artifact[key]
-                    for key in (
-                        "storage_backend",
-                        "object_key",
-                        "content_sha256",
-                        "size_bytes",
-                        "media_type",
-                        "encryption",
-                        "version_id",
-                    )
-                }
-                if (
-                    stored_artifact is None
-                    or stored_artifact["state"] != "live"
-                    or any(
-                        stored_artifact[key] != value
-                        for key, value in expected_artifact.items()
-                    )
-                ):
-                    raise CanonicalLifecycleError("canonical_artifact_conflict")
-                existing = conn.execute(
-                    """SELECT revision FROM canonical_events
+            (tenant_id, source_id, artifact["artifact_id"]),
+        ).fetchone()
+        expected_artifact = {
+            key: artifact[key]
+            for key in (
+                "storage_backend",
+                "object_key",
+                "content_sha256",
+                "size_bytes",
+                "media_type",
+                "encryption",
+                "version_id",
+            )
+        }
+        if (
+            stored_artifact is None
+            or stored_artifact["state"] != "live"
+            or any(
+                stored_artifact[key] != value
+                for key, value in expected_artifact.items()
+            )
+        ):
+            raise CanonicalLifecycleError("canonical_artifact_conflict")
+        existing = conn.execute(
+            """SELECT revision FROM canonical_events
                        WHERE tenant_id=%s AND source_id=%s
                          AND native_id=%s AND content_sha256=%s""",
-                    (tenant_id, source_id, native_id, event_sha256),
-                ).fetchone()
-                if existing:
-                    revision = existing["revision"]
-                    inserted_actor_links = attribute_canonical_events(
-                        conn,
-                        tenant_id=tenant_id,
-                        source_id=source_id,
-                        events=((event_id, connector_id, event),),
-                        identity_index=self.actor_identity_index,
-                    )
-                    if inserted_actor_links:
-                        mark_logical_evidence_dirty(
-                            conn,
-                            tenant_id=tenant_id,
-                            source_id=source_id,
-                            native_ids=[native_id],
-                            reason="ingest",
-                        )
-                    if _notification:
-                        mark_logical_notification_pending(
-                            conn, tenant_id=tenant_id, source_id=source_id, event_id=event_id,
-                        )
-                    return {
-                        "status": "committed",
-                        "inserted": 0,
-                        "duplicate_events": 1,
-                        "revision": revision,
-                        "receipt": (
-                            f"recall://{source_id}/{native_id}?rev={revision}#item=0"
-                        ),
-                        "replay": True,
-                    }
-                if connector_id == "slack.messages" and native_id.startswith("slack:") and not is_tombstone:
-                    terminal = conn.execute(
-                        """SELECT max(revision) AS revision FROM canonical_events
+            (tenant_id, source_id, native_id, event_sha256),
+        ).fetchone()
+        if existing:
+            revision = existing["revision"]
+            inserted_actor_links = attribute_canonical_events(
+                conn,
+                tenant_id=tenant_id,
+                source_id=source_id,
+                events=((event_id, connector_id, event),),
+                identity_index=self.actor_identity_index,
+            )
+            if inserted_actor_links:
+                mark_logical_evidence_dirty(
+                    conn,
+                    tenant_id=tenant_id,
+                    source_id=source_id,
+                    native_ids=[native_id],
+                    reason="ingest",
+                )
+            if notification:
+                mark_logical_notification_pending(
+                    conn, tenant_id=tenant_id, source_id=source_id, event_id=event_id,
+                )
+            return {
+                "status": "committed",
+                "inserted": 0,
+                "duplicate_events": 1,
+                "revision": revision,
+                "receipt": (
+                    f"recall://{source_id}/{native_id}?rev={revision}#item=0"
+                ),
+                "replay": True,
+            }
+        if connector_id == "slack.messages" and native_id.startswith("slack:") and not is_tombstone:
+            terminal = conn.execute(
+                """SELECT max(revision) AS revision FROM canonical_events
                            WHERE tenant_id=%s AND source_id=%s AND native_id=%s AND is_tombstone""",
-                        (tenant_id, source_id, native_id),
-                    ).fetchone()["revision"]
-                    if terminal is not None:
-                        _audit_slack_suppression(conn, tenant_id=tenant_id, source_id=source_id,
-                            rows=[(event_id, identity_sha256, artifact["size_bytes"], artifact["artifact_id"])])
-                        return _slack_terminal_ack(source_id, native_id, int(terminal))
-                row = conn.execute(
-                    """SELECT COALESCE(max(revision),0)+1 AS revision
+                (tenant_id, source_id, native_id),
+            ).fetchone()["revision"]
+            if terminal is not None:
+                _audit_slack_suppression(conn, tenant_id=tenant_id, source_id=source_id,
+                    rows=[(event_id, identity_sha256, artifact["size_bytes"], artifact["artifact_id"])])
+                return _slack_terminal_ack(source_id, native_id, int(terminal))
+        row = conn.execute(
+            """SELECT COALESCE(max(revision),0)+1 AS revision
                        FROM canonical_events
                        WHERE tenant_id=%s AND source_id=%s AND native_id=%s""",
-                    (tenant_id, source_id, native_id),
-                ).fetchone()
-                revision = row["revision"]
-                receipt = f"recall://{source_id}/{native_id}?rev={revision}#item=0"
-                _ensure_lineage_jobs(conn, tenant_id=tenant_id, source_id=source_id,
-                                     connector_ids=[connector_id])
-                conn.execute(
-                    f"""INSERT INTO canonical_events(
+            (tenant_id, source_id, native_id),
+        ).fetchone()
+        revision = row["revision"]
+        receipt = f"recall://{source_id}/{native_id}?rev={revision}#item=0"
+        _ensure_lineage_jobs(conn, tenant_id=tenant_id, source_id=source_id,
+                             connector_ids=[connector_id])
+        conn.execute(
+            f"""INSERT INTO canonical_events(
                            tenant_id,source_id,event_id,native_id,native_parent_id,
                            artifact_id,job_id,kind,content_sha256,revision,
                            occurred_at,observed_at,is_tombstone,canonical_redacted,
@@ -784,58 +800,58 @@ class CanonicalPlane:
                            (SELECT CASE WHEN %s THEN {_compact_event_expression('input')}
                                    ELSE input.canonical_redacted END
                             FROM (VALUES (%s::jsonb)) input(canonical_redacted)),%s,%s)""",
-                    (
-                        tenant_id,
-                        source_id,
-                        event_id,
-                        native_id,
-                        event.get("native_parent_id"),
-                        artifact["artifact_id"],
-                        job_id,
-                        event["kind"],
-                        event_sha256,
-                        revision,
-                        event["occurred_at"],
-                        event["observed_at"],
-                        is_tombstone,
-                        compact_body,
-                        json.dumps(event),
-                        _source_ordinal(event),
-                        "raw" if compact_body else "inline",
-                    ),
-                )
-                attribute_canonical_events(
-                    conn,
-                    tenant_id=tenant_id,
-                    source_id=source_id,
-                    events=((event_id, connector_id, event),),
-                    identity_index=self.actor_identity_index,
-                )
-                affected_native_ids = (
-                    _linked_native_ids(
-                        conn,
-                        tenant_id=tenant_id,
-                        source_id=source_id,
-                        native_id=native_id,
-                    )
-                    if is_tombstone
-                    else [native_id]
-                )
-                if not is_tombstone:
-                    self._restore_history(conn, history, tenant_id=tenant_id,
-                                          source_id=source_id, native_ids=affected_native_ids)
-                conn.execute(
-                    """UPDATE canonical_documents
+            (
+                tenant_id,
+                source_id,
+                event_id,
+                native_id,
+                event.get("native_parent_id"),
+                artifact["artifact_id"],
+                job_id,
+                event["kind"],
+                event_sha256,
+                revision,
+                event["occurred_at"],
+                event["observed_at"],
+                is_tombstone,
+                compact_body,
+                json.dumps(event),
+                _source_ordinal(event),
+                "raw" if compact_body else "inline",
+            ),
+        )
+        attribute_canonical_events(
+            conn,
+            tenant_id=tenant_id,
+            source_id=source_id,
+            events=((event_id, connector_id, event),),
+            identity_index=self.actor_identity_index,
+        )
+        affected_native_ids = (
+            _linked_native_ids(
+                conn,
+                tenant_id=tenant_id,
+                source_id=source_id,
+                native_id=native_id,
+            )
+            if is_tombstone
+            else [native_id]
+        )
+        if not is_tombstone:
+            self._restore_history(conn, history, tenant_id=tenant_id,
+                                  source_id=source_id, native_ids=affected_native_ids)
+        conn.execute(
+            """UPDATE canonical_documents
                        SET is_current=false,
                            text_redacted=CASE WHEN %s THEN '' ELSE text_redacted END,
                            deleted_at=CASE WHEN %s THEN now() ELSE deleted_at END
                        WHERE tenant_id=%s AND source_id=%s AND native_id=ANY(%s)
                          AND is_current""",
-                    (is_tombstone, is_tombstone, tenant_id, source_id, affected_native_ids),
-                )
-                if is_tombstone:
-                    conn.execute(
-                        """UPDATE canonical_chunks chunk
+            (is_tombstone, is_tombstone, tenant_id, source_id, affected_native_ids),
+        )
+        if is_tombstone:
+            conn.execute(
+                """UPDATE canonical_chunks chunk
                            SET deleted_at=now(),
                                text_redacted=CASE
                                    WHEN document.deleted_at IS NOT NULL AND NOT document.is_current
@@ -847,71 +863,71 @@ class CanonicalPlane:
                              AND document.tenant_id=%s AND document.source_id=%s
                              AND document.native_id=ANY(%s)
                              AND chunk.deleted_at IS NULL""",
-                        (tenant_id, source_id, affected_native_ids),
-                    )
-                else:
-                    conn.execute(
-                        """INSERT INTO canonical_documents(
+                (tenant_id, source_id, affected_native_ids),
+            )
+        else:
+            conn.execute(
+                """INSERT INTO canonical_documents(
                                tenant_id,source_id,document_id,event_id,artifact_id,native_id,
                                content_sha256,revision,is_current,text_redacted,text_sha256,body_location
                            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,true,%s,%s,%s)""",
-                        (
-                            tenant_id,
-                            source_id,
-                            document_id,
-                            event_id,
-                            artifact["artifact_id"],
-                            native_id,
-                            event_sha256,
-                            revision,
-                            "" if compact_body else text_redacted,
-                            text_sha256,
-                            "chunks" if compact_body else "inline",
-                        ),
-                    )
-                    with conn.cursor() as cursor:
-                        cursor.executemany(
-                            """INSERT INTO canonical_chunks(
+                (
+                    tenant_id,
+                    source_id,
+                    document_id,
+                    event_id,
+                    artifact["artifact_id"],
+                    native_id,
+                    event_sha256,
+                    revision,
+                    "" if compact_body else text_redacted,
+                    text_sha256,
+                    "chunks" if compact_body else "inline",
+                ),
+            )
+            with conn.cursor() as cursor:
+                cursor.executemany(
+                    """INSERT INTO canonical_chunks(
                                    tenant_id,source_id,chunk_id,document_id,ordinal,
                                    receipt,text_redacted,text_sha256
                                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)""",
-                            [
-                                (
-                                    tenant_id,
-                                    source_id,
-                                    _opaque(
-                                        "chk",
-                                        tenant_id,
-                                        source_id,
-                                        document_id,
-                                        str(ordinal),
-                                    ),
-                                    document_id,
-                                    ordinal,
-                                    item_receipt(
-                                        source_id,
-                                        native_id,
-                                        revision,
-                                        ordinal,
-                                    ),
-                                    chunk_text,
-                                    hashlib.sha256(chunk_text.encode()).hexdigest(),
-                                )
-                                for ordinal, chunk_text in enumerate(chunk_texts)
-                            ],
+                    [
+                        (
+                            tenant_id,
+                            source_id,
+                            _opaque(
+                                "chk",
+                                tenant_id,
+                                source_id,
+                                document_id,
+                                str(ordinal),
+                            ),
+                            document_id,
+                            ordinal,
+                            item_receipt(
+                                source_id,
+                                native_id,
+                                revision,
+                                ordinal,
+                            ),
+                            chunk_text,
+                            hashlib.sha256(chunk_text.encode()).hexdigest(),
                         )
-                mark_logical_evidence_dirty(
-                    conn,
-                    tenant_id=tenant_id,
-                    source_id=source_id,
-                    native_ids=affected_native_ids,
-                    reason="ingest",
-                    new_native_ids=(native_id,) if revision == 1 and not is_tombstone else (),
+                        for ordinal, chunk_text in enumerate(chunk_texts)
+                    ],
                 )
-                if _notification:
-                    mark_logical_notification_pending(
-                        conn, tenant_id=tenant_id, source_id=source_id, event_id=event_id,
-                    )
+        mark_logical_evidence_dirty(
+            conn,
+            tenant_id=tenant_id,
+            source_id=source_id,
+            native_ids=affected_native_ids,
+            reason="ingest",
+            new_native_ids=(native_id,) if revision == 1 and not is_tombstone else (),
+        )
+        if notification:
+            mark_logical_notification_pending(
+                conn, tenant_id=tenant_id, source_id=source_id, event_id=event_id,
+            )
         return {
             "status": "committed",
             "inserted": 1,
