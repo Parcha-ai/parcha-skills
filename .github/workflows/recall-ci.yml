@@ -179,6 +179,7 @@ jobs:
             e2e_locator_delta_publication.py \
             e2e_logical_append_capability.py \
             e2e_logical_append_reader.py \
+            e2e_logical_append_prefix_delta.py \
             e2e_logical_append_snapshot.py \
             e2e_logical_append_observability.py \
             e2e_logical_attempt_stage_timing.py \
