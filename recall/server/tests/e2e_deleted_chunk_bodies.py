@@ -5,6 +5,8 @@
 from pathlib import Path
 from contextlib import contextmanager
 import hashlib
+import json
+import os
 from unittest.mock import patch
 
 import psycopg
@@ -14,7 +16,10 @@ import unittest
 SERVER = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(SERVER.parent), str(SERVER)]
 import e2e_historical_bundle_reader as fixture
-from recall_server.deleted_chunk_bodies import clear_deleted_chunk_bodies
+from recall_server.deleted_chunk_bodies import (
+    clear_deleted_chunk_bodies,
+    discover_deleted_chunk_bodies,
+)
 from recall_server.chunk_retirement import ChunkRetirementError, retire_current_chunks
 from recall_server.canonical import CanonicalLifecycleError
 from recall_server.projectors import canonical_json
@@ -50,6 +55,28 @@ class DeletedChunkBodyTests(unittest.TestCase):
         )
         return value
 
+    def restore_prevention_fixture(self, rows):
+        # Reproduce the production backlog written before tombstones cleared
+        # text. This fixture restores only the strict already-deleted cohort.
+        with self.store.connect() as c:
+            for row in rows:
+                c.execute(
+                    """UPDATE canonical_chunks chunk SET text_redacted=%s
+                    FROM canonical_documents document
+                    WHERE chunk.tenant_id=%s AND chunk.source_id=%s AND chunk.chunk_id=%s
+                      AND document.tenant_id=chunk.tenant_id AND document.source_id=chunk.source_id
+                      AND document.document_id=chunk.document_id
+                      AND chunk.deleted_at IS NOT NULL AND document.deleted_at IS NOT NULL
+                      AND NOT document.is_current""",
+                    (row["text_redacted"], self.tenant, self.source, row["chunk_id"]),
+                )
+
+    def write_legacy_tombstone(self, event=None):
+        rows = self.rows()
+        result = self.write(event or self.tombstone())
+        self.restore_prevention_fixture(rows)
+        return result
+
     def rows(self):
         with self.store.connect() as c:
             return c.execute(
@@ -76,7 +103,7 @@ class DeletedChunkBodyTests(unittest.TestCase):
         self.write(self.event())
         self.write(self.event(revision=2))
         self.write(self.event(native="live"))
-        self.write(self.tombstone())
+        self.write_legacy_tombstone()
         before = self.rows()
         eligible = [
             r
@@ -121,7 +148,7 @@ class DeletedChunkBodyTests(unittest.TestCase):
     def deleted_fixture(self):
         original = self.event()
         result = self.write(original)
-        self.write(self.tombstone())
+        self.write_legacy_tombstone()
         return original, result
 
     def test_dry_run_and_repeated_clear_are_exact_and_idempotent(self):
@@ -171,7 +198,7 @@ class DeletedChunkBodyTests(unittest.TestCase):
         self.write(self.event(revision=2))
         self.assertEqual(self.clear(apply=True)["cleared_chunks"], 0)
         self.assertEqual(self.resolve(), original)
-        self.write(self.tombstone())
+        self.write_legacy_tombstone()
         self.clear(apply=True)
         deleted_docs = tuple(
             {r["document_id"] for r in self.rows() if r["document_deleted"]}
@@ -195,7 +222,7 @@ class DeletedChunkBodyTests(unittest.TestCase):
     def test_forget_retry_after_archive_failure_needs_metadata_not_deleted_text(self):
         self.write(self.event())
         with patch.object(
-            self.archive, "delete_raw", side_effect=RuntimeError("provider failure")
+            self.archive, "delete", side_effect=RuntimeError("provider failure")
         ):
             with self.assertRaisesRegex(
                 CanonicalLifecycleError, "archive_delete_failed"
@@ -213,7 +240,7 @@ class DeletedChunkBodyTests(unittest.TestCase):
         self.write(self.event())
         self.write(self.event(native="live"))
         self.project()
-        self.write(self.tombstone())
+        self.write_legacy_tombstone()
         self.clear(apply=True)
         self.project()
         live = self.store.resolve(
@@ -310,6 +337,7 @@ class DeletedChunkBodyTests(unittest.TestCase):
         child["native_parent_id"] = "turn"
         self.write(child)
         self.write(self.event(native="survivor"))
+        before_tombstone = self.rows()
         tombstone = self.tombstone()
         self.plane.ingest_document(
             tenant_id=self.tenant,
@@ -319,6 +347,7 @@ class DeletedChunkBodyTests(unittest.TestCase):
             envelope=tombstone,
             text_redacted="",
         )
+        self.restore_prevention_fixture(before_tombstone)
         result = self.clear(apply=True)
         self.assertEqual(result["cleared_chunks"], 2)
         rows = self.rows()
@@ -446,7 +475,7 @@ class DeletedChunkBodyTests(unittest.TestCase):
         self.write(original)
         deleted = self.tombstone(native)
         deleted["provenance"]["connector_id"] = "slack.messages"
-        self.write(deleted)
+        self.write_legacy_tombstone(deleted)
         self.clear(apply=True)
         replacement = self.event(native=native, revision=3)
         replacement["provenance"]["connector_id"] = "slack.messages"
@@ -456,6 +485,221 @@ class DeletedChunkBodyTests(unittest.TestCase):
         self.assertTrue(
             all(not r["text_redacted"] and not r["is_current"] for r in self.rows())
         )
+
+    def test_new_scalar_and_batch_tombstones_clear_only_current_deleted_body(self):
+        for scalar in (True, False):
+            with self.subTest(scalar=scalar):
+                native = "parent-" + str(scalar)
+                child = "child-" + str(scalar)
+                for revision in (1, 2):
+                    self.write(self.event(native=native, revision=revision))
+                    value = self.event(native=child, revision=revision)
+                    value["native_parent_id"] = native
+                    self.write(value)
+                before = self.rows()
+                with self.store.connect() as c:
+                    event_metadata = c.execute(
+                        "SELECT event_id,content_sha256,revision FROM canonical_events WHERE tenant_id=%s AND source_id=%s ORDER BY event_id",
+                        (self.tenant, self.source),
+                    ).fetchall()
+                tombstone = self.tombstone(native)
+                if scalar:
+                    self.plane.ingest_document(
+                        tenant_id=self.tenant,
+                        principal_id=self.principal,
+                        connector_id="synthetic.history",
+                        artifact_ref=tombstone["provenance"]["artifact_ref"],
+                        envelope=tombstone,
+                        text_redacted="",
+                    )
+                else:
+                    self.write(tombstone)
+                after = {r["chunk_id"]: r for r in self.rows()}
+                cleared = 0
+                preserved_history = 0
+                for old in before:
+                    row = after[old["chunk_id"]]
+                    if old["is_current"] and row["document_deleted"]:
+                        self.assertEqual(row["text_redacted"], "")
+                        cleared += 1
+                    else:
+                        self.assertEqual(row["text_redacted"], old["text_redacted"])
+                        preserved_history += int(
+                            old["revision"] == 1 and row["document_deleted"] is None
+                        )
+                    for field in (
+                        "chunk_id",
+                        "document_id",
+                        "receipt",
+                        "ordinal",
+                        "text_sha256",
+                    ):
+                        self.assertEqual(row[field], old[field])
+                self.assertEqual(cleared, 2)
+                self.assertGreaterEqual(preserved_history, 2)
+                with self.store.connect() as c:
+                    events = c.execute(
+                        "SELECT event_id,content_sha256,revision FROM canonical_events WHERE tenant_id=%s AND source_id=%s ORDER BY event_id",
+                        (self.tenant, self.source),
+                    ).fetchall()
+                self.assertTrue(all(row in events for row in event_metadata))
+
+    def test_discovery_advances_over_live_and_empty_pages_with_frozen_source_bound(
+        self,
+    ):
+        for native in ("one", "two", "three", "four", "live"):
+            self.write(self.event(native=native))
+            if native != "live":
+                self.write_legacy_tombstone(self.tombstone(native))
+        all_rows = self.rows()
+        first_deleted = next(r for r in all_rows if r["document_deleted"])
+        self.clear(apply=True, chunk_ids=(first_deleted["chunk_id"],))
+        expected = {
+            r["chunk_id"]
+            for r in self.rows()
+            if r["document_deleted"] and r["text_redacted"]
+        }
+        seen = set()
+        after = None
+        through = None
+        scanned = 0
+        pages = 0
+        while True:
+            page = discover_deleted_chunk_bodies(
+                self.store,
+                tenant_id=self.tenant,
+                source_id=self.source,
+                principal_id=self.principal,
+                after_chunk_id=after,
+                through_chunk_id=through,
+                limit=1,
+            )
+            self.assertLessEqual(page["scanned_keys"], 1)
+            self.assertFalse(seen.intersection(page["candidate_chunk_ids"]))
+            seen.update(page["candidate_chunk_ids"])
+            scanned += page["scanned_keys"]
+            pages += 1
+            if through is not None:
+                self.assertEqual(page["through_chunk_id"], through)
+            if page["pass_complete"]:
+                break
+            self.assertNotEqual(page["after_chunk_id"], after)
+            after, through = page["after_chunk_id"], page["through_chunk_id"]
+            self.assertLess(pages, 10)
+        self.assertEqual(seen, expected)
+        self.assertEqual(scanned, len(all_rows))
+        self.assertEqual(pages, len(all_rows))
+        self.assertTrue(through)
+
+    def test_discovery_uses_existing_source_key_index_on_populated_relation(self):
+        self.deleted_fixture()
+        document = self.rows()[0]["document_id"]
+        with self.store.connect() as c:
+            c.execute(
+                """INSERT INTO canonical_chunks(tenant_id,source_id,chunk_id,document_id,
+                ordinal,receipt,text_redacted,text_sha256,deleted_at)
+                SELECT %s,%s,'chk_'||lpad(to_hex(n),32,'0'),%s,10000+n,
+                    'recall://plan/test?rev=1#item='||n,'x',%s,now()
+                FROM generate_series(1,5000) n""",
+                (self.tenant, self.source, document, hashlib.sha256(b"x").hexdigest()),
+            )
+            c.execute("ANALYZE canonical_chunks")
+            c.execute("ANALYZE canonical_documents")
+        actual = self.store
+        plans = []
+
+        class ExplainedStore:
+            connect = actual.connect
+            _set_statement_deadline = staticmethod(actual._set_statement_deadline)
+
+            @staticmethod
+            def _execute_bounded(connection, sql, args, deadline):
+                if (
+                    "SELECT chunk_id FROM canonical_chunks" in sql
+                    or "FROM canonical_chunks chunk JOIN canonical_documents" in sql
+                ):
+                    plan = actual._execute_bounded(
+                        connection,
+                        "EXPLAIN (ANALYZE,BUFFERS,FORMAT JSON) " + sql,
+                        args,
+                        deadline,
+                    ).fetchone()["QUERY PLAN"][0]
+                    plans.append(dict(sql=sql, plan=plan))
+                return actual._execute_bounded(connection, sql, args, deadline)
+
+        first = discover_deleted_chunk_bodies(
+            ExplainedStore(),
+            tenant_id=self.tenant,
+            source_id=self.source,
+            principal_id=self.principal,
+            limit=50,
+        )
+        second = discover_deleted_chunk_bodies(
+            ExplainedStore(),
+            tenant_id=self.tenant,
+            source_id=self.source,
+            principal_id=self.principal,
+            limit=50,
+            after_chunk_id=first["after_chunk_id"],
+            through_chunk_id=first["through_chunk_id"],
+        )
+        self.assertEqual(first["scanned_keys"], 50)
+        self.assertEqual(second["scanned_keys"], 50)
+        self.assertEqual(first["eligible_utf8_bytes"], 50)
+        self.assertEqual(second["eligible_utf8_bytes"], 50)
+        self.assertFalse(
+            set(first["candidate_chunk_ids"]).intersection(
+                second["candidate_chunk_ids"]
+            )
+        )
+        self.assertEqual(len(plans), 5)
+
+        def nodes(plan):
+            yield plan
+            for child in plan.get("Plans", []):
+                yield from nodes(child)
+
+        for item in plans:
+            if "SELECT chunk_id FROM canonical_chunks" in item["sql"]:
+                scans = [
+                    node
+                    for node in nodes(item["plan"]["Plan"])
+                    if node.get("Relation Name") == "canonical_chunks"
+                ]
+                self.assertEqual(len(scans), 1)
+                self.assertIn(scans[0]["Node Type"], ("Index Scan", "Index Only Scan"))
+                self.assertEqual(scans[0]["Index Name"], "canonical_chunks_pkey")
+                self.assertIn("tenant_id", scans[0]["Index Cond"])
+                self.assertIn("source_id", scans[0]["Index Cond"])
+        if os.environ.get("RECALL_DISCOVERY_PLAN_PATH"):
+            Path(os.environ["RECALL_DISCOVERY_PLAN_PATH"]).write_text(
+                json.dumps(plans, indent=2, default=str) + "\n"
+            )
+
+    def test_discovery_requires_current_source_authority_and_frozen_cursor(self):
+        self.deleted_fixture()
+        with self.assertRaisesRegex(
+            ChunkRetirementError, "deleted_chunk_scope_invalid"
+        ):
+            discover_deleted_chunk_bodies(
+                self.store,
+                tenant_id=self.tenant,
+                source_id=self.source,
+                principal_id=self.principal,
+                after_chunk_id=self.rows()[0]["chunk_id"],
+            )
+        with self.store.connect() as c:
+            c.execute(
+                "DELETE FROM canonical_source_grants WHERE tenant_id=%s AND source_id=%s",
+                (self.tenant, self.source),
+            )
+        with self.assertRaisesRegex(ChunkRetirementError, "retirement_owner_required"):
+            discover_deleted_chunk_bodies(
+                self.store,
+                tenant_id=self.tenant,
+                source_id=self.source,
+                principal_id=self.principal,
+            )
 
 
 if __name__ == "__main__":

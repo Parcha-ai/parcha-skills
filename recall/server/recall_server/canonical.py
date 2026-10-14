@@ -820,7 +820,10 @@ class CanonicalPlane:
                 if is_tombstone:
                     conn.execute(
                         """UPDATE canonical_chunks chunk
-                           SET deleted_at=now()
+                           SET deleted_at=now(),
+                               text_redacted=CASE
+                                   WHEN document.deleted_at IS NOT NULL AND NOT document.is_current
+                                   THEN '' ELSE chunk.text_redacted END
                            FROM canonical_documents document
                            WHERE chunk.tenant_id=document.tenant_id
                              AND chunk.source_id=document.source_id
@@ -1463,7 +1466,10 @@ class CanonicalPlane:
                     if is_tombstone_batch:
                         connection.execute(
                             """UPDATE canonical_chunks chunk
-                               SET deleted_at=now()
+                               SET deleted_at=now(),
+                                   text_redacted=CASE
+                                       WHEN document.deleted_at IS NOT NULL AND NOT document.is_current
+                                       THEN '' ELSE chunk.text_redacted END
                                FROM canonical_documents document
                                WHERE chunk.tenant_id=document.tenant_id
                                  AND chunk.source_id=document.source_id

@@ -122,3 +122,96 @@ def clear_deleted_chunk_bodies(
         cleared_utf8_bytes=body_bytes if apply else 0,
         physical_bytes_reclaimed=0,
     )
+
+
+def discover_deleted_chunk_bodies(
+    store,
+    *,
+    tenant_id,
+    source_id,
+    principal_id,
+    after_chunk_id=None,
+    through_chunk_id=None,
+    limit=MAX_KEYS,
+    deadline_at=None,
+):
+    """Advance one source-key window, including pages with no eligible bodies.
+
+    Keep the returned upper key for the entire pass. A completed pass covers
+    its traversed key range, not concurrent arrivals or global exhaustion.
+    Returned candidates require the apply owner's fresh authority/deletion check.
+    """
+    if (
+        any(
+            not isinstance(value, str) or not IDENTITY_RE.fullmatch(value)
+            for value in (tenant_id, source_id, principal_id)
+        )
+        or type(limit) is not int
+        or not 1 <= limit <= MAX_KEYS
+        or any(
+            value is not None
+            and (not isinstance(value, str) or not IDENTITY_RE.fullmatch(value))
+            for value in (after_chunk_id, through_chunk_id)
+        )
+        or after_chunk_id is not None
+        and (through_chunk_id is None or after_chunk_id > through_chunk_id)
+    ):
+        raise ChunkRetirementError("deleted_chunk_scope_invalid")
+    if deadline_at is None:
+        deadline_at = time.monotonic() + 5
+    if type(deadline_at) not in (int, float) or not math.isfinite(deadline_at):
+        raise ChunkRetirementError("deleted_chunk_deadline_invalid")
+    with store.connect() as connection, connection.transaction():
+        connection.execute("SET TRANSACTION READ ONLY")
+        connection.execute("SET LOCAL lock_timeout='250ms'")
+        require_retirement_owner(
+            store,
+            connection,
+            (tenant_id, source_id),
+            principal_id,
+            deadline_at,
+            lock=False,
+        )
+
+        def query(sql, args):
+            return store._execute_bounded(connection, sql, args, deadline_at)
+
+        if through_chunk_id is None:
+            upper = query(
+                """SELECT chunk_id FROM canonical_chunks
+                WHERE tenant_id=%s AND source_id=%s
+                ORDER BY chunk_id DESC LIMIT 1""",
+                (tenant_id, source_id),
+            ).fetchone()
+            through_chunk_id = upper["chunk_id"] if upper else None
+        keys = []
+        candidates = []
+        if through_chunk_id is not None:
+            lower = " AND chunk_id>%s" if after_chunk_id is not None else ""
+            args = (
+                (tenant_id, source_id, through_chunk_id)
+                + ((after_chunk_id,) if after_chunk_id is not None else ())
+                + (limit,)
+            )
+            keys = query(
+                """SELECT chunk_id FROM canonical_chunks
+                WHERE tenant_id=%s AND source_id=%s AND chunk_id<=%s"""
+                + lower
+                + " ORDER BY chunk_id LIMIT %s",
+                args,
+            ).fetchall()
+            if keys:
+                candidates = query(
+                    _SNAPSHOT, (tenant_id, source_id, [row["chunk_id"] for row in keys])
+                ).fetchall()
+    next_key = keys[-1]["chunk_id"] if keys else after_chunk_id
+    return dict(
+        candidate_chunk_ids=tuple(
+            row["chunk_id"] for row in candidates if row["body_bytes"] > 0
+        ),
+        scanned_keys=len(keys),
+        after_chunk_id=next_key,
+        through_chunk_id=through_chunk_id,
+        pass_complete=(len(keys) < limit or next_key == through_chunk_id),
+        eligible_utf8_bytes=sum(row["body_bytes"] for row in candidates),
+    )
