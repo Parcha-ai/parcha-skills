@@ -815,10 +815,11 @@ class CanonicalPlane:
                 conn.execute(
                     """UPDATE canonical_documents
                        SET is_current=false,
+                           text_redacted=CASE WHEN %s THEN '' ELSE text_redacted END,
                            deleted_at=CASE WHEN %s THEN now() ELSE deleted_at END
                        WHERE tenant_id=%s AND source_id=%s AND native_id=ANY(%s)
                          AND is_current""",
-                    (is_tombstone, tenant_id, source_id, affected_native_ids),
+                    (is_tombstone, is_tombstone, tenant_id, source_id, affected_native_ids),
                 )
                 if is_tombstone:
                     conn.execute(
@@ -1454,12 +1455,14 @@ class CanonicalPlane:
                     connection.execute(
                         """UPDATE canonical_documents
                            SET is_current=false,
+                               text_redacted=CASE WHEN %s THEN '' ELSE text_redacted END,
                                deleted_at=CASE
                                    WHEN %s THEN now() ELSE deleted_at
                                END
                            WHERE tenant_id=%s AND source_id=%s
                              AND native_id=ANY(%s) AND is_current""",
                         (
+                            is_tombstone_batch,
                             is_tombstone_batch,
                             tenant_id,
                             source_id,

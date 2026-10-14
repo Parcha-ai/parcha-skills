@@ -150,6 +150,7 @@ jobs:
             e2e_pending_archived_chunks.py \
             e2e_chunk_body_locators.py \
             e2e_locator_spool.py \
+            e2e_locator_delta_publication.py \
             e2e_locator_backfill_plan.py \
             e2e_locator_backfill_apply.py \
             e2e_revision_history.py \
@@ -166,6 +167,7 @@ jobs:
             e2e_retirement_runner.py \
             e2e_company_retirement_authority.py \
             e2e_deleted_chunk_bodies.py \
+            e2e_deleted_document_bodies.py \
             e2e_retirement_detachment.py \
             e2e_retirement_policy.py \
             e2e_retirement_maintenance.py \

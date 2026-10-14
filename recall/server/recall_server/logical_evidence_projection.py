@@ -96,11 +96,44 @@ class _LogicalWorkSuperseded(Exception):
 class _LocatorSpool:
     """Private, replayable metadata stream; RAM does not grow with the parent."""
 
-    def __init__(self):
+    def __init__(self, *, complete_metadata=False):
         self._file = tempfile.TemporaryFile(mode="w+b")
+        self.complete_metadata = complete_metadata
+        self.count = 0
+        self._current = None
+        self._desired = None
 
     def append(self, location):
         self._file.write(orjson.dumps(location) + b"\n")
+        self.count += 1
+
+    def observe(self, row):
+        self._current = row
+        self._desired = (None, None)
+
+    def locate(self, location):
+        if location[0] != self._current["document_id"]:
+            raise LogicalEvidenceError("logical_evidence_state_invalid")
+        self._desired = tuple(location[1:])
+
+    def finish(self):
+        row = self._current
+        previous = row["body_record_ordinal"], row["body_record_count"]
+        # Existing repair owners only fill NULL positions. Include every NULL
+        # snapshot so a concurrent repair cannot hide a required reset.
+        if previous != self._desired or None in previous:
+            self.append(
+                (
+                    row["document_id"],
+                    row["event_id"],
+                    row["native_id"],
+                    row["document_revision"],
+                    row["document_text_sha256"],
+                    *self._desired,
+                )
+            )
+        self._current = None
+        self._desired = None
 
     def __iter__(self):
         self._file.seek(0)
@@ -909,6 +942,7 @@ class CanonicalLogicalEvidenceProjector:
                            )"""
                         """SELECT selected.candidate_ordinal,
                               document.document_id,document.body_location,
+                              document.body_record_ordinal,document.body_record_count,
                               event.tenant_id,event.source_id,
                               event.event_id,event.native_id,event.kind,
                               event.occurred_at,
@@ -1097,12 +1131,18 @@ class CanonicalLogicalEvidenceProjector:
                                 and isinstance(document_id, str)
                                 and 1 <= len(document_id) <= 255):
                             inline_ids[document_id] = None
+                        locations.observe(row)
                         yield row
+                        locations.finish()
 
                 final_start = spool.tell()
-                locations = body_locators[ordinal] = _LocatorSpool()
+                locations = body_locators[ordinal] = _LocatorSpool(
+                    complete_metadata=True
+                )
                 try:
-                    for record in self._record_stream(resolved_rows(), locate=locations.append):
+                    for record in self._record_stream(
+                        resolved_rows(), locate=locations.locate
+                    ):
                         if checkpoint is not None:
                             checkpoint()
                         spool.write(record.encode(source_id=candidate.source_id))
@@ -2010,6 +2050,12 @@ class CanonicalLogicalEvidenceProjector:
         COPY streams private metadata into a transaction-local table. The
         changed-row set stays in Postgres, where sorting can spill to disk.
         """
+        if isinstance(locators, _LocatorSpool) and locators.complete_metadata:
+            return CanonicalLogicalEvidenceProjector._publish_locator_delta(
+                connection, candidate, locators
+            )
+        # Empty-parent deletion and older upload callers do not carry a complete
+        # canonical input snapshot; retain the original membership/reset owner.
         connection.execute(
             """CREATE TEMP TABLE recall_body_locator_desired (
                    document_id text PRIMARY KEY,
@@ -2053,6 +2099,66 @@ class CanonicalLogicalEvidenceProjector:
              candidate.tenant_id, candidate.source_id),
         )
         return changed.rowcount
+
+    @staticmethod
+    def _publish_locator_delta(connection, candidate, locators):
+        """Publish prepared changes after the caller has locked the queue CAS.
+
+        The complete input stream established parent membership. Recheck each
+        changed document's immutable identity and currentness here. Unchanged
+        non-NULL positions cannot be changed by the NULL-only repair owners.
+        """
+        if not locators.count:
+            return 0
+        connection.execute(
+            """CREATE TEMP TABLE recall_body_locator_delta (
+                document_id text PRIMARY KEY, event_id text NOT NULL,
+                native_id text NOT NULL, revision integer NOT NULL,
+                text_sha256 text NOT NULL, record_ordinal integer,
+                record_count integer,
+                CHECK ((record_ordinal IS NULL AND record_count IS NULL)
+                    OR (record_ordinal >= 0 AND record_count >= 1))
+            ) ON COMMIT DROP"""
+        )
+        with connection.cursor() as cursor:
+            with cursor.copy(
+                "COPY pg_temp.recall_body_locator_delta "
+                "(document_id,event_id,native_id,revision,text_sha256,record_ordinal,record_count) FROM STDIN"
+            ) as writer:
+                for location in locators:
+                    writer.write_row(location)
+        connection.execute("ANALYZE pg_temp.recall_body_locator_delta")
+        result = connection.execute(
+            """WITH locked AS MATERIALIZED (
+                SELECT document.document_id,desired.record_ordinal,desired.record_count
+                FROM pg_temp.recall_body_locator_delta desired
+                JOIN canonical_documents document
+                  ON document.tenant_id=%s AND document.source_id=%s
+                 AND document.document_id=desired.document_id
+                 AND document.event_id=desired.event_id AND document.native_id=desired.native_id
+                 AND document.revision=desired.revision AND document.text_sha256=desired.text_sha256
+                WHERE document.is_current AND document.deleted_at IS NULL
+                ORDER BY document.document_id FOR UPDATE OF document NOWAIT
+            ), changed AS (
+                UPDATE canonical_documents document
+                SET body_record_ordinal=locked.record_ordinal,body_record_count=locked.record_count
+                FROM locked WHERE document.tenant_id=%s AND document.source_id=%s
+                  AND document.document_id=locked.document_id
+                  AND (document.body_record_ordinal,document.body_record_count)
+                      IS DISTINCT FROM (locked.record_ordinal,locked.record_count)
+                RETURNING document.document_id
+            ) SELECT (SELECT count(*) FROM locked) AS matched,
+                     (SELECT count(*) FROM changed) AS changed""",
+            (
+                candidate.tenant_id,
+                candidate.source_id,
+                candidate.tenant_id,
+                candidate.source_id,
+            ),
+        ).fetchone()
+        if result["matched"] != locators.count:
+            raise LogicalEvidenceError("logical_evidence_source_changed")
+        return result["changed"]
 
     def _commit_empty(
         self,
