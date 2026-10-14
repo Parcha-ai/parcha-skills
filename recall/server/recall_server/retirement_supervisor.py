@@ -98,7 +98,7 @@ class RetirementSupervisor:
                     return _empty("commit_outcome_unknown", unknown=True)
             LOG.info(
                 "retirement_child status=%s elapsed_ms=%s cpu_seconds=%s peak_rss_kib=%s "
-                "archive_bytes=%s cleared_utf8_bytes=%s unknown=%s error_class=%s phase=%s "
+                "archive_bytes=%s cleared_utf8_bytes=%s unknown=%s error_class=%s phase=%s cause_error_code=%s "
                 "committed_sql_ms=%s committed_hash_ms=%s archive_read_ms=%s "
                 "claim_wall_ms=%s parent_wall_ms=%s metadata_capture_ms=%s",
                 result["status"],
@@ -110,6 +110,7 @@ class RetirementSupervisor:
                 result.get("commit_outcome_unknown"),
                 result.get("error_class"),
                 result.get("phase"),
+                result.get("cause_error_code"),
                 result.get("committed_sql_ms"),
                 result.get("committed_hash_ms"),
                 result.get("archive_read_ms"),

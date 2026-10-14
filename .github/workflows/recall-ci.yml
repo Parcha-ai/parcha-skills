@@ -115,6 +115,7 @@ jobs:
             e2e_search_plane_projection.py \
             e2e_turbopuffer_forget_fence.py \
             e2e_retained_passage_receipts.py \
+            e2e_handback_projection.py \
             e2e_passage_receipt_repair.py \
             e2e_turbopuffer_quantum.py \
             e2e_singleton_search_publication.py \
@@ -124,6 +125,10 @@ jobs:
             e2e_singleton_parent_receipts.py \
             e2e_singleton_projection_membership.py \
             e2e_singleton_maintenance_membership.py \
+            e2e_singleton_metadata_restore.py \
+            e2e_singleton_metadata_admission.py \
+            e2e_singleton_survivor_fence.py \
+            e2e_singleton_profile_capability.py \
             e2e_authority_covering_indexes.py \
             e2e_slack_passage_visibility.py \
             e2e_slack_visible_text_replay.py \
@@ -186,6 +191,8 @@ jobs:
             e2e_located_public_reads.py \
             e2e_retirement_runner.py \
             e2e_retirement_capture_timing.py \
+            e2e_retirement_error_cause.py \
+            e2e_retirement_capture_batching.py \
             e2e_retirement_query_pipeline.py \
             e2e_company_retirement_authority.py \
             e2e_deleted_chunk_bodies.py \

@@ -15,7 +15,7 @@ class SlackDeletionSchemaCompatibility(unittest.TestCase):
                 self.assertEqual(assess_snapshot(snapshot)['status'], 'ready')
 
     def test_77_cannot_hide_a_missing_mandatory_or_unknown_version(self):
-        for versions in ([*range(1, 69), 77], [*range(1, 70), 77, 80], [*range(1, 70), 77, 77]):
+        for versions in ([*range(1, 69), 77], [*range(1, 70), 77, 81], [*range(1, 70), 77, 77]):
             with self.subTest(versions=versions):
                 snapshot = healthy_snapshot()
                 snapshot['migration_versions'] = versions

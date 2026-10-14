@@ -102,6 +102,39 @@ class StagedHistory:
             raise HistoryUnavailable() from None
 
 
+def _stage_history_rows(store, archive, staged, *, tenant_id, rows, deadline_at=None):
+    # Share immutable parts within each parent and retain only eight documents
+    # in memory; the complete request stays on the existing private spool.
+    for _, group in groupby(rows, lambda row: (row['source_id'], row['native_parent_id'])):
+        grouped = list(group)
+        for offset in range(0, len(grouped), READ_DOCUMENTS):
+            batch = grouped[offset:offset + READ_DOCUMENTS]
+            read_deadline = time.monotonic() + READ_SECONDS
+            if deadline_at is not None:
+                read_deadline = min(read_deadline, deadline_at)
+            restored = read_archived_chunks(store, archive, tenant_id=tenant_id,
+                source_ids=(batch[0]['source_id'],),
+                document_ids=tuple(row['document_id'] for row in batch), deadline_at=read_deadline)
+            for row in batch:
+                chunks = restored.get((row['source_id'], row['document_id']))
+                if chunks is None:
+                    raise HistoryUnavailable()
+                staged.add(row, chunks)
+            del chunks, restored
+
+
+@contextmanager
+def stage_history_rows(store, archive, *, tenant_id, rows, deadline_at):
+    """Stage already-authorized exact documents without retaining a SQL lease."""
+    with StagedHistory() as staged:
+        try:
+            _stage_history_rows(store, archive, staged, tenant_id=tenant_id,
+                                rows=rows, deadline_at=deadline_at)
+        except Exception:
+            raise HistoryUnavailable() from None
+        yield staged
+
+
 @contextmanager
 def prepare_history(store, archive, *, tenant_id: str, candidates: list[dict[str, Any]]):
     """Stage only missing current bodies that a genuinely new revision replaces."""
@@ -145,23 +178,7 @@ def prepare_history(store, archive, *, tenant_id: str, candidates: list[dict[str
                 ''', (encoded, tenant_id, EMPTY_SHA256)).fetchall()
             if rows and archive is None:
                 raise HistoryUnavailable()
-            # Share immutable-part reads within each parent, at most eight docs
-            # and the reader's 64MiB limit per call. Only one parent's bounded
-            # bodies live in RAM; the complete batch stays on the private spool.
-            for _, group in groupby(rows, lambda row: (row['source_id'], row['native_parent_id'])):
-                grouped = list(group)
-                for offset in range(0, len(grouped), READ_DOCUMENTS):
-                    batch = grouped[offset:offset + READ_DOCUMENTS]
-                    restored = read_archived_chunks(store, archive, tenant_id=tenant_id,
-                        source_ids=(batch[0]['source_id'],),
-                        document_ids=tuple(row['document_id'] for row in batch),
-                        deadline_at=time.monotonic() + READ_SECONDS)
-                    for row in batch:
-                        chunks = restored.get((row['source_id'], row['document_id']))
-                        if chunks is None:
-                            raise HistoryUnavailable()
-                        staged.add(row, chunks)
-                    del chunks, restored
+            _stage_history_rows(store, archive, staged, tenant_id=tenant_id, rows=rows)
         except HistoryAuthorityError:
             raise
         except Exception:
@@ -169,11 +186,18 @@ def prepare_history(store, archive, *, tenant_id: str, candidates: list[dict[str
         yield staged
 
 
-def restore_outgoing(connection, staged, *, tenant_id, source_id, native_ids, store=None):
-    """Called after replay detection, under the writer's native advisory locks."""
+def restore_outgoing(connection, staged, *, tenant_id, source_id, native_ids, store=None, deadline_at=None, restore_mode="body"):
+    """Reconstruct under native locks; explicit metadata rollback keeps bodies archived."""
+    if restore_mode not in {"body", "metadata"}:
+        raise HistoryUnavailable()
+    def execute(sql, parameters):
+        if deadline_at is not None:
+            return store._execute_bounded(connection, sql, parameters, deadline_at)
+        return connection.execute(sql, parameters)
+
     profile = ('document.chunk_receipt_profile' if getattr(store, 'verified_singleton_receipts', False)
                else 'NULL::smallint')
-    rows = connection.execute(f'''
+    rows = execute(f'''
         SELECT document.tenant_id,document.source_id,document.document_id,
                document.revision,document.text_sha256,document.native_id,document.created_at,
                {profile} AS chunk_receipt_profile
@@ -187,6 +211,8 @@ def restore_outgoing(connection, staged, *, tenant_id, source_id, native_ids, st
          ORDER BY document.document_id FOR UPDATE
     ''', (tenant_id, source_id, native_ids, EMPTY_SHA256)).fetchall()
     for row in rows:
+        if restore_mode == 'metadata' and row['chunk_receipt_profile'] is None:
+            raise HistoryUnavailable()
         if row['chunk_receipt_profile'] is not None:
             from .receipt_membership import lookup_receipt_metadata
             from .projectors import item_receipt
@@ -194,7 +220,7 @@ def restore_outgoing(connection, staged, *, tenant_id, source_id, native_ids, st
             receipt = item_receipt(source_id, row['native_id'], row['revision'], 0)
             member = lookup_receipt_metadata(store, tenant_id=tenant_id,
                 authorized_sources=(source_id,), receipts=(receipt,),
-                allow_verified_singletons=True, connection=connection).get(receipt)
+                allow_verified_singletons=True, connection=connection, deadline_at=deadline_at).get(receipt)
             if member is None or member['document_id'] != row['document_id'] or staged is None:
                 raise HistoryUnavailable()
             restored = staged.read(row)
@@ -202,17 +228,19 @@ def restore_outgoing(connection, staged, *, tenant_id, source_id, native_ids, st
                     or restored[0]['receipt'] != receipt
                     or hashlib.sha256(restored[0]['text_redacted'].encode()).hexdigest() != member['text_sha256']):
                 raise HistoryUnavailable()
-            connection.execute('''INSERT INTO canonical_chunks(
+            execute('''INSERT INTO canonical_chunks(
                 tenant_id,source_id,chunk_id,document_id,ordinal,receipt,text_redacted,text_sha256,created_at)
                 VALUES (%s,%s,%s,%s,0,%s,%s,%s,%s)''',
                 (tenant_id, source_id, member['chunk_id'], row['document_id'], receipt,
-                 restored[0]['text_redacted'], member['text_sha256'], row['created_at']))
-            changed = connection.execute('''UPDATE canonical_documents SET chunk_receipt_profile=NULL
+                 restored[0]['text_redacted'] if restore_mode == 'body' else '', member['text_sha256'], row['created_at']))
+            changed = execute('''UPDATE canonical_documents SET chunk_receipt_profile=NULL
                 WHERE tenant_id=%s AND source_id=%s AND document_id=%s AND chunk_receipt_profile=1''',
                 (tenant_id, source_id, row['document_id']))
             if changed.rowcount != 1:
                 raise HistoryUnavailable()
-        chunks = connection.execute('''
+            if restore_mode == 'metadata':
+                continue
+        chunks = execute('''
             SELECT ordinal,receipt,text_sha256,
                    (text_redacted='' AND text_sha256<>%s) AS missing
               FROM canonical_chunks
@@ -232,7 +260,7 @@ def restore_outgoing(connection, staged, *, tenant_id, source_id, native_ids, st
             raise HistoryUnavailable()
         payload = [{**candidate, 'text_sha256': chunk['text_sha256']}
                    for candidate, chunk in zip(restored, chunks, strict=True) if chunk['missing']]
-        updated = connection.execute('''
+        updated = execute('''
             UPDATE canonical_chunks chunk SET text_redacted=restored.text_redacted
               FROM jsonb_to_recordset(%s::jsonb) restored(
                   ordinal integer,receipt text,text_redacted text,text_sha256 text)
