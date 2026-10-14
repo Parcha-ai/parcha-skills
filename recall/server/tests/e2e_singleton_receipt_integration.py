@@ -15,14 +15,16 @@ class SingletonIntegrationTests(fixtures.ReceiptMembershipTests):
             requested_at='2026-10-14T00:01:00Z', idempotency_key='singleton-forget')
 
     def test_integration_resolve_matches_original_public_response(self):
+        from recall_server.db import BrainStore
         written = self.ingest('turn/public', 'Exact public body α 🧠')
         receipt = written['receipt']
         original = self.store.resolve(receipt, tenant_id=self.tenant,
             authorized_sources=(self.source,), chunk_body_archive=self.archive)
         document = self.baseline(receipt)
         self.admit_fixture(document['document_id'])
-        with patch.object(self.store, 'verified_singleton_receipts', True, create=True):
-            resolved = self.store.resolve(receipt, tenant_id=self.tenant,
+        enabled = BrainStore(self.store.dsn, verified_singleton_receipts=True)
+        self.addCleanup(enabled.close)
+        resolved = enabled.resolve(receipt, tenant_id=self.tenant,
                 authorized_sources=(self.source,), chunk_body_archive=self.archive)
         self.assertEqual(resolved, original)
 
