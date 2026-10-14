@@ -25,10 +25,10 @@ class ReceiptMembershipTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.store=BrainStore(os.environ['RECALL_DATABASE_URL']);cls.store.migrate()
-        # Proposed profile exists only in this disposable fixture; no migration
-        # or production activation accompanies this inactive reader boundary.
+        # Compatibility fixtures also support the optional profile column before
+        # migration 080 is applied; no rows are admitted by migration.
         with cls.store.connect() as connection:
-            connection.execute('ALTER TABLE canonical_documents ADD COLUMN chunk_receipt_profile smallint')
+            connection.execute('ALTER TABLE canonical_documents ADD COLUMN IF NOT EXISTS chunk_receipt_profile smallint')
     @classmethod
     def tearDownClass(cls):
         with cls.store.connect() as connection:

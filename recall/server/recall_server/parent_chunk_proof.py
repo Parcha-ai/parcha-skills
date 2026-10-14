@@ -19,6 +19,10 @@ from .db import SearchDeadlineExceeded
 from .locator_backfill_plan import _DOCUMENTS_SQL, _MeteredArchive, _PARENT_SQL
 from .logical_body_proof import iter_parent_bodies
 
+# Metadata only: bodies remain in PostgreSQL/archive; the per-row and spool
+# budgets below still apply. A modest batch reduces capture round trips.
+_CAPTURE_FETCH_ROWS = 128
+
 _METADATA_FIELDS = frozenset({'tenant_id', 'source_id', 'document_id', 'native_id', 'revision',
     'text_sha256', 'body_record_ordinal', 'body_record_count', 'kind', 'raw_media_type',
     'structural_types', 'chunks', 'pending', 'pg_body_bytes'})
@@ -148,25 +152,25 @@ def _capture(store, spool, scope, limits, deadline_at):
             cursor.execute(sql, (*scope, limits.max_documents + 1, limits.batch_chunks + 1))
             while True:
                 if deadline_at is None:
-                    rows = cursor.fetchmany(32)
+                    rows = cursor.fetchmany(_CAPTURE_FETCH_ROWS)
                 else:
                     remaining_ms = int((deadline_at - time.monotonic()) * 1000)
                     if remaining_ms <= 0:
                         raise SearchDeadlineExceeded('search deadline exceeded')
-                    # Keep the 32-row memory bound; update the timeout and fetch
+                    # Keep a fixed metadata-row bound; update the timeout and fetch
                     # in one request rather than paying a second round trip.
                     with connection.cursor() as fetch:
                         fetch.execute(pg_sql.SQL(
                             "SELECT set_config('statement_timeout', {}, true); "
-                            'FETCH FORWARD 32 FROM {}'
+                            'FETCH FORWARD {} FROM {}'
                         ).format(pg_sql.Literal(f'{remaining_ms}ms'),
-                                 pg_sql.Identifier('retirement_metadata')), prepare=False)
+                                 pg_sql.Literal(_CAPTURE_FETCH_ROWS), pg_sql.Identifier('retirement_metadata')), prepare=False)
                         setting = fetch.fetchone()
                         if (not isinstance(setting, dict) or set(setting) != {'set_config'}
                                 or not isinstance(setting['set_config'], str) or not fetch.nextset()):
                             raise _error('parent_retirement_metadata_invalid')
                         rows = fetch.fetchall()
-                        if len(rows) > 32 or fetch.nextset():
+                        if len(rows) > _CAPTURE_FETCH_ROWS or fetch.nextset():
                             raise _error('parent_retirement_metadata_invalid')
                 if not rows:
                     break

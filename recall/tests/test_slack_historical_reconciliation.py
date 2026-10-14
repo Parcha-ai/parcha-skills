@@ -304,6 +304,41 @@ class SlackHistoricalReconciliation(unittest.TestCase):
                 finally:
                     active.close()
 
+    def test_historical_contract_reason_is_content_free_and_keeps_retry_position(self):
+        from connectors.sdk import ConnectorContractError
+        for message, expected in (
+            ('slack time pagination did not advance', 'pagination_not_advanced'),
+            ('slack historical thread root is missing', 'thread_root_missing'),
+            ('private message and token=secret', 'unclassified_contract_error'),
+        ):
+            with self.subTest(expected=expected), tempfile.TemporaryDirectory() as directory:
+                rail = HistoricalRail()
+                connector = SlackWorkspaceConnector(
+                    rail=rail, source_id='synthetic:slack:contract-reason', workspace_id='T111',
+                )
+                connector.reconciliation_epoch = 'a' * 64
+                active = ConnectorRunner(connector=connector, brain=FakeBrain(),
+                                         spool_path=Path(directory) / 'spool.db')
+                try:
+                    for _ in range(3):
+                        active.run_once()
+                    rail.root['reply_count'] = 1
+                    for _ in range(14):
+                        active.run_once()
+                    with patch.object(rail, 'request', side_effect=ConnectorContractError(message)):
+                        with self.assertLogs('connectors.slack_reconciliation', level='WARNING') as logs:
+                            active.run_once()
+                    self.assertEqual([record.getMessage() for record in logs.records],
+                                     ['slack historical page refused reason=' + expected])
+                    status = active.doctor()['coverage']['historical_reconciliation']
+                    self.assertEqual(status['historical_failures'], 1)
+                    self.assertEqual(status['last_error_code'], 'connector_invalid_page')
+                    self.assertEqual(status['completed_channel_visits'], 0)
+                    self.assertTrue(status['historical_page_in_progress'])
+                    self.assertFalse(status['pending_checkpoint'])
+                finally:
+                    active.close()
+
     def test_historical_provider_outage_preserves_worker_failure_and_position(self):
         rail = HistoricalRail()
         brain = FakeBrain()

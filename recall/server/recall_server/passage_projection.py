@@ -107,7 +107,34 @@ def visible_message_text(text: str) -> str | None:
         if candidate is not None
         for block in _text_blocks(candidate)
     ))
-    return "\n".join(blocks) if blocks else None
+    if blocks:
+        return "\n".join(blocks)
+    # Claude can deliver its final report through this named tool instead of a
+    # text block. Keep existing visible projections (and their offsets) intact.
+    if (
+        value.get("type") != "assistant"
+        or not isinstance(message, dict)
+        or message.get("role") != "assistant"
+        or not isinstance(message.get("content"), list)
+    ):
+        return None
+    reports = []
+    for block in message["content"]:
+        if (
+            not isinstance(block, dict)
+            or block.get("type") != "tool_use"
+            or block.get("name") != "SubagentHandback"
+        ):
+            continue
+        report = block.get("input")
+        if (
+            isinstance(report, dict)
+            and set(report) == {"message"}
+            and isinstance(report["message"], str)
+            and report["message"].strip()
+        ):
+            reports.append(report["message"])
+    return "\n".join(dict.fromkeys(reports)) if reports else None
 
 
 @dataclass(frozen=True)

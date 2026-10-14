@@ -3021,19 +3021,27 @@ class CanonicalLogicalEvidenceProjector:
                         ).fetchall())
                     except psycopg.errors.LockNotAvailable:
                         raise LogicalEvidenceError("logical_evidence_parent_busy") from None
+                    # An admitted row has no physical chunk to witness its sole
+                    # archived body. Any profile marker must refuse whole-parent
+                    # deletion; this grants no authority from an unverified marker.
+                    profile_survivor = (
+                        " OR document.chunk_receipt_profile IS NOT NULL"
+                        if getattr(self.store, "verified_singleton_receipts", False)
+                        else ""
+                    )
                     survivor = connection.execute(
-                        """SELECT 1 FROM canonical_documents document
+                        f"""SELECT 1 FROM canonical_documents document
                            JOIN canonical_events event USING(tenant_id,source_id,event_id)
                            WHERE document.tenant_id=%s AND document.source_id=%s
                              AND COALESCE(event.native_parent_id,event.native_id)=%s
                              AND document.is_current AND document.deleted_at IS NULL
                              AND NOT (document.native_id=ANY(%s))
-                             AND EXISTS (SELECT 1 FROM canonical_chunks chunk
+                             AND (EXISTS (SELECT 1 FROM canonical_chunks chunk
                                  WHERE chunk.tenant_id=document.tenant_id
                                    AND chunk.source_id=document.source_id
                                    AND chunk.document_id=document.document_id
                                    AND chunk.deleted_at IS NULL AND chunk.text_redacted=''
-                                   AND chunk.text_sha256<>%s)
+                                   AND chunk.text_sha256<>%s){profile_survivor})
                            LIMIT 1""",
                         (tenant_id, source_id, parent_id, native_ids, hashlib.sha256(b"").hexdigest()),
                     ).fetchone()
