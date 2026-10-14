@@ -1686,7 +1686,10 @@ class CanonicalPassageProjector:
             raise ValueError("plan_scope")
         target = plan["target"]
         deadline = min(deadline_at or time.monotonic() + 15, time.monotonic() + 15)
+        membership_enabled = getattr(self.store, "verified_singleton_receipts", False)
         with self.store.connect() as connection, connection.transaction():
+            if membership_enabled:
+                connection.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
 
             def query(sql, args):
                 return self.store._execute_bounded(
@@ -1766,15 +1769,25 @@ class CanonicalPassageProjector:
             ).fetchone()["pending"]
             if pending:
                 raise ValueError("projection_pending")
-            stale = query(
-                """SELECT count(*) AS count FROM unnest(%s::text[]) receipt(value)
-                WHERE NOT EXISTS(SELECT 1 FROM canonical_chunks chunk JOIN canonical_documents document
-                     ON document.tenant_id=chunk.tenant_id AND document.source_id=chunk.source_id
-                    AND document.document_id=chunk.document_id
-                    WHERE chunk.tenant_id=%s AND chunk.source_id=%s AND chunk.receipt=receipt.value
-                      AND chunk.deleted_at IS NULL AND document.is_current AND document.deleted_at IS NULL)""",
-                (receipts, tenant, target["source_id"]),
-            ).fetchone()["count"]
+            if membership_enabled:
+                from .receipt_membership import lookup_current_search_membership
+
+                members = lookup_current_search_membership(
+                    self.store, tenant_id=tenant,
+                    authorized_sources=(target["source_id"],), receipts=tuple(receipts),
+                    connection=connection, deadline_at=min(deadline, time.monotonic() + 5),
+                )
+                stale = sum((target["source_id"], receipt) not in members for receipt in receipts)
+            else:
+                stale = query(
+                    """SELECT count(*) AS count FROM unnest(%s::text[]) receipt(value)
+                    WHERE NOT EXISTS(SELECT 1 FROM canonical_chunks chunk JOIN canonical_documents document
+                         ON document.tenant_id=chunk.tenant_id AND document.source_id=chunk.source_id
+                        AND document.document_id=chunk.document_id
+                        WHERE chunk.tenant_id=%s AND chunk.source_id=%s AND chunk.receipt=receipt.value
+                          AND chunk.deleted_at IS NULL AND document.is_current AND document.deleted_at IS NULL)""",
+                    (receipts, tenant, target["source_id"]),
+                ).fetchone()["count"]
             if stale != plan["stale_receipts"] or stale <= 0:
                 raise ValueError("witness_changed")
             inserted = query(
