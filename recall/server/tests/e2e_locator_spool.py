@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Locator spooling stays bounded and disk failure precedes all object uploads."""
+
 from __future__ import annotations
 
 import errno
@@ -24,13 +25,19 @@ from recall_server.logical_evidence_projection import _LocatorSpool  # noqa: E40
 
 def disk_failure(store, root, fail_at):
     tenant, source, archive, projection, projector, _ = fixture(store, root)
+    # Exercise real repair work; a fully unchanged prefix now needs no spool writes.
+    with store.connect() as connection:
+        connection.execute(
+            "UPDATE canonical_documents SET body_record_ordinal=NULL,body_record_count=NULL WHERE tenant_id=%s AND source_id=%s",
+            (tenant, source),
+        )
     before = snapshot(store, tenant, source)
     mark_dirty(store, tenant, source)
     created = []
 
     class FailingSpool(_LocatorSpool):
-        def __init__(self):
-            super().__init__()
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
             self.writes = 0
             created.append(self)
 
