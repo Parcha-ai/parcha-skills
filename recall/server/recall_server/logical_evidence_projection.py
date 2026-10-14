@@ -891,7 +891,9 @@ class CanonicalLogicalEvidenceProjector:
                                 and self.excluded_structural_types == DEFAULT_EXCLUDED_STRUCTURAL_TYPES)
             with self.store.connect() as connection:
                 existing_parts: dict[int, list[dict[str, Any]]] = {}
-                append_columns = ",to_jsonb(append_queue) AS append_queue" if append_candidate else ""
+                append_columns = (",to_jsonb(append_queue) AS append_queue,"
+                    "EXISTS(SELECT 1 FROM schema_migrations WHERE version=79) AS append_capability"
+                    if append_candidate else "")
                 append_join = ("LEFT JOIN canonical_evidence_document_queue append_queue "
                     "ON append_queue.tenant_id=evidence.tenant_id AND append_queue.source_id=evidence.source_id "
                     "AND append_queue.native_parent_id=evidence.native_parent_id") if append_candidate else ""
@@ -933,7 +935,7 @@ class CanonicalLogicalEvidenceProjector:
                     pins[ordinal] = row["manifest"]
                     if append_candidate:
                         from .logical_append_reader import eligible
-                        if eligible(candidates[ordinal], row["manifest"], row.get("append_queue")):
+                        if row.get("append_capability") and eligible(candidates[ordinal], row["manifest"], row.get("append_queue")):
                             append_ordinals.add(ordinal)
                     pinned_parts.setdefault(ordinal, []).append(row)
                     existing_parts.setdefault(

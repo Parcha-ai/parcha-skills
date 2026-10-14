@@ -142,6 +142,43 @@ class AppendReader(unittest.TestCase):
                 full.body_locators.close()
                 appended.body_locators.close()
 
+    def test_removed_optional_schema_marker_forces_full_even_with_stored_binding(self):
+        candidate, upload = self.prepare()
+        upload.body_locators.close()
+        with self.store.connect() as connection:
+            connection.execute("DELETE FROM schema_migrations WHERE version=79")
+        seen = []
+        original = self.logical._record_stream
+
+        def records(rows, **kwargs):
+            def tracked():
+                for row in rows:
+                    seen.append(row["native_id"])
+                    yield row
+
+            return original(tracked(), **kwargs)
+
+        with patch.object(self.logical, "_record_stream", records):
+            upload = self.logical._prepare_batch_and_upload((candidate,))[0]
+        upload.body_locators.close()
+        self.assertEqual(seen, ["old-0", "old-1", "old-2", "new"])
+
+    def test_structural_only_append_advances_frontier_without_changing_content(self):
+        self.ingest("visible", 1)
+        self.assertEqual(self.publish()["documents"], 1)
+        before = self.catalog()
+        self.logical.append_enabled = True
+        self.ingest("structural", 2, record_type="token_count")
+        self.assertTrue(self.safe())
+        self.publish()
+        after = self.catalog()
+        self.assertEqual(after["manifest_artifact_id"], before["manifest_artifact_id"])
+        self.assertEqual(after["append_source_ordinal"], 2)
+        self.assertIsNone(self.queue())
+        self.ingest("new", 3)
+        self.assertTrue(self.safe())
+        self.assertEqual(self.publish()["records"], 2)
+
     def test_custom_retention_prefix_cannot_opt_into_default_append(self):
         from recall_server.logical_evidence_projection import (
             DEFAULT_EXCLUDED_STRUCTURAL_TYPES,
@@ -345,6 +382,123 @@ class AppendReader(unittest.TestCase):
         finally:
             full.body_locators.close()
             appended.body_locators.close()
+
+
+@unittest.skipUnless(
+    os.environ.get("RECALL_TEST_APPEND_LARGE") == "1", "opt-in 10k-parent measurement"
+)
+class LargeAppendReader(unittest.TestCase):
+    setUp = AppendReader.setUp
+    event = AppendReader.event
+    publish = AppendReader.publish
+
+    def test_ten_thousand_prefix_rows_stay_out_of_append_sql(self):
+        import hashlib
+        import resource
+        import time
+
+        seeded = time.monotonic()
+        for start in range(0, 10_000, 1000):
+            events = []
+            for index in range(start, start + 1000):
+                text = "".join(
+                    hashlib.sha256(f"{index}:{part}".encode()).hexdigest()
+                    for part in range(32)
+                )
+                events.append(self.event(f"old-{index:05d}", index + 1, text))
+            self.plane.ingest_batch(
+                tenant_id=self.tenant, principal_id=self.principal, events=events
+            )
+        self.assertEqual(self.publish()["records"], 10_000)
+        self.plane.ingest_batch(
+            tenant_id=self.tenant,
+            principal_id=self.principal,
+            events=[
+                self.event(f"new-{index}", 10_001 + index, "New exact body " * 100)
+                for index in range(10)
+            ],
+        )
+        seed_seconds = time.monotonic() - seeded
+        candidate = self.logical._pending(tenant_id=self.tenant, limit=1)[0]
+        statements, actual = [], []
+        original_execute = psycopg.ServerCursor.execute
+        original_records = self.logical._record_stream
+
+        def execute(cursor, query, params=None, **kwargs):
+            if cursor.name == "logical_evidence_batch_stream":
+                statements.append((query, params))
+            return original_execute(cursor, query, params, **kwargs)
+
+        def records(rows, **kwargs):
+            def inputs():
+                for row in rows:
+                    actual[-1]["rows"] += 1
+                    actual[-1]["bytes"] += len(row["event_text"].encode())
+                    actual[-1]["old_rows"] += int(row["native_id"].startswith("old-"))
+                    yield row
+
+            return original_records(inputs(), **kwargs)
+
+        uploads, times = [], []
+        try:
+            for enabled in (False, True):
+                self.logical.append_enabled = enabled
+                actual.append(dict(rows=0, bytes=0, old_rows=0))
+                started = time.monotonic()
+                with (
+                    patch.object(psycopg.ServerCursor, "execute", execute),
+                    patch.object(self.logical, "_record_stream", records),
+                ):
+                    uploads.append(
+                        self.logical._prepare_batch_and_upload((candidate,))[0]
+                    )
+                times.append(time.monotonic() - started)
+            full, appended = uploads
+            self.assertEqual([row["rows"] for row in actual], [10_010, 10])
+            self.assertEqual([row["old_rows"] for row in actual], [10_000, 0])
+            self.assertEqual(full.prepared, appended.prepared)
+            self.assertEqual(full.manifest.encode(), appended.manifest.encode())
+            self.assertEqual(full.part_references, appended.part_references)
+            self.assertEqual(full.manifest_reference, appended.manifest_reference)
+            self.assertEqual(list(full.body_locators), list(appended.body_locators))
+
+            def loops(node):
+                return (
+                    node.get("Actual Loops", 0)
+                    if node.get("Relation Name") == "canonical_chunks"
+                    else 0
+                ) + sum(loops(child) for child in node.get("Plans", []))
+
+            actual_loops = []
+            with self.store.connect() as connection:
+                for query, params in statements:
+                    plan = connection.execute(
+                        "EXPLAIN (ANALYZE,BUFFERS,FORMAT JSON) " + query, params
+                    ).fetchone()["QUERY PLAN"][0]
+                    actual_loops.append(loops(plan["Plan"]))
+            self.assertEqual(actual_loops, [10_010, 10])
+            self.assertEqual(
+                self.logical._commit_upload(candidate, appended), "committed"
+            )
+            print(
+                dict(
+                    seed_seconds=round(seed_seconds, 3),
+                    full_seconds=round(times[0], 3),
+                    append_seconds=round(times[1], 3),
+                    full_sql=actual[0],
+                    append_sql=actual[1],
+                    chunk_lookup_loops=actual_loops,
+                    archive_document_bytes=sum(
+                        ref["size_bytes"] for ref in full.part_references
+                    ),
+                    process_peak_rss_kib=resource.getrusage(
+                        resource.RUSAGE_SELF
+                    ).ru_maxrss,
+                )
+            )
+        finally:
+            for upload in uploads:
+                upload.body_locators.close()
 
 
 class AppendReaderCapabilityMatrix(fixtures.AppendCapability):

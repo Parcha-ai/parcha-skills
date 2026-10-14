@@ -40,14 +40,21 @@ that did commit. No retirement verifier changes are included.
 * Real PostgreSQL: eight prefix inputs plus two new inputs returned only the two
   new bodies. Actual chunk lookup loops fell from ten to two. Full and append
   prepared metadata, manifest, part references and locator intents matched.
-* Twenty-four PostgreSQL cases cover the capability fallback matrix, custom
-  exclusions, multi-segment Unicode bodies, cold retired chunks, missing archive
+* Twenty-six PostgreSQL cases cover the capability fallback matrix, custom
+  exclusions, schema-marker removal, structural-only appends, multi-segment Unicode bodies, cold retired chunks, missing archive
   objects, lease-free archive body reads, catalog replacement, concurrent append,
   forget and lost acknowledgment.
 * A 100,000-record prefix (97,266,670 bytes in 24 parts) plus ten new records
   produced identical bytes and references. The local builder took 3.025 seconds
   for the full path and 0.322 seconds for append, with process peak RSS 245,060 KiB.
   This uses a local synthetic archive, not production database or network timing.
+* Opt-in real PostgreSQL measurement: 10,000 old records plus ten new records
+  returned 10,010 rows/20,745,250 body bytes on full preparation versus ten
+  rows/15,250 bytes on append, with zero old bodies. Actual chunk lookup loops
+  fell from 10,010 to ten. Full preparation took 2.683 seconds versus 0.220 seconds;
+  outputs matched and the unchanged commit succeeded. The archive document was
+  23,506,830 bytes, process peak RSS 208,960 KiB, and fixture seeding took 78.773
+  seconds. This is local PostgreSQL/filesystem evidence, not a hosted result.
 * Retained full-publication, locator, supersession, archive-admission and original
   retirement-runner gates pass. The frozen fallback comparison passes in its
   isolated PostgreSQL fixture (148 shapes, 264 ordered rows, unchanged legacy
