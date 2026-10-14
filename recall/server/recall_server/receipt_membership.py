@@ -48,6 +48,75 @@ def admitted_singleton_metadata(row: dict[str, Any], *, include_deleted: bool = 
             'ordinal': 0, 'receipt': receipt, 'text_sha256': row['document_text_sha256']}
 
 
+def lookup_current_search_membership(
+    store: Any, *, tenant_id: str, authorized_sources: tuple[str, ...],
+    receipts: tuple[str, ...], connection: Any, deadline_at: float,
+) -> set[tuple[str, str]]:
+    """Keep physical search proof first; derive only unresolved admitted receipts.
+
+    Supported ingest/forget writers atomically invalidate current documents on
+    edit or deletion. Current search therefore retains its existing live chunk
+    and current-document authority, without historical event probes. The full
+    metadata lookup below deliberately keeps its stronger historical fences.
+
+    This opt-in boundary requires the separately admitted profile column. The
+    admission owner must set the profile and remove its exact chunk atomically.
+    A flag never overrides a retained deleted or different-ordinal chunk.
+    """
+    if (not isinstance(tenant_id, str) or not V2_AUTHORITY_RE.fullmatch(tenant_id)
+            or not isinstance(authorized_sources, tuple)
+            or any(not isinstance(source, str) or not V2_AUTHORITY_RE.fullmatch(source)
+                   for source in authorized_sources)
+            or not isinstance(receipts, tuple)
+            or any(not isinstance(receipt, str) for receipt in receipts)):
+        raise ReceiptMembershipError('receipt_membership_authority_invalid')
+    requested = []
+    for receipt in dict.fromkeys(receipts):
+        source, native, revision, ordinal = _identity(receipt)
+        if source in authorized_sources:
+            requested.append((receipt, source, native, revision, ordinal))
+    if not requested:
+        return set()
+    rows = store._execute_bounded(connection, """WITH requested AS MATERIALIZED (
+        SELECT * FROM unnest(%s::text[],%s::text[],%s::text[],%s::integer[],%s::integer[])
+          AS wanted(receipt,source_id,native_id,revision,ordinal)
+    ), physical AS MATERIALIZED (
+        SELECT requested.source_id,requested.receipt
+          FROM requested
+          JOIN canonical_chunks chunk ON chunk.tenant_id=%s
+           AND chunk.source_id=requested.source_id AND chunk.receipt=requested.receipt
+           AND chunk.deleted_at IS NULL
+          JOIN canonical_documents document ON document.tenant_id=chunk.tenant_id
+           AND document.source_id=chunk.source_id AND document.document_id=chunk.document_id
+           AND document.is_current AND document.deleted_at IS NULL
+    ), unresolved AS MATERIALIZED (
+        SELECT requested.* FROM requested WHERE NOT EXISTS (
+            SELECT 1 FROM physical WHERE physical.source_id=requested.source_id
+              AND physical.receipt=requested.receipt
+        )
+    )
+    SELECT physical.source_id,physical.receipt,true AS allowed FROM physical
+    UNION ALL
+    SELECT unresolved.source_id,unresolved.receipt,
+           document.chunk_receipt_profile=1 AND NOT EXISTS (
+               SELECT 1 FROM canonical_chunks remaining
+                WHERE remaining.tenant_id=document.tenant_id
+                  AND remaining.source_id=document.source_id
+                  AND remaining.document_id=document.document_id
+           ) AS allowed
+      FROM unresolved
+      JOIN canonical_documents document ON document.tenant_id=%s
+       AND document.source_id=unresolved.source_id AND document.native_id=unresolved.native_id
+       AND document.revision=unresolved.revision
+     WHERE document.is_current AND document.deleted_at IS NULL
+       AND document.chunk_receipt_profile IS NOT NULL AND unresolved.ordinal=0
+    """, tuple([row[index] for row in requested] for index in range(5)) + (
+        tenant_id, tenant_id), deadline_at).fetchall()
+    if any(not row['allowed'] for row in rows):
+        raise ReceiptMembershipError('receipt_membership_profile_invalid')
+    return {(row['source_id'], row['receipt']) for row in rows}
+
+
 def lookup_receipt_metadata(
     store: Any, *, tenant_id: str, authorized_sources: tuple[str, ...],
     receipts: tuple[str, ...], allow_verified_singletons: bool = False,

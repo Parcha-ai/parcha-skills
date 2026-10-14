@@ -43,6 +43,24 @@ SPARSE_LIMIT = 400
 MAX_SPARSE_TOKENS = 8
 
 
+_SELECTED_AUTHORITY_SQL = """
+                            SELECT passage.tenant_id,passage.source_id,passage.passage_id,
+                                   passage.logical_document_id,passage.text_sha256,passage.receipts,
+                                   evidence.revision,evidence.manifest_object_key,
+                                   evidence.manifest_content_sha256
+                              FROM canonical_passages passage
+                              JOIN canonical_passage_documents projected
+                                USING(tenant_id,source_id,logical_document_id,policy_fingerprint)
+                              JOIN canonical_evidence_documents evidence
+                                USING(tenant_id,source_id,logical_document_id)
+                             WHERE passage.tenant_id=%s AND passage.source_id=ANY(%s)
+                               AND passage.policy_fingerprint=%s
+                               AND (passage.source_id,passage.passage_id) IN (
+                                   SELECT * FROM unnest(%s::text[],%s::text[])
+                               )
+                               AND cardinality(passage.receipts)>0
+"""
+
 def _value(row: Any, key: str, default: Any = None) -> Any:
     """Attribute ``key`` of a result row, or ``default``.
 
@@ -360,6 +378,29 @@ class TurbopufferHintRetrieval(PassageHintRetrieval):
             return [], status
         return self._scored(raw), "ok"
 
+    def _authorize_singletons(self, connection, requested, deadline_at):
+        """Keep catalog and typed receipt membership in one request snapshot."""
+        from .receipt_membership import lookup_current_search_membership
+
+        with connection.transaction():
+            # Set isolation before _execute_bounded issues SELECT set_config.
+            # The first data statement and every following statement keep the
+            # caller's deadline; no snapshot survives this transaction.
+            if time.monotonic() >= deadline_at:
+                raise SearchDeadlineExceeded()
+            connection.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            selected = self.store._execute_bounded(connection, _SELECTED_AUTHORITY_SQL,
+                (self.tenant_id, self.sources, self.policy_fingerprint,
+                 [source for source, _ in requested], [passage for _, passage in requested]),
+                deadline_at).fetchall()
+            receipts = tuple(dict.fromkeys(receipt for row in selected for receipt in row['receipts']))
+            members = lookup_current_search_membership(self.store, tenant_id=self.tenant_id,
+                authorized_sources=tuple(self.sources), receipts=receipts,
+                deadline_at=deadline_at, connection=connection)
+            return [row for row in selected if all(
+                (row['source_id'], receipt) in members
+                for receipt in row['receipts'])]
+
     def _authorize_ranges(self, results, legs, *, deadline_at, include_arms=False):
         """Canonical receipt metadata fences asynchronous search-plane writes.
 
@@ -399,9 +440,12 @@ class TurbopufferHintRetrieval(PassageHintRetrieval):
             if time.monotonic() >= deadline_at:
                 raise SearchDeadlineExceeded()
             with self.store.connect() as connection:
-                authoritative = self.store._execute_bounded(
-                    connection,
-                    """WITH selected AS MATERIALIZED (
+                if getattr(self.store, 'verified_singleton_receipts', False):
+                    authoritative = self._authorize_singletons(connection, requested, deadline_at)
+                else:
+                    authoritative = self.store._execute_bounded(
+                        connection,
+                        """WITH selected AS MATERIALIZED (
                             SELECT passage.tenant_id,passage.source_id,passage.passage_id,
                                    passage.logical_document_id,passage.text_sha256,passage.receipts,
                                    evidence.revision,evidence.manifest_object_key,
@@ -448,11 +492,11 @@ class TurbopufferHintRetrieval(PassageHintRetrieval):
                                   selected.revision,selected.manifest_object_key,
                                   selected.manifest_content_sha256
                         HAVING bool_and(live.value IS NOT NULL)""",
-                    (self.tenant_id, self.sources, self.policy_fingerprint,
-                     [source for source, _passage in requested],
-                     [passage for _source, passage in requested]),
-                    deadline_at,
-                ).fetchall()
+                        (self.tenant_id, self.sources, self.policy_fingerprint,
+                         [source for source, _passage in requested],
+                         [passage for _source, passage in requested]),
+                        deadline_at,
+                    ).fetchall()
         except SearchDeadlineExceeded:
             status = "deadline-exceeded"
         except Exception:
