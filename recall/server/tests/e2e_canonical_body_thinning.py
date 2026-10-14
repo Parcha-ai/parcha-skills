@@ -305,6 +305,7 @@ def main() -> None:
         assert good["canonical_redacted"]["provenance"] == {
             "cwd": "/workspace/project",
             "branch": "main",
+            "original_path": "/private/source/transcript.jsonl",
         }
         assert good["canonical_redacted"]["content"]["type"] == "assistant"
         assert (

@@ -51,6 +51,8 @@ def _compact_event_expression(alias: str = "event") -> str:
         f"'privacy_policy_version',{alias}.canonical_redacted #> "
         "'{provenance,privacy_policy_version}',"
         f"'harness',{alias}.canonical_redacted #> '{{provenance,harness}}',"
+        f"'uri',{alias}.canonical_redacted #> '{{provenance,uri}}',"
+        f"'original_path',{alias}.canonical_redacted #> '{{provenance,original_path}}',"
         f"'cwd',{alias}.canonical_redacted #> '{{provenance,cwd}}',"
         f"'branch',{alias}.canonical_redacted #> '{{provenance,branch}}',"
         f"'slot',{alias}.canonical_redacted #> '{{provenance,slot}}',"
@@ -59,6 +61,9 @@ def _compact_event_expression(alias: str = "event") -> str:
     )
     return (
         "jsonb_strip_nulls(jsonb_build_object("
+        f"'principal_id',{alias}.canonical_redacted->'principal_id',"
+        f"'visibility',{alias}.canonical_redacted->'visibility',"
+        f"'content_type',{alias}.canonical_redacted->'content_type',"
         f"'role',{alias}.canonical_redacted->'role',"
         f"'type',{alias}.canonical_redacted->'type',"
         f"'provenance',{provenance},"
