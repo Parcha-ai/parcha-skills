@@ -12,6 +12,7 @@ already consume, so nothing above the arms changes.
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import time
 from typing import Any
@@ -588,6 +589,14 @@ class TurbopufferHintRetrieval(PassageHintRetrieval):
                     continue
                 text = _value(item, TEXT_ATTRIBUTE)
                 if not isinstance(text, str):
+                    continue
+                # Authority checked catalog metadata before this separate body
+                # fetch. Bind the returned bytes to that same canonical hash.
+                authorized_rows = leg_rows.get(passage_id, ())
+                body_sha256 = hashlib.sha256(text.encode()).hexdigest()
+                if not authorized_rows or any(
+                    row.get("text_sha256") != body_sha256 for row in authorized_rows
+                ):
                     continue
                 spans = parse_spans(_value(item, "spans"))
                 header = _value(item, "header") or None

@@ -179,6 +179,53 @@ class ArmTests(unittest.TestCase):
         ns.fail_queries = None
         self.assertEqual(retrieval._lexical_candidates("q", deadline_at=time.monotonic() - 1, **common)[1], "deadline-exceeded")
 
+    def test_search_rejects_body_bytes_changed_after_catalog_authorization(self) -> None:
+        client = FakeTurbopuffer()
+        ns = self._seed(client)
+        retrieval, store = self._retrieval(client)
+        store.query_clauses = False
+        store.rerank_runtime = RerankWiringTests._FakeRerank({})
+        original_query = ns.query
+        corrupt_text = "UNAUTHORIZED replacement body after catalog authorization"
+
+        def changed_body(**kwargs):
+            response = original_query(**kwargs)
+            if kwargs.get("rank_by") == ("id", "asc"):
+                for row in response.rows:
+                    if row["id"] == f"psg_{1:032x}":
+                        row["text"] = corrupt_text
+            return response
+
+        ns.query = changed_body
+        response = retrieval.search(
+            "why did the deploy fail?", lexical_query="deploy fail",
+            since=None, until=None, limit=10,
+        )
+        self.assertNotIn(corrupt_text, repr(response))
+        self.assertNotIn(corrupt_text, repr(store.rerank_runtime.calls))
+        self.assertEqual(response["diagnostics"]["hydrate_status"], "partial")
+        self.assertGreater(response["diagnostics"]["hydrated_passages"], 0)
+        affected = next(row for row in response["results"] if row["logical_document_id"] == LDOC)
+        rejected = next(row for row in affected["matching_ranges"] if row["passage_id"] == f"psg_{1:032x}")
+        self.assertEqual(rejected["text"], "")
+
+    def test_search_checks_full_utf8_body_before_clipping_output(self) -> None:
+        client = FakeTurbopuffer()
+        ns = client.namespace(SETTINGS.namespace(TENANT))
+        text = "deployment αβ " * 2000
+        ns.write(upsert_rows=[passage_row(catalog_passage(1, text))])
+        retrieval, store = self._retrieval(client)
+        store.query_clauses = False
+        response = retrieval.search(
+            "deployment", lexical_query="deployment",
+            since=None, until=None, limit=10,
+        )
+        hint = response["results"][0]["matching_ranges"][0]
+        self.assertTrue(hint["text_clipped"])
+        self.assertTrue(text.startswith(hint["text"]))
+        self.assertTrue(hint["text"])
+        self.assertEqual(response["diagnostics"]["hydrate_status"], "ok")
+
     def test_search_runs_fusion_rerank_and_hints_on_the_plane(self) -> None:
         client = FakeTurbopuffer()
         ns = self._seed(client)

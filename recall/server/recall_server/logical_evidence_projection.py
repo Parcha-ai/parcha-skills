@@ -164,6 +164,7 @@ class _LocatedUpload(LogicalEvidenceUpload):
     body_locators: _LocatorSpool | None = None
     inline_document_ids: tuple[str, ...] = ()
     append_base_manifest_id: str | None = None
+    input_sql_rows: int | None = None
 
 
 def _close_body_locators(upload):
@@ -876,6 +877,7 @@ class CanonicalLogicalEvidenceProjector:
             raise ValueError("queue currentness checkpoint requires one worker parent")
         uploads: list[LogicalEvidenceUpload | None] = [None] * len(candidates)
         completed: list[LogicalEvidenceUpload] = []
+        input_sql_rows = [0] * len(candidates)
         spool = tempfile.TemporaryFile(mode="w+b")
         ranges: list[tuple[int, int, int]] = []
         input_spool = None
@@ -1156,6 +1158,7 @@ class CanonicalLogicalEvidenceProjector:
                             # This file is private, self-produced and never
                             # accepted as input from another process or source.
                             pickle.dump(dict(row), input_spool, protocol=5)
+                            input_sql_rows[ordinal] += 1
                         input_ranges.append((ordinal, start, input_spool.tell()))
                 if append_ordinals and not input_ranges:
                     input_ranges.append((0, input_spool.tell(), input_spool.tell()))
@@ -1280,6 +1283,7 @@ class CanonicalLogicalEvidenceProjector:
                     **vars(upload), body_locators=body_locators[ordinal],
                     inline_document_ids=inline_document_ids[ordinal],
                     append_base_manifest_id=(prefix.manifest_reference["artifact_id"] if prefix else None),
+                    input_sql_rows=input_sql_rows[ordinal],
                 )
                 uploads[ordinal] = upload
                 completed.append(upload)
@@ -2544,17 +2548,21 @@ class CanonicalLogicalEvidenceProjector:
             started = time.monotonic()
             identity = hashlib.sha256(json.dumps(parent_key(candidate)).encode()).hexdigest()
             status = "error"
+            upload = None
             owner_log("logical owner started parent_sha256=%s estimated_bytes=%s estimated_records=%s",
                       identity, candidate.estimated_bytes, candidate.estimated_records)
             try:
                 result = prepare_parent(candidate)
-                status = result[1]
+                upload, status = result
                 return result
             finally:
                 owner_log("logical owner completed parent_sha256=%s estimated_bytes=%s "
-                          "estimated_records=%s elapsed_ms=%s status=%s",
+                          "estimated_records=%s elapsed_ms=%s status=%s append_used=%s input_sql_rows=%s",
                           identity, candidate.estimated_bytes, candidate.estimated_records,
-                          max(0, round((time.monotonic() - started) * 1000)), status)
+                          max(0, round((time.monotonic() - started) * 1000)), status,
+                          (getattr(upload, "append_base_manifest_id", None) is not None
+                           if upload is not None else None),
+                          getattr(upload, "input_sql_rows", None))
 
         def fill_slots(executor):
             nonlocal batches
