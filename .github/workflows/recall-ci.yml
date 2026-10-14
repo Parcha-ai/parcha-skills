@@ -84,6 +84,7 @@ jobs:
             e2e_logical_admission_sharing.py \
             e2e_logical_small_work_progress.py \
             e2e_logical_early_supersession.py \
+            e2e_logical_dispatch_refresh.py \
             e2e_logical_periodic_supersession.py \
             e2e_logical_stream_supersession.py \
             e2e_pool_warmup.py \

@@ -37,6 +37,7 @@ class InterruptingProjector(CanonicalLogicalEvidenceProjector):
         self.projection = None
         self.bound_tenant_id = "tenant:company:synthetic"
         self.raw_archive = None
+        self.append_enabled = False
         self.excluded_structural_types = (
             "file-history-snapshot",
             "queue-operation",
