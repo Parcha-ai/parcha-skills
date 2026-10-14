@@ -29,16 +29,16 @@ class SingletonMetadataRestore(ReceiptMembershipTests):
         result = self.restore(original, apply=True, reviewed_plan=preview['plan'])
         self.assertEqual(result['restored_documents'], 1)
         self.assertEqual(self.baseline(original['receipt']), original)
-        self.assertEqual(self.store.resolve(original['receipt'], tenant_id=self.tenant, authorized_sources=(self.source,)), self.public_response)
+        self.assertEqual(self.store.resolve(original['receipt'], tenant_id=self.tenant, authorized_sources=(self.source,), chunk_body_archive=self.archive), self.public_response)
         with self.store.connect() as connection:
             row = connection.execute('''SELECT chunk.text_redacted,document.chunk_receipt_profile
                 FROM canonical_chunks chunk JOIN canonical_documents document USING(tenant_id,source_id,document_id)
                 WHERE chunk.tenant_id=%s AND chunk.receipt=%s''',
                 (self.tenant, original['receipt'])).fetchone()
-        self.assertEqual(row, dict(text_redacted='Exact archive rollback body α 🧠', chunk_receipt_profile=None))
+        self.assertEqual(row, dict(text_redacted='', chunk_receipt_profile=None))
         with self.store.connect() as connection:
             progress = connection.execute('SELECT enabled FROM canonical_chunk_retirement_progress WHERE tenant_id=%s AND source_id=%s AND native_parent_id=%s', (self.tenant, self.source, 'session')).fetchone()
-        self.assertEqual(progress, {'enabled': False})
+        self.assertIsNone(progress)
 
     def test_restore_requires_the_existing_source_owner_grant(self):
         original = self.prepare()
@@ -190,7 +190,11 @@ class SingletonMetadataRestore(ReceiptMembershipTests):
         from recall_server import singleton_metadata_restore as owner
         original = self.prepare()
         preview = self.restore(original)
-        with patch.object(owner, 'disable_parent_retirement_after_restore', side_effect=ChunkRetirementError('synthetic rollback')):
+        restore = owner.restore_outgoing
+        def restore_then_fail(*args, **kwargs):
+            restore(*args, **kwargs)
+            raise ChunkRetirementError('synthetic rollback after reconstruction')
+        with patch.object(owner, 'restore_outgoing', restore_then_fail):
             with self.assertRaises(ChunkRetirementError):
                 self.restore(original, apply=True, reviewed_plan=preview['plan'])
         self.assertIsNone(self.baseline(original['receipt']))
@@ -207,6 +211,24 @@ class SingletonMetadataRestore(ReceiptMembershipTests):
                 self.restore(original, deadline_at=time.monotonic()-1)
         read.assert_not_called()
         self.assertIsNone(self.baseline(original['receipt']))
+
+
+    def test_restore_metadata_only_keeps_archived_bytes_out_of_sql_and_progress_enabled(self):
+        from recall_server.chunk_retirement import set_parent_retirement_enabled
+        original = self.prepare()
+        set_parent_retirement_enabled(self.store, tenant_id=self.tenant, source_id=self.source,
+                                      native_parent_id='session', enabled=True)
+        with self.store.connect() as connection:
+            before = connection.execute('SELECT * FROM canonical_chunk_retirement_progress WHERE tenant_id=%s AND source_id=%s', (self.tenant,self.source)).fetchone()
+        preview = self.restore(original)
+        result = self.restore(original, apply=True, reviewed_plan=preview['plan'])
+        with self.store.connect() as connection:
+            chunk = connection.execute('SELECT text_redacted FROM canonical_chunks WHERE tenant_id=%s AND receipt=%s', (self.tenant,original['receipt'])).fetchone()
+            after = connection.execute('SELECT * FROM canonical_chunk_retirement_progress WHERE tenant_id=%s AND source_id=%s', (self.tenant,self.source)).fetchone()
+        self.assertEqual(chunk, {'text_redacted': ''})
+        self.assertEqual(result['restored_body_bytes'], 0)
+        self.assertEqual(after, before)
+        self.assertEqual(self.store.resolve(original['receipt'], tenant_id=self.tenant, authorized_sources=(self.source,), chunk_body_archive=self.archive), self.public_response)
 
 
 if __name__ == '__main__':

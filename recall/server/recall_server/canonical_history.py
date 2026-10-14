@@ -186,8 +186,10 @@ def prepare_history(store, archive, *, tenant_id: str, candidates: list[dict[str
         yield staged
 
 
-def restore_outgoing(connection, staged, *, tenant_id, source_id, native_ids, store=None, deadline_at=None):
-    """Called after replay detection, under the writer's native advisory locks."""
+def restore_outgoing(connection, staged, *, tenant_id, source_id, native_ids, store=None, deadline_at=None, restore_mode="body"):
+    """Reconstruct under native locks; explicit metadata rollback keeps bodies archived."""
+    if restore_mode not in {"body", "metadata"}:
+        raise HistoryUnavailable()
     def execute(sql, parameters):
         if deadline_at is not None:
             return store._execute_bounded(connection, sql, parameters, deadline_at)
@@ -209,6 +211,8 @@ def restore_outgoing(connection, staged, *, tenant_id, source_id, native_ids, st
          ORDER BY document.document_id FOR UPDATE
     ''', (tenant_id, source_id, native_ids, EMPTY_SHA256)).fetchall()
     for row in rows:
+        if restore_mode == 'metadata' and row['chunk_receipt_profile'] is None:
+            raise HistoryUnavailable()
         if row['chunk_receipt_profile'] is not None:
             from .receipt_membership import lookup_receipt_metadata
             from .projectors import item_receipt
@@ -228,12 +232,14 @@ def restore_outgoing(connection, staged, *, tenant_id, source_id, native_ids, st
                 tenant_id,source_id,chunk_id,document_id,ordinal,receipt,text_redacted,text_sha256,created_at)
                 VALUES (%s,%s,%s,%s,0,%s,%s,%s,%s)''',
                 (tenant_id, source_id, member['chunk_id'], row['document_id'], receipt,
-                 restored[0]['text_redacted'], member['text_sha256'], row['created_at']))
+                 restored[0]['text_redacted'] if restore_mode == 'body' else '', member['text_sha256'], row['created_at']))
             changed = execute('''UPDATE canonical_documents SET chunk_receipt_profile=NULL
                 WHERE tenant_id=%s AND source_id=%s AND document_id=%s AND chunk_receipt_profile=1''',
                 (tenant_id, source_id, row['document_id']))
             if changed.rowcount != 1:
                 raise HistoryUnavailable()
+            if restore_mode == 'metadata':
+                continue
         chunks = execute('''
             SELECT ordinal,receipt,text_sha256,
                    (text_redacted='' AND text_sha256<>%s) AS missing

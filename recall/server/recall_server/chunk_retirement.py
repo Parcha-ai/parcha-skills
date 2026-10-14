@@ -34,23 +34,6 @@ class ChunkRetirementError(RuntimeError):
         super().__init__(code)
 
 
-def disable_parent_retirement_after_restore(store, connection, *, tenant_id, source_id, parents, deadline_at):
-    # Restoration pauses later bulk work for these exact parents. The
-    # ledger is optional for the older explicit schema68 command.
-    ledger = store._execute_bounded(connection,
-        "SELECT to_regclass('canonical_chunk_retirement_progress') AS ledger", (), deadline_at).fetchone()['ledger']
-    if ledger is not None:
-        store._execute_bounded(connection, '''INSERT INTO canonical_chunk_retirement_progress
-            (tenant_id,source_id,native_parent_id,logical_document_id,enabled,status)
-            SELECT tenant_id,source_id,native_parent_id,logical_document_id,false,'disabled'
-            FROM canonical_evidence_documents
-            WHERE tenant_id=%s AND source_id=%s AND logical_document_id=ANY(%s)
-            ON CONFLICT(tenant_id,source_id,native_parent_id) DO UPDATE SET
-            enabled=false,scope_epoch=canonical_chunk_retirement_progress.scope_epoch+1,
-            status='disabled',updated_at=clock_timestamp()''',
-            (tenant_id, source_id, parents), deadline_at)
-
-
 def _check(deadline_at):
     if time.monotonic() >= deadline_at:
         raise SearchDeadlineExceeded()
@@ -152,8 +135,20 @@ def _apply_verified(store, *, catalog, plan, tenant_id, source_id, document_ids,
         if _plan(current_catalog, current_chunks, plan['runtime_profile'], plan['operation']) != plan:
             raise ChunkRetirementError('chunk_retirement_proof_changed')
         if plan['operation'] == 'restore':
-            disable_parent_retirement_after_restore(store, connection, tenant_id=tenant_id,
-                source_id=source_id, parents=parents, deadline_at=deadline_at)
+            # Restoration pauses later bulk work for these exact parents. The
+            # ledger is optional for the older explicit schema68 command.
+            ledger = store._execute_bounded(connection,
+                "SELECT to_regclass('canonical_chunk_retirement_progress') AS ledger", (), deadline_at).fetchone()['ledger']
+            if ledger is not None:
+                store._execute_bounded(connection, '''INSERT INTO canonical_chunk_retirement_progress
+                    (tenant_id,source_id,native_parent_id,logical_document_id,enabled,status)
+                    SELECT tenant_id,source_id,native_parent_id,logical_document_id,false,'disabled'
+                    FROM canonical_evidence_documents
+                    WHERE tenant_id=%s AND source_id=%s AND logical_document_id=ANY(%s)
+                    ON CONFLICT(tenant_id,source_id,native_parent_id) DO UPDATE SET
+                    enabled=false,scope_epoch=canonical_chunk_retirement_progress.scope_epoch+1,
+                    status='disabled',updated_at=clock_timestamp()''',
+                    (tenant_id, source_id, parents), deadline_at)
             for document in plan['documents']:
                 missing = {chunk['ordinal'] for chunk in document['chunks']
                     if chunk['current_bytes'] == 0 and chunk['text_sha256'] != EMPTY_SHA256}

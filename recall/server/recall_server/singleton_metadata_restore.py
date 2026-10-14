@@ -12,7 +12,7 @@ from .canonical_history import restore_outgoing, stage_history_rows
 from .chunk_bodies import chunk_catalog_snapshot
 from .chunk_retirement import (
     ChunkRetirementError, _try_parent_native_locks,
-    disable_parent_retirement_after_restore, require_retirement_owner,
+    require_retirement_owner,
 )
 from .db import V2_AUTHORITY_RE
 from .parent_chunk_proof import read_parent_catalog
@@ -42,8 +42,10 @@ def _validate(tenant_id, source_id, principal_id, document_ids, deadline_at):
 
 def restore_singleton_metadata(store, archive, *, tenant_id, source_id, principal_id,
                                document_ids, apply=False, reviewed_plan=None, deadline_at=None):
-    """Restore exact verified bodies and metadata, dry-run unless explicitly applied.
+    """Restore exact metadata with empty text, dry-run unless explicitly applied.
 
+    Admission removed an already body-retired row. This restores that state
+    without adding archived plaintext back to SQL or changing retirement progress.
     No profile is issued here. Preparation releases SQL before archive reads;
     apply rechecks source authority and the exact catalog under existing locks.
     An exception, including a lost COMMIT acknowledgment, returns no counters.
@@ -72,12 +74,13 @@ def restore_singleton_metadata(store, archive, *, tenant_id, source_id, principa
             if len(chunks) != 1 or chunks[0]['ordinal'] != 0:
                 raise ChunkRetirementError('singleton_restore_metadata_invalid')
             plan_documents.append(dict(document, chunk_id=_opaque('chk', tenant_id, source_id, document['document_id'], '0'), receipt=chunks[0]['receipt'],
-                body_bytes=len(chunks[0]['text_redacted'].encode())))
+                body_bytes=0, archive_utf8_bytes=len(chunks[0]['text_redacted'].encode())))
         plan = dict(version=1, tenant_id=tenant_id, source_id=source_id,
                     documents=plan_documents, catalog_sha256=fingerprint)
         if not apply:
             return dict(status='dry_run', plan=plan, restored_documents=0,
-                        eligible_documents=len(documents), eligible_utf8_bytes=sum(d['body_bytes'] for d in plan_documents))
+                        eligible_documents=len(documents), restored_body_bytes=0,
+                        verified_archive_utf8_bytes=sum(d['archive_utf8_bytes'] for d in plan_documents))
         if plan != reviewed_plan:
             raise ChunkRetirementError('singleton_restore_plan_changed')
         with store.connect() as connection, connection.transaction():
@@ -91,21 +94,19 @@ def restore_singleton_metadata(store, archive, *, tenant_id, source_id, principa
             if locked != documents:
                 raise ChunkRetirementError('singleton_restore_documents_changed')
             parents = sorted({row['native_parent_id'] or row['native_id'] for row in rows})
-            logical_ids = []
             for parent in parents:
-                catalog = read_parent_catalog(store, connection, (*scope, parent), deadline_at, lock=True)
-                logical_ids.append(catalog['manifest']['logical_document_id'])
+                read_parent_catalog(store, connection, (*scope, parent), deadline_at, lock=True)
             after = chunk_catalog_snapshot(store, tenant_id=tenant_id, source_ids=(source_id,),
                 document_ids=document_ids, connection=connection, deadline_at=deadline_at)
             if after != before:
                 raise ChunkRetirementError('singleton_restore_catalog_changed')
             restore_outgoing(connection, staged, tenant_id=tenant_id, source_id=source_id,
-                native_ids=[document['native_id'] for document in documents], store=store, deadline_at=deadline_at)
-            disable_parent_retirement_after_restore(store, connection, tenant_id=tenant_id,
-                source_id=source_id, parents=logical_ids, deadline_at=deadline_at)
+                native_ids=[document['native_id'] for document in documents], store=store,
+                deadline_at=deadline_at, restore_mode='metadata')
             _check(deadline_at)
         return dict(status='restored', plan=plan, restored_documents=len(documents),
-                    restored_utf8_bytes=sum(d['body_bytes'] for d in plan_documents))
+                    restored_body_bytes=0,
+                    verified_archive_utf8_bytes=sum(d['archive_utf8_bytes'] for d in plan_documents))
 
 
 def inspect_singleton_restoration(store, *, principal_id, reviewed_plan, deadline_at=None):
@@ -135,6 +136,7 @@ def inspect_singleton_restoration(store, *, principal_id, reviewed_plan, deadlin
     restored = sum(counts[row['document_id']] == 1 and row['chunk_receipt_profile'] is None
                    and row['ordinal'] == 0 and all(row[key] == expected[row['document_id']][key]
                      for key in ('native_id','revision','text_sha256','created_at','chunk_id','receipt','body_bytes'))
-                   and row['chunk_sha256'] == row['actual_sha256'] == row['text_sha256'] for row in rows)
+                   and row['chunk_sha256'] == row['text_sha256']
+                   and row['actual_sha256'] == hashlib.sha256(b'').hexdigest() for row in rows)
     return dict(original_commit_outcome='unknown', restored_documents=restored,
                 requested_documents=len(documents), mutation_replayed=False)
