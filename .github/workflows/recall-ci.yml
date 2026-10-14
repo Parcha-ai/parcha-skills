@@ -62,6 +62,7 @@ jobs:
             e2e_v2_canonical_plane.py \
             e2e_slack_deletion_ordering.py \
             e2e_collector_retention_policy.py \
+            e2e_collector_history_recovery.py \
             e2e_compact_ingest_metadata.py \
             e2e_compact_canonical_bodies.py \
             e2e_audit_retirement.py \
