@@ -1558,28 +1558,11 @@ class BoundCanonicalRetrieval:
             member_parameters = ()
             execute = connection.execute
             if getattr(self.store, "verified_singleton_receipts", False):
-                from .receipt_membership import lookup_receipt_metadata, ReceiptMembershipError
-
                 deadline = time.monotonic() + self.store.search_deadline_ms / 1000
+                from .receipt_membership import verified_receipt_relation
                 connection.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
-                try:
-                    members = lookup_receipt_metadata(self.store, tenant_id=self.tenant_id,
-                        authorized_sources=tuple(sources), receipts=tuple(receipts),
-                        allow_verified_singletons=True, connection=connection, deadline_at=deadline)
-                except (ReceiptMembershipError, SearchDeadlineExceeded) as error:
-                    raise DeepInspectionError("deep_inspector_receipt_scope_violation") from error
-                if set(receipts) != set(members):
-                    raise DeepInspectionError("deep_inspector_receipt_scope_violation")
-                # The shared full metadata owner has checked every physical or
-                # admitted receipt. Keep the existing event, actor and evidence
-                # predicates in that same snapshot before accepting scan output.
-                chunk_relation = """(SELECT %s::text AS tenant_id,member.*,
-                    NULL::timestamptz AS deleted_at FROM unnest(
-                        %s::text[],%s::text[],%s::text[]
-                    ) AS member(source_id,document_id,receipt)) chunk"""
-                member_parameters = (self.tenant_id,
-                    [m["source_id"] for m in members.values()],
-                    [m["document_id"] for m in members.values()], list(members))
+                chunk_relation, member_parameters = verified_receipt_relation(self.store, connection,
+                    tenant_id=self.tenant_id, receipts=receipts, sources=sources, deadline_at=deadline)
                 def execute(statement, parameters):
                     return self.store._execute_bounded(connection, statement, parameters, deadline)
             rows = execute(
@@ -2007,16 +1990,33 @@ class BoundCanonicalRetrieval:
         body_sql = "NULL::text" if self.chunk_body_archive is not None else "chunk.text_redacted"
         try:
             with self.store.connect() as connection:
+                chunk_relation = "canonical_chunks chunk"
+                member_parameters = ()
+                inline_join = ""
+                if getattr(self.store, "verified_singleton_receipts", False):
+                    if deadline_at is None:
+                        deadline_at = time.monotonic() + self.store.search_deadline_ms / 1000
+                    from .receipt_membership import verified_receipt_relation
+                    connection.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+                    chunk_relation, member_parameters = verified_receipt_relation(self.store, connection,
+                        tenant_id=self.tenant_id, receipts=receipts, sources=sources, deadline_at=deadline_at)
+                    if self.chunk_body_archive is None:
+                        body_sql = "inline_chunk.text_redacted"
+                        inline_join = """
+                         LEFT JOIN canonical_chunks inline_chunk
+                            ON inline_chunk.tenant_id=chunk.tenant_id
+                           AND inline_chunk.source_id=chunk.source_id
+                           AND inline_chunk.receipt=chunk.receipt"""
                 rows = self.store._execute_bounded(
                     connection,
                     f"""SELECT chunk.receipt,chunk.source_id,chunk.document_id,
                               chunk.ordinal,{body_sql} AS text_redacted,
                               event.occurred_at
-                         FROM canonical_chunks chunk
+                         FROM {chunk_relation}
                          JOIN canonical_documents document
                            USING(tenant_id,source_id,document_id)
                          JOIN canonical_events event
-                           USING(tenant_id,source_id,event_id)
+                           USING(tenant_id,source_id,event_id){inline_join}
                         WHERE chunk.tenant_id=%s
                           AND chunk.source_id=ANY(%s)
                           AND chunk.receipt=ANY(%s)
@@ -2029,7 +2029,7 @@ class BoundCanonicalRetrieval:
                                OR event.occurred_at<=%s)
                         ORDER BY event.occurred_at,chunk.ordinal,
                                  chunk.receipt""",
-                    (
+                    member_parameters + (
                         self.tenant_id,
                         sources,
                         receipts,
@@ -2043,10 +2043,13 @@ class BoundCanonicalRetrieval:
                     else time.monotonic()
                     + self.store.search_deadline_ms / 1000,
                 ).fetchall()
+            if self.chunk_body_archive is None and any(row["text_redacted"] is None for row in rows):
+                raise ChunkBodyError("archived_chunk_body_unavailable")
             self._hydrate_chunk_rows(rows, deadline_at=deadline_at)
-        except (SearchDeadlineExceeded, ChunkBodyError) as error:
+        except (SearchDeadlineExceeded, ChunkBodyError, DeepInspectionError) as error:
             diagnostics["time_clip_status"] = (
-                "deadline-exceeded" if isinstance(error, SearchDeadlineExceeded)
+                "deadline-exceeded" if (isinstance(error, SearchDeadlineExceeded)
+                    or isinstance(error.__cause__, SearchDeadlineExceeded))
                 else "evidence-unavailable"
             )
             diagnostics["time_clip_elapsed_ms"] = round((time.monotonic() - clip_started) * 1000, 3)
@@ -2295,9 +2298,20 @@ class BoundCanonicalRetrieval:
         mentioned = agent_evidence_receipts(stdout)
         if mentioned:
             with self.store.connect() as connection:
-                verified_rows = connection.execute(
-                    """SELECT DISTINCT chunk.receipt
-                         FROM canonical_chunks chunk
+                chunk_relation = "canonical_chunks chunk"
+                member_parameters = ()
+                execute = connection.execute
+                if getattr(self.store, "verified_singleton_receipts", False):
+                    deadline = time.monotonic() + self.store.search_deadline_ms / 1000
+                    from .receipt_membership import verified_receipt_relation
+                    connection.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+                    chunk_relation, member_parameters = verified_receipt_relation(self.store, connection,
+                        tenant_id=self.tenant_id, receipts=mentioned, sources=self.authorized_sources, deadline_at=deadline)
+                    def execute(statement, parameters):
+                        return self.store._execute_bounded(connection, statement, parameters, deadline)
+                verified_rows = execute(
+                    f"""SELECT DISTINCT chunk.receipt
+                         FROM {chunk_relation}
                          JOIN canonical_documents canonical
                            USING(tenant_id,source_id,document_id)
                          JOIN canonical_events event
@@ -2315,7 +2329,7 @@ class BoundCanonicalRetrieval:
                           AND chunk.deleted_at IS NULL
                           AND canonical.is_current
                           AND canonical.deleted_at IS NULL""",
-                    (
+                    member_parameters + (
                         self.tenant_id,
                         list(self.authorized_sources),
                         mentioned,

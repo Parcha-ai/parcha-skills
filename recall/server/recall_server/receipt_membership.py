@@ -204,3 +204,31 @@ def lookup_receipt_metadata(
             'revision', 'ordinal', 'receipt', 'text_sha256', 'is_current',
         )}
     return result
+
+
+def verified_receipt_relation(
+    store: Any, connection: Any, *, tenant_id: str,
+    receipts: tuple[str, ...] | list[str], sources: tuple[str, ...] | list[str],
+    deadline_at: float,
+) -> tuple[str, tuple[Any, ...]]:
+    """Render proven identities for filters in the caller's read-only snapshot."""
+    from .db import SearchDeadlineExceeded
+    from .deep_inspection import DeepInspectionError
+
+    try:
+        members = lookup_receipt_metadata(store, tenant_id=tenant_id,
+            authorized_sources=tuple(sources), receipts=tuple(receipts),
+            allow_verified_singletons=True, connection=connection, deadline_at=deadline_at)
+    except (ReceiptMembershipError, SearchDeadlineExceeded) as error:
+        raise DeepInspectionError("deep_inspector_receipt_scope_violation") from error
+    # Callers keep their event/actor/time/admitted-document SQL predicates
+    # after the same full owner has proved physical and admitted identities.
+    relation = """(SELECT %s::text AS tenant_id,member.*,
+        NULL::timestamptz AS deleted_at FROM unnest(
+            %s::text[],%s::text[],%s::integer[],%s::text[]
+        ) AS member(source_id,document_id,ordinal,receipt)) chunk"""
+    parameters = (tenant_id,
+        [m["source_id"] for m in members.values()],
+        [m["document_id"] for m in members.values()],
+        [m["ordinal"] for m in members.values()], list(members))
+    return relation, parameters
