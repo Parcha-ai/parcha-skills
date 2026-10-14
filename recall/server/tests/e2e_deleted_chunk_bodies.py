@@ -301,6 +301,62 @@ class DeletedChunkBodyTests(unittest.TestCase):
                 self.clear(apply=True)
         self.assertEqual(before, self.rows())
 
+    def multiple_deleted_natives(self):
+        for native in ("z-last", "a-first", "m-middle"):
+            self.write(self.event(native=native))
+            self.write(self.event(native=native, revision=2))
+            self.write_legacy_tombstone(self.tombstone(native))
+
+    def test_native_locks_use_one_ordered_query_for_distinct_natives(self):
+        self.multiple_deleted_natives()
+        original = self.store._execute_bounded
+        locks = []
+
+        def measured(connection, sql, args, deadline):
+            if "pg_try_advisory_xact_lock" in sql:
+                locks.append((sql, args))
+            return original(connection, sql, args, deadline)
+
+        with patch.object(self.store, "_execute_bounded", side_effect=measured):
+            result = self.clear(apply=True)
+        self.assertEqual(result["cleared_chunks"], 3)
+        self.assertEqual(len(locks), 1)
+        self.assertIn("WITH ORDINALITY", locks[0][0])
+        self.assertEqual(
+            locks[0][1][0],
+            [
+                f"v2\x1f{self.tenant}\x1f{self.source}\x1f{native}"
+                for native in ("a-first", "m-middle", "z-last")
+            ],
+        )
+
+    def test_any_contended_native_rolls_back_all_keys_and_releases_other_locks(self):
+        self.multiple_deleted_natives()
+        before = self.rows()
+        for blocked in ("a-first", "m-middle", "z-last"):
+            with (
+                self.subTest(blocked=blocked),
+                psycopg.connect(self.store.dsn) as blocker,
+            ):
+                key = f"v2\x1f{self.tenant}\x1f{self.source}\x1f{blocked}"
+                blocker.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended(%s,0))", (key,)
+                )
+                with self.assertRaisesRegex(
+                    ChunkRetirementError, "deleted_chunk_lock_busy"
+                ):
+                    self.clear(apply=True)
+                self.assertEqual(self.rows(), before)
+                with psycopg.connect(self.store.dsn) as observer:
+                    for native in ("a-first", "m-middle", "z-last"):
+                        key = f"v2\x1f{self.tenant}\x1f{self.source}\x1f{native}"
+                        got = observer.execute(
+                            "SELECT pg_try_advisory_xact_lock(hashtextextended(%s,0))",
+                            (key,),
+                        ).fetchone()[0]
+                        self.assertEqual(got, native != blocked)
+        self.assertEqual(self.clear(apply=True)["cleared_chunks"], 3)
+
     def test_lost_commit_ack_returns_no_success_and_exact_retry_observes_empty(self):
         self.deleted_fixture()
         actual = self.store
