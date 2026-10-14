@@ -104,6 +104,10 @@ class _LogicalWorkSuperseded(Exception):
     """A worker's captured queue state no longer owns this preparation."""
 
 
+class _LogicalAdmissionConnectionClosed(Exception):
+    """Archive HEAD lost its connection before any publication mutation."""
+
+
 class _LocatorSpool:
     """Private, replayable metadata stream; RAM does not grow with the parent."""
 
@@ -1850,7 +1854,17 @@ class CanonicalLogicalEvidenceProjector:
         with self.store.connect() as connection:
             with connection.transaction():
                 from .archive_ownership import admit_references
-                admit_references(connection, self.projection.archive, upload.all_references)
+                from .archive import ArchiveError
+                from botocore.exceptions import ConnectionClosedError
+                try:
+                    admit_references(connection, self.projection.archive, upload.all_references)
+                except ArchiveError as error:
+                    if type(error) is ArchiveError and isinstance(error.__cause__, ConnectionClosedError):
+                        # Carry only this pre-publication failure through rollback.
+                        # Authorization, corruption and later SQL/COMMIT failures
+                        # retain their existing exception paths.
+                        raise _LogicalAdmissionConnectionClosed from error
+                    raise
                 connection.execute(
                     "SELECT pg_advisory_xact_lock(hashtextextended(%s,0))",
                     ("logical-evidence\x1f" + prepared.logical_document_id,),
@@ -2542,6 +2556,12 @@ class CanonicalLogicalEvidenceProjector:
             if upload is None:
                 return self._commit_empty(candidate)
             status = self._commit(candidate, upload)
+        except _LogicalAdmissionConnectionClosed as error:
+            # The transaction has unwound. Cleanup/backoff must both succeed
+            # before isolating this parent from independent in-flight owners.
+            self._schedule_cleanup(upload.cleanup_references)
+            self._mark_failed(candidate, error.__cause__)
+            return "failed"
         except psycopg.errors.LockNotAvailable:
             # _commit's transaction has already rolled back and released its
             # queue lock. Retain the queue for a fresh attempt; contention must
