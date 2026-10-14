@@ -139,24 +139,48 @@ class ArchiveAdmissionTests(unittest.TestCase):
 
         event = self.event()
         reference = event["provenance"]["artifact_ref"]
-        with patch.object(
-            self.archive, "verify_raw_bounded", wraps=self.archive.verify_raw_bounded
-        ) as verify:
+        with (
+            patch.object(
+                self.archive,
+                "verify_raw_bounded",
+                wraps=self.archive.verify_raw_bounded,
+            ) as verify,
+            self.assertLogs("recall_server.archive_ownership", level="INFO") as logs,
+        ):
             with self.store.connect() as c:
                 self.assertEqual(
                     admit_references(c, self.archive, [reference] * 100), 1
                 )
             self.assertEqual(verify.call_count, 1)
+        self.assertEqual(len(logs.output), 1)
+        self.assertIn(
+            "occurrences=100 unique=1 live_reused=0 new_references=1", logs.output[0]
+        )
+        self.assertIn("outcome=ok", logs.output[0])
+        self.assertIn("head_wall_ms=", logs.output[0])
+        self.assertIn("helper_elapsed_ms=", logs.output[0])
+        for value in (
+            self.tenant,
+            self.source,
+            reference["artifact_id"],
+            reference["object_key"],
+        ):
+            self.assertNotIn(value, logs.output[0])
         self.write(event)
-        with patch.object(
-            self.archive,
-            "verify_raw_bounded",
-            side_effect=AssertionError("unexpected HEAD"),
+        with (
+            patch.object(
+                self.archive,
+                "verify_raw_bounded",
+                side_effect=AssertionError("unexpected HEAD"),
+            ),
+            self.assertLogs("recall_server.archive_ownership", level="INFO") as logs,
         ):
             with self.store.connect() as c:
                 self.assertEqual(
                     admit_references(c, self.archive, [reference] * 100), 0
                 )
+        self.assertEqual(len(logs.output), 1)
+        self.assertIn("live_reused=1 new_references=0", logs.output[0])
 
     def test_admission_does_not_trust_deleted_bundle_or_deleting_raw(self):
         from recall_server.archive_ownership import admit_references
@@ -268,8 +292,13 @@ class ArchiveAdmissionTests(unittest.TestCase):
     def test_raw_admission_refuses_object_deleted_after_upload(self):
         event = self.event()
         self.remove_unregistered([event["provenance"]["artifact_ref"]])
-        with self.assertRaises(ArchiveNotFound):
+        with (
+            self.assertLogs("recall_server.archive_ownership", level="INFO") as logs,
+            self.assertRaises(ArchiveNotFound),
+        ):
             self.write(event)
+        self.assertEqual(len(logs.output), 1)
+        self.assertIn("outcome=error", logs.output[0])
 
     def test_bundle_admission_refuses_object_deleted_after_upload(self):
         self.write(self.event())

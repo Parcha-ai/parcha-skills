@@ -1,9 +1,12 @@
 """Coordinate archive admission with the existing artifact deletion guard."""
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import logging
 import time
 
 from .archive import S3_DEADLINE_CONNECT_TIMEOUT
+
+logger = logging.getLogger(__name__)
 
 REFERENCE_FIELDS = (
     "tenant_id",
@@ -90,47 +93,73 @@ def admit_references(connection, archive, references):
     """
     from .canonical import CanonicalLifecycleError, _guard_artifact_admission
 
+    started = time.monotonic()
+    occurrences = live_reused = new_references = 0
+    head_wall_ms = 0.0
+    outcome = "error"
     unique = {}
-    for reference in references:
-        key = tuple(
-            reference[name] for name in ("tenant_id", "source_id", "artifact_id")
-        )
-        if key in unique and reference_key(unique[key]) != reference_key(reference):
-            raise CanonicalLifecycleError("canonical_artifact_conflict")
-        unique[key] = reference
-    groups = {}
-    for tenant, source, artifact in sorted(unique):
-        groups.setdefault((tenant, source), []).append(artifact)
-    for (tenant, source), artifacts in groups.items():
-        _guard_artifact_admission(connection, tenant, source, artifacts)
-    references = list(unique.values())
-    live = live_references(connection, references)
-    pending = [
-        reference for reference in references if reference_key(reference) not in live
-    ]
+    try:
+        for reference in references:
+            occurrences += 1
+            key = tuple(
+                reference[name] for name in ("tenant_id", "source_id", "artifact_id")
+            )
+            if key in unique and reference_key(unique[key]) != reference_key(reference):
+                raise CanonicalLifecycleError("canonical_artifact_conflict")
+            unique[key] = reference
+        groups = {}
+        for tenant, source, artifact in sorted(unique):
+            groups.setdefault((tenant, source), []).append(artifact)
+        for (tenant, source), artifacts in groups.items():
+            _guard_artifact_admission(connection, tenant, source, artifacts)
+        references = list(unique.values())
+        live = live_references(connection, references)
+        pending = [
+            reference for reference in references if reference_key(reference) not in live
+        ]
 
-    def verify(reference):
-        # Per-request SDK timeouts bound failed checks. Total successful work
-        # scales with new objects, not events; no batch-size rejection is added.
-        seconds = (
-            S3_DEADLINE_CONNECT_TIMEOUT
-            + getattr(archive, "deadline_read_timeout_seconds", 0.5)
-            + 0.25
-        )
-        archive.verify_raw_bounded(reference, deadline_at=time.monotonic() + seconds)
+        live_reused = len(references) - len(pending)
+        new_references = len(pending)
 
-    if len(pending) == 1:
-        verify(pending[0])
-    elif pending:
-        with ThreadPoolExecutor(
-            max_workers=4, thread_name_prefix="recall-admit-head"
-        ) as pool:
-            futures = [pool.submit(verify, reference) for reference in pending]
-            try:
-                for future in as_completed(futures):
-                    future.result()
-            except BaseException:
-                for future in futures:
-                    future.cancel()
-                raise
-    return len(pending)
+        def verify(reference):
+            # Per-request SDK timeouts bound failed checks. Total successful work
+            # scales with new objects, not events; no batch-size rejection is added.
+            seconds = (
+                S3_DEADLINE_CONNECT_TIMEOUT
+                + getattr(archive, "deadline_read_timeout_seconds", 0.5)
+                + 0.25
+            )
+            archive.verify_raw_bounded(reference, deadline_at=time.monotonic() + seconds)
+
+        head_started = time.monotonic()
+        try:
+            if len(pending) == 1:
+                verify(pending[0])
+            elif pending:
+                with ThreadPoolExecutor(
+                    max_workers=4, thread_name_prefix="recall-admit-head"
+                ) as pool:
+                    futures = [pool.submit(verify, reference) for reference in pending]
+                    try:
+                        for future in as_completed(futures):
+                            future.result()
+                    except BaseException:
+                        for future in futures:
+                            future.cancel()
+                        raise
+        finally:
+            head_wall_ms = (time.monotonic() - head_started) * 1000 if pending else 0.0
+        outcome = "ok"
+        return len(pending)
+    finally:
+        logger.info(
+            "archive_admission occurrences=%d unique=%d live_reused=%d "
+            "new_references=%d head_wall_ms=%.3f helper_elapsed_ms=%.3f outcome=%s",
+            occurrences,
+            len(unique),
+            live_reused,
+            new_references,
+            head_wall_ms,
+            (time.monotonic() - started) * 1000,
+            outcome,
+        )

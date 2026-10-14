@@ -194,6 +194,7 @@ def main() -> None:
         endpoint_url="https://0123456789abcdef0123456789abcdef.r2.cloudflarestorage.com",
         namespace_key=b"a" * 32,
         client=fake_r2,
+        deadline_client=fake_r2,
         compatibility_profile="r2",
     )
     plane = CanonicalPlane(store, archive)
