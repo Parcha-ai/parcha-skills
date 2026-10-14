@@ -500,6 +500,7 @@ class LogicalPartUploadTests(unittest.TestCase):
                 records=iter(original),
                 part_bytes=1_024,
                 existing_part_references=first.part_references,
+                on_failed_upload=lambda references: [archive.delete_raw(r) for r in references],
             )
 
         self.assertEqual(archive.objects, old_objects)
@@ -519,9 +520,21 @@ class LogicalPartUploadTests(unittest.TestCase):
                 revision=1,
                 records=iter(_records(20)),
                 part_bytes=1_024,
+                on_failed_upload=lambda references: [archive.delete_raw(r) for r in references],
             )
 
         self.assertEqual(archive.objects, {})
+
+    def test_failed_upload_without_catalog_cleanup_authority_retains_objects(self) -> None:
+        archive = _ConcurrentArchive(fail_media_type=MANIFEST_MEDIA_TYPE)
+        projection = LogicalEvidenceProjectionStore(archive)
+        with self.assertRaisesRegex(RuntimeError, "synthetic upload failure"):
+            projection.put_records(
+                tenant_id="tenant:parallel", source_id="source:parallel",
+                native_parent_id="session:unowned", revision=1,
+                records=iter(_records(2)), part_bytes=1_024,
+            )
+        self.assertEqual(len(archive.objects), 2)
 
 
 if __name__ == "__main__":

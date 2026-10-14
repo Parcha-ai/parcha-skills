@@ -37,6 +37,8 @@ class EvidenceArchive(Protocol):
                          source_id: str, expires_in: int) -> str: ...
     def read_raw(self, value: dict[str, Any]) -> bytes: ...
     def delete_raw(self, value: dict[str, Any]) -> bool: ...
+    def verify_raw_bounded(self, value: dict[str, Any], *, deadline_at: float) -> None: ...
+    def delete_internal_raw_bounded(self, value: dict[str, Any], *, deadline_at: float) -> bool: ...
 
 
 def _timestamp(value: str) -> str:
@@ -508,6 +510,33 @@ class CanonicalEvidenceProjector:
                 )
             try:
                 with self.store.connect() as connection:
+                    from .archive_ownership import admit_references
+                    # Uploads happen without a database lease. Rejoin the same
+                    # native lock used by ingest/forget before admitting them.
+                    for tenant, source, native in sorted({
+                        (row["tenant_id"], row["source_id"], row["native_id"])
+                        for row, _bundle in entries
+                    }):
+                        connection.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s,0))",
+                            (f"v2\x1f{tenant}\x1f{source}\x1f{native}",))
+                    current = connection.execute(
+                        """SELECT document.tenant_id,document.source_id,document.document_id,
+                                  document.revision,document.text_sha256
+                           FROM canonical_documents document
+                           JOIN unnest(%s::text[],%s::text[],%s::text[])
+                                AS target(tenant_id,source_id,document_id)
+                             USING(tenant_id,source_id,document_id)
+                           WHERE document.is_current AND document.deleted_at IS NULL""",
+                        ([row["tenant_id"] for row, _ in entries],
+                         [row["source_id"] for row, _ in entries],
+                         [row["document_id"] for row, _ in entries]),
+                    ).fetchall()
+                    fields = ("tenant_id", "source_id", "document_id", "revision", "text_sha256")
+                    if {tuple(row[field] for field in fields) for row in current} != {
+                        tuple(row[field] for field in fields) for row, _ in entries
+                    }:
+                        raise EvidenceProjectionError("evidence_publication_stale")
+                    admit_references(connection, self.projection.archive, references)
                     with connection.cursor() as cursor:
                         cursor.executemany(
                             """INSERT INTO canonical_evidence_objects(
@@ -675,9 +704,14 @@ class CanonicalEvidenceProjector:
         assert tenant_id is not None
         if not native_ids:
             return 0
+        from .archive_ownership import delete_persisted_reference, live_references, reference_key
+        from .canonical import _lock_artifacts
         with self.store.connect() as connection:
+            for native in sorted(set(native_ids)):
+                connection.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s,0))",
+                    (f"v2\x1f{tenant_id}\x1f{source_id}\x1f{native}",))
             rows = connection.execute(
-                """SELECT evidence.*
+                """SELECT evidence.*,document.deleted_at
                    FROM canonical_evidence_objects evidence
                    JOIN canonical_documents document
                      USING(tenant_id,source_id,document_id)
@@ -686,10 +720,16 @@ class CanonicalEvidenceProjector:
                    ORDER BY evidence.document_id""",
                 (tenant_id, source_id, native_ids),
             ).fetchall()
-        references = [self._reference(row) for row in rows]
-        for reference in references:
-            self.projection.delete(reference)
-        with self.store.connect() as connection:
+            if any(row["deleted_at"] is None for row in rows):
+                raise EvidenceProjectionError("evidence_forget_not_started")
+            references = [self._reference(row) for row in rows]
+            _lock_artifacts(connection, tenant_id, source_id,
+                [reference["artifact_id"] for reference in references])
+            retained = live_references(connection, references,
+                excluding_evidence_documents=[row["document_id"] for row in rows])
+            for reference in references:
+                if reference_key(reference) not in retained:
+                    delete_persisted_reference(self.projection.archive, reference)
             connection.execute(
                 """DELETE FROM canonical_evidence_objects evidence
                    USING canonical_documents document

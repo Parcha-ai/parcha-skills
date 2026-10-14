@@ -201,6 +201,9 @@ class FlakyDeleteArchive:
     def verify_raw(self, value):
         return self.delegate.verify_raw(value)
 
+    def verify_raw_bounded(self, value, *, deadline_at):
+        return self.delegate.verify_raw_bounded(value, deadline_at=deadline_at)
+
     def delete_raw(self, value):
         if self.failures_remaining:
             self.failures_remaining -= 1

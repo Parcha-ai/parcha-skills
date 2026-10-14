@@ -2013,6 +2013,8 @@ class CanonicalParquetScanProjector:
         scope = (candidate.tenant_id, candidate.source_id, candidate.bucket_start)
         with self.store.connect() as connection:
             with connection.transaction():
+                from .archive_ownership import admit_references
+                admit_references(connection, self.archive, upload.references.values())
                 connection.execute(
                     "SELECT pg_advisory_xact_lock(hashtextextended(%s,0))",
                     (

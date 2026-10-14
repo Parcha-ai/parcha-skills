@@ -8,7 +8,7 @@ from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from datetime import datetime
-from typing import Any, Iterable, Protocol
+from typing import Any, Callable, Iterable, Protocol
 from urllib.parse import urlsplit
 
 import orjson
@@ -54,6 +54,7 @@ class EvidenceArchive(Protocol):
     ) -> dict[str, Any]: ...
 
     def verify_raw(self, value: dict[str, Any]) -> None: ...
+    def verify_raw_bounded(self, value: dict[str, Any], *, deadline_at: float) -> None: ...
     def read_raw(self, value: dict[str, Any]) -> bytes: ...
     def delete_raw(self, value: dict[str, Any]) -> bool: ...
 
@@ -593,6 +594,7 @@ class LogicalEvidenceProjectionStore:
         prepared: PreparedLogicalDocument,
         *,
         retention_profile: str = "lossless-v1",
+        on_failed_upload: Callable[[tuple[dict[str, Any], ...]], None] | None = None,
     ) -> LogicalEvidenceUpload:
         part_references: list[dict[str, Any]] = []
         try:
@@ -648,11 +650,10 @@ class LogicalEvidenceProjectionStore:
                 created_at=prepared.first_occurred_at,
             )
         except Exception:
-            for reference in reversed(part_references):
-                try:
-                    self.archive.delete_raw(reference)
-                except Exception:
-                    pass
+            # A deterministic part can already belong to another publisher.
+            # Only the catalog cleanup owner can decide whether to delete it.
+            if on_failed_upload is not None:
+                on_failed_upload(tuple(part_references))
             raise
         return LogicalEvidenceUpload(
             prepared=prepared,
@@ -673,6 +674,7 @@ class LogicalEvidenceProjectionStore:
         part_bytes: int = DEFAULT_PART_BYTES,
         retention_profile: str = "lossless-v1",
         existing_part_references: tuple[dict[str, Any], ...] = (),
+        on_failed_upload: Callable[[tuple[dict[str, Any], ...]], None] | None = None,
     ) -> LogicalEvidenceUpload:
         """Upload a logical document with memory bounded to one object part."""
 
@@ -975,11 +977,8 @@ class LogicalEvidenceProjectionStore:
                     )
                 except Exception:
                     pass
-            for reference in reversed(created_part_references):
-                try:
-                    self.archive.delete_raw(reference)
-                except Exception:
-                    pass
+            if on_failed_upload is not None:
+                on_failed_upload(tuple(created_part_references))
             raise
         finally:
             if part_executor is not None:
