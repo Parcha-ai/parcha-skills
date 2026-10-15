@@ -149,8 +149,8 @@ class MultichunkRecovery(unittest.TestCase):
             self.recover()
         self.assert_no_correction()
 
-    def test_total_byte_limit_remains_65536(self):
-        self.prepare_chunks('x' * 65536)
+    def test_expected_byte_limit_matches_canonical_ingestion_domain(self):
+        self.expected['text_bytes'] = 8_000_001
         with patch.object(self.archive, 'verify_raw_bounded') as head:
             with self.assertRaisesRegex(CollectorHistoryRecoveryError, 'scope_invalid'):
                 self.recover()
@@ -212,7 +212,7 @@ class MultichunkRecovery(unittest.TestCase):
                 (tenant_id,source_id,chunk_id,document_id,ordinal,receipt,text_redacted,text_sha256,deleted_at)
                 SELECT tenant_id,source_id,chunk_id||':overflow:'||n::text,document_id,n,
                        %s||n::text,'x',%s,deleted_at
-                FROM canonical_chunks CROSS JOIN generate_series(2,128) n
+                FROM canonical_chunks CROSS JOIN generate_series(2,507) n
                 WHERE tenant_id=%s AND source_id=%s AND document_id=%s AND ordinal=0''',
                 (item_receipt(self.source, self.expected['native_id'], 1, 0)[:-1],
                  hashlib.sha256(b'x').hexdigest(), self.tenant, self.source, self.expected['document_id']))
