@@ -133,7 +133,7 @@ class ClaimDiagnosticTests(unittest.TestCase):
                 runner, "_authorize", side_effect=lambda *a: store.step("authorize")
             ),
             patch.object(
-                runner, "retire_parent_chunks", return_value=complete
+                runner, "retire_parent_windows", return_value=complete
             ) as retire,
         ):
             result = runner.run_retirement(
@@ -224,7 +224,7 @@ class ClaimDiagnosticTests(unittest.TestCase):
                         "_authorize",
                         side_effect=lambda *a: store.step("authorize"),
                     ),
-                    patch.object(runner, "retire_parent_chunks") as retire,
+                    patch.object(runner, "retire_parent_windows") as retire,
                     self.assertRaises(PrivateError) as caught,
                 ):
                     runner.run_retirement(store, Mock(), scope=self.scope(), apply=True)
@@ -359,7 +359,7 @@ class ClaimDiagnosticTests(unittest.TestCase):
                 self.subTest(error=type(error).__name__),
                 patch.object(runner, "_claim", side_effect=[candidate, error]),
                 patch.object(
-                    runner, "retire_parent_chunks", return_value={"complete": True}
+                    runner, "retire_parent_windows", return_value={"complete": True}
                 ),
             ):
                 result = runner.run_retirement(
@@ -379,7 +379,7 @@ class ClaimDiagnosticTests(unittest.TestCase):
                 runner, "_authorize", side_effect=lambda *a: store.step("authorize")
             ),
             patch.object(
-                runner, "retire_parent_chunks", return_value={"complete": True}
+                runner, "retire_parent_windows", return_value={"complete": True}
             ),
         ):
             claim = runner._claim

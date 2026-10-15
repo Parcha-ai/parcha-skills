@@ -499,11 +499,11 @@ process.main()
     def test_committed_but_lost_response_is_observed_then_safe_next_round(self):
         self.activate()
         self.ready()
-        clear = runner.retire_parent_chunks
+        clear = runner.retire_parent_windows
         def lost_response(*args, **kwargs):
             clear(*args, **kwargs)
             raise ChunkRetirementError('parent_retirement_unavailable')
-        with patch.object(runner, 'retire_parent_chunks', side_effect=lost_response):
+        with patch.object(runner, 'retire_parent_windows', side_effect=lost_response):
             first = self.worker().cycle(busy=False)
         self.assertTrue(first['commit_outcome_unknown'], first)
         self.assertIsNotNone(self.policy_state()['maintenance_intent'])

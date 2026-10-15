@@ -421,13 +421,21 @@ def _try_parent_native_locks(query, scope, rows):
     )
 
 
-def _retire_parent_batch(store, *, proof, rows, scope, limits, deadline_at, complete, remaining_bytes, owner_principal_id=None, metadata_mode="keep"):
+def _retire_parent_batch(store, *, proof, rows, scope, limits, deadline_at, complete, remaining_bytes, owner_principal_id=None, metadata_mode="keep", coverage=None):
     from .parent_chunk_proof import manifest_identity, read_parent_catalog
     if os.environ.get('RECALL_CHUNK_BODY_READS', 'postgres') != 'archive':
         raise ChunkRetirementError('chunk_retirement_archive_reads_required')
     manifest = proof['manifest']
     documents = {row['document_id']: row for row in rows}
     document_ids = sorted(documents)
+    lock_rows = rows
+    if coverage is not None:
+        from .parent_chunk_window import coverage_natives, recheck_coverage
+        if complete or owner_principal_id is None:
+            raise ChunkRetirementError('parent_retirement_window_coverage')
+        lock_rows = coverage_natives(coverage, rows, limits)
+        if scope[2] not in {row['native_id'] for row in lock_rows}:
+            lock_rows.append(dict(native_id=scope[2]))
     hashed_bytes = cleared_bytes = cleared_chunks = cleared_documents = 0
     retired_metadata_chunks = 0
     hash_ms = 0.0
@@ -437,7 +445,7 @@ def _retire_parent_batch(store, *, proof, rows, scope, limits, deadline_at, comp
             return store._execute_bounded(connection, sql, values, deadline_at)
         if owner_principal_id is not None:
             require_retirement_owner(store, connection, scope[:2], owner_principal_id, deadline_at)
-        if not _try_parent_native_locks(query, scope, rows):
+        if not _try_parent_native_locks(query, scope, lock_rows):
             raise ChunkRetirementError('parent_retirement_lock_busy')
         locked = query('''SELECT document.tenant_id,document.source_id,document.document_id,document.native_id,
                     document.revision,document.text_sha256,document.body_record_ordinal,document.body_record_count,event.kind,
@@ -464,6 +472,8 @@ def _retire_parent_batch(store, *, proof, rows, scope, limits, deadline_at, comp
         progress = _parent_progress(store, connection, scope, deadline_at, lock=True)
         if not progress or not progress['enabled'] or progress['scope_epoch'] != proof['scope_epoch']:
             raise ChunkRetirementError('parent_retirement_disabled')
+        if coverage is not None:
+            recheck_coverage(store, connection, scope, coverage, progress, manifest, deadline_at)
         chunks = query('''SELECT document_id,ordinal,receipt,text_sha256,octet_length(text_redacted) AS pg_bytes
             FROM canonical_chunks WHERE tenant_id=%s AND source_id=%s AND document_id=ANY(%s)
               AND deleted_at IS NULL ORDER BY document_id,ordinal FOR UPDATE NOWAIT''', (*scope[:2], document_ids)).fetchall()
@@ -508,7 +518,8 @@ def _retire_parent_batch(store, *, proof, rows, scope, limits, deadline_at, comp
                 dependencies = _singleton_metadata_dependencies(store, connection, *scope[:2], candidates, deadline_at)
                 candidates = [row for row in candidates if row['chunks'][0]['chunk_id'] not in dependencies]
                 retired_metadata_chunks = _admit_singleton_metadata(query, scope[:2], candidates)
-        cursor = max((row['body_record_ordinal'] + row['body_record_count'] - 1 for row in rows), default=-1)
+        cursor = (coverage['covered_through'] if coverage is not None else
+                  max((row['body_record_ordinal'] + row['body_record_count'] - 1 for row in rows), default=-1))
         if progress['manifest_artifact_id'] == manifest['manifest_artifact_id']:
             cursor = max(cursor, progress['last_record_ordinal'])
         query('''UPDATE canonical_chunk_retirement_progress SET manifest_artifact_id=%s,last_record_ordinal=%s,status=%s,

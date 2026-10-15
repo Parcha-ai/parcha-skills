@@ -688,7 +688,7 @@ def claim_unknown_state_recovery(store, root):
                 assert unchanged[field] == after[field]
         age()
         fresh_before = state()
-        original_retire = runner.retire_parent_chunks
+        original_retire = runner.retire_parent_windows
         stale_checks = []
         # An uncommitted epoch number can legitimately be reused after rollback.
         # Fence only the last actually committed old epoch. The old invocation
@@ -713,7 +713,7 @@ def claim_unknown_state_recovery(store, root):
             return original_retire(*args, **kwargs)
 
         with patch.object(
-            runner, "retire_parent_chunks", side_effect=assert_old_epoch_fenced
+            runner, "retire_parent_windows", side_effect=assert_old_epoch_fenced
         ):
             recovered = runner.run_retirement(store, archive, scope=scope, apply=True)
         assert stale_checks == [True] and recovered["completed_parent_proofs"] == 1
