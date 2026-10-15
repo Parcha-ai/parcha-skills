@@ -26,7 +26,11 @@ class ForgottenTriggerIndex(unittest.TestCase):
                          '020_v2_lifecycle_guards.sql').read_text().split(
                              'CREATE OR REPLACE FUNCTION', 1)[1].split(
                                  'DROP TRIGGER', 1)[0]
-        self.original = 'CREATE OR REPLACE FUNCTION' + self.original
+        self.original = ('CREATE OR REPLACE FUNCTION' + self.original).replace(
+            'target_sha256 char(64);', 'target_sha256 text;')
+        legacy_body = self.original.split('AS $$', 1)[1].split('$$;', 1)[0].strip()
+        self.assertEqual(hashlib.sha256(legacy_body.encode()).hexdigest(),
+                         'ff787f738004a4d9a3ffc7a88c482de31d13d3d0da90d0b5847284597a3641d4')
         self.candidate = self.connection.execute(
             "SELECT pg_get_functiondef('recall_v2_reject_forgotten_event'::regproc) AS body"
         ).fetchone()['body']
@@ -63,6 +67,21 @@ class ForgottenTriggerIndex(unittest.TestCase):
                LIMIT 1""",
             ('evt_' + self.target(native), native, self.target(native),
              self.fixture.tenant, self.fixture.source))
+
+    def test_repeated_migrate_keeps_the_indexed_trigger_definition(self):
+        # Non-retired databases replay pre067 migrations. A recorded081 must not
+        # allow020 to restore the original text variable on the next migrate.
+        self.assertIn('target_sha256 char(64);', self.candidate)
+        versions = {row['version'] for row in self.connection.execute(
+            'SELECT version FROM schema_migrations').fetchall()}
+        self.assertNotIn(67, versions)
+        self.assertIn(81, versions)
+        for _ in range(2):
+            self.fixture.store.migrate()
+            body = self.connection.execute(
+                "SELECT pg_get_functiondef('recall_v2_reject_forgotten_event'::regproc) AS body"
+            ).fetchone()['body']
+            self.assertEqual(body, self.candidate)
 
     def test_original_and_candidate_reject_pending_and_completed_forget(self):
         for arm, function in (('old', self.original), ('new', self.candidate)):
