@@ -217,6 +217,22 @@ def singleton_receipt_capability(verified_singleton_receipts=None):
     return verified_singleton_receipts
 
 
+class _ReadOnlyStore:
+    """Read-owner configuration and checkout; no delegated mutation methods."""
+
+    def __init__(self, store):
+        self._store = store
+
+    def connect(self):
+        return self._store.read_connection()
+
+    def __getattr__(self, name):
+        value = getattr(self._store, name)
+        if callable(value) and name != "_execute_bounded":
+            raise AttributeError(name)
+        return value
+
+
 class BrainStore:
     def __init__(self, dsn: str, search_deadline_ms: int | None = None,
                  semantic_runtime: SemanticRuntime | None = None,
@@ -225,12 +241,14 @@ class BrainStore:
                  pool_max_size: int | None = None,
                  audit_batch_rows: int | None = None,
                  audit_batch_seconds: float | None = None,
-                 verified_singleton_receipts: bool | None = None):
+                 verified_singleton_receipts: bool | None = None,
+                 reserved_read_connections: int = 0):
         verified_singleton_receipts = singleton_receipt_capability(verified_singleton_receipts)
         # Off by default. Migration and explicit activation never admit rows.
         self.verified_singleton_receipts = verified_singleton_receipts
         self.dsn = dsn
         self._pool: ConnectionPool | None = None
+        self._read_pool: ConnectionPool | None = None
         self._pool_lock = threading.Lock()
         self._last_ready_at: float | None = None
         env_batch_rows, env_batch_seconds = batch_settings_from_env()
@@ -258,6 +276,14 @@ class BrainStore:
         if not 4 <= configured_pool_size <= 32:
             raise ValueError("database pool size must be between 4 and 32")
         self.pool_max_size = configured_pool_size
+        if (
+            isinstance(reserved_read_connections, bool)
+            or not isinstance(reserved_read_connections, int)
+            or not 0 <= reserved_read_connections <= configured_pool_size - 4
+        ):
+            raise ValueError("read reservation must leave at least four general connections")
+        self.reserved_read_connections = reserved_read_connections
+        self._read_view = _ReadOnlyStore(self)
         # A search runs up to SEARCH_ARM_CONNECTIONS pooled statements at
         # once. Admit only as many concurrent searches as leave
         # SEARCH_RESERVED_CONNECTIONS for the single-connection tools.
@@ -329,7 +355,7 @@ class BrainStore:
                         self.dsn,
                         kwargs={"row_factory": dict_row},
                         min_size=1,
-                        max_size=self.pool_max_size,
+                        max_size=self.pool_max_size - self.reserved_read_connections,
                         timeout=5,
                         max_idle=300,
                         max_lifetime=1800,
@@ -347,13 +373,47 @@ class BrainStore:
                     self._pool = pool
         return self._pool.connection()
 
+    def read_connection(self):
+        """Borrow reserved capacity for an explicit read owner, if enabled."""
+        if not self.reserved_read_connections:
+            return self.connect()
+        if self._read_pool is None:
+            with self._pool_lock:
+                if self._read_pool is None:
+                    def configure(connection):
+                        connection.read_only = True
+
+                    pool = ConnectionPool(
+                        self.dsn,
+                        kwargs={"row_factory": dict_row},
+                        min_size=0,
+                        max_size=self.reserved_read_connections,
+                        timeout=5,
+                        max_idle=300,
+                        max_lifetime=1800,
+                        configure=configure,
+                        open=True,
+                        name="recall-brain-read",
+                    )
+                    try:
+                        with pool.connection() as probe:
+                            self.verify_search_plane(probe)
+                    except Exception:
+                        pool.close()
+                        raise
+                    self._read_pool = pool
+        return self._read_pool.connection()
+
+    def read_only_view(self):
+        return self._read_view if self.reserved_read_connections else self
+
     def prepare_pool(self, minimum_size: int, *, timeout: float = 60.0) -> None:
         """Pre-warm bounded parallel workers before their measured work starts."""
 
         if (
             isinstance(minimum_size, bool)
             or not isinstance(minimum_size, int)
-            or not 1 <= minimum_size <= self.pool_max_size
+            or not 1 <= minimum_size <= self.pool_max_size - self.reserved_read_connections
             or not 1 <= timeout <= 300
         ):
             raise ValueError("database pool warmup budget is invalid")
@@ -382,6 +442,8 @@ class BrainStore:
         finally:
             if self._pool is not None:
                 self._pool.close()
+            if self._read_pool is not None:
+                self._read_pool.close()
 
     def migrate(self, *, retire_postgres_plane: bool = False) -> dict[str, Any]:
         """Apply the numbered migrations in order; every file is idempotent.
@@ -1155,7 +1217,7 @@ class BrainStore:
 
     def authenticate_bearer(self, plaintext: str, required_scope: str) -> dict | None:
         digest = hashlib.sha256(plaintext.encode()).hexdigest()
-        with self.connect() as conn:
+        with self.read_connection() as conn:
             row = conn.execute(
                 """SELECT credential.id,credential.name,credential.tenant_id,
                           credential.source_id,credential.principal_id,
@@ -1266,7 +1328,7 @@ class BrainStore:
         ):
             return None
         subject_sha256 = hashlib.sha256(subject.encode()).hexdigest()
-        with self.connect() as conn:
+        with self.read_connection() as conn:
             rows = conn.execute(
                 """SELECT binding.tenant_id,binding.principal_id,
                           binding.principal_kind,
@@ -1564,7 +1626,7 @@ class BrainStore:
             or not V2_AUTHORITY_RE.fullmatch(principal_id)
         ):
             return []
-        with self.connect() as conn:
+        with self.read_connection() as conn:
             brain_access = conn.execute(
                 """SELECT 1 FROM brain_access_grants
                    WHERE tenant_id=%s AND principal_id=%s
@@ -1691,6 +1753,10 @@ class BrainStore:
 
     def _readiness_connection(self):
         """A pooled connection with a short wait so the probe answers quickly."""
+        if self.reserved_read_connections:
+            if self._read_pool is None:
+                self.read_connection()
+            return self._read_pool.connection(timeout=1.0)
         if self._pool is None:
             self.connect()
         if self._pool is not None:
