@@ -74,8 +74,9 @@ def test_long_running_collector_iteration_publishes_health() -> None:
         def flush(self):
             return {"acked": 2}
 
-        def doctor(self, *, include_dead_letters):
+        def doctor(self, *, include_dead_letters, include_ack_latency):
             assert include_dead_letters is False
+            assert include_ack_latency is False
             return {
                 "collector_version": 1,
                 "scan_complete": True,

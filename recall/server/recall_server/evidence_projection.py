@@ -37,6 +37,8 @@ class EvidenceArchive(Protocol):
                          source_id: str, expires_in: int) -> str: ...
     def read_raw(self, value: dict[str, Any]) -> bytes: ...
     def delete_raw(self, value: dict[str, Any]) -> bool: ...
+    def verify_raw_bounded(self, value: dict[str, Any], *, deadline_at: float) -> None: ...
+    def delete_internal_raw_bounded(self, value: dict[str, Any], *, deadline_at: float) -> bool: ...
 
 
 def _timestamp(value: str) -> str:
@@ -361,6 +363,55 @@ class CanonicalEvidenceProjector:
         bundle.validate()
         return bundle
 
+    def admit_outgoing(self, connection, *, row, bundle, reference):
+        """Admit one staged revision inside its writer's native-locked transaction."""
+        from .archive_ownership import admit_references
+        from .canonical import CanonicalLifecycleError
+
+        self._tenant(row['tenant_id'])
+        current = connection.execute('''SELECT document.revision,document.text_sha256,document.native_id,
+                COALESCE(event.native_parent_id,event.native_id) AS native_parent_id
+            FROM canonical_documents document JOIN canonical_events event
+              USING(tenant_id,source_id,event_id)
+            WHERE document.tenant_id=%s AND document.source_id=%s AND document.document_id=%s
+              AND document.is_current AND document.deleted_at IS NULL AND NOT event.is_tombstone''',
+            (row['tenant_id'], row['source_id'], row['document_id'])).fetchone()
+        if (current is None or current['revision'] != bundle['revision']
+                or current['text_sha256'] != bundle['text_sha256']
+                or hashlib.sha256('\x1f'.join((row['tenant_id'], row['source_id'],
+                    current['native_parent_id'])).encode()).hexdigest() != bundle['session_sha256']):
+            raise EvidenceProjectionError('evidence_publication_stale')
+        identities = [hashlib.sha256('\x1f'.join((row['tenant_id'], row['source_id'], native)).encode()).hexdigest()
+                      for native in (current['native_id'], current['native_parent_id'])]
+        if connection.execute('''SELECT 1 FROM forget_tombstones
+            WHERE tenant_id=%s AND source_id=%s AND target_identity_sha256=ANY(%s) LIMIT 1''',
+            (row['tenant_id'], row['source_id'], identities)).fetchone():
+            raise CanonicalLifecycleError('canonical_identity_forgotten')
+        # Preserve the existing artifact lock + bounded HEAD race proof. Body
+        # reads and uploads happened before the writer acquired a connection.
+        admit_references(connection, self.projection.archive, [reference])
+        connection.execute('''INSERT INTO canonical_evidence_objects(
+                tenant_id,source_id,document_id,evidence_id,artifact_id,storage_backend,
+                object_key,content_sha256,size_bytes,media_type,encryption,version_id,
+                text_sha256,revision,receipt_count,created_at)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            ON CONFLICT(tenant_id,source_id,document_id) DO NOTHING''',
+            (row['tenant_id'], row['source_id'], row['document_id'], bundle['evidence_id'],
+             reference['artifact_id'], reference['storage_backend'], reference['object_key'],
+             reference['content_sha256'], reference['size_bytes'], reference['media_type'],
+             reference['encryption'], reference['version_id'], bundle['text_sha256'],
+             bundle['revision'], bundle['receipt_count'], reference['created_at']))
+        stored = connection.execute('''SELECT * FROM canonical_evidence_objects
+            WHERE tenant_id=%s AND source_id=%s AND document_id=%s''',
+            (row['tenant_id'], row['source_id'], row['document_id'])).fetchone()
+        expected = self._reference(stored)
+        if (any(expected[key] != reference[key] for key in expected)
+                or stored['evidence_id'] != bundle['evidence_id']
+                or stored['text_sha256'] != bundle['text_sha256']
+                or stored['revision'] != bundle['revision']
+                or stored['receipt_count'] != bundle['receipt_count']):
+            raise EvidenceProjectionError('evidence_projection_conflict')
+
     def project_pending(
         self,
         *,
@@ -481,11 +532,7 @@ class CanonicalEvidenceProjector:
                         continue
                     if reference not in references:
                         references.append(reference)
-                for reference in references:
-                    try:
-                        self.projection.delete(reference)
-                    except Exception:
-                        pass
+                self._schedule_cleanup(references)
                 raise
 
             values = []
@@ -512,6 +559,33 @@ class CanonicalEvidenceProjector:
                 )
             try:
                 with self.store.connect() as connection:
+                    from .archive_ownership import admit_references
+                    # Uploads happen without a database lease. Rejoin the same
+                    # native lock used by ingest/forget before admitting them.
+                    for tenant, source, native in sorted({
+                        (row["tenant_id"], row["source_id"], row["native_id"])
+                        for row, _bundle in entries
+                    }):
+                        connection.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s,0))",
+                            (f"v2\x1f{tenant}\x1f{source}\x1f{native}",))
+                    current = connection.execute(
+                        """SELECT document.tenant_id,document.source_id,document.document_id,
+                                  document.revision,document.text_sha256
+                           FROM canonical_documents document
+                           JOIN unnest(%s::text[],%s::text[],%s::text[])
+                                AS target(tenant_id,source_id,document_id)
+                             USING(tenant_id,source_id,document_id)
+                           WHERE document.is_current AND document.deleted_at IS NULL""",
+                        ([row["tenant_id"] for row, _ in entries],
+                         [row["source_id"] for row, _ in entries],
+                         [row["document_id"] for row, _ in entries]),
+                    ).fetchall()
+                    fields = ("tenant_id", "source_id", "document_id", "revision", "text_sha256")
+                    if {tuple(row[field] for field in fields) for row in current} != {
+                        tuple(row[field] for field in fields) for row, _ in entries
+                    }:
+                        raise EvidenceProjectionError("evidence_publication_stale")
+                    admit_references(connection, self.projection.archive, references)
                     with connection.cursor() as cursor:
                         cursor.executemany(
                             """INSERT INTO canonical_evidence_objects(
@@ -569,11 +643,7 @@ class CanonicalEvidenceProjector:
                                 "evidence_projection_conflict"
                             )
             except Exception:
-                for reference in references:
-                    try:
-                        self.projection.delete(reference)
-                    except Exception:
-                        pass
+                self._schedule_cleanup(references)
                 raise
             processed += len(entries)
             batches += 1
@@ -582,6 +652,15 @@ class CanonicalEvidenceProjector:
             "processed": processed,
             "batches": batches,
         }
+
+    def _schedule_cleanup(self, references):
+        # Upload success does not confer deletion authority: another publisher
+        # may already own this same deterministic object. Use the shared queue.
+        from .logical_evidence_projection import CanonicalLogicalEvidenceProjector
+        if references:
+            with self.store.connect() as connection, connection.transaction():
+                CanonicalLogicalEvidenceProjector._enqueue_cleanup(
+                    connection, tuple(references))
 
     def references_for_receipts(
         self,
@@ -674,9 +753,14 @@ class CanonicalEvidenceProjector:
         assert tenant_id is not None
         if not native_ids:
             return 0
+        from .archive_ownership import delete_persisted_reference, live_references, reference_key
+        from .canonical import _lock_artifacts
         with self.store.connect() as connection:
+            for native in sorted(set(native_ids)):
+                connection.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s,0))",
+                    (f"v2\x1f{tenant_id}\x1f{source_id}\x1f{native}",))
             rows = connection.execute(
-                """SELECT evidence.*
+                """SELECT evidence.*,document.deleted_at
                    FROM canonical_evidence_objects evidence
                    JOIN canonical_documents document
                      USING(tenant_id,source_id,document_id)
@@ -685,10 +769,16 @@ class CanonicalEvidenceProjector:
                    ORDER BY evidence.document_id""",
                 (tenant_id, source_id, native_ids),
             ).fetchall()
-        references = [self._reference(row) for row in rows]
-        for reference in references:
-            self.projection.delete(reference)
-        with self.store.connect() as connection:
+            if any(row["deleted_at"] is None for row in rows):
+                raise EvidenceProjectionError("evidence_forget_not_started")
+            references = [self._reference(row) for row in rows]
+            _lock_artifacts(connection, tenant_id, source_id,
+                [reference["artifact_id"] for reference in references])
+            retained = live_references(connection, references,
+                excluding_evidence_documents=[row["document_id"] for row in rows])
+            for reference in references:
+                if reference_key(reference) not in retained:
+                    delete_persisted_reference(self.projection.archive, reference)
             connection.execute(
                 """DELETE FROM canonical_evidence_objects evidence
                    USING canonical_documents document

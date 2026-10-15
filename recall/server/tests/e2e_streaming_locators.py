@@ -64,7 +64,7 @@ def setup(store, root, count=10):
 
 def metadata_fetch_protocol(store, root):
     """Real portal results, deadline cancellation and cleanup through _capture."""
-    scope, _, _ = setup(store, root, count=65)
+    scope, _, _ = setup(store, root, count=257)
     before = state(store, scope)
     execute = psycopg.Cursor.execute
     statements = []
@@ -74,7 +74,7 @@ def metadata_fetch_protocol(store, root):
         if text.startswith("SELECT set_config('statement_timeout',") and '; FETCH FORWARD' in text:
             statements.append(text)
             assert kwargs == {'prepare': False}
-            assert text.endswith('FETCH FORWARD 32 FROM "retirement_metadata"')
+            assert text.endswith('FETCH FORWARD 256 FROM "retirement_metadata"')
         return execute(cursor, query, *args, **kwargs)
 
     def capture(deadline):
@@ -87,14 +87,14 @@ def metadata_fetch_protocol(store, root):
                     (scope['tenant_id'], scope['source_id'], scope['native_parent_id']),
                     ParentRetirementLimits(), deadline,
                 )
-                assert result[2:] == (65, 65)
-                assert spool.index.execute('SELECT count(*) FROM documents').fetchone()[0] == 65
+                assert result[2:] == (257, 257)
+                assert spool.index.execute('SELECT count(*) FROM documents').fetchone()[0] == 257
         finally:
             assert (path is None or not path.exists()) and store.active_connections == 0
 
     with patch.object(psycopg.Cursor, 'execute', observed):
         capture(time.monotonic() + 30)
-    assert len(statements) == 4  # Three bounded data FETCHes and one empty FETCH.
+    assert len(statements) == 3  # Two bounded data FETCHes and one empty FETCH.
     assert state(store, scope) == before
 
     for stage in ('setting', 'fetch'):
@@ -111,7 +111,7 @@ def metadata_fetch_protocol(store, root):
                         query = psycopg.sql.SQL(
                             "SELECT set_config('statement_timeout','50ms',true) "
                             'FROM (SELECT pg_sleep(2)) delayed; '
-                            'FETCH FORWARD 32 FROM "retirement_metadata"'
+                            'FETCH FORWARD 256 FROM "retirement_metadata"'
                         )
                     else:
                         execute(control, 'CLOSE "retirement_metadata"; '

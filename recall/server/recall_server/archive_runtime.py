@@ -133,19 +133,18 @@ def build_archive_store(
         aws_secret_access_key=configured["RECALL_ARCHIVE_SECRET_ACCESS_KEY"],
     )
     client = client_factory(**connection_options, **client_options)
-    deadline_client = None
-    if deadline_reads:
-        from botocore.config import Config
+    # New archive ownership needs bounded metadata checks in every read mode.
+    from botocore.config import Config
 
-        deadline_client = BotoS3Client(client_factory(
-            **connection_options,
-            config=Config(
-                retries={"total_max_attempts": 1},
-                connect_timeout=S3_DEADLINE_CONNECT_TIMEOUT,
-                read_timeout=read_timeout,
-                max_pool_connections=8,
-            ),
-        ))
+    deadline_client = BotoS3Client(client_factory(
+        **connection_options,
+        config=Config(
+            retries={"total_max_attempts": 1},
+            connect_timeout=S3_DEADLINE_CONNECT_TIMEOUT,
+            read_timeout=read_timeout,
+            max_pool_connections=8,
+        ),
+    ))
     return S3ArchiveStore(
         bucket=configured["RECALL_ARCHIVE_BUCKET"],
         endpoint_url=endpoint_url,

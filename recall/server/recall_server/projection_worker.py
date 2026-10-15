@@ -7,6 +7,7 @@ import threading
 import time
 import urllib.error
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from http.client import RemoteDisconnected
 from typing import Any
 
@@ -34,6 +35,9 @@ PROJECTION_TOTALS: dict[str, int] = {
     "parquet_rows_written": 0,
     "search_plane_rows_written": 0,
     "bodies_thinned": 0,
+    "retirement_cleared_documents": 0,
+    "retirement_cleared_utf8_bytes": 0,
+    "retirement_elapsed_ms": 0,
     # Wall-clock spent per phase, in milliseconds, so a slow cycle can be
     # attributed to embedding, passages, logical (including S3 cleanup),
     # parquet, or thinning from /metrics alone.
@@ -53,6 +57,8 @@ _CYCLE_TO_TOTAL = {
     "parquet_rows": "parquet_rows_written",
     "search_plane_rows": "search_plane_rows_written",
     "canonical_bodies_thinned": "bodies_thinned",
+    "retirement_cleared_documents": "retirement_cleared_documents",
+    "retirement_cleared_utf8_bytes": "retirement_cleared_utf8_bytes",
 }
 PHASE_ELAPSED_KEYS = (
     "cycle_elapsed_ms",
@@ -62,6 +68,7 @@ PHASE_ELAPSED_KEYS = (
     "parquet_elapsed_ms",
     "search_plane_elapsed_ms",
     "thin_elapsed_ms",
+    "retirement_elapsed_ms",
 )
 _CYCLE_TO_TOTAL.update({key: key for key in PHASE_ELAPSED_KEYS})
 
@@ -77,6 +84,102 @@ def record_cycle(result: dict[str, int | str]) -> None:
 def projection_totals() -> dict[str, int]:
     with PROJECTION_TOTALS_LOCK:
         return dict(PROJECTION_TOTALS)
+
+
+class BackgroundBodyThinner:
+    """One bounded call at a time; preparation snapshots hints on the coordinator.
+
+    The existing owner retains its cursor and SQL transaction rules. Its pool
+    acquisition and statements are bounded; closing waits for that call rather
+    than abandoning a transaction or allowing another owner to overlap it.
+    """
+
+    def __init__(
+        self,
+        prepare: Callable[[bool], Callable[[], dict[str, Any]]],
+        *,
+        clock: Callable[[], float] = time.monotonic,
+    ):
+        self.prepare, self.clock = prepare, clock
+        self._executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="recall-body-thinning"
+        )
+        self._future = None
+        self.started_at = clock() - 30.0
+        self.closed = False
+        self.completed_attempts = 0
+        self.failed_attempts = 0
+
+    def tick(self, busy: bool) -> dict[str, Any] | None:
+        if self.closed:
+            return None
+        if self._future is not None:
+            if not self._future.done():
+                return None
+            return self._collect()
+        now = self.clock()
+        if now - self.started_at < 30.0:
+            return None
+        work = self.prepare(busy)
+
+        def invoke():
+            started = time.monotonic()
+            return dict(work(), elapsed_ms=round((time.monotonic() - started) * 1000))
+
+        self._future = self._executor.submit(invoke)
+        self.started_at = now
+        return None
+
+    def _collect(self):
+        future, self._future = self._future, None
+        try:
+            result = future.result()
+        except Exception as error:
+            # The owner retains its cursor after rollback or a lost commit ACK.
+            # Report the failed attempt without aborting unrelated publication.
+            self.failed_attempts += 1
+            LOG.warning(
+                "background thinning failed type=%s failed_attempts=%s",
+                type(error).__name__, self.failed_attempts,
+                exc_info=True,
+            )
+            return None
+        self.completed_attempts += 1
+        # Count on acknowledgment, including shutdown between cycle reports.
+        # The worker still reports per-cycle sums but must not count them twice.
+        record_cycle(
+            {
+                "canonical_bodies_thinned": result["documents"],
+                "thin_elapsed_ms": result["elapsed_ms"],
+            }
+        )
+        LOG.info(
+            "background thinning documents=%s document_bytes=%s event_bytes=%s elapsed_ms=%s",
+            result["documents"],
+            result["document_bytes_removed"],
+            result["event_bytes_replaced"],
+            result["elapsed_ms"],
+        )
+        return result
+
+    def close(self):
+        if self.closed:
+            return
+        self.closed = True
+        self._executor.shutdown(wait=True, cancel_futures=True)
+        if self._future is not None and not self._future.cancelled():
+            try:
+                self._collect()
+            except Exception as error:  # Preserve the original shutdown cause.
+                LOG.warning(
+                    "background thinning shutdown failed type=%s", type(error).__name__
+                )
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        self.close()
 
 
 def run_projection_worker(
@@ -95,6 +198,8 @@ def run_projection_worker(
     once: bool = False,
     sleep: Callable[[float], Any] = time.sleep,
     body_thinner: Callable[[bool], dict[str, Any]] | None = None,
+    retirement_maintainer: Callable[[bool], dict[str, Any]] | None = None,
+    background_thinner: BackgroundBodyThinner | None = None,
     quiet_seconds: float = 0.0,
     max_wait_seconds: float = 0.0,
     clock: Callable[[], float] = time.monotonic,
@@ -110,9 +215,10 @@ def run_projection_worker(
     ``search_plane`` (H3-b) drains the search projection outbox into
     turbopuffer before logical work and on ready parent completions; ``None`` (no
     turbopuffer settings, or ``--search-plane off``) skips the phase and the
-    cycle reports zeros for it. Each publication tick retains the configured
-    passage batch/concurrency and one bounded search drain. Completions are
-    coalesced by the logical coordinator; downstream calls never overlap.
+    cycle reports zeros for it. Each publication tick admits at most one
+    concurrent passage wave, capped by the configured batch size, and one
+    bounded search drain. Completions are coalesced by the logical coordinator;
+    downstream calls never overlap.
 
     With ``skip_embedding`` (H5-2) the embedding phase is left to the
     dedicated ``embedding-worker`` process: the cycle reports
@@ -122,6 +228,8 @@ def run_projection_worker(
     Postgres embeddings table is retired.
     """
 
+    if body_thinner is not None and background_thinner is not None:
+        raise ValueError("canonical thinning owners overlap")
     if not 0.1 <= interval_seconds <= 300:
         raise ValueError("projection worker interval is invalid")
     if getattr(getattr(passages, "store", None), "search_plane", "postgres") == "turbopuffer":
@@ -142,6 +250,18 @@ def run_projection_worker(
     last_parquet_started = clock()
     last_busy_thin_cycle: int | None = None
     last_busy_thin_started = 0.0
+    last_retirement_started = clock() - 30.0
+    # A child can finish before a later publication phase fails. Carry its
+    # observed counters until a successful cycle records them exactly once.
+    retired = {"status": "disabled" if retirement_maintainer is None else "deferred"}
+
+    def empty_thinning():
+        return dict(
+            status="deferred", documents=0, refused=0, document_bytes_removed=0,
+            event_bytes_replaced=0, elapsed_ms=0,
+        )
+
+    background_result = empty_thinning()
 
     def elapsed_ms(started: float) -> int:
         return max(0, int(round((clock() - started) * 1000)))
@@ -200,6 +320,35 @@ def run_projection_worker(
                     elif isinstance(value, int):
                         total[key] = int(total.get(key, 0)) + value
 
+            def maintain_retirement(busy):
+                nonlocal last_retirement_started, active_phase, phase_started
+                now = clock()
+                if retirement_maintainer is None or now - last_retirement_started < 30.0:
+                    return
+                previous_phase, previous_started = active_phase, phase_started
+                active_phase, phase_started = "retirement", now
+                last_retirement_started = now
+                accumulate(retired, retirement_maintainer(busy))
+                phase_elapsed["retirement_elapsed_ms"] += elapsed_ms(now)
+                if previous_phase in {"passage", "logical"}:
+                    previous_started += clock() - now
+                active_phase, phase_started = previous_phase, previous_started
+
+            def maintain_thinning(busy):
+                nonlocal active_phase, phase_started
+                if background_thinner is None:
+                    return
+                previous_phase, previous_started = active_phase, phase_started
+                active_phase, phase_started = "thin", clock()
+                current = background_thinner.tick(busy)
+                if current is not None:
+                    for key, value in current.items():
+                        if key in {"status", "historical_window_size", "committed_hints_pending"}:
+                            background_result[key] = value
+                        elif type(value) is int:
+                            background_result[key] = int(background_result.get(key, 0)) + value
+                active_phase, phase_started = previous_phase, previous_started
+
             search_ticks = 0
 
             def publish_search():
@@ -237,6 +386,12 @@ def run_projection_worker(
                     phase_elapsed["logical_elapsed_ms"] = 0
                 active_phase, phase_started = previous_phase, previous_started
 
+            def heartbeat():
+                if search_plane is not None:
+                    publish_search()
+                maintain_retirement(True)
+                maintain_thinning(True)
+
             def publish_ready():
                 nonlocal active_phase, phase_started, passage_elapsed_ms
                 previous_phase, previous_started = active_phase, phase_started
@@ -248,8 +403,10 @@ def run_projection_worker(
                 before_search_ticks = search_ticks
                 tick = passages.project_pending(
                     tenant_id=tenant_id,
-                    batch_size=passage_batch_size,
-                    max_batches=max_batches_per_cycle,
+                    # Yield to logical admission after one active wave, even
+                    # when a large passage backlog remains.
+                    batch_size=min(passage_batch_size, passage_concurrency),
+                    max_batches=1,
                     concurrency=passage_concurrency,
                     on_progress=publish_search if search_plane is not None else None,
                 )
@@ -264,6 +421,11 @@ def run_projection_worker(
                     previous_started += clock() - publication_started
                 active_phase, phase_started = previous_phase, previous_started
 
+            def publish_progress():
+                # Frequent completions can prevent the idle heartbeat entirely.
+                maintain_retirement(True)
+                publish_ready()
+
             # Drain existing work first, then publish completed parents while
             # unrelated preparation continues in the bounded logical executor.
             publish_ready()
@@ -277,8 +439,17 @@ def run_projection_worker(
                 quiet_seconds=quiet_seconds,
                 max_wait_seconds=max_wait_seconds,
                 cleanup_concurrency=cleanup_concurrency,
-                on_progress=publish_ready,
-                on_heartbeat=publish_search if search_plane is not None else None,
+                on_progress=publish_progress,
+                on_heartbeat=heartbeat if search_plane is not None or retirement_maintainer is not None or background_thinner is not None else None,
+                # Stop admitting at the existing scan cadence, then settle
+                # active owners. Translate the worker clock's remaining time
+                # into the projector's monotonic clock; callbacks are not killed.
+                admission_deadline_at=(
+                    time.monotonic() + max(
+                        0.0, last_parquet_started + parquet_max_wait_seconds - clock()
+                    )
+                    if scan is not None else None
+                ),
             )
             logical_elapsed_ms = elapsed_ms(phase_started)
             phase_elapsed["logical_elapsed_ms"] = logical_elapsed_ms
@@ -340,6 +511,8 @@ def run_projection_worker(
             phase_elapsed["parquet_elapsed_ms"] = parquet_elapsed_ms
             active_phase = "thin"
             phase_started = clock()
+            # Synchronous callers preserve the prior cadence. The background
+            # owner independently limits submissions to one per 30 seconds.
             # Preserve the thinner's row-level authority gates. While busy,
             # yield two cycles between batches, but run after 30 seconds at the
             # next reachable boundary. Earlier phases can exceed that interval.
@@ -355,7 +528,9 @@ def run_projection_worker(
                 or cycles - last_busy_thin_cycle >= 3
                 or phase_started - last_busy_thin_started >= 30.0
             )
+            maintain_thinning(thin_busy)
             thinned = (
+                background_result if background_thinner is not None else
                 body_thinner(thin_busy)
                 if body_thinner is not None and thin_due
                 else {
@@ -371,8 +546,12 @@ def run_projection_worker(
                 # path can retry at its next reachable thinning boundary.
                 last_busy_thin_cycle = cycles
                 last_busy_thin_started = phase_started
-            thin_elapsed_ms = elapsed_ms(phase_started)
+            thin_elapsed_ms = (
+                int(background_result["elapsed_ms"]) if background_thinner is not None
+                else elapsed_ms(phase_started)
+            )
             phase_elapsed["thin_elapsed_ms"] = thin_elapsed_ms
+            maintain_retirement(thin_busy)
             active_phase = "outbox"
             phase_started = clock()
             # H3-a: source-months waiting for the Lance writer, one cheap
@@ -400,10 +579,18 @@ def run_projection_worker(
                     and int(scanned["contended"]) == 0
                     and int(scanned.get("requeued", 0)) == 0
                     and thinned["status"] == "complete"
+                    and retired["status"] == "disabled"
                     and int(searched["months"]) == 0
                     and int(searched["failed"]) == 0
                     else "pending"
                 ),
+                "retirement_status": str(retired["status"]),
+                "retirement_cleared_documents": int(retired.get("cleared_documents", 0)),
+                "retirement_cleared_utf8_bytes": int(retired.get("cleared_utf8_bytes", 0)),
+                "retirement_archive_bytes": int(retired.get("archive_bytes", 0)),
+                "retirement_enrolled_parents": int(retired.get("enrolled_parents", 0)),
+                "retirement_reconciled_intents": int(retired.get("reconciled_intents", 0)),
+                "retirement_unknown": int(bool(retired.get("commit_outcome_unknown", False))),
                 "documents": int(documents["documents"]),
                 "logical_repaired": int(documents.get("repaired", 0)),
                 "logical_pending": int(documents.get("pending", 0)),
@@ -438,7 +625,7 @@ def run_projection_worker(
                 "search_plane_rate_limited": int(searched.get("rate_limited", 0)),
                 "canonical_bodies_thinned": int(thinned["documents"]),
                 "thin_mode": "busy" if thin_busy else "idle",
-                "thin_deferred": int(body_thinner is not None and not thin_due),
+                "thin_deferred": int(thinned["status"] == "deferred"),
                 "thin_probe_timeouts": int(thinned.get("historical_probe_timeouts", 0)),
                 "thin_window_size": int(thinned.get("historical_window_size", 0)),
                 "thin_hints_pending": int(thinned.get("committed_hints_pending", 0)),
@@ -472,8 +659,16 @@ def run_projection_worker(
                 "parquet_elapsed_ms": parquet_elapsed_ms,
                 "search_plane_elapsed_ms": search_plane_elapsed_ms,
                 "thin_elapsed_ms": thin_elapsed_ms,
+                "retirement_elapsed_ms": phase_elapsed["retirement_elapsed_ms"],
             }
-            record_cycle(result)
+            recorded = dict(result)
+            if background_thinner is not None:
+                # Already counted once when the background result was collected.
+                recorded.pop("canonical_bodies_thinned")
+                recorded.pop("thin_elapsed_ms")
+            record_cycle(recorded)
+            background_result = empty_thinning()
+            retired = {"status": "disabled" if retirement_maintainer is None else "deferred"}
             LOG.info(
                 "projection cycle status=%s documents=%s logical_repaired=%s "
                 "logical_pending=%s logical_waiting=%s records=%s "
@@ -501,7 +696,10 @@ def run_projection_worker(
                 "old_objects_deleted=%s search_outbox_pending=%s "
                 "cycle_elapsed_ms=%s embed_elapsed_ms=%s passage_elapsed_ms=%s "
                 "logical_elapsed_ms=%s parquet_elapsed_ms=%s "
-                "search_plane_elapsed_ms=%s thin_elapsed_ms=%s "
+                "search_plane_elapsed_ms=%s thin_elapsed_ms=%s retirement_elapsed_ms=%s "
+                "retirement_status=%s retirement_cleared_documents=%s "
+                "retirement_cleared_utf8_bytes=%s retirement_archive_bytes=%s "
+                "retirement_enrolled_parents=%s retirement_reconciled_intents=%s retirement_unknown=%s "
                 "passage_warmup_ms=%s passage_pending_ms=%s passage_prepare_ms=%s "
                 "passage_commit_ms=%s passage_count_ms=%s",
                 *(
@@ -556,6 +754,9 @@ def run_projection_worker(
                         "old_objects_deleted",
                         "search_outbox_pending",
                         *PHASE_ELAPSED_KEYS,
+                        "retirement_status", "retirement_cleared_documents",
+                        "retirement_cleared_utf8_bytes", "retirement_archive_bytes",
+                        "retirement_enrolled_parents", "retirement_reconciled_intents", "retirement_unknown",
                         "passage_warmup_ms",
                         "passage_pending_ms",
                         "passage_prepare_ms",
@@ -599,6 +800,7 @@ def run_projection_worker(
                 "parquet_stale",
                 "search_plane_months",
                 "canonical_bodies_thinned",
+                "retirement_cleared_documents",
                 "stale",
                 "pruned",
             )

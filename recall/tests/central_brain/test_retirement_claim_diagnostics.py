@@ -133,7 +133,7 @@ class ClaimDiagnosticTests(unittest.TestCase):
                 runner, "_authorize", side_effect=lambda *a: store.step("authorize")
             ),
             patch.object(
-                runner, "retire_parent_chunks", return_value=complete
+                runner, "retire_parent_windows", return_value=complete
             ) as retire,
         ):
             result = runner.run_retirement(
@@ -152,18 +152,32 @@ class ClaimDiagnosticTests(unittest.TestCase):
                 "batches",
                 "cleared_documents",
                 "cleared_chunks",
+                "retired_metadata_chunks",
                 "cleared_utf8_bytes",
                 "eligible_documents",
                 "commit_outcome_unknown",
                 "errors",
                 "excluded",
                 "archive_gets",
+                "committed_sql_ms",
+                "committed_hash_ms",
+                "archive_read_ms",
+                "claim_wall_ms",
+                "parent_wall_ms",
+                "metadata_capture_ms",
+                "metadata_rows",
+                "metadata_fetches",
+                "metadata_fetch_ms",
+                "metadata_membership_calls",
+                "metadata_membership_ms",
+                "metadata_spool_ms",
                 "archive_bytes",
                 "body_eligibility",
                 "physical_reclaimed_bytes",
             },
         )
         self.assertEqual(result["status"], "claim_refused")
+        self.assertEqual(result["retired_metadata_chunks"], 0)
         self.assertEqual(
             (
                 result["attempted_parents"],
@@ -210,7 +224,7 @@ class ClaimDiagnosticTests(unittest.TestCase):
                         "_authorize",
                         side_effect=lambda *a: store.step("authorize"),
                     ),
-                    patch.object(runner, "retire_parent_chunks") as retire,
+                    patch.object(runner, "retire_parent_windows") as retire,
                     self.assertRaises(PrivateError) as caught,
                 ):
                     runner.run_retirement(store, Mock(), scope=self.scope(), apply=True)
@@ -345,7 +359,7 @@ class ClaimDiagnosticTests(unittest.TestCase):
                 self.subTest(error=type(error).__name__),
                 patch.object(runner, "_claim", side_effect=[candidate, error]),
                 patch.object(
-                    runner, "retire_parent_chunks", return_value={"complete": True}
+                    runner, "retire_parent_windows", return_value={"complete": True}
                 ),
             ):
                 result = runner.run_retirement(
@@ -365,7 +379,7 @@ class ClaimDiagnosticTests(unittest.TestCase):
                 runner, "_authorize", side_effect=lambda *a: store.step("authorize")
             ),
             patch.object(
-                runner, "retire_parent_chunks", return_value={"complete": True}
+                runner, "retire_parent_windows", return_value={"complete": True}
             ),
         ):
             claim = runner._claim

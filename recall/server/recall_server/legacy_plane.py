@@ -27,6 +27,7 @@ from .canonical import (
     CanonicalArchiveGateway,
     CanonicalLifecycleError,
     CanonicalPlane,
+    _filesystem_cleanup,
 )
 from .projectors import canonical_json, validate_envelope
 
@@ -216,6 +217,20 @@ class LegacyIngestBridge:
         each envelope's canonical JSON is the archived artifact.
         ``connector_id`` names the connector for envelopes that carry none.
         """
+        cleanup = isinstance(events, list) and any(
+            isinstance(event, dict) and _filesystem_cleanup(event, connector_id)
+            for event in events)
+        # A compatibility flag must never send filesystem cleanup to the old
+        # destructive writer. This batch commits through the canonical owner.
+        if cleanup:
+            if not idempotency_key or len(idempotency_key) > 200:
+                raise ValueError('invalid idempotency key')
+            if not self.canonical_available:
+                raise CanonicalPlaneUnavailable('canonical plane unavailable')
+            acknowledgement = self._ingest_canonical(
+                events, principal=principal, raw_payload=raw_payload,
+                media_type=media_type, connector_id=connector_id, notification=notification)
+            return acknowledgement, acknowledgement['replay']
         if legacy_writes_enabled(self.environment):
             if self.canonical_available:
                 self._ingest_canonical(
@@ -254,12 +269,35 @@ class LegacyIngestBridge:
         if not isinstance(events, list) or not events:
             raise ValueError("empty ingest batch")
         tenant_id = legacy_ingest_tenant_id(principal, self.environment)
-        prepared: list[tuple[str, str, dict[str, Any], dict[str, Any]]] = []
+        cleanup_sources = set()
+        # Refuse stale/revoked marker authority before any other batch member's
+        # gateway can register a source. The write transaction checks it again.
+        for original in events:
+            if not _filesystem_cleanup(original, connector_id):
+                continue
+            envelope = validate_envelope(original)
+            cleanup_sources.add(envelope['source_id'])
+            if (not principal or principal.get('principal_id') != envelope['principal_id']
+                    or principal.get('source_id') not in (None, envelope['source_id'])):
+                raise CanonicalLifecycleError('canonical_authority_forbidden')
+            with self.store.connect() as connection, connection.transaction():
+                self.canonical_plane.authorize_filesystem_cleanup(connection,
+                    tenant_id=tenant_id, principal_id=envelope['principal_id'],
+                    event=envelope, connector_id=legacy_connector_id(envelope, connector_id))
+        prepared: list[tuple[str, str, dict[str, Any] | None, dict[str, Any]]] = []
         for original in events:
             envelope = copy.deepcopy(validate_envelope(original))
             principal_id = envelope["principal_id"]
             source_id = envelope["source_id"]
             event_connector_id = legacy_connector_id(envelope, connector_id)
+            if _filesystem_cleanup(envelope, event_connector_id):
+                if (not principal or principal.get('principal_id') != principal_id
+                        or principal.get('source_id') not in (None, source_id)):
+                    raise CanonicalLifecycleError('canonical_authority_forbidden')
+                # No upload or canonical read for a cleanup marker, including
+                # an identity the owner has explicitly forgotten already.
+                prepared.append((principal_id, event_connector_id, None, envelope))
+                continue
             payload = (
                 raw_payload
                 if raw_payload is not None
@@ -278,6 +316,7 @@ class LegacyIngestBridge:
                 payload=payload,
                 media_type=media_type,
                 created_at=envelope["observed_at"],
+                **({'require_existing_owner': True} if source_id in cleanup_sources else {}),
             )
             provenance = dict(envelope.get("provenance") or {})
             provenance["connector_id"] = event_connector_id
@@ -291,6 +330,16 @@ class LegacyIngestBridge:
             connection = stack.enter_context(self.store.connect())
             with connection.transaction():
                 for principal_id, event_connector_id, artifact, envelope in prepared:
+                    if artifact is None:
+                        self.canonical_plane.authorize_filesystem_cleanup(connection,
+                            tenant_id=tenant_id, principal_id=principal_id,
+                            event=envelope, connector_id=event_connector_id)
+                for principal_id, event_connector_id, artifact, envelope in prepared:
+                    if artifact is None:
+                        results.append(self.canonical_plane.suppress_filesystem_cleanup(
+                            connection, tenant_id=tenant_id, principal_id=principal_id,
+                            event=envelope, connector_id=event_connector_id))
+                        continue
                     results.append(
                         self.canonical_plane.ingest_document(
                             tenant_id=tenant_id,
@@ -312,6 +361,10 @@ class LegacyIngestBridge:
             ),
             "receipts": [result["receipt"] for result in results],
             "replay": all(result["replay"] for result in results),
+            **({"suppressed_filesystem_events": sum(result.get("suppressed_filesystem_events", 0) for result in results)}
+               if any(result.get("suppressed_filesystem_events") for result in results) else {}),
+            **({"suppressed_deleted_events": sum(result.get("suppressed_deleted_events", 0) for result in results)}
+               if any(result.get("suppressed_deleted_events") for result in results) else {}),
         }
 
 

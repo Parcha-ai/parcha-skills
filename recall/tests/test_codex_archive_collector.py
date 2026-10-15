@@ -11,6 +11,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from collector.collector import Collector, CollectorRuntimeError
+from scripts.eval_codex_archive_l2 import _seed_legacy_acknowledged_deletions
 
 
 def _line(value: dict) -> str:
@@ -269,8 +270,9 @@ class CodexArchiveCollectorTest(unittest.TestCase):
         target.parent.mkdir(parents=True, exist_ok=True)
         source.replace(target)
         removed = legacy.scan()
-        self.assertEqual(removed["tombstones_queued"], 2)
-        self.assertEqual(legacy.flush()["acked"], 2)
+        self.assertEqual(removed["tombstones_queued"], 0)
+        self.assertEqual(legacy.flush()["acked"], 0)
+        self.assertEqual(_seed_legacy_acknowledged_deletions(legacy), 2)
         receipts = self._rows(legacy)
         legacy.db.execute("DROP TABLE codex_session_locations")
         legacy.db.execute("DROP TABLE codex_sessions")
@@ -330,8 +332,9 @@ class CodexArchiveCollectorTest(unittest.TestCase):
             max_scan_records=100_000,
             max_scan_seconds=60,
         )
-        self.assertEqual(single_root.scan()["tombstones_queued"], 2)
-        self.assertEqual(single_root.flush()["acked"], 2)
+        self.assertEqual(single_root.scan()["tombstones_queued"], 0)
+        self.assertEqual(single_root.flush()["acked"], 0)
+        self.assertEqual(_seed_legacy_acknowledged_deletions(single_root), 2)
         single_root.close()
 
         restoring = self.collector(max_scan_records=1)

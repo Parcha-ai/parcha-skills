@@ -91,7 +91,7 @@ class RunnerTests(unittest.TestCase):
         )
         with (
             patch.object(runner, "_claim", side_effect=[self.candidate(), None]),
-            patch.object(runner, "retire_parent_chunks", return_value=result) as retire,
+            patch.object(runner, "retire_parent_windows", return_value=result) as retire,
         ):
             report = runner.run_retirement(
                 Mock(), Mock(), scope=self.scope(), apply=True
@@ -101,6 +101,32 @@ class RunnerTests(unittest.TestCase):
         self.assertTrue(retire.call_args.kwargs["apply"])
         self.assertEqual(retire.call_args.kwargs["required_scope_epoch"], 2)
         self.assertEqual(retire.call_args.kwargs["owner_principal_id"], "principal")
+
+    def test_byte_limited_partial_stops_before_proving_another_parent(self):
+        partial = dict(status='partial', complete=False, batches=1,
+                       cleared_documents=1, cleared_chunks=1, cleared_utf8_bytes=47)
+        with patch.object(runner, '_claim', side_effect=[self.candidate(), self.candidate('tail'), None]) as claim, patch.object(runner, 'retire_parent_windows', return_value=partial) as retire:
+            report = runner.run_retirement(Mock(), Mock(), scope=self.scope(), apply=True,
+                limits=runner.RunnerLimits(max_clear_bytes=64))
+        self.assertEqual(report['status'], 'clear_budget_limited')
+        self.assertEqual(report['cleared_utf8_bytes'], 47)
+        self.assertEqual(claim.call_count, 1)
+        self.assertEqual(retire.call_count, 1)
+
+    def test_parent_batch_or_parent_byte_cap_keeps_fair_advance(self):
+        from recall_server.chunk_retirement import ParentRetirementLimits
+        for parent_limits in (ParentRetirementLimits(max_batches=1),
+                              ParentRetirementLimits(max_clear_bytes=50)):
+            with self.subTest(parent_limits=parent_limits):
+                partial = dict(status='partial', complete=False, batches=1,
+                               cleared_documents=1, cleared_chunks=1, cleared_utf8_bytes=47)
+                complete = dict(status='applied', complete=True, batches=1,
+                                cleared_documents=1, cleared_chunks=1, cleared_utf8_bytes=5)
+                with patch.object(runner, '_claim', side_effect=[self.candidate(), self.candidate('tail'), None]), patch.object(runner, 'retire_parent_windows', side_effect=[partial, complete]):
+                    report = runner.run_retirement(Mock(), Mock(), scope=self.scope(), apply=True,
+                        limits=runner.RunnerLimits(max_clear_bytes=200), parent_limits=parent_limits)
+                self.assertEqual(report['attempted_parents'], 2)
+                self.assertEqual(report['cleared_utf8_bytes'], 52)
 
     def test_stop_before_claim_preserves_all_work(self):
         with patch.object(runner, "_claim") as claim:
@@ -127,7 +153,7 @@ class RunnerTests(unittest.TestCase):
                 "_claim",
                 side_effect=[self.candidate("bad"), self.candidate("good"), None],
             ),
-            patch.object(runner, "retire_parent_chunks", side_effect=[bad, good]),
+            patch.object(runner, "retire_parent_windows", side_effect=[bad, good]),
         ):
             result = runner.run_retirement(
                 Mock(), Mock(), scope=self.scope(), apply=True
@@ -138,7 +164,7 @@ class RunnerTests(unittest.TestCase):
         bad.committed = {"cleared_utf8_bytes": 2}
         with (
             patch.object(runner, "_claim", return_value=self.candidate()) as claim,
-            patch.object(runner, "retire_parent_chunks", side_effect=bad),
+            patch.object(runner, "retire_parent_windows", side_effect=bad),
         ):
             result = runner.run_retirement(
                 Mock(), Mock(), scope=self.scope(), apply=True
@@ -156,6 +182,62 @@ class RunnerTests(unittest.TestCase):
             meter.read_raw({"size_bytes": 5})
         self.assertEqual((meter.gets, meter.bytes), (1, 6))
         self.assertEqual(archive.read_raw.call_count, 1)
+
+    def test_timers_keep_acknowledged_prefix_separate_from_unknown_parent_wall(self):
+        clock = [100.0]
+        candidates = iter((self.candidate('first'), self.candidate('unknown')))
+        def claim(*args, **kwargs):
+            clock[0] += .25
+            return next(candidates)
+        def retire(*args, **kwargs):
+            clock[0] += 2
+            if kwargs['native_parent_id'] == 'unknown':
+                error = ChunkRetirementError('parent_retirement_unavailable')
+                error.committed = dict(cleared_utf8_bytes=3, sql_ms=200., hash_ms=50.)
+                error.attempt_metrics = dict(metadata_capture_ms=600., metadata_rows=7, metadata_fetches=2,
+                                             metadata_fetch_ms=300., metadata_membership_calls=1,
+                                             metadata_membership_ms=100., metadata_spool_ms=25.)
+                raise error
+            return dict(complete=True, batches=1, cleared_utf8_bytes=10,
+                        sql_ms=500., hash_ms=100., metadata_capture_ms=800.,
+                        metadata_rows=10, metadata_fetches=2, metadata_fetch_ms=400.,
+                        metadata_membership_calls=1, metadata_membership_ms=200., metadata_spool_ms=50.)
+        with patch.object(runner.time, 'monotonic', side_effect=lambda:clock[0]), \
+             patch.object(runner, '_claim', side_effect=claim), \
+             patch.object(runner, 'retire_parent_windows', side_effect=retire):
+            result = runner.run_retirement(Mock(), Mock(), scope=self.scope(), apply=True,
+                                           deadline_at=200.)
+        self.assertTrue(result['commit_outcome_unknown'])
+        self.assertEqual(result['cleared_utf8_bytes'], 13)
+        self.assertEqual(result['committed_sql_ms'], 700.)
+        self.assertEqual(result['committed_hash_ms'], 150.)
+        self.assertEqual(result['parent_wall_ms'], 4000.)
+        self.assertEqual(result['claim_wall_ms'], 500.)
+        self.assertEqual(result['metadata_capture_ms'], 1400.)
+        self.assertEqual({key: result[key] for key in runner.CAPTURE_DETAIL_FIELDS}, dict(
+            metadata_rows=17, metadata_fetches=4, metadata_fetch_ms=700.,
+            metadata_membership_calls=2, metadata_membership_ms=300., metadata_spool_ms=75.))
+
+    def test_archive_wall_includes_failed_reads_but_not_budget_refusal(self):
+        clock = [100.0]
+        def failed(*args, **kwargs):
+            clock[0] += .5
+            raise ValueError('transport')
+        for bounded in (False, True):
+            archive = Mock()
+            archive.read_raw.side_effect = failed
+            archive.read_raw_bounded.side_effect = failed
+            meter = runner.RunArchive(archive, max_bytes=10)
+            with patch.object(runner.time, 'monotonic', side_effect=lambda:clock[0]):
+                with self.assertRaises(ValueError):
+                    if bounded:
+                        meter.read_raw_bounded({'size_bytes':6}, deadline_at=200.)
+                    else:
+                        meter.read_raw({'size_bytes':6})
+                with self.assertRaises(ChunkRetirementError):
+                    meter.read_raw({'size_bytes':5})
+            self.assertEqual(meter.read_ms, 500.)
+            self.assertEqual((meter.gets,meter.bytes),(1,6))
 
     def test_expired_already_empty_prefix_stops_before_another_commit(self):
         import os

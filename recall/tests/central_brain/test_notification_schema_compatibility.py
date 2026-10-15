@@ -4,6 +4,7 @@ import itertools
 import unittest
 
 from tests.central_brain.test_core_deployment import healthy_snapshot
+from recall_server import SCHEMA_VERSION
 from recall_server.capabilities import CapabilityError, assess_snapshot
 
 
@@ -64,8 +65,8 @@ class NotificationSchemaCompatibility(unittest.TestCase):
         for versions in (
             [n for n in complete if n != 68],
             [n for n in complete if n != 69],
-            complete + [75],
-            list(range(1, 71)) + [75],
+            complete + [SCHEMA_VERSION + 1],
+            list(range(1, 71)) + [SCHEMA_VERSION + 1],
             complete + [72],
             complete[:-3] + [72, 71, 73],
             [0] + complete,

@@ -34,6 +34,21 @@ def refused(callback):
     raise AssertionError("unsafe runner action succeeded")
 
 
+def assert_archive_cost(store, archive, tenant, source, report):
+    # Each subset reads a part at most once for discovery and once for the
+    # unchanged selected reader. Only the original full EOF proof adds a read.
+    bound = 2 * report["batches"] + report["completed_parent_proofs"]
+    assert archive.reads and all(0 < count <= bound for count in archive.reads.values())
+    with store.connect() as connection:
+        sizes = {row["artifact_id"]: row["size_bytes"] for row in connection.execute(
+            "SELECT artifact_id,size_bytes FROM canonical_evidence_document_parts WHERE tenant_id=%s AND source_id=%s",
+            (tenant, source),
+        ).fetchall()}
+    assert report["archive_gets"] == sum(archive.reads.values())
+    assert report["archive_bytes"] == sum(sizes[key] * count for key, count in archive.reads.items())
+    assert report["archive_bytes"] <= runner.RunnerLimits().max_archive_bytes
+
+
 def scenario(store, root):
     tenant, source, archive, _, _, _ = fixture(store, root, count=4)
     scope = runner.RetirementScope(tenant, "principal:reprojection", (source,))
@@ -135,7 +150,10 @@ def scenario(store, root):
         and first["partial_parents"] == 1
         and remaining() == 3
     ), first
-    assert all(n == 1 for n in archive.reads.values()), "runner repeated archive proof"
+    assert_archive_cost(store, archive, tenant, source, first)
+    assert 0 < first["committed_hash_ms"] <= first["committed_sql_ms"]
+    assert first["parent_wall_ms"] >= first["committed_sql_ms"]
+    assert first["archive_read_ms"] > 0 and first["claim_wall_ms"] > 0
     partial = state()
     runner.enroll_cohort(store, scope=scope, reviewed_plan=page)
     assert state() == partial
@@ -685,7 +703,7 @@ def claim_unknown_state_recovery(store, root):
                 assert unchanged[field] == after[field]
         age()
         fresh_before = state()
-        original_retire = runner.retire_parent_chunks
+        original_retire = runner.retire_parent_windows
         stale_checks = []
         # An uncommitted epoch number can legitimately be reused after rollback.
         # Fence only the last actually committed old epoch. The old invocation
@@ -710,7 +728,7 @@ def claim_unknown_state_recovery(store, root):
             return original_retire(*args, **kwargs)
 
         with patch.object(
-            runner, "retire_parent_chunks", side_effect=assert_old_epoch_fenced
+            runner, "retire_parent_windows", side_effect=assert_old_epoch_fenced
         ):
             recovered = runner.run_retirement(store, archive, scope=scope, apply=True)
         assert stale_checks == [True] and recovered["completed_parent_proofs"] == 1
@@ -742,6 +760,37 @@ def claim_unknown_state_recovery(store, root):
         assert reads() == expected_reads
 
 
+def byte_budget_stops_before_next_proof(store, root):
+    tenant, source, archive, _, projector, texts = fixture(store, root, count=2)
+    scope = runner.RetirementScope(tenant, 'principal:reprojection', (source,))
+    with store.connect() as c:
+        c.execute("INSERT INTO canonical_source_grants VALUES(%s,%s,%s,'owner',now())",
+                  (tenant, scope.principal_id, source))
+        insert_record(c, tenant=tenant, source=source, parent='zulu-budget',
+                      native='zulu-budget-event', text='untouched tail body', role='user', byte_start=100)
+        mark_logical_evidence_dirty(c, tenant_id=tenant, source_id=source,
+                                   native_ids=['zulu-budget-event'], reason='ingest')
+    projected = projector.project_pending(tenant_id=tenant, batch_size=1, max_batches=1, upload_concurrency=1)
+    assert projected['failed'] == 0
+    runner.enroll_cohort(store, scope=scope, reviewed_plan=runner.plan_cohort(store, scope=scope))
+    with store.connect() as c:
+        c.execute("UPDATE canonical_chunk_retirement_progress SET updated_at=now()-CASE WHEN native_parent_id='session' THEN interval '3 minutes' ELSE interval '2 minutes' END WHERE tenant_id=%s AND source_id=%s", (tenant, source))
+        tail_before = c.execute("SELECT * FROM canonical_chunk_retirement_progress WHERE tenant_id=%s AND source_id=%s AND native_parent_id='zulu-budget'", (tenant, source)).fetchone()
+        tail_parts = c.execute("SELECT artifact_id FROM canonical_evidence_document_parts WHERE tenant_id=%s AND source_id=%s AND logical_document_id=%s", (tenant, source, tail_before['logical_document_id'])).fetchall()
+    archive.reads.clear()
+    report = runner.run_retirement(store, archive, scope=scope, apply=True,
+        limits=runner.RunnerLimits(max_clear_bytes=len(texts['event-0000'].encode()) + 17))
+    assert report['attempted_parents'] == report['partial_parents'] == report['cleared_documents'] == 1, report
+    assert report['status'] == 'clear_budget_limited', report
+    assert report['cleared_utf8_bytes'] == len(texts['event-0000'].encode()), report
+    assert not any(archive.reads[part['artifact_id']] for part in tail_parts), 'spent archive reads after byte-budget stop'
+    with store.connect() as c:
+        assert c.execute("SELECT * FROM canonical_chunk_retirement_progress WHERE tenant_id=%s AND source_id=%s AND native_parent_id='zulu-budget'", (tenant, source)).fetchone() == tail_before
+        c.execute("UPDATE canonical_chunk_retirement_progress SET updated_at=now()-interval '2 minutes' WHERE tenant_id=%s AND source_id=%s", (tenant, source))
+    resumed = runner.run_retirement(store, archive, scope=scope, apply=True)
+    assert resumed['completed_parent_proofs'] == resumed['cleared_documents'] == 2, resumed
+
+
 def main():
     admin_dsn = os.environ["RECALL_DATABASE_URL"]
     database = "recall_runner_" + uuid.uuid4().hex
@@ -757,6 +806,7 @@ def main():
             tempfile.TemporaryDirectory() as tmp,
             patch.dict(os.environ, RECALL_CHUNK_BODY_READS="archive"),
         ):
+            byte_budget_stops_before_next_proof(store, Path(tmp))
             scenario(store, Path(tmp))
             races(store, Path(tmp))
             paging_and_fairness(store, Path(tmp))

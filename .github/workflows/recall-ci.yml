@@ -52,11 +52,26 @@ jobs:
       - run: ruff check . --select E9,F,PLE
       - run: bandit -q -lll -r . -x tests,server/tests
       - run: pip-audit -r server/requirements.txt
+      - name: Retired job-index lifecycle (isolated PostgreSQL 17)
+        run: bash server/tests/run_job_status_index_fixture.sh
       - name: Fresh-PostgreSQL end-to-end suite
         run: |
           for test in \
             e2e_brainstore.py \
+            e2e_source_status_index_order.py \
             e2e_v2_canonical_plane.py \
+            e2e_slack_deletion_ordering.py \
+            e2e_collector_retention_policy.py \
+            e2e_legacy_cleanup_ack.py \
+            e2e_collector_history_recovery.py \
+            e2e_collector_history_lock_outcome.py \
+            e2e_collector_history_compacted.py \
+            e2e_collector_history_multichunk.py \
+            e2e_collector_history_size.py \
+            e2e_compact_ingest_metadata.py \
+            e2e_compact_canonical_bodies.py \
+            e2e_audit_retirement.py \
+            e2e_audit_retirement_batch.py \
             e2e_binary_archive.py \
             e2e_storage_legacy_cut.py \
             e2e_canonical_body_thinning.py \
@@ -66,19 +81,28 @@ jobs:
             e2e_logical_source_fairness.py \
             e2e_logical_backlog_admission.py \
             e2e_logical_parent_progress.py \
+            e2e_passage_callback_quantum.py \
+            e2e_logical_slot_refill.py \
+            e2e_logical_admission_isolation.py \
             e2e_passage_parent_progress.py \
             e2e_passage_dispatch_order.py \
             e2e_passage_set_admission.py \
             e2e_passage_source_fairness.py \
             e2e_passage_lock_contention.py \
             e2e_logical_streaming_progress.py \
+            e2e_logical_stream_order.py \
             e2e_logical_admission_sharing.py \
             e2e_logical_small_work_progress.py \
             e2e_logical_early_supersession.py \
+            e2e_logical_dispatch_refresh.py \
             e2e_logical_periodic_supersession.py \
+            e2e_logical_stream_supersession.py \
             e2e_pool_warmup.py \
+            e2e_mcp_read_reservation.py \
             e2e_logical_parent_fallback.py \
             e2e_cleanup_transaction_waves.py \
+            e2e_archive_reference_lifetime.py \
+            e2e_archive_admission_races.py \
             e2e_cleanup_reference_indexes.py \
             e2e_archive_reprojection.py \
             e2e_v2_lifecycle.py \
@@ -99,9 +123,30 @@ jobs:
             e2e_parquet_scan_fragments.py \
             e2e_scan_upstream_completeness.py \
             e2e_search_outbox.py \
+            e2e_search_publication_reconcile.py \
             e2e_search_plane_projection.py \
             e2e_turbopuffer_forget_fence.py \
+            e2e_turbopuffer_mixed_ranges.py \
+            e2e_retained_passage_receipts.py \
+            e2e_forgotten_trigger_index.py \
+            e2e_handback_projection.py \
+            e2e_report_unit_authority.py \
+            e2e_assistant_final_units.py \
+            e2e_passage_receipt_repair.py \
             e2e_turbopuffer_quantum.py \
+            e2e_singleton_search_publication.py \
+            e2e_singleton_parquet_receipts.py \
+            e2e_singleton_agent_receipts.py \
+            e2e_singleton_time_clip.py \
+            e2e_singleton_parent_receipts.py \
+            e2e_singleton_projection_membership.py \
+            e2e_singleton_maintenance_membership.py \
+            e2e_singleton_metadata_restore.py \
+            e2e_singleton_metadata_admission.py \
+            e2e_singleton_survivor_fence.py \
+            e2e_singleton_profile_capability.py \
+            e2e_singleton_retirement_store.py \
+            e2e_singleton_worker_convergence.py \
             e2e_authority_covering_indexes.py \
             e2e_slack_passage_visibility.py \
             e2e_slack_visible_text_replay.py \
@@ -132,16 +177,35 @@ jobs:
             e2e_retire_postgres_plane.py \
             e2e_parent_scoped_retrieval.py \
             e2e_archived_chunk_reads.py \
+            e2e_receipt_membership.py \
+            e2e_singleton_receipt_integration.py \
+            e2e_singleton_search_authority.py \
+            e2e_singleton_public_reads.py \
+            e2e_singleton_passage_reads.py \
+            e2e_singleton_related_reads.py \
             e2e_context_neighbor_work.py \
             e2e_pending_archived_chunks.py \
             e2e_chunk_body_locators.py \
             e2e_locator_spool.py \
+            e2e_locator_delta_publication.py \
+            e2e_logical_append_capability.py \
+            e2e_logical_append_reader.py \
+            e2e_logical_append_prefix_delta.py \
+            e2e_logical_append_snapshot.py \
+            e2e_logical_append_observability.py \
+            e2e_logical_attempt_stage_timing.py \
+            e2e_logical_append_admission.py \
             e2e_locator_backfill_plan.py \
             e2e_locator_backfill_apply.py \
             e2e_revision_history.py \
+            e2e_archived_outgoing_history.py \
+            e2e_historical_bundle_reader.py \
             e2e_chunk_retirement.py \
             e2e_chunk_vector_retirement.py \
             e2e_parent_chunk_retirement.py \
+            e2e_selective_retirement_experiment.py \
+            e2e_parent_retirement_window.py \
+            e2e_retirement_window_runner.py \
             e2e_optional_reconcile_index.py \
             e2e_context_time_index.py \
             e2e_streaming_locators.py \
@@ -149,6 +213,19 @@ jobs:
             e2e_context_neighbor_plan.py \
             e2e_located_public_reads.py \
             e2e_retirement_runner.py \
+            e2e_retirement_claim_source.py \
+            e2e_retirement_capture_timing.py \
+            e2e_retirement_capture_observability.py \
+            e2e_retirement_error_cause.py \
+            e2e_retirement_capture_batching.py \
+            e2e_retirement_query_pipeline.py \
+            e2e_company_retirement_authority.py \
+            e2e_deleted_chunk_bodies.py \
+            e2e_deleted_document_bodies.py \
+            e2e_retirement_detachment.py \
+            e2e_retirement_policy.py \
+            e2e_retirement_maintenance.py \
+            e2e_finite_retirement.py \
             e2e_archived_resolve.py
           do
             python "server/tests/$test"

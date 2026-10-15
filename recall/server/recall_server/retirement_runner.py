@@ -1,10 +1,12 @@
 """Bounded maintenance for an explicitly enrolled, surviving parent cohort.
 
 This is invocation-local scheduling over schema069, not a second proof or queue.
-Catalog deletion also deletes its ledger: ordinary runs never enroll replacements.
+Schema075 retains detached intent after catalog deletion. Ordinary runs never
+enroll or rebind replacements; rebind requires a fresh explicit owner review.
 """
 
 from collections import Counter
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass, replace
 import hashlib
 import time
@@ -16,10 +18,11 @@ from .chunk_retirement import (
     ParentRetirementLimits,
     _parent_deadline,
     require_retirement_owner,
-    retire_parent_chunks,
 )
+from .parent_chunk_window import retire_parent_windows
 from .logical_evidence import IDENTITY_RE
 from .parent_chunk_proof import (
+    CAPTURE_DETAIL_FIELDS,
     manifest_identity,
     parent_retirement_plan,
     read_parent_catalog,
@@ -140,8 +143,7 @@ def plan_cohort(store, *, scope, after=None, limit=100, deadline_at=None):
     return plan
 
 
-def enroll_cohort(store, *, scope, reviewed_plan, deadline_at=None):
-    """Insert this reviewed existing page only. Never reset or enable a ledger row."""
+def _reviewed_parents(scope, reviewed_plan):
     if not isinstance(scope, RetirementScope) or not isinstance(reviewed_plan, dict):
         _invalid()
     unsigned = {k: v for k, v in reviewed_plan.items() if k != "proof_sha256"}
@@ -172,6 +174,12 @@ def enroll_cohort(store, *, scope, reviewed_plan, deadline_at=None):
         or len(set(keys)) != len(keys)
     ):
         _invalid()
+    return parents
+
+
+def enroll_cohort(store, *, scope, reviewed_plan, deadline_at=None):
+    """Insert this reviewed existing page only. Never reset or enable a ledger row."""
+    parents = _reviewed_parents(scope, reviewed_plan)
     deadline_at = min(_parent_deadline(deadline_at), time.monotonic() + 5)
     inserted = 0
     with store.connect() as connection, connection.transaction():
@@ -199,6 +207,65 @@ def enroll_cohort(store, *, scope, reviewed_plan, deadline_at=None):
         inserted_parents=inserted,
         preserved_parents=len(parents) - inserted,
     )
+
+
+def rebind_detached_parent(
+    store, *, scope, reviewed_plan, expected_scope_epoch, deadline_at=None,
+):
+    """Explicitly authorize one replacement catalog; never undo disable/restore."""
+    return _bind_reviewed_parent(store, scope=scope, reviewed_plan=reviewed_plan,
+        expected_scope_epoch=expected_scope_epoch, required_status='detached',
+        deadline_at=deadline_at)
+
+
+def enroll_baseline_parent(store, *, scope, reviewed_plan, expected_scope_epoch, deadline_at=None):
+    """Approve one frozen baseline parent; disabled/restored rows remain held."""
+    return _bind_reviewed_parent(store, scope=scope, reviewed_plan=reviewed_plan,
+        expected_scope_epoch=expected_scope_epoch, required_status='baseline',
+        deadline_at=deadline_at)
+
+
+def _bind_reviewed_parent(store, *, scope, reviewed_plan, expected_scope_epoch,
+                          required_status, deadline_at=None, connection=None):
+    parents = _reviewed_parents(scope, reviewed_plan)
+    if (len(parents) != 1 or type(expected_scope_epoch) is not int
+            or expected_scope_epoch < 1):
+        _invalid()
+    plan = parents[0]
+    key = scope.tenant_id, plan['source_id'], plan['native_parent_id']
+    deadline_at = min(_parent_deadline(deadline_at), time.monotonic() + 5)
+    context = store.connect() if connection is None else nullcontext(connection)
+    with context as connection, connection.transaction():
+        _authorize(store, connection, scope, deadline_at)
+        schema = store._execute_bounded(connection,
+            'SELECT 1 FROM schema_migrations WHERE version=%s',
+            (76 if required_status == 'baseline' else 75,), deadline_at).fetchone()
+        if schema is None:
+            raise ChunkRetirementError('retirement_rebind_schema_required')
+        catalog = read_parent_catalog(store, connection, key, deadline_at, lock=True)
+        if _cohort_entry(catalog['manifest']) != plan:
+            raise ChunkRetirementError('retirement_cohort_changed')
+        # Preserve the established catalog-then-ledger lock order. A concurrent
+        # restore/disable wins through its status and epoch, never a last write.
+        store._execute_bounded(connection, '''SELECT 1
+            FROM canonical_chunk_retirement_progress
+            WHERE tenant_id=%s AND source_id=%s AND native_parent_id=%s
+            FOR UPDATE NOWAIT''', key, deadline_at).fetchone()
+        updated = store._execute_bounded(connection, '''
+            UPDATE canonical_chunk_retirement_progress
+            SET logical_document_id=%s,enabled=true,status='pending',
+                scope_epoch=scope_epoch+1,manifest_artifact_id=NULL,
+                last_record_ordinal=-1,updated_at=clock_timestamp()
+            WHERE tenant_id=%s AND source_id=%s AND native_parent_id=%s
+              AND logical_document_id IS NULL AND NOT enabled
+              AND status=%s AND scope_epoch=%s
+            RETURNING scope_epoch''',
+            (catalog['manifest']['logical_document_id'], *key, required_status, expected_scope_epoch),
+            deadline_at).fetchone()
+        if updated is None:
+            raise ChunkRetirementError('retirement_rebind_refused')
+    return dict(status='enrolled' if required_status == 'baseline' else 'rebound',
+                scope_epoch=updated['scope_epoch'])
 
 
 _ELIGIBLE = """progress.tenant_id=%s AND progress.source_id=ANY(%s) AND progress.enabled
@@ -309,14 +376,19 @@ def _claim(store, *, scope, limits, deadline_at, attempted, diagnostic=None):
         diagnostic["phase"] = "authorize"
         _authorize(store, connection, scope, deadline_at)
         diagnostic["phase"] = "candidate_select"
+        # ANY on progress is not propagated across the join by the planner.
+        # The redundant catalog predicate keeps both sides source-scoped.
         row = store._execute_bounded(
             connection,
             """SELECT progress.source_id,progress.native_parent_id,
-            progress.scope_epoch,to_jsonb(evidence) AS manifest """
+            progress.scope_epoch,progress.cumulative_cleared_documents,
+            progress.cumulative_cleared_chunks,progress.cumulative_cleared_utf8_bytes,
+            to_jsonb(evidence) AS manifest """
             + _JOIN
             + " WHERE "
             + _ELIGIBLE
             + """
+            AND evidence.source_id=ANY(%s)
             AND progress.updated_at <= clock_timestamp() - (%s * interval '1 second')
             AND NOT EXISTS(SELECT 1 FROM unnest(%s::text[],%s::text[]) seen(source,parent)
                 WHERE seen.source=progress.source_id AND seen.parent=progress.native_parent_id)
@@ -324,6 +396,7 @@ def _claim(store, *, scope, limits, deadline_at, attempted, diagnostic=None):
             FOR UPDATE OF progress SKIP LOCKED""",
             (
                 scope.tenant_id,
+                list(scope.source_ids),
                 list(scope.source_ids),
                 limits.cooldown_seconds,
                 [p[0] for p in attempted],
@@ -354,6 +427,7 @@ class RunArchive:
     def __init__(self, delegate, *, max_bytes):
         self.delegate, self.max_bytes = delegate, max_bytes
         self.gets = self.bytes = 0
+        self.read_ms = 0.0
 
     def read_raw(self, reference):
         size = reference["size_bytes"]
@@ -361,7 +435,11 @@ class RunArchive:
             raise ChunkRetirementError("retirement_runner_archive_budget")
         self.gets += 1
         self.bytes += size
-        return self.delegate.read_raw(reference)
+        started = time.monotonic()
+        try:
+            return self.delegate.read_raw(reference)
+        finally:
+            self.read_ms += (time.monotonic() - started) * 1000
 
     def read_raw_bounded(self, reference, *, deadline_at):
         # _VerifiedArchive calls this surface when available. Preserve transport
@@ -372,11 +450,15 @@ class RunArchive:
         self.gets += 1
         self.bytes += size
         bounded = getattr(self.delegate, "read_raw_bounded", None)
-        return (
-            bounded(reference, deadline_at=deadline_at)
-            if callable(bounded)
-            else self.delegate.read_raw(reference)
-        )
+        started = time.monotonic()
+        try:
+            return (
+                bounded(reference, deadline_at=deadline_at)
+                if callable(bounded)
+                else self.delegate.read_raw(reference)
+            )
+        finally:
+            self.read_ms += (time.monotonic() - started) * 1000
 
 
 def run_retirement(
@@ -389,8 +471,12 @@ def run_retirement(
     parent_limits=None,
     deadline_at=None,
     should_stop=None,
+    before_parent=None,
+    parent_limits_for=None,
+    metadata_mode="keep",
+    failure_diagnostic=None,
 ):
-    """Sequential enabled-only maintenance; fresh whole-parent proof once per claim."""
+    """Sequential enabled-only maintenance; bounded selected proofs within each claim."""
     limits = RunnerLimits() if limits is None else limits
     parent_limits = ParentRetirementLimits() if parent_limits is None else parent_limits
     if (
@@ -398,8 +484,13 @@ def run_retirement(
         or not isinstance(limits, RunnerLimits)
         or not isinstance(parent_limits, ParentRetirementLimits)
         or type(apply) is not bool
+        or metadata_mode not in ("keep", "singleton")
         or should_stop is not None
         and not callable(should_stop)
+        or before_parent is not None
+        and not callable(before_parent)
+        or parent_limits_for is not None
+        and not callable(parent_limits_for)
     ):
         _invalid()
     deadline_at = _parent_deadline(deadline_at)
@@ -418,8 +509,15 @@ def run_retirement(
         batches=0,
         cleared_documents=0,
         cleared_chunks=0,
+        retired_metadata_chunks=0,
         cleared_utf8_bytes=0,
         eligible_documents=0,
+        committed_sql_ms=0.0,
+        committed_hash_ms=0.0,
+        claim_wall_ms=0.0,
+        parent_wall_ms=0.0,
+        metadata_capture_ms=0.0,
+        **{field: 0 for field in CAPTURE_DETAIL_FIELDS},
         commit_outcome_unknown=False,
     )
     errors, excluded, attempted = Counter(), Counter(), []
@@ -432,6 +530,7 @@ def run_retirement(
         if remaining_bytes <= 0 or remaining_archive <= 0:
             break
         claim_diagnostic = {}
+        claim_started = time.monotonic()
         try:
             candidate = _claim(
                 store,
@@ -443,6 +542,8 @@ def run_retirement(
             )
         except Exception as error:
             if not attempted:
+                if failure_diagnostic is not None:
+                    failure_diagnostic.update(claim_diagnostic)
                 raise
             errors[
                 error.error_code
@@ -454,14 +555,24 @@ def run_retirement(
                 errors[label] += 1
             report["status"] = "claim_refused"
             break
+        finally:
+            report["claim_wall_ms"] += (time.monotonic() - claim_started) * 1000
         if candidate is None:
             report["status"] = "no_ready_parents"
             break
         attempted.append((candidate["source_id"], candidate["native_parent_id"]))
         report["attempted_parents"] += 1
         key = scope.tenant_id, candidate["source_id"], candidate["native_parent_id"]
+        if before_parent is not None:
+            # Persist caller execution intent after the epoch claim and before
+            # any archive read or clearing. A failed observer stops this call.
+            before_parent(candidate)
+        parent_started = time.monotonic()
         try:
-            result = retire_parent_chunks(
+            selected_limits = parent_limits if parent_limits_for is None else parent_limits_for(candidate)
+            if not isinstance(selected_limits, ParentRetirementLimits):
+                raise ChunkRetirementError("parent_retirement_limits_invalid")
+            result = retire_parent_windows(
                 store,
                 meter,
                 tenant_id=key[0],
@@ -470,17 +581,20 @@ def run_retirement(
                 apply=True,
                 reviewed_plan=parent_retirement_plan(key, candidate["manifest"]),
                 limits=replace(
-                    parent_limits,
-                    max_clear_bytes=min(parent_limits.max_clear_bytes, remaining_bytes),
+                    selected_limits,
+                    max_clear_bytes=min(selected_limits.max_clear_bytes, remaining_bytes),
                     max_archive_bytes=min(
-                        parent_limits.max_archive_bytes, remaining_archive
+                        selected_limits.max_archive_bytes, remaining_archive
                     ),
                 ),
                 deadline_at=deadline_at,
                 required_scope_epoch=candidate["scope_epoch"],
                 owner_principal_id=scope.principal_id,
                 should_stop=should_stop,
+                metadata_mode=metadata_mode,
             )
+            for field in ("metadata_capture_ms", *CAPTURE_DETAIL_FIELDS):
+                report[field] += result.get(field, 0)
             report["completed_parent_proofs"] += int(result["complete"])
             report["partial_parents"] += int(not result["complete"])
             report["eligible_documents"] += result.get("eligible_documents", 0)
@@ -489,19 +603,43 @@ def run_retirement(
             report["failed_parents"] += 1
             errors[error.error_code] += 1
             result = getattr(error, "committed", {})
+            for field in ("metadata_capture_ms", *CAPTURE_DETAIL_FIELDS):
+                report[field] += getattr(error, "attempt_metrics", {}).get(field, 0)
             if error.error_code == "parent_retirement_unavailable":
                 # COMMIT may have succeeded before Python observed its counters.
                 # Stop; a later explicit invocation resumes from the durable ledger.
                 report["commit_outcome_unknown"] = True
                 report["status"] = "commit_outcome_unknown"
+                report.update(getattr(error, "cause_details", {}))
+        finally:
+            report["parent_wall_ms"] += (time.monotonic() - parent_started) * 1000
+        # These nested timers cover only acknowledged batches, including an
+        # acknowledged prefix attached to a later unknown commit. Parent wall
+        # time also includes proof, refusals, and unacknowledged attempts.
+        report["committed_sql_ms"] += result.get("sql_ms", 0.0)
+        report["committed_hash_ms"] += result.get("hash_ms", 0.0)
         for field in (
             "batches",
             "cleared_documents",
             "cleared_chunks",
+            "retired_metadata_chunks",
             "cleared_utf8_bytes",
         ):
             report[field] += result.get(field, 0)
         if report["commit_outcome_unknown"] or "retirement_owner_required" in errors:
+            break
+        if result.get("archive_budget_limited"):
+            report["status"] = "archive_budget_limited"
+            break
+        if (
+            result.get("status") == "partial"
+            and result.get("batches", 0) < parent_limits.max_batches
+            and remaining_bytes <= parent_limits.max_clear_bytes
+        ):
+            # The owner stopped before its batch cap, so the remaining clear
+            # budget cannot fit the next whole document. Another full-parent
+            # proof would spend archive I/O trying to use the same small residue.
+            report["status"] = "clear_budget_limited"
             break
     return dict(
         report,
@@ -509,6 +647,7 @@ def run_retirement(
         excluded=dict(excluded),
         archive_gets=meter.gets,
         archive_bytes=meter.bytes,
+        archive_read_ms=meter.read_ms,
         body_eligibility="proved_targets_only",
         physical_reclaimed_bytes=None,
     )

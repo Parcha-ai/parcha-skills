@@ -200,9 +200,9 @@ class PeriodicSupersession(EarlySupersession):
         checks = []
         original = self.logical._check_candidate_current
 
-        def check(candidate):
+        def check(candidate, **kwargs):
             checks.append(candidate.native_parent_id)
-            original(candidate)
+            original(candidate, **kwargs)
 
         with (
             patch.object(module, "time", SimpleNamespace(monotonic=lambda: 0.0)),
@@ -218,9 +218,9 @@ class PeriodicSupersession(EarlySupersession):
         original = self.logical._check_candidate_current
         stream = self.logical._record_stream
 
-        def check(candidate):
+        def check(candidate, **kwargs):
             checks.append(candidate.native_parent_id)
-            original(candidate)
+            original(candidate, **kwargs)
 
         def advance(rows, **kwargs):
             for record in stream(rows, **kwargs):
@@ -260,11 +260,11 @@ class PeriodicSupersession(EarlySupersession):
         original = self.logical._check_candidate_current
         checks = []
 
-        def check(candidate):
+        def check(candidate, **kwargs):
             checks.append(candidate.native_parent_id)
             if candidate.native_parent_id == "large" and self.clock[0] > 0:
                 raise psycopg.OperationalError("synthetic queue check unavailable")
-            original(candidate)
+            original(candidate, **kwargs)
 
         stream = self.logical._record_stream
 

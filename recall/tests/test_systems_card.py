@@ -525,6 +525,7 @@ class AccuracyTest(unittest.TestCase):
             context.private_dir = str(out)
             result = accuracy.TruthBoundaryProbe().run(context)
             self.assertEqual(result.metrics["cases"], 15)
+            self.assertEqual(result.metrics["backend_error_rate"], 0.0)
             self.assertEqual(result.metrics["boundary_recall@20"], 1.0)
             self.assertEqual(result.metrics["boundary_mrr"], 1.0)
             self.assertEqual(result.metrics["negative_false_hit_rate"], 1.0)
@@ -540,6 +541,43 @@ class AccuracyTest(unittest.TestCase):
                 for boundary in case["gold_boundaries"]:
                     self.assertNotIn(boundary["receipts"][0], rendered)
         self.assertTrue(gold)
+
+    def test_truth_probe_records_failed_authority_even_with_http_success(self):
+        cases = truth_cases()
+        by_query = {case["question"]: case for case in cases}
+
+        def search(arguments):
+            return {"results": [
+                {"logical_document_id": b["logical_document_id"],
+                 "source_id": b["source_id"], "revision": 1,
+                 "matching_ranges": [{"receipts": b["receipts"]}]}
+                for b in by_query[arguments["query"]]["gold_boundaries"]
+            ], "diagnostics": {"authority_status": "unavailable",
+                               "hydrate_status": "unavailable",
+                               "rerank_status": "ok"}}
+
+        tools = default_tools()
+        tools["recall_search"] = search
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            truth = root / "truth.jsonl"
+            truth.write_text("".join(json.dumps(c) + "\n" for c in cases))
+            truth.chmod(0o600)
+            context = make_context(FakeBrain(tools), truth_path=str(truth),
+                                   truth_split="validation", accuracy_pointer_checks=0)
+            context.private_dir = str(root / "out")
+            capture = mock.Mock()
+            context.options["_candidate_capture"] = capture
+            result = accuracy.TruthBoundaryProbe().run(context)
+            self.assertEqual(capture.capture_case.call_count, 15)
+            self.assertTrue(all(call.kwargs["search_error"] == "authority_unavailable"
+                                for call in capture.capture_case.call_args_list))
+            self.assertEqual(result.metrics["backend_error_rate"], 1.0)
+            self.assertEqual(result.metrics["boundary_recall@20"], 1.0)
+            self.assertEqual(result.metrics["authorization_violation_rate"], 0.0)
+            saved = next((root / "out").glob("systems-card-boundaries-*.jsonl"))
+            rows = [json.loads(line) for line in saved.read_text().splitlines()]
+            self.assertTrue(all(row["backend_error"] == "authority_unavailable" for row in rows))
 
     def test_truth_probe_skips_without_truth(self):
         result = accuracy.TruthBoundaryProbe().run(make_context(FakeBrain(default_tools())))

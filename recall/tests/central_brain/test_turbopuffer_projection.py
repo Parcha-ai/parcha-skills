@@ -114,6 +114,13 @@ class _Catalog:
     def execute(self, sql: str, params: Any = None) -> _Result:
         folded = " ".join(sql.split())
         self.statements.append((folded, params))
+        if "pg_try_advisory_lock" in folded:
+            return _Result([{"acquired": True}])
+        if "pg_advisory_unlock" in folded:
+            return _Result()
+        if folded.startswith("SELECT passage_id FROM canonical_passages"):
+            return _Result([{"passage_id": row["passage_id"]} for row in self.passages
+                            if row["passage_id"] in params[1]])
         if "FROM search_projection_outbox" in folded and "count(*)" in folded:
             return _Result([{"count": len(self.outbox)}])
         if "FROM search_projection_outbox" in folded and folded.startswith("SELECT"):
@@ -126,9 +133,9 @@ class _Catalog:
             )
             return _Result(claims[: params[1]])
         if folded.startswith("DELETE FROM search_projection_outbox"):
-            _tenant, source, month, generation = params
+            _tenant, source, month, generation, queued_at = params
             row = self.outbox.get((source, month))
-            if row and row["generation"] == generation:
+            if row and row["generation"] == generation and row["queued_at"] == queued_at:
                 del self.outbox[(source, month)]
                 return _Result(rowcount=1)
             return _Result(rowcount=0)
@@ -154,16 +161,17 @@ class _Catalog:
         if "FROM search_projection_tombstones" in folded and folded.startswith("SELECT"):
             _tenant, source, month = params
             return _Result([
-                {"passage_id": row["passage_id"]}
+                {"passage_id": row["passage_id"], "deleted_at": row.get("deleted_at", self.watermark)}
                 for row in self.tombstones
                 if row["source_id"] == source and row["month"] == month
             ])
         if folded.startswith("DELETE FROM search_projection_tombstones"):
-            _tenant, source, ids = params
+            _tenant, source, ids, tokens = params
             before = len(self.tombstones)
             self.tombstones = [
                 row for row in self.tombstones
-                if not (row["source_id"] == source and row["passage_id"] in ids)
+                if not (row["source_id"] == source and
+                        (row["passage_id"], row.get("deleted_at", self.watermark)) in set(zip(ids, tokens)))
             ]
             return _Result(rowcount=before - len(self.tombstones))
         if "FROM canonical_passages passage" in folded and "passage.passage_id=ANY(" in folded:

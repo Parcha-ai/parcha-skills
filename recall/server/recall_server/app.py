@@ -1502,6 +1502,17 @@ class Handler(BaseHTTPRequestHandler):
                     principal_id=principal_id,
                     events=events,
                 )
+                # The owner returned after COMMIT; count includes accepted replays.
+                suppressed = acknowledgement.get("suppressed_filesystem_events", 0)
+                if suppressed > 0:
+                    LOG.info(
+                        "canonical filesystem cleanup suppressed tenant_sha256=%s "
+                        "source_sha256=%s count=%s batch_size=%s",
+                        hashlib.sha256(tenant_id.encode()).hexdigest(),
+                        hashlib.sha256(source_id.encode()).hexdigest(),
+                        suppressed,
+                        len(events),
+                    )
                 with COUNTER_LOCK:
                     COUNTERS[
                         "ingest_replays"
@@ -1805,7 +1816,17 @@ class Handler(BaseHTTPRequestHandler):
                 if os.environ.get("RECALL_CANONICAL_MCP_ENABLED") == "1":
                     if self.canonical_retrieval is None:
                         raise RuntimeError("canonical retrieval unavailable")
-                    mcp_store = self.canonical_retrieval.bind(principal)
+                    params = body.get("params") if isinstance(body, dict) else None
+                    reserved_read = (
+                        self.store.reserved_read_connections > 0
+                        and isinstance(params, dict)
+                        and body.get("method") == "tools/call"
+                        and params.get("name") in {"recall_show", "recall_search"}
+                    )
+                    mcp_store = (
+                        self.canonical_retrieval.bind(principal, read_only=True)
+                        if reserved_read else self.canonical_retrieval.bind(principal)
+                    )
                 response = dispatch_mcp(
                     mcp_store,
                     principal,
@@ -1850,6 +1871,8 @@ class Handler(BaseHTTPRequestHandler):
                     ),
                 )
                 return
+            except PoolTimeout:
+                raise
             except Exception as exc:
                 LOG.error("mcp tool failed type=%s", type(exc).__name__)
                 self.send_json(
@@ -2088,6 +2111,11 @@ def configure_runtime(dsn: str) -> None:
         dsn,
         semantic_runtime=SemanticRuntime.from_env(),
         rerank_runtime=build_rerank_runtime(),
+        # HTTP-only opt-in. Worker BrainStore constructors retain one pool.
+        reserved_read_connections=(
+            int(os.environ.get("RECALL_MCP_READ_RESERVE", "0"))
+            if Handler.public_mcp_profile() else 0
+        ),
     )
     chunk_body_reads = os.environ.get("RECALL_CHUNK_BODY_READS", "postgres")
     if chunk_body_reads not in {"postgres", "archive"}:

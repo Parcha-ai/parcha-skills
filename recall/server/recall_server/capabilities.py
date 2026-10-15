@@ -7,12 +7,19 @@ from urllib.parse import parse_qs, urlsplit
 
 from . import (
     CLEANUP_REFERENCE_INDEX_VERSION,
+    SUPPRESSED_ARTIFACT_SCHEMA_VERSION,
     MANDATORY_SCHEMA_VERSION,
     NATIVE_CONVERSATION_SCHEMA_VERSION,
     NOTIFICATION_PRIORITY_SCHEMA_VERSION,
     PASSAGE_NOTIFICATION_SCHEMA_VERSION,
     RECONCILIATION_INDEX_VERSION,
     RETIRE_POSTGRES_PLANE_VERSION,
+    RETIREMENT_DETACHMENT_VERSION,
+    RETIREMENT_POLICY_VERSION,
+    RETIREMENT_MAINTENANCE_VERSION,
+    LOGICAL_APPEND_CAPABILITY_VERSION,
+    SINGLETON_RECEIPT_PROFILE_VERSION,
+    FORGOTTEN_EVENT_DIGEST_TYPE_VERSION,
 )
 
 
@@ -192,7 +199,27 @@ def assess_snapshot(snapshot: dict[str, Any], profile: str = "production") -> di
                       + ([PASSAGE_NOTIFICATION_SCHEMA_VERSION]
                          if PASSAGE_NOTIFICATION_SCHEMA_VERSION in versions else [])
                       + ([CLEANUP_REFERENCE_INDEX_VERSION]
-                         if CLEANUP_REFERENCE_INDEX_VERSION in versions else []))
+                         if CLEANUP_REFERENCE_INDEX_VERSION in versions else [])
+                      + ([RETIREMENT_DETACHMENT_VERSION]
+                         if RETIREMENT_DETACHMENT_VERSION in versions else [])
+                      + ([RETIREMENT_POLICY_VERSION]
+                         if RETIREMENT_POLICY_VERSION in versions else [])
+                      + ([SUPPRESSED_ARTIFACT_SCHEMA_VERSION]
+                         if SUPPRESSED_ARTIFACT_SCHEMA_VERSION in versions else [])
+                      + ([RETIREMENT_MAINTENANCE_VERSION]
+                         if RETIREMENT_MAINTENANCE_VERSION in versions else [])
+                      + ([LOGICAL_APPEND_CAPABILITY_VERSION]
+                         if LOGICAL_APPEND_CAPABILITY_VERSION in versions else [])
+                      + ([SINGLETON_RECEIPT_PROFILE_VERSION]
+                         if SINGLETON_RECEIPT_PROFILE_VERSION in versions else [])
+                      + ([FORGOTTEN_EVENT_DIGEST_TYPE_VERSION]
+                         if FORGOTTEN_EVENT_DIGEST_TYPE_VERSION in versions else []))
+    if (RETIREMENT_POLICY_VERSION in versions
+            and RETIREMENT_DETACHMENT_VERSION not in versions):
+        raise CapabilityError("schema_drift")
+    if (RETIREMENT_MAINTENANCE_VERSION in versions
+            and RETIREMENT_POLICY_VERSION not in versions):
+        raise CapabilityError("schema_drift")
     if versions != expected:
         raise CapabilityError("schema_drift")
     vector_plane_present = snapshot.get("postgres_vector_plane_present")

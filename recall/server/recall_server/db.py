@@ -22,6 +22,7 @@ from . import (
     MANDATORY_SCHEMA_VERSION,
     PROJECTOR_VERSION,
     RETIRE_POSTGRES_PLANE_VERSION,
+    SINGLETON_RECEIPT_PROFILE_VERSION,
 )
 from .actor_attribution import (
     actor_id_for_employee_key,
@@ -199,6 +200,39 @@ def related_candidate_limit(result_limit: int) -> int:
     return min(400, max(100, result_limit * 20))
 
 
+def singleton_receipt_capability(verified_singleton_receipts=None):
+    """Shared activation contract for serving and the bounded retirement child."""
+    if verified_singleton_receipts is None:
+        configured_profile = os.environ.get("RECALL_VERIFIED_SINGLETON_RECEIPTS", "0")
+        if configured_profile not in {"0", "1"}:
+            raise ValueError("RECALL_VERIFIED_SINGLETON_RECEIPTS must be 0 or 1")
+        verified_singleton_receipts = configured_profile == "1"
+        if verified_singleton_receipts and (
+            os.environ.get("RECALL_CHUNK_BODY_READS", "postgres") != "archive"
+            or os.environ.get("RECALL_SEARCH_PLANE", "postgres") != "turbopuffer"
+        ):
+            raise ValueError("singleton receipts require archive bodies and turbopuffer")
+    if type(verified_singleton_receipts) is not bool:
+        raise ValueError("invalid singleton receipt capability")
+    return verified_singleton_receipts
+
+
+class _ReadOnlyStore:
+    """Read-owner configuration and checkout; no delegated mutation methods."""
+
+    def __init__(self, store):
+        self._store = store
+
+    def connect(self):
+        return self._store.read_connection()
+
+    def __getattr__(self, name):
+        value = getattr(self._store, name)
+        if callable(value) and name != "_execute_bounded":
+            raise AttributeError(name)
+        return value
+
+
 class BrainStore:
     def __init__(self, dsn: str, search_deadline_ms: int | None = None,
                  semantic_runtime: SemanticRuntime | None = None,
@@ -206,9 +240,15 @@ class BrainStore:
                  semantic_minimum_similarity: float | None = None,
                  pool_max_size: int | None = None,
                  audit_batch_rows: int | None = None,
-                 audit_batch_seconds: float | None = None):
+                 audit_batch_seconds: float | None = None,
+                 verified_singleton_receipts: bool | None = None,
+                 reserved_read_connections: int = 0):
+        verified_singleton_receipts = singleton_receipt_capability(verified_singleton_receipts)
+        # Off by default. Migration and explicit activation never admit rows.
+        self.verified_singleton_receipts = verified_singleton_receipts
         self.dsn = dsn
         self._pool: ConnectionPool | None = None
+        self._read_pool: ConnectionPool | None = None
         self._pool_lock = threading.Lock()
         self._last_ready_at: float | None = None
         env_batch_rows, env_batch_seconds = batch_settings_from_env()
@@ -236,6 +276,14 @@ class BrainStore:
         if not 4 <= configured_pool_size <= 32:
             raise ValueError("database pool size must be between 4 and 32")
         self.pool_max_size = configured_pool_size
+        if (
+            isinstance(reserved_read_connections, bool)
+            or not isinstance(reserved_read_connections, int)
+            or not 0 <= reserved_read_connections <= configured_pool_size - 4
+        ):
+            raise ValueError("read reservation must leave at least four general connections")
+        self.reserved_read_connections = reserved_read_connections
+        self._read_view = _ReadOnlyStore(self)
         # A search runs up to SEARCH_ARM_CONNECTIONS pooled statements at
         # once. Admit only as many concurrent searches as leave
         # SEARCH_RESERVED_CONNECTIONS for the single-connection tools.
@@ -303,11 +351,11 @@ class BrainStore:
         if self._pool is None:
             with self._pool_lock:
                 if self._pool is None:
-                    self._pool = ConnectionPool(
+                    pool = ConnectionPool(
                         self.dsn,
                         kwargs={"row_factory": dict_row},
                         min_size=1,
-                        max_size=self.pool_max_size,
+                        max_size=self.pool_max_size - self.reserved_read_connections,
                         timeout=5,
                         max_idle=300,
                         max_lifetime=1800,
@@ -316,9 +364,48 @@ class BrainStore:
                     )
                     # H3-e': a process on the postgres plane must not start
                     # against a database whose vector plane 067 dropped.
-                    with self._pool.connection() as probe:
-                        self.verify_search_plane(probe)
+                    try:
+                        with pool.connection() as probe:
+                            self.verify_search_plane(probe)
+                    except Exception:
+                        pool.close()
+                        raise
+                    self._pool = pool
         return self._pool.connection()
+
+    def read_connection(self):
+        """Borrow reserved capacity for an explicit read owner, if enabled."""
+        if not self.reserved_read_connections:
+            return self.connect()
+        if self._read_pool is None:
+            with self._pool_lock:
+                if self._read_pool is None:
+                    def configure(connection):
+                        connection.read_only = True
+
+                    pool = ConnectionPool(
+                        self.dsn,
+                        kwargs={"row_factory": dict_row},
+                        min_size=0,
+                        max_size=self.reserved_read_connections,
+                        timeout=5,
+                        max_idle=300,
+                        max_lifetime=1800,
+                        configure=configure,
+                        open=True,
+                        name="recall-brain-read",
+                    )
+                    try:
+                        with pool.connection() as probe:
+                            self.verify_search_plane(probe)
+                    except Exception:
+                        pool.close()
+                        raise
+                    self._read_pool = pool
+        return self._read_pool.connection()
+
+    def read_only_view(self):
+        return self._read_view if self.reserved_read_connections else self
 
     def prepare_pool(self, minimum_size: int, *, timeout: float = 60.0) -> None:
         """Pre-warm bounded parallel workers before their measured work starts."""
@@ -326,7 +413,7 @@ class BrainStore:
         if (
             isinstance(minimum_size, bool)
             or not isinstance(minimum_size, int)
-            or not 1 <= minimum_size <= self.pool_max_size
+            or not 1 <= minimum_size <= self.pool_max_size - self.reserved_read_connections
             or not 1 <= timeout <= 300
         ):
             raise ValueError("database pool warmup budget is invalid")
@@ -355,6 +442,8 @@ class BrainStore:
         finally:
             if self._pool is not None:
                 self._pool.close()
+            if self._read_pool is not None:
+                self._read_pool.close()
 
     def migrate(self, *, retire_postgres_plane: bool = False) -> dict[str, Any]:
         """Apply the numbered migrations in order; every file is idempotent.
@@ -418,6 +507,15 @@ class BrainStore:
 
         versions = applied_migration_versions(connection)
         retired = RETIRE_POSTGRES_PLANE_VERSION in versions
+        if self.verified_singleton_receipts:
+            if SINGLETON_RECEIPT_PROFILE_VERSION not in versions:
+                raise SearchPlaneSchemaError("singleton receipt schema is not installed")
+            shape = connection.execute("""SELECT atttypid='smallint'::regtype AS correct_type,
+                attnotnull,atthasdef FROM pg_attribute
+                WHERE attrelid=to_regclass('public.canonical_documents')
+                  AND attname='chunk_receipt_profile' AND NOT attisdropped""").fetchone()
+            if shape != {'correct_type': True, 'attnotnull': False, 'atthasdef': False}:
+                raise SearchPlaneSchemaError("singleton receipt schema is incompatible")
         if retired and self.search_plane != "turbopuffer":
             raise SearchPlaneSchemaError(POSTGRES_PLANE_RETIRED)
         return {
@@ -1119,7 +1217,7 @@ class BrainStore:
 
     def authenticate_bearer(self, plaintext: str, required_scope: str) -> dict | None:
         digest = hashlib.sha256(plaintext.encode()).hexdigest()
-        with self.connect() as conn:
+        with self.read_connection() as conn:
             row = conn.execute(
                 """SELECT credential.id,credential.name,credential.tenant_id,
                           credential.source_id,credential.principal_id,
@@ -1230,7 +1328,7 @@ class BrainStore:
         ):
             return None
         subject_sha256 = hashlib.sha256(subject.encode()).hexdigest()
-        with self.connect() as conn:
+        with self.read_connection() as conn:
             rows = conn.execute(
                 """SELECT binding.tenant_id,binding.principal_id,
                           binding.principal_kind,
@@ -1528,7 +1626,7 @@ class BrainStore:
             or not V2_AUTHORITY_RE.fullmatch(principal_id)
         ):
             return []
-        with self.connect() as conn:
+        with self.read_connection() as conn:
             brain_access = conn.execute(
                 """SELECT 1 FROM brain_access_grants
                    WHERE tenant_id=%s AND principal_id=%s
@@ -1655,6 +1753,10 @@ class BrainStore:
 
     def _readiness_connection(self):
         """A pooled connection with a short wait so the probe answers quickly."""
+        if self.reserved_read_connections:
+            if self._read_pool is None:
+                self.read_connection()
+            return self._read_pool.connection(timeout=1.0)
         if self._pool is None:
             self.connect()
         if self._pool is not None:
@@ -2949,16 +3051,13 @@ class BrainStore:
         if canonical is not None:
             event, items = canonical["event"], canonical["items"]
             if chunk_body_archive is not None:
-                from .chunk_bodies import ChunkBodyError
                 from .chunk_hydration import hydrate_chunk_rows
 
-                # Old revisions are deliberately retained inline. The logical
-                # archive and its fallback eligibility describe current records.
-                historical = [item for item in items if not item["is_current"]]
-                if any(not isinstance(item["text_redacted"], str)
-                       or hashlib.sha256(item["text_redacted"].encode()).hexdigest() != item["text_sha256"]
-                       for item in historical):
-                    raise ChunkBodyError("archived_chunk_body_unavailable")
+                from .historical_hydration import hydrate_historical_rows
+
+                hydrate_historical_rows(self, chunk_body_archive,
+                    [item for item in items if not item['is_current']],
+                    tenant_id=event['tenant_id'], source_ids=(source_id,), deadline_at=deadline_at)
                 hydrate_chunk_rows(
                     self, chunk_body_archive, [item for item in items if item["is_current"]],
                     tenant_id=event["tenant_id"], source_ids=(source_id,), deadline_at=deadline_at,
@@ -3089,10 +3188,22 @@ class BrainStore:
             (event["occurred_at"], event["tenant_id"], source_id, event["event_id"]),
             deadline_at,
         ).fetchall()
-        return {
-            "event": event,
-            "items": items,
-        }
+        if self.verified_singleton_receipts:
+            from .receipt_membership import lookup_receipt_metadata, ReceiptMembershipError
+            from .projectors import item_receipt
+
+            receipt = item_receipt(source_id, native_id, revision, 0)
+            metadata = lookup_receipt_metadata(
+                self, tenant_id=event['tenant_id'], authorized_sources=(source_id,),
+                receipts=(receipt,), allow_verified_singletons=True,
+                current_only=False, deadline_at=deadline_at, connection=conn,
+            ).get(receipt)
+            if not items and metadata is not None:
+                if not metadata_only:
+                    raise ReceiptMembershipError('receipt_membership_archive_required')
+                items = [dict(metadata, occurred_at=event['occurred_at'],
+                              role=None, surface=None, text_redacted=None)]
+        return {"event": event, "items": items}
 
     @staticmethod
     def _read_filters(

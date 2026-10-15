@@ -12,6 +12,7 @@ already consume, so nothing above the arms changes.
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import time
 from typing import Any
@@ -20,6 +21,7 @@ from .db import SearchDeadlineExceeded, bounded_search_text
 from .passage_retrieval import (
     DENSE_NEAREST_LIMIT,
     PassageHintRetrieval,
+    collapse_document_candidates,
     identifier_tokens,
 )
 from .turbopuffer_plane import EMBED_TEXT_ATTRIBUTE, TEXT_ATTRIBUTE, TurbopufferSettings
@@ -35,13 +37,37 @@ CATALOG_ATTRIBUTES = (
     "doc_first_occurred_at", "doc_last_occurred_at", "manifest_object_key",
     "manifest_content_sha256", "text_sha256",
 )
-BODY_ATTRIBUTES = ("receipts", "spans", "header", TEXT_ATTRIBUTE)
+BODY_ATTRIBUTES = ("spans", "header", TEXT_ATTRIBUTE)
 ROW_ATTRIBUTES = CATALOG_ATTRIBUTES + BODY_ATTRIBUTES
 HYDRATE_BATCH_IDS = 200
 LEXICAL_LIMIT = 400
 SPARSE_LIMIT = 400
 MAX_SPARSE_TOKENS = 8
 
+
+_SELECTED_AUTHORITY_SQL = """
+                            SELECT passage.tenant_id,passage.source_id,passage.passage_id,
+                                   passage.logical_document_id,passage.text_sha256,passage.receipts,
+                                   evidence.revision,evidence.manifest_object_key,
+                                   evidence.manifest_content_sha256,
+                                   CASE WHEN jsonb_array_length(passage.spans)=1
+                                     AND passage.token_count<=1024
+                                     AND passage.spans->0->>'source_byte_start'='0'
+                                     AND passage.spans->0->>'passage_byte_start'='0'
+                                     AND passage.spans->0->>'source_byte_end'=passage.spans->0->>'passage_byte_end'
+                                   THEN passage.spans->0->>'source_unit' END AS source_unit
+                              FROM canonical_passages passage
+                              JOIN canonical_passage_documents projected
+                                USING(tenant_id,source_id,logical_document_id,policy_fingerprint)
+                              JOIN canonical_evidence_documents evidence
+                                USING(tenant_id,source_id,logical_document_id)
+                             WHERE passage.tenant_id=%s AND passage.source_id=ANY(%s)
+                               AND passage.policy_fingerprint=%s
+                               AND (passage.source_id,passage.passage_id) IN (
+                                   SELECT * FROM unnest(%s::text[],%s::text[])
+                               )
+                               AND cardinality(passage.receipts)>0
+"""
 
 def _value(row: Any, key: str, default: Any = None) -> Any:
     """Attribute ``key`` of a result row, or ``default``.
@@ -360,7 +386,45 @@ class TurbopufferHintRetrieval(PassageHintRetrieval):
             return [], status
         return self._scored(raw), "ok"
 
-    def _authorize_ranges(self, results, legs, *, deadline_at, include_arms=False):
+    def _authorize_singletons(self, connection, requested, deadline_at, *, stages=None):
+        """Keep catalog and typed receipt membership in one request snapshot."""
+        from .receipt_membership import lookup_current_search_membership
+
+        stages = {} if stages is None else stages
+        with connection.transaction():
+            # Set isolation before _execute_bounded issues SELECT set_config.
+            # The first data statement and every following statement keep the
+            # caller's deadline; no snapshot survives this transaction.
+            if time.monotonic() >= deadline_at:
+                raise SearchDeadlineExceeded()
+            connection.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            stage_started = time.monotonic()
+            selected = self.store._execute_bounded(connection, _SELECTED_AUTHORITY_SQL,
+                (self.tenant_id, self.sources, self.policy_fingerprint,
+                 [source for source, _ in requested], [passage for _, passage in requested]),
+                deadline_at).fetchall()
+            stages['catalog_ms'] = round((time.monotonic() - stage_started) * 1000, 3)
+            stage_started = time.monotonic()
+            receipts = tuple(dict.fromkeys(receipt for row in selected for receipt in row['receipts']))
+            stages['receipt_prepare_ms'] = round((time.monotonic() - stage_started) * 1000, 3)
+            stages['selected_passages'] = len(selected)
+            stages['receipt_references'] = sum(len(row['receipts']) for row in selected)
+            stages['unique_receipts'] = len(receipts)
+            stage_started = time.monotonic()
+            members = lookup_current_search_membership(self.store, tenant_id=self.tenant_id,
+                authorized_sources=tuple(self.sources), receipts=receipts,
+                deadline_at=deadline_at, connection=connection)
+            stages['membership_ms'] = round((time.monotonic() - stage_started) * 1000, 3)
+            stages['allowed_receipts'] = len(members)
+            authoritative = [row for row in selected if all(
+                (row['source_id'], receipt) in members
+                for receipt in row['receipts'])]
+            stage_started = time.monotonic()
+        stages['transaction_exit_ms'] = round((time.monotonic() - stage_started) * 1000, 3)
+        return authoritative
+
+    def _authorize_ranges(self, results, legs, *, deadline_at, include_arms=False,
+                          collapse_options=None):
         """Canonical receipt metadata fences asynchronous search-plane writes.
 
         Body retirement clears text, retaining the receipt rows. A deleting or
@@ -368,6 +432,12 @@ class TurbopufferHintRetrieval(PassageHintRetrieval):
         cached vendor body and diagnostic arm results.
         """
         started = time.monotonic()
+        # Completed stages only; null means unobserved, including failures.
+        # Membership includes helper preparation/fetch, not just SQL time.
+        stages = dict.fromkeys(('checkout_ms', 'catalog_ms', 'receipt_prepare_ms',
+                                'membership_ms', 'transaction_exit_ms', 'selected_passages',
+                                'receipt_references', 'unique_receipts', 'allowed_receipts'))
+        stages['path'] = 'unobserved'
         # Normal output and reranking consume only this already-collapsed
         # pool, including every nominated row and all its matching ranges.
         # Diagnostic arms have a separate collapse, so they require all IDs.
@@ -388,22 +458,39 @@ class TurbopufferHintRetrieval(PassageHintRetrieval):
                             if row.get("passage_id") in selected_ids
                             and isinstance(row.get("source_id"), str)})
         if not ids:
+            stages['path'] = 'empty'
             results.clear()
             for _name, _weight, rows in legs:
                 rows.clear()
             return {"authority_status": "ok", "authority_rejected": 0,
+                    "authority_stages": stages,
                     "authority_elapsed_ms": round((time.monotonic() - started) * 1000, 3)}
         status = "ok"
         authoritative = []
         try:
             if time.monotonic() >= deadline_at:
                 raise SearchDeadlineExceeded()
+            checkout_started = time.monotonic()
             with self.store.connect() as connection:
-                authoritative = self.store._execute_bounded(
-                    connection,
-                    """WITH selected AS MATERIALIZED (
+                stages['checkout_ms'] = round((time.monotonic() - checkout_started) * 1000, 3)
+                if getattr(self.store, 'verified_singleton_receipts', False):
+                    stages['path'] = 'singleton'
+                    authoritative = self._authorize_singletons(connection, requested, deadline_at, stages=stages)
+                else:
+                    stages['path'] = 'legacy'
+                    authoritative = self.store._execute_bounded(
+                        connection,
+                        """WITH selected AS MATERIALIZED (
                             SELECT passage.tenant_id,passage.source_id,passage.passage_id,
-                                   passage.logical_document_id,passage.text_sha256,passage.receipts
+                                   passage.logical_document_id,passage.text_sha256,passage.receipts,
+                                   evidence.revision,evidence.manifest_object_key,
+                                   evidence.manifest_content_sha256,
+                                   CASE WHEN jsonb_array_length(passage.spans)=1
+                                     AND passage.token_count<=1024
+                                     AND passage.spans->0->>'source_byte_start'='0'
+                                     AND passage.spans->0->>'passage_byte_start'='0'
+                                     AND passage.spans->0->>'source_byte_end'=passage.spans->0->>'passage_byte_end'
+                                   THEN passage.spans->0->>'source_unit' END AS source_unit
                               FROM canonical_passages passage
                               JOIN canonical_passage_documents projected
                                 USING(tenant_id,source_id,logical_document_id,policy_fingerprint)
@@ -433,20 +520,24 @@ class TurbopufferHintRetrieval(PassageHintRetrieval):
                                AND document.is_current AND document.deleted_at IS NULL
                         )
                         SELECT selected.tenant_id,selected.source_id,selected.passage_id,
-                               selected.logical_document_id,selected.text_sha256
+                               selected.logical_document_id,selected.text_sha256,selected.receipts,
+                               selected.revision,selected.manifest_object_key,
+                               selected.manifest_content_sha256,selected.source_unit
                           FROM selected
                           CROSS JOIN LATERAL unnest(selected.receipts) AS receipt(value)
                           LEFT JOIN live_receipts live
                             ON live.tenant_id=selected.tenant_id
                            AND live.source_id=selected.source_id AND live.value=receipt.value
                          GROUP BY selected.tenant_id,selected.source_id,selected.passage_id,
-                                  selected.logical_document_id,selected.text_sha256
+                                  selected.logical_document_id,selected.text_sha256,selected.receipts,
+                                  selected.revision,selected.manifest_object_key,
+                                  selected.manifest_content_sha256,selected.source_unit
                         HAVING bool_and(live.value IS NOT NULL)""",
-                    (self.tenant_id, self.sources, self.policy_fingerprint,
-                     [source for source, _passage in requested],
-                     [passage for _source, passage in requested]),
-                    deadline_at,
-                ).fetchall()
+                        (self.tenant_id, self.sources, self.policy_fingerprint,
+                         [source for source, _passage in requested],
+                         [passage for _source, passage in requested]),
+                        deadline_at,
+                    ).fetchall()
         except SearchDeadlineExceeded:
             status = "deadline-exceeded"
         except Exception:
@@ -454,14 +545,48 @@ class TurbopufferHintRetrieval(PassageHintRetrieval):
         def identity(row):
             return (row.get("source_id"), row.get("logical_document_id"),
                     row.get("passage_id"), row.get("text_sha256"))
-        allowed = {identity(row) for row in authoritative
+        allowed = {identity(row): row for row in authoritative
                    if row.get("tenant_id") == self.tenant_id
                    and row.get("source_id") in self.sources}
-        live = set()
+        admitted = {
+            (row["source_id"], row["logical_document_id"], item.get("passage_id"))
+            for row in results for item in row.get("matching_ranges", ())
+        }
+        rebuild = collapse_options is not None and any(
+            (row.get("source_id"), row.get("logical_document_id"), row.get("passage_id")) in admitted
+            and identity(row) not in allowed
+            for _name, _weight, rows in legs for row in rows
+        )
+        locator_fields = ("revision", "manifest_object_key", "manifest_content_sha256")
+        live = {}
         for _name, _weight, rows in legs:
             rows[:] = [row for row in rows if identity(row) in allowed]
-            live.update((row["source_id"], row["logical_document_id"], row["passage_id"])
-                        for row in rows)
+            for row in rows:
+                canonical = allowed[identity(row)]
+                row["receipts"] = list(canonical["receipts"])
+                row["source_unit"] = canonical.get("source_unit")
+                row.update({field: canonical[field] for field in locator_fields})
+                live[(row["source_id"], row["logical_document_id"], row["passage_id"])] = canonical
+        if rebuild:
+            # Rebuild every field from authorized rows, never the stale collapsed
+            # metadata. Admission is already decided: preserve its parent set
+            # and nomination priority, not a rejected arm's evidence or scores.
+            # Diagnostic arms may contain additional authorized candidates.
+            nominees = {(row["source_id"], row["logical_document_id"])
+                        for row in results if row.get("nominated")}
+            surviving = tuple((name, weight, [row for row in rows if
+                (row["source_id"], row["logical_document_id"], row["passage_id"]) in admitted])
+                for name, weight, rows in legs)
+            rebuild_options = {**collapse_options, "limit": len(results), "nominate_per_arm": 0}
+            results[:] = collapse_document_candidates(surviving, **rebuild_options)
+            for row in results:
+                if (row["source_id"], row["logical_document_id"]) in nominees:
+                    row["nominated"] = True
+            if time.monotonic() >= deadline_at:
+                status = "deadline-exceeded"
+                results.clear()
+                for _name, _weight, rows in legs:
+                    rows.clear()
         # A collapsed document can carry metadata from any of its selected
         # ranges. Drop the whole collapsed row if any range lost authority;
         # never preserve a forgotten range's receipts, title, or body.
@@ -469,7 +594,13 @@ class TurbopufferHintRetrieval(PassageHintRetrieval):
             (row.get("source_id"), row.get("logical_document_id"), item.get("passage_id")) in live
             for item in row["matching_ranges"]
         )]
+        for row in results:
+            for item in row["matching_ranges"]:
+                canonical = live[(row["source_id"], row["logical_document_id"], item["passage_id"])]
+                item["receipts"] = list(canonical["receipts"])
+                row.update({field: canonical[field] for field in locator_fields})
         return {"authority_status": status,
+                "authority_stages": stages,
                 "authority_rejected": len(set(ids) - {key[2] for key in live}),
                 "authority_elapsed_ms": round((time.monotonic() - started) * 1000, 3)}
 
@@ -480,12 +611,13 @@ class TurbopufferHintRetrieval(PassageHintRetrieval):
         *,
         deadline_at: float,
         include_arms: bool = False,
+        collapse_options: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Fetch the bodies of the collapsed head's ranges in one pass.
 
         The arms returned catalog rows; the ranges that survived the
         collapse (and the leg rows behind them, which the reranker reads)
-        get text, spans, receipts, and header here: one ``id In`` query per
+        get text, spans, and header here: one ``id In`` query per
         ``HYDRATE_BATCH_IDS`` ids, ordered by id so the plane reads them in
         one sweep. A shortfall leaves the affected ranges bodiless
         (``hydrate_status`` says so) rather than dropping the result.
@@ -493,6 +625,7 @@ class TurbopufferHintRetrieval(PassageHintRetrieval):
 
         authority = self._authorize_ranges(
             results, legs, deadline_at=deadline_at, include_arms=include_arms,
+            collapse_options=collapse_options,
         )
         wanted: dict[str, list[dict[str, Any]]] = {}
         for row in results:
@@ -530,15 +663,22 @@ class TurbopufferHintRetrieval(PassageHintRetrieval):
                 text = _value(item, TEXT_ATTRIBUTE)
                 if not isinstance(text, str):
                     continue
+                # Authority checked catalog metadata before this separate body
+                # fetch. Bind the returned bytes to that same canonical hash.
+                authorized_rows = leg_rows.get(passage_id, ())
+                body_sha256 = hashlib.sha256(text.encode()).hexdigest()
+                if not authorized_rows or any(
+                    row.get("text_sha256") != body_sha256 for row in authorized_rows
+                ):
+                    continue
                 spans = parse_spans(_value(item, "spans"))
-                receipts = list(_value(item, "receipts") or ())
                 header = _value(item, "header") or None
                 bounded, clipped = bounded_search_text(text)
                 for hint in wanted[passage_id]:
-                    hint.update({"text": bounded, "text_clipped": clipped, "spans": spans, "receipts": receipts})
+                    hint.update({"text": bounded, "text_clipped": clipped, "spans": spans})
                 for row in leg_rows.get(passage_id, ()):
                     row.update({
-                        "text_redacted": text, "spans": spans, "receipts": receipts, "header_redacted": header,
+                        "text_redacted": text, "spans": spans, "header_redacted": header,
                     })
                 hydrated += 1
         if hydrated < len(ids) and status == "ok":

@@ -183,6 +183,9 @@ def source_rows(count):
             tenant_id="tenant",
             source_id="source",
             document_id="doc_" + str(i).zfill(32),
+            event_id="evt_" + str(i).zfill(32),
+            body_record_ordinal=None,
+            body_record_count=None,
             body_location="inline",
             event_text=text,
             document_revision=1,
@@ -369,8 +372,16 @@ class PublicationTests(unittest.TestCase):
             for i in range(260)
         ]
         budgets = []
+        pending_rows = list(rows)
 
-        def prepare(candidates, *, hint_limit, require_current_queue):
+        def commit(candidate, upload):
+            pending_rows.remove(candidate)
+            return "committed"
+
+        def prepare(candidates, *, hint_limit, require_current_queue, attempt_metrics):
+            self.assertEqual(attempt_metrics, dict(
+                input_capture_wall_ms=None, archive_prepare_wall_ms=None, commit_wall_ms=None,
+            ))
             self.assertTrue(require_current_queue)
             budgets.append((len(candidates), hint_limit))
             if candidates[0].native_parent_id == "130":
@@ -385,9 +396,9 @@ class PublicationTests(unittest.TestCase):
 
         with (
             patch.object(p, "_check_candidate_current", return_value=None),
-            patch.object(p, "_pending", return_value=rows),
+            patch.object(p, "_pending", side_effect=lambda **kwargs: list(pending_rows)),
             patch.object(p, "_prepare_batch_and_upload", side_effect=prepare),
-            patch.object(p, "_commit_upload", return_value="committed"),
+            patch.object(p, "_commit_upload", side_effect=commit),
             patch.object(p, "_mark_failed") as mark_failed,
             patch.object(
                 p,

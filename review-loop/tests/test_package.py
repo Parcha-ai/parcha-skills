@@ -45,10 +45,11 @@ class ReviewLoopPackageTest(unittest.TestCase):
         self.assertIn("Never dismiss a human review", text)
         self.assertIn("never mints", text)
 
-    def test_bounded_iterations_timeout_and_report(self):
+    def test_uncapped_iterations_timeout_and_report(self):
         text = SKILL.read_text()
-        self.assertRegex(text, r"\| `--max-iterations N` \| no \| 3 \|")
+        self.assertRegex(text, r"\| `--max-iterations N` \| no \| None \(no cap\)")
         self.assertIn("## Stop on timeout", text)
+        self.assertIn("## Stop on stall", text)
         self.assertIn("Never continue\nwith stale or missing review results", text)
         for field in ("| Iterations |", "| Threads found (per reviewer) |", "| Resolved this run |", "| Remaining |", "| Final Greptile score |"):
             self.assertIn(field, text)

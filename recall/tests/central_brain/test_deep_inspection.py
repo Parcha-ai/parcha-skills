@@ -708,6 +708,9 @@ class DeepInspectionContractTests(unittest.TestCase):
             def fetchall(self):
                 return self.values
 
+            def fetchone(self):
+                return self.values[0] if self.values else None
+
         class Cursor:
             def __init__(self, store):
                 self.store = store
@@ -719,6 +722,9 @@ class DeepInspectionContractTests(unittest.TestCase):
                 return False
 
             def executemany(self, _sql, values):
+                if 'canonical_evidence_cleanup_queue' in _sql:
+                    self.store.cleanup.extend(values)
+                    return
                 self.store.bulk_writes += 1
                 for value in values:
                     self.store.stored[(value[0], value[1], value[2])] = {
@@ -737,7 +743,17 @@ class DeepInspectionContractTests(unittest.TestCase):
             def __init__(self, store):
                 self.store = store
 
-            def execute(self, sql, _params):
+            def execute(self, sql, _params=()):
+                if "pg_advisory_xact_lock" in sql:
+                    return Rows([])
+                if "to_regclass('public.canonical_artifact_forget_tombstones')" in sql:
+                    return Rows([{"present": True}])
+                if "FROM canonical_artifact_forget_tombstones" in sql:
+                    return Rows([])
+                if "WITH targets AS" in sql:
+                    return Rows([])  # These uploads have no committed catalogue yet.
+                if "FROM canonical_documents document" in sql and "JOIN unnest" in sql:
+                    return Rows(documents)
                 if "FROM canonical_documents document" in sql:
                     self.store.pending_sql = sql
                     self.store.pending_reads += 1
@@ -748,6 +764,9 @@ class DeepInspectionContractTests(unittest.TestCase):
                 if "FROM canonical_evidence_objects evidence" in sql:
                     return Rows(list(self.store.stored.values()))
                 raise AssertionError("unexpected projector query")
+
+            def transaction(self):
+                return self
 
             def cursor(self):
                 return Cursor(self.store)
@@ -764,6 +783,7 @@ class DeepInspectionContractTests(unittest.TestCase):
             bulk_writes = 0
             pending_sql = ""
             stored = {}
+            cleanup = []
 
             def connect(self):
                 return Connection(self)
@@ -774,6 +794,12 @@ class DeepInspectionContractTests(unittest.TestCase):
                 self.active = 0
                 self.max_active = 0
                 self.deleted = []
+                self.archive = self
+                self.uploaded = {}
+
+            def verify_raw_bounded(self, reference, *, deadline_at):
+                assert time.monotonic() < deadline_at
+                assert self.uploaded[reference["artifact_id"]] == reference
 
             def put(self, *, tenant_id, source_id, document_id, bundle):
                 with self.lock:
@@ -782,7 +808,9 @@ class DeepInspectionContractTests(unittest.TestCase):
                 time.sleep(0.02)
                 with self.lock:
                     self.active -= 1
-                return {
+                reference = {
+                    "tenant_id": tenant_id,
+                    "source_id": source_id,
                     "artifact_id": "art_" + document_id.removeprefix("doc_"),
                     "storage_backend": "s3",
                     "object_key": "objects/aa/" + document_id.removeprefix("doc_"),
@@ -793,6 +821,8 @@ class DeepInspectionContractTests(unittest.TestCase):
                     "version_id": "s3-sha256-" + bundle.text_sha256,
                     "created_at": bundle.occurred_at,
                 }
+                self.uploaded[reference["artifact_id"]] = reference
+                return reference
 
             def delete(self, reference):
                 self.deleted.append(reference["artifact_id"])
@@ -837,7 +867,8 @@ class DeepInspectionContractTests(unittest.TestCase):
                 max_batches=1,
                 upload_concurrency=2,
             )
-        self.assertEqual(len(projection.deleted), 2)
+        self.assertEqual(projection.deleted, [])
+        self.assertEqual(len(store.cleanup), 2)
 
     def test_archil_rejects_untrusted_identifiers(self):
         with self.assertRaises(DeepInspectionError):
@@ -920,7 +951,8 @@ class DeepInspectionContractTests(unittest.TestCase):
             "mount --rbind /tmp/recall-authorized /mnt/archil/evidence",
             command,
         )
-        self.assertIn('subprocess.run(["mount","--bind"', command)
+        self.assertIn('checked_mount(libc.mount,', command)
+        self.assertIn('checked_mount(libc.syscall,442,', command)
         self.assertIn("hashlib.sha256", command)
         self.assertIn("shutil.copyfile", command)
         self.assertIn("env -i HOME=/tmp", command)

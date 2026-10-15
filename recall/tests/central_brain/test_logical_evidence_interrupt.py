@@ -37,6 +37,7 @@ class InterruptingProjector(CanonicalLogicalEvidenceProjector):
         self.projection = None
         self.bound_tenant_id = "tenant:company:synthetic"
         self.raw_archive = None
+        self.append_enabled = False
         self.excluded_structural_types = (
             "file-history-snapshot",
             "queue-operation",
@@ -226,6 +227,7 @@ class PoisonedGroupIsolationTests(TestCase):
                         revision=1,
                     )
                     for parent in ("good-a", "poison", "good-b")
+                    if parent not in self.committed
                 ]
 
             def _prepare_batch_and_upload(self, candidates, **kwargs):

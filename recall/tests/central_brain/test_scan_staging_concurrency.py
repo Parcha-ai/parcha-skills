@@ -1,16 +1,17 @@
 """Run the generated stage; gates prove overlap and failure barriers."""
 from contextlib import ExitStack, contextmanager, redirect_stderr
+import ctypes
+import errno
 import hashlib
 import io
 from pathlib import Path
 import shlex
 import shutil
-import subprocess
 import tempfile
 import threading
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from recall_server.deep_inspection import AgentExecObject, _agent_exec_command
 
@@ -120,7 +121,8 @@ class ScanStagingConcurrencyTests(unittest.TestCase):
                 if fail == 'bind' and command[2].endswith(self.tool.object_key if scan else self.items[0].object_key):
                     with self.lock:
                         self.active -= 1
-                    raise subprocess.CalledProcessError(1, ['mount'])
+                    ctypes.set_errno(errno.EPERM)
+                    return -1
                 cls(command[3]).chmod(0o600)
                 copy(command[2], command[3])
                 cls(command[3]).chmod(0o400)
@@ -131,7 +133,22 @@ class ScanStagingConcurrencyTests(unittest.TestCase):
                     self.active -= 1
                     self.completed += 1
                 if fail == 'remount' and command[3].endswith(self.tool.object_key if scan else self.items[0].object_key):
-                    raise subprocess.CalledProcessError(1, ['mount'])
+                    ctypes.set_errno(errno.EPERM)
+                    return -1
+
+        def bind(source, destination, filesystem, flags, data):
+            self.assertEqual((filesystem, flags, data), (None, 4096, None))
+            return mounted(['mount', '--bind', source.decode(), destination.decode()], check=True) or 0
+
+        def readonly(number, directory, destination, flags, pointer, size):
+            attr = pointer._obj
+            self.assertEqual((number, directory, flags, size), (442, -100, 0, 32))
+            self.assertEqual((attr.attr_set, attr.attr_clr, attr.propagation, attr.userns_fd), (1, 0, 0, 0))
+            return mounted(['mount', '-o', 'remount,bind,ro', destination.decode()], check=True) or 0
+
+        libc = Mock()
+        libc.mount.side_effect = bind
+        libc.syscall.side_effect = readonly
 
         if escape:
             path = self.root / 'mnt/archil/evidence' / self.items[0].object_key
@@ -143,7 +160,7 @@ class ScanStagingConcurrencyTests(unittest.TestCase):
             stack.enter_context(patch.object(cls, 'is_file', is_file))
             stack.enter_context(patch.object(cls, 'touch', touch))
             stack.enter_context(patch.object(cls, 'open', opening))
-            stack.enter_context(patch('subprocess.run', side_effect=mounted))
+            stack.enter_context(patch('ctypes.CDLL', return_value=libc))
             stack.enter_context(patch('platform.machine', return_value='x86_64'))
             stack.enter_context(patch('sys.argv', ['stage', *arguments]))
             stack.enter_context(patch('shutil.copyfile', side_effect=lambda src, dst: copy(src, mapped(dst))))
@@ -170,8 +187,9 @@ class ScanStagingConcurrencyTests(unittest.TestCase):
                 # A fresh fixture avoids a prior exclusive destination.
                 other = type(self)(); other.setUp()
                 try:
-                    with self.assertRaises(subprocess.CalledProcessError):
+                    with self.assertRaises(OSError) as error:
                         other.stage(delay=.01, fail=failure)
+                    self.assertEqual(error.exception.errno, errno.EPERM)
                     self.assertEqual(other.active, 0)
                     self.assertNotIn('objects_ready', other.stderr.getvalue())
                     self.assertFalse((other.root / 'tmp/recall-agent/duckdb-real').exists())

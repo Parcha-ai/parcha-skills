@@ -1,5 +1,7 @@
 """Execute the generated staging script with synthetic files and mocked mounts."""
 from contextlib import ExitStack, redirect_stderr
+import ctypes
+import errno
 import hashlib
 import io
 import json
@@ -8,7 +10,7 @@ import shlex
 import shutil
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from recall_server.deep_inspection import AgentExecObject, _agent_exec_command
 
@@ -36,7 +38,8 @@ class ScanManifestStagingTests(unittest.TestCase):
         self.objects.append(value)
         return value
 
-    def stage(self, aliases=None, datasets=None, *, tools=None, inventory=None, allow_missing=False):
+    def stage(self, aliases=None, datasets=None, *, tools=None, inventory=None, allow_missing=False,
+              mount_failure=None, machine='x86_64'):
         if inventory is not None:
             local = self.root / "tmp/recall-agent/inventory.json"
             if not local.is_symlink():
@@ -74,6 +77,35 @@ class ScanManifestStagingTests(unittest.TestCase):
             else:
                 self.assertEqual(command[:3], ['mount', '-o', 'remount,bind,ro'])
 
+        def failed(operation):
+            if mount_failure == operation:
+                ctypes.set_errno(errno.EPERM)
+                return True
+            if mount_failure == 'unsupported' and operation == 'readonly':
+                ctypes.set_errno(errno.ENOSYS)
+                return True
+            return False
+
+        def bind(source, destination, filesystem, flags, data):
+            self.assertEqual((filesystem, flags, data), (None, 4096, None))
+            if failed('bind'):
+                return -1
+            mounted(['mount', '--bind', source.decode(), destination.decode()], check=True)
+            return 0
+
+        def readonly(number, directory, destination, flags, pointer, size):
+            attr = pointer._obj
+            self.assertEqual((number, directory, flags, size), (442, -100, 0, 32))
+            self.assertEqual((attr.attr_set, attr.attr_clr, attr.propagation, attr.userns_fd), (1, 0, 0, 0))
+            if failed('readonly'):
+                return -1
+            mounted(['mount', '-o', 'remount,bind,ro', destination.decode()], check=True)
+            return 0
+
+        libc = Mock()
+        libc.mount.side_effect = bind
+        libc.syscall.side_effect = readonly
+
         def read(path, *args, **kwargs):
             self.reads.append(path)
             return original_read(path, *args, **kwargs)
@@ -96,8 +128,8 @@ class ScanManifestStagingTests(unittest.TestCase):
             stack.enter_context(patch.object(original_path, 'rglob', walk))
             stack.enter_context(patch.object(original_path, 'resolve', resolve))
             stack.enter_context(patch.object(original_path, 'is_file', is_file))
-            stack.enter_context(patch('subprocess.run', side_effect=mounted))
-            stack.enter_context(patch('platform.machine', return_value='x86_64'))
+            stack.enter_context(patch('ctypes.CDLL', return_value=libc))
+            stack.enter_context(patch('platform.machine', return_value=machine))
             stack.enter_context(patch('sys.argv', ['stage', *arguments]))
             stack.enter_context(patch('shutil.copyfile', side_effect=lambda src, dst: original_copy(src, mapped_path(dst))))
             stderr = io.StringIO()
@@ -160,6 +192,29 @@ class ScanManifestStagingTests(unittest.TestCase):
         with self.assertRaises(SystemExit) as error:
             self.stage(tools={'linux-x86_64': bad})
         self.assertEqual(error.exception.code, 66)
+
+    def test_failed_mount_or_readonly_attribute_stops_before_aliases(self):
+        for operation in ('bind', 'readonly'):
+            with self.subTest(operation=operation):
+                helper = ScanManifestStagingTests()
+                helper.setUp()
+                self.addCleanup(helper.doCleanups)
+                with self.assertRaises(OSError) as error:
+                    helper.stage(mount_failure=operation)
+                self.assertEqual(error.exception.errno, errno.EPERM)
+                self.assertFalse(any((helper.root / 'tmp/recall-datasets').rglob('*.parquet')))
+
+    def test_unsupported_mount_setattr_stops_before_aliases(self):
+        with self.assertRaises(OSError) as error:
+            self.stage(mount_failure='unsupported')
+        self.assertEqual(error.exception.errno, errno.ENOSYS)
+        self.assertFalse(any((self.root / 'tmp/recall-datasets').rglob('*.parquet')))
+
+    def test_unknown_syscall_architecture_stops_before_staging(self):
+        with self.assertRaises(SystemExit) as error:
+            self.stage(machine='unknown')
+        self.assertEqual(error.exception.code, 69)
+        self.assertEqual(self.mounts, [])
 
     def test_dataset_alias_reuses_staged_file_without_metadata_reprobe(self):
         alias = 's1/2026-09/passages-part-00000.parquet'

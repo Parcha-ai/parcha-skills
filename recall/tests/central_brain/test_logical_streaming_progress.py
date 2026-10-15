@@ -194,5 +194,113 @@ class StreamingAdmissionTests(unittest.TestCase):
                     item.native_parent_id == 'large' for item in projector.queue))
 
 
+class PublicationHandoffTests(unittest.TestCase):
+    def test_deadline_during_callback_settles_without_admitting_more(self):
+        import time
+        projector = QueueProjector(['large', 'small', 'tiny0', 'tiny1'])
+        projector.hold_replacement = True
+        now = [time.monotonic()]
+        deadline = now[0] + 1000
+        callbacks = []
+
+        def publish():
+            callbacks.append(True)
+            now[0] = deadline + 1
+            projector.release.set()
+
+        with patch('recall_server.logical_evidence_projection.time',
+                   SimpleNamespace(monotonic=lambda: now[0])):
+            result = projector.project_pending(batch_size=4, max_batches=1,
+                upload_concurrency=2, on_progress=publish,
+                admission_deadline_at=deadline)
+        self.assertEqual(result['documents'], 3)
+        self.assertEqual([c.native_parent_id for c in projector.queue], ['tiny1'])
+        self.assertEqual(set(projector.started), {'large', 'small', 'tiny0'})
+        self.assertEqual(projector.peak, 2)
+        self.assertTrue(callbacks)
+        self.assertFalse(any(t.name == 'recall-logical-refill' for t in threading.enumerate()))
+
+    def test_feeder_failure_joins_and_preserves_exception(self):
+        projector = QueueProjector(['large', 'small', 'tiny0', 'tiny1'])
+        failed = threading.Event()
+        pending = projector._pending
+        failure = RuntimeError('synthetic nomination failure')
+
+        def nominate(**kwargs):
+            if threading.current_thread().name == 'recall-logical-refill':
+                failed.set()
+                raise failure
+            return pending(**kwargs)
+
+        def publish():
+            self.assertTrue(failed.wait(2))
+            projector.release.set()
+
+        with patch.object(projector, '_pending', side_effect=nominate):
+            try:
+                with self.assertRaises(RuntimeError) as caught:
+                    projector.project_pending(batch_size=4, max_batches=1,
+                        upload_concurrency=2, on_progress=publish)
+                self.assertIs(caught.exception, failure)
+            finally:
+                projector.release.set()
+        self.assertEqual(set(projector.started), {'large', 'small', 'tiny0'})
+        self.assertTrue('large' in projector.cleaned or not any(
+            c.native_parent_id == 'large' for c in projector.queue))
+        self.assertFalse(any(t.name.startswith('recall-logical-evidence')
+                             for t in threading.enumerate()))
+        self.assertFalse(any(t.name == 'recall-logical-refill' for t in threading.enumerate()))
+
+    def test_callback_failure_stops_feeder_before_handoff_returns(self):
+        projector = QueueProjector(['large', 'small', 'tiny0', 'tiny1', 'tiny2'])
+        nominee_started, release_nominee = threading.Event(), threading.Event()
+        pending = projector._pending
+        callback_failed = threading.Event()
+        failure = RuntimeError('synthetic publication failure')
+        handoff_stopped = threading.Event()
+        native_thread = threading.Thread
+
+        class HandoffThread(native_thread):
+            def join(self, *args, **kwargs):
+                if self.name == 'recall-logical-refill':
+                    handoff_stopped.set()
+                return super().join(*args, **kwargs)
+
+        def nominate(**kwargs):
+            if threading.current_thread().name == 'recall-logical-refill':
+                nominee_started.set()
+                if not release_nominee.wait(3):
+                    raise AssertionError('nomination_not_released')
+            return pending(**kwargs)
+
+        def publish():
+            self.assertTrue(nominee_started.wait(2))
+            callback_failed.set()
+            raise failure
+
+        with patch.object(projector, '_pending', side_effect=nominate), \
+                patch('recall_server.logical_evidence_projection.threading.Thread', HandoffThread), \
+                ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(projector.project_pending, batch_size=5,
+                max_batches=1, upload_concurrency=2, on_progress=publish)
+            try:
+                self.assertTrue(callback_failed.wait(3))
+                self.assertTrue(handoff_stopped.wait(2))
+                self.assertFalse(future.done())
+                admitted = dict(projector.started)
+            finally:
+                release_nominee.set()
+                projector.release.set()
+            with self.assertRaises(RuntimeError) as caught:
+                future.result(timeout=5)
+            self.assertIs(caught.exception, failure)
+        self.assertEqual(dict(projector.started), admitted)
+        self.assertTrue('large' in projector.cleaned or not any(
+            c.native_parent_id == 'large' for c in projector.queue))
+        self.assertFalse(any(t.name.startswith('recall-logical-evidence')
+                             for t in threading.enumerate()))
+        self.assertFalse(any(t.name == 'recall-logical-refill' for t in threading.enumerate()))
+
+
 if __name__ == '__main__':
     unittest.main()

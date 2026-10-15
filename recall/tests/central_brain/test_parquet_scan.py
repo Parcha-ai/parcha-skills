@@ -968,6 +968,8 @@ class _CommitConnection:
 
     def execute(self, query, parameters=None):
         self.statements.append((query, parameters))
+        if "to_regclass('public.canonical_artifact_forget_tombstones')" in query:
+            return _CommitResult([{"present": True}])
         if "FROM canonical_parquet_scan_queue" in query and "SELECT" in query:
             return _CommitResult(
                 [
@@ -1169,7 +1171,7 @@ class ParquetFragmentDeltaTest(unittest.TestCase):
         candidate = _candidate()
         live = [_live_shard(dataset, index) for dataset in SCAN_DATASETS for index in (0, 1)]
         store = _CommitStore(live, candidate)
-        projector = CanonicalParquetScanProjector(store, _Evidence(None))
+        projector = CanonicalParquetScanProjector(store, _Evidence(mock.Mock(spec=["verify_raw_bounded"])))
         member = FragmentMember("document:beta", 1, "f" * 64)
         upload = ScanUpload(
             "a" * 64,
@@ -1242,7 +1244,7 @@ class ParquetFragmentDeltaTest(unittest.TestCase):
         candidate = _candidate()
         live = [_live_shard(dataset, index) for dataset in SCAN_DATASETS for index in (0, 1)]
         projector = CanonicalParquetScanProjector(
-            _CommitStore(live, candidate), _Evidence(None)
+            _CommitStore(live, candidate), _Evidence(mock.Mock(spec=["verify_raw_bounded"]))
         )
         upload = ScanUpload(
             "a" * 64,
@@ -1262,7 +1264,7 @@ class ParquetFragmentDeltaTest(unittest.TestCase):
         candidate = _candidate()
         live = [_live_shard(dataset, 0) for dataset in SCAN_DATASETS]
         projector = CanonicalParquetScanProjector(
-            _CommitStore(live, candidate), _Evidence(None)
+            _CommitStore(live, candidate), _Evidence(mock.Mock(spec=["verify_raw_bounded"]))
         )
         upload = ScanUpload(
             "a" * 64,
@@ -1292,7 +1294,7 @@ class ParquetFragmentDeltaTest(unittest.TestCase):
 
         store = _CommitStore(live, candidate)
         store.connection = _Moved(live, candidate)
-        projector = CanonicalParquetScanProjector(store, _Evidence(None))
+        projector = CanonicalParquetScanProjector(store, _Evidence(mock.Mock(spec=["verify_raw_bounded"])))
         upload = ScanUpload(
             "a" * 64,
             {("records", 1): _live_shard("records", 1)},

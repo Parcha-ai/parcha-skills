@@ -1412,12 +1412,13 @@ class ControlPlane:
                 (principal_id,),
             ).fetchall()
 
+    @staticmethod
     def _brain_admin(
-        self,
         connection: Any,
         *,
         principal_id: str,
         tenant_id: str,
+        lock: bool = False,
     ) -> dict[str, Any]:
         row = connection.execute(
             """SELECT space.organization_id,space.brain_kind,space.slug,
@@ -1431,7 +1432,8 @@ class ControlPlane:
                JOIN brain_memberships membership
                  ON membership.organization_id=space.organization_id
                 AND membership.principal_id=%s
-               WHERE space.tenant_id=%s""",
+               WHERE space.tenant_id=%s"""
+            + (" FOR SHARE OF space,access,membership NOWAIT" if lock else ""),
             (principal_id, principal_id, tenant_id),
         ).fetchone()
         if (

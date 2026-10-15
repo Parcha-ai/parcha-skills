@@ -39,6 +39,7 @@ from .canonical import CanonicalArchiveGateway, CanonicalPlane
 from .canonical_retrieval import CanonicalRetrieval
 from .control import ControlError, SecretBox
 from .db import BrainStore
+from .evidence_projection import CanonicalEvidenceProjector, EvidenceProjectionStore
 from .logical_evidence import LogicalEvidenceProjectionStore
 from .logical_evidence_projection import CanonicalLogicalEvidenceProjector
 from .passage_index import CanonicalPassageProjector
@@ -341,7 +342,12 @@ class ManagedConnectorWorker:
             actor_identity_index=ActorIdentityIndex(secret_box.blind_index),
             chunk_body_archive=chunk_body_archive,
         )
-        self.retrieval = CanonicalRetrieval(store, archive)
+        # Keep managed ingest's existing history fallback. Explicit forget must
+        # also remove revision bundles created by a serving writer for this source.
+        history_forget_owner = (CanonicalEvidenceProjector(store,
+            EvidenceProjectionStore(chunk_body_archive)) if chunk_body_archive is not None else None)
+        self.retrieval = CanonicalRetrieval(store, archive,
+            evidence_projector=history_forget_owner)
 
     def _claim(self) -> dict[str, Any] | None:
         with self.store.connect() as connection:
@@ -354,7 +360,10 @@ class ManagedConnectorWorker:
                               installation.connection_id,
                               installation.privacy_mode,
                               installation.selectors,
+                              installation.revision,
                               connection.provider,
+                              connection.subject_id AS provider_subject_id,
+                              connection.granted_scopes,
                               connection.status AS connection_status,
                               connection.encrypted_credentials,
                               connection.encryption_key_id
@@ -533,6 +542,14 @@ class ManagedConnectorWorker:
             row["privacy_mode"],
             rails,
         )
+        if connector_id == "slack.messages" and getattr(connector, "public_history", False):
+            connector.reconciliation_epoch = hashlib.sha256(json.dumps([
+                str(row["id"]), str(row["connection_id"]), row["revision"],
+                row["provider_subject_id"], sorted(row["granted_scopes"]),
+            ], separators=(",", ":")).encode()).hexdigest()
+            connector.reconciliation_enabled = os.environ.get(
+                "RECALL_SLACK_RECONCILIATION_ENABLED", "1"
+            ) == "1"
         return connector, spool
 
     @staticmethod

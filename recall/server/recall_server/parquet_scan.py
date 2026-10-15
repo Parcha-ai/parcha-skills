@@ -1096,11 +1096,28 @@ class CanonicalParquetScanProjector:
         if not document_ids:
             return
         bucket_end = _next_month(candidate.bucket_start)
+        membership_enabled = getattr(self.store, "verified_singleton_receipts", False)
+        membership_predicate = "true" if membership_enabled else """NOT EXISTS (
+                          SELECT 1 FROM unnest(passage.receipts) AS receipt(value)
+                          LEFT JOIN canonical_chunks chunk
+                            ON chunk.tenant_id=passage.tenant_id
+                           AND chunk.source_id=passage.source_id
+                           AND chunk.receipt=receipt.value
+                           AND chunk.deleted_at IS NULL
+                          LEFT JOIN canonical_documents document
+                            ON document.tenant_id=chunk.tenant_id
+                           AND document.source_id=chunk.source_id
+                           AND document.document_id=chunk.document_id
+                           AND document.is_current AND document.deleted_at IS NULL
+                          WHERE document.document_id IS NULL
+                      )"""
         with self.store.connect() as connection:
+            if membership_enabled:
+                connection.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
             with connection.cursor(name="parquet_passage_stream") as cursor:
                 cursor.itersize = 2_000
                 cursor.execute(
-                    """SELECT passage.logical_document_id,passage.revision,
+                    f"""SELECT passage.logical_document_id,passage.revision,
                           passage.passage_id,passage.ordinal,
                           passage.first_occurred_at,passage.last_occurred_at,
                           passage.token_count,passage.roles,passage.receipts,
@@ -1128,20 +1145,7 @@ class CanonicalParquetScanProjector:
                     WHERE passage.tenant_id=%s AND passage.source_id=%s
                       AND passage.logical_document_id=ANY(%s)
                       AND cardinality(passage.receipts)>0
-                      AND NOT EXISTS (
-                          SELECT 1 FROM unnest(passage.receipts) AS receipt(value)
-                          LEFT JOIN canonical_chunks chunk
-                            ON chunk.tenant_id=passage.tenant_id
-                           AND chunk.source_id=passage.source_id
-                           AND chunk.receipt=receipt.value
-                           AND chunk.deleted_at IS NULL
-                          LEFT JOIN canonical_documents document
-                            ON document.tenant_id=chunk.tenant_id
-                           AND document.source_id=chunk.source_id
-                           AND document.document_id=chunk.document_id
-                           AND document.is_current AND document.deleted_at IS NULL
-                          WHERE document.document_id IS NULL
-                      )
+                      AND {membership_predicate}
                       AND passage.last_occurred_at >= %s
                       AND passage.first_occurred_at < %s
                     ORDER BY passage.logical_document_id,
@@ -1155,7 +1159,22 @@ class CanonicalParquetScanProjector:
                         bucket_end,
                     ),
                 )
-                yield from cursor
+                if not membership_enabled:
+                    yield from cursor
+                    return
+                from .receipt_membership import lookup_current_search_membership
+
+                while rows := cursor.fetchmany(cursor.itersize):
+                    members = lookup_current_search_membership(
+                        self.store, tenant_id=candidate.tenant_id,
+                        authorized_sources=(candidate.source_id,),
+                        receipts=tuple(dict.fromkeys(receipt for row in rows for receipt in row["receipts"])),
+                        connection=connection,
+                        deadline_at=time.monotonic() + self.store.search_deadline_ms / 1000,
+                    )
+                    for row in rows:
+                        if all((candidate.source_id, receipt) in members for receipt in row["receipts"]):
+                            yield row
 
     def _catalog(self, candidate: ScanCandidate) -> ScanCatalog:
         """Read the live parts, their document membership, and the dirty set."""
@@ -2013,6 +2032,8 @@ class CanonicalParquetScanProjector:
         scope = (candidate.tenant_id, candidate.source_id, candidate.bucket_start)
         with self.store.connect() as connection:
             with connection.transaction():
+                from .archive_ownership import admit_references
+                admit_references(connection, self.archive, upload.references.values())
                 connection.execute(
                     "SELECT pg_advisory_xact_lock(hashtextextended(%s,0))",
                     (

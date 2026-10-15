@@ -34,7 +34,7 @@ SCALE = 20_000
 def claim_sql():
     statements = [node.value for node in ast.walk(ast.parse(inspect.getsource(owner)))
                   if isinstance(node, ast.Constant) and isinstance(node.value, str)
-                  and 'AS removable' in node.value and 'FOR UPDATE SKIP LOCKED' in node.value]
+                  and 'SELECT target.*' in node.value and 'canonical_evidence_objects' in node.value]
     assert len(statements) == 1, 'must exercise the actual cleanup owner SQL'
     return statements[0]
 
@@ -97,7 +97,9 @@ class CleanupReferenceIndexes(unittest.TestCase):
                 connection.execute(sql.SQL('ANALYZE {}').format(sql.Identifier(table)))
             connection.execute('ANALYZE canonical_evidence_cleanup_queue')
         cls.query = claim_sql()
-        cls.params = (cls.tenant, cls.tenant, [], [], [], 8)
+        cls.params = ([r['tenant_id'] for r in cls.references],
+                      [r['source_id'] for r in cls.references],
+                      [r['artifact_id'] for r in cls.references])
 
     @classmethod
     def tearDownClass(cls):
@@ -111,8 +113,9 @@ class CleanupReferenceIndexes(unittest.TestCase):
                                   self.params).fetchone()['QUERY PLAN'][0]
 
     def decisions(self, connection):
-        return {row['artifact_id']: row['removable'] for row in
-                connection.execute(self.query, self.params).fetchall()}
+        protected = {row['artifact_id'] for row in
+                     connection.execute(self.query, self.params).fetchall()}
+        return {r['artifact_id']: r['artifact_id'] not in protected for r in self.references}
 
     def test_selective_artifact_probes_preserve_exact_claims(self):
         with self.store.connect() as connection:

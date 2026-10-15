@@ -88,7 +88,7 @@ class ParentProgressTests(unittest.TestCase):
             interval_seconds=1, once=True, skip_embedding=True, search_plane=search)
         self.assertTrue(logical.assert_published)
         self.assertEqual(owners, {threading.get_ident()})
-        self.assertEqual(passages.budget['batch_size'], 3)
+        self.assertEqual(passages.budget['batch_size'], 2)
         self.assertEqual(passages.budget['max_batches'], 1)
         self.assertEqual(passages.budget['concurrency'], 2)
         self.assertEqual(result['passage_documents'], 1)

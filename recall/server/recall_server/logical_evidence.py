@@ -8,7 +8,7 @@ from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from datetime import datetime
-from typing import Any, Iterable, Protocol
+from typing import Any, Callable, Iterable, Protocol
 from urllib.parse import urlsplit
 
 import orjson
@@ -54,6 +54,7 @@ class EvidenceArchive(Protocol):
     ) -> dict[str, Any]: ...
 
     def verify_raw(self, value: dict[str, Any]) -> None: ...
+    def verify_raw_bounded(self, value: dict[str, Any], *, deadline_at: float) -> None: ...
     def read_raw(self, value: dict[str, Any]) -> bytes: ...
     def delete_raw(self, value: dict[str, Any]) -> bool: ...
 
@@ -593,6 +594,7 @@ class LogicalEvidenceProjectionStore:
         prepared: PreparedLogicalDocument,
         *,
         retention_profile: str = "lossless-v1",
+        on_failed_upload: Callable[[tuple[dict[str, Any], ...]], None] | None = None,
     ) -> LogicalEvidenceUpload:
         part_references: list[dict[str, Any]] = []
         try:
@@ -648,11 +650,10 @@ class LogicalEvidenceProjectionStore:
                 created_at=prepared.first_occurred_at,
             )
         except Exception:
-            for reference in reversed(part_references):
-                try:
-                    self.archive.delete_raw(reference)
-                except Exception:
-                    pass
+            # A deterministic part can already belong to another publisher.
+            # Only the catalog cleanup owner can decide whether to delete it.
+            if on_failed_upload is not None:
+                on_failed_upload(tuple(part_references))
             raise
         return LogicalEvidenceUpload(
             prepared=prepared,
@@ -673,6 +674,9 @@ class LogicalEvidenceProjectionStore:
         part_bytes: int = DEFAULT_PART_BYTES,
         retention_profile: str = "lossless-v1",
         existing_part_references: tuple[dict[str, Any], ...] = (),
+        on_failed_upload: Callable[[tuple[dict[str, Any], ...]], None] | None = None,
+        prefix: LogicalEvidenceUpload | None = None,
+        prefix_checkpoint: Callable[[], None] | None = None,
     ) -> LogicalEvidenceUpload:
         """Upload a logical document with memory bounded to one object part."""
 
@@ -858,6 +862,75 @@ class LogicalEvidenceProjectionStore:
             part_last_time = None
 
         try:
+            if prefix is not None:
+                # The catalog owner binds this immutable prefix to the queue.
+                # Recheck archive bytes without decoding or rebuilding its records.
+                previous = prefix.prepared
+                prefix.manifest.validate()
+                if (previous.tenant_id != tenant_id or previous.source_id != source_id
+                        or previous.native_parent_id != native_parent_id
+                        or previous.logical_document_id != document_id
+                        or prefix.manifest.logical_document_id != document_id
+                        or prefix.manifest.native_parent_sha256 != hashlib.sha256(native_parent_id.encode()).hexdigest()
+                        or revision != previous.revision + 1
+                        or previous.revision != prefix.manifest.revision
+                        or previous.evidence_id != prefix.manifest.evidence_id
+                        or previous.first_occurred_at != prefix.manifest.first_occurred_at
+                        or previous.last_occurred_at != prefix.manifest.last_occurred_at
+                        or prefix.manifest.retention_profile != retention_profile
+                        or previous.record_count != prefix.manifest.record_count
+                        or previous.receipt_count != prefix.manifest.receipt_count
+                        or previous.document_content_sha256 != prefix.manifest.document_content_sha256
+                        or len(previous.parts) != len(prefix.part_references)
+                        or len(previous.parts) != len(prefix.manifest.parts)):
+                    raise LogicalEvidenceError("logical_evidence_prefix_invalid")
+                archived_manifest = self.read_manifest(prefix.manifest_reference,
+                    tenant_id=tenant_id, source_id=source_id)
+                if archived_manifest != json.loads(prefix.manifest.encode()):
+                    raise LogicalEvidenceError("logical_evidence_prefix_invalid")
+                if not existing_part_references:
+                    existing_part_references = prefix.part_references
+                prior_size = None
+                for index, (part, reference) in enumerate(zip(previous.parts, prefix.part_references, strict=True)):
+                    if prefix_checkpoint is not None:
+                        prefix_checkpoint()
+                    payload = self.read_part(reference, tenant_id=tenant_id, source_id=source_id)
+                    count = part.last_record_ordinal - part.first_record_ordinal + 1
+                    if (part.ordinal != index or part.first_record_ordinal != record_count
+                            or len(payload) != reference["size_bytes"] or not payload.endswith(b"\n")
+                            or payload.count(b"\n") != count
+                            or (len(payload) > part_bytes and count != 1)
+                            or (prior_size is not None and prior_size <= part_bytes
+                                and prior_size + payload.find(b"\n") + 1 <= part_bytes)):
+                        raise LogicalEvidenceError("logical_evidence_prefix_invalid")
+                    prepared_part = replace(part, payload=payload)
+                    manifest_part = ManifestPart.from_reference(prepared=prepared_part,
+                        reference=reference, tenant_id=tenant_id, source_id=source_id)
+                    if manifest_part != prefix.manifest.parts[index]:
+                        raise LogicalEvidenceError("logical_evidence_prefix_invalid")
+                    document_digest.update(payload)
+                    record_count += count
+                    receipt_count += part.receipt_count
+                    prior_size = len(payload)
+                    if index < len(previous.parts) - 1:
+                        accept_part(prepared_part, reference, created=False)
+                        next_part_ordinal += 1
+                    else:
+                        # Only the last existing part can acquire appended records.
+                        part_payload = bytearray(payload)
+                        part_start = part.first_record_ordinal
+                        part_receipt_count = part.receipt_count
+                        part_created_at = reference["created_at"]
+                        part_first_occurred, part_last_occurred = part.first_occurred_at, part.last_occurred_at
+                        part_first_time, part_last_time = (_parsed_timestamp(part_first_occurred),
+                                                          _parsed_timestamp(part_last_occurred))
+                if (record_count != previous.record_count or receipt_count != previous.receipt_count
+                        or document_digest.hexdigest() != previous.document_content_sha256):
+                    raise LogicalEvidenceError("logical_evidence_prefix_invalid")
+                if prefix_checkpoint is not None:
+                    prefix_checkpoint()
+                first_occurred, last_occurred = previous.first_occurred_at, previous.last_occurred_at
+                first_time, last_time = _parsed_timestamp(first_occurred), _parsed_timestamp(last_occurred)
             for record in records:
                 if (
                     record_count >= MAX_DOCUMENT_RECORDS
@@ -975,11 +1048,8 @@ class LogicalEvidenceProjectionStore:
                     )
                 except Exception:
                     pass
-            for reference in reversed(created_part_references):
-                try:
-                    self.archive.delete_raw(reference)
-                except Exception:
-                    pass
+            if on_failed_upload is not None:
+                on_failed_upload(tuple(created_part_references))
             raise
         finally:
             if part_executor is not None:

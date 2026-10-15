@@ -96,6 +96,96 @@ class CollectorTest(unittest.TestCase):
             token="test-token-not-a-secret",
         )
 
+    def test_unavailable_claude_root_preserves_history_and_reports_incomplete_scan(self) -> None:
+        transcript = self.root / "session.jsonl"
+        transcript.write_text(claude_line("retain captured history"))
+        collector = self.collector()
+        self.addCleanup(collector.close)
+        collector.scan()
+        collector.flush()
+        self.root.rename(self.root.with_name("temporarily-unavailable"))
+
+        with self.assertRaisesRegex(CollectorRuntimeError, "source_unavailable"):
+            collector.scan()
+        self.assertEqual(collector.pending_envelopes(), [])
+        doctor = collector.doctor(include_dead_letters=False)
+        self.assertEqual(doctor["records"], 1)
+        self.assertFalse(doctor["scan_complete"])
+        self.assertEqual(doctor["last_error_code"], "source_unavailable")
+        self.assertEqual(doctor["coverage_percent"], 0.0)
+
+    def test_incomplete_claude_traversal_preserves_history_and_recovers(self) -> None:
+        nested = self.root / "project"
+        nested.mkdir()
+        (nested / "session.jsonl").write_text(claude_line("retained nested history"))
+        collector = self.collector()
+        self.addCleanup(collector.close)
+        collector.scan()
+        collector.flush()
+        scandir = os.scandir
+
+        def unreadable(path):
+            if os.fspath(path) == str(nested):
+                raise PermissionError("synthetic unavailable directory")
+            return scandir(path)
+
+        with mock.patch("os.scandir", side_effect=unreadable):
+            with self.assertRaisesRegex(CollectorRuntimeError, "inventory_incomplete"):
+                collector.scan()
+            doctor = collector.doctor(include_dead_letters=False)
+            self.assertEqual(doctor["last_error_code"], "inventory_incomplete")
+            self.assertFalse(doctor["scan_complete"])
+        self.assertEqual(collector.pending_envelopes(), [])
+        self.assertEqual(collector.doctor(include_dead_letters=False)["records"], 1)
+        recovered = collector.scan()
+        self.assertEqual(recovered["tombstones_queued"], 0)
+        self.assertEqual(recovered["records_queued"], 0)
+        self.assertIsNone(collector.doctor(include_dead_letters=False)["last_error_code"])
+
+    def test_root_replaced_during_inventory_cannot_authorize_deletion(self) -> None:
+        (self.root / "session.jsonl").write_text(claude_line("history before root swap"))
+        collector = self.collector()
+        self.addCleanup(collector.close)
+        collector.scan()
+        collector.flush()
+        scandir = os.scandir
+        replaced = False
+
+        def replace_root(path):
+            nonlocal replaced
+            if not replaced and os.fspath(path) == str(self.root):
+                replaced = True
+                self.root.rename(self.root.with_name("old-root"))
+                self.root.mkdir()
+            return scandir(path)
+
+        with mock.patch("os.scandir", side_effect=replace_root):
+            with self.assertRaisesRegex(CollectorRuntimeError, "inventory_incomplete"):
+                collector.scan()
+        self.assertEqual(collector.pending_envelopes(), [])
+        self.assertEqual(collector.doctor(include_dead_letters=False)["records"], 1)
+
+    def test_root_stat_permission_failure_is_content_free_health_error(self) -> None:
+        (self.root / "session.jsonl").write_text(claude_line("history"))
+        collector = self.collector()
+        self.addCleanup(collector.close)
+        collector.scan()
+        collector.flush()
+        original = Path.stat
+
+        def denied(path, *args, **kwargs):
+            if path == self.root:
+                raise PermissionError("sensitive filesystem path")
+            return original(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "stat", denied):
+            with self.assertRaisesRegex(CollectorRuntimeError, "source_unavailable"):
+                collector.scan()
+            doctor = collector.doctor(include_dead_letters=False)
+            self.assertEqual(doctor["last_error_code"], "source_unavailable")
+            self.assertFalse(doctor["scan_complete"])
+        self.assertEqual(collector.pending_envelopes(), [])
+
     def test_default_archive_concurrency_leaves_capacity_for_ingest(self) -> None:
         collector = self.collector()
         self.assertEqual(collector.archive_workers, 2)
@@ -118,7 +208,7 @@ class CollectorTest(unittest.TestCase):
         self.assertEqual(MAX_CANONICAL_BATCH_EVENTS, 1_000)
         collector.close()
 
-    def test_canonical_flush_bounds_tombstones_and_keeps_live_batches_separate(self) -> None:
+    def test_rewrite_flushes_only_new_content_and_retains_removed_history(self) -> None:
         batch_kinds: list[list[str]] = []
         batch_sizes: list[int] = []
 
@@ -184,15 +274,8 @@ class CollectorTest(unittest.TestCase):
         collector.scan()
         result = collector.flush()
 
-        self.assertEqual(result["acked"], MAX_CANONICAL_TOMBSTONE_BATCH_EVENTS + 6)
-        self.assertEqual(
-            batch_sizes,
-            [
-                1,
-                MAX_CANONICAL_TOMBSTONE_BATCH_EVENTS,
-                5,
-            ],
-        )
+        self.assertEqual(result["acked"], 1)
+        self.assertEqual(batch_sizes, [1])
         self.assertTrue(all(
             len(set(kinds)) == 1
             for kinds in batch_kinds
@@ -209,6 +292,173 @@ class CollectorTest(unittest.TestCase):
         os.utime(newer, ns=(2_000_000_000, 2_000_000_000))
         collector = self.collector()
         self.assertEqual(collector.discover(), [newer, older])
+        collector.close()
+
+    def test_rewrite_during_bounded_scan_revisits_already_scanned_prefix(self) -> None:
+        transcript = self.root / "session.jsonl"
+        transcript.write_text(claude_line("old prefix") + claude_line("tail evidence"))
+        collector = self.collector()
+        collector.max_scan_records = 1
+        self.assertFalse(collector.scan()["scan_complete"])
+        collector.flush()
+        collector.close()
+
+        transcript.write_text(claude_line("new prefix") + claude_line("tail evidence"))
+        collector = self.collector()
+        self.addCleanup(collector.close)
+        for _ in range(3):
+            collector.scan()
+            collector.flush()
+        delivered = [event for batch in AckServer.received for event in batch["events"]]
+        self.assertIn("new prefix", [event["content"]["message"]["content"] for event in delivered])
+        self.assertIn("old prefix", [event["content"]["message"]["content"] for event in delivered])
+        self.assertFalse(any(event["kind"] == "tombstone" for event in delivered))
+
+    def test_append_during_bounded_scan_keeps_existing_progress(self) -> None:
+        transcript = self.root / "session.jsonl"
+        transcript.write_text(claude_line("first evidence") + claude_line("second evidence"))
+        collector = self.collector()
+        self.addCleanup(collector.close)
+        collector.max_scan_records = 1
+        collector.scan()
+        collector.flush()
+        with transcript.open("a") as output:
+            output.write(claude_line("third evidence"))
+        collector.scan()
+        collector.flush()
+        delivered = [event["content"]["message"]["content"]
+                     for batch in AckServer.received for event in batch["events"]]
+        self.assertEqual(delivered, ["first evidence", "second evidence"])
+        collector.scan()
+        collector.flush()
+        delivered = [event["content"]["message"]["content"]
+                     for batch in AckServer.received for event in batch["events"]]
+        self.assertEqual(delivered, ["first evidence", "second evidence", "third evidence"])
+
+    def test_truncation_during_bounded_scan_keeps_old_history_and_reads_replacement(self) -> None:
+        transcript = self.root / "session.jsonl"
+        transcript.write_text(claude_line("first evidence") + claude_line("second evidence")
+                              + claude_line("third evidence"))
+        collector = self.collector()
+        self.addCleanup(collector.close)
+        collector.max_scan_records = 2
+        collector.scan()
+        collector.flush()
+        transcript.write_text(claude_line("short"))
+        self.assertTrue(collector.scan()["scan_complete"])
+        collector.flush()
+        delivered = [event for batch in AckServer.received for event in batch["events"]]
+        self.assertEqual([event["content"]["message"]["content"] for event in delivered],
+                         ["first evidence", "second evidence", "short"])
+        self.assertFalse(any(event["kind"] == "tombstone" for event in delivered))
+
+    def test_busy_newest_file_does_not_starve_history_across_restart(self) -> None:
+        older = self.root / "a-history.jsonl"
+        newer = self.root / "z-live.jsonl"
+        older.write_text(claude_line("older evidence"))
+        newer.write_text(claude_line("live opener") + claude_line("live backlog"))
+        os.utime(older, ns=(1_000_000_000, 1_000_000_000))
+        for cycle in range(2):
+            with newer.open("a") as output:
+                output.write(claude_line(f"live append {cycle}"))
+            os.utime(newer, ns=(10_000_000_000 + cycle, 10_000_000_000 + cycle))
+            collector = self.collector()
+            collector.max_scan_records = 1
+            result = collector.scan()
+            self.assertLessEqual(result["records_queued"], 1)
+            collector.flush()
+            collector.close()
+        delivered = [event for batch in AckServer.received for event in batch["events"]]
+        self.assertIn("older evidence", [event["content"]["message"]["content"] for event in delivered])
+        self.assertEqual({event["source_id"] for event in delivered}, {"claude:linux:test"})
+
+    def test_large_history_backlog_keeps_live_appends_within_two_scan_slices(self) -> None:
+        for index in range(8):
+            history = self.root / f"a-history-{index}.jsonl"
+            history.write_text("".join(claude_line(f"history {index} record {record}") for record in range(10)))
+            os.utime(history, ns=(1_000_000_000 + index, 1_000_000_000 + index))
+        live = self.root / "z-live.jsonl"
+        collector = self.collector()
+        collector.max_scan_records = 4
+        for cycle in range(5):
+            with live.open("a") as output:
+                output.write(claude_line(f"live {cycle}"))
+            os.utime(live, ns=(10_000_000_000 + cycle, 10_000_000_000 + cycle))
+            scan = collector.scan()
+            self.assertLessEqual(scan["records_queued"], 4)
+            collector.flush()
+            delivered = [event["content"]["message"]["content"] for batch in AckServer.received for event in batch["events"]]
+            if cycle % 2 == 0:
+                for earlier in range(cycle + 1):
+                    self.assertIn(f"live {earlier}", delivered)
+        self.assertTrue(any(text.startswith("history ") for text in delivered))
+        collector.close()
+
+    def test_fair_scan_survives_renamed_cursor_and_mtime_changes_without_false_deletion(self) -> None:
+        first = self.root / "a-history.jsonl"
+        waiting = self.root / "b-history.jsonl"
+        live = self.root / "z-live.jsonl"
+        first.write_text(claude_line("first history") + claude_line("first continuation"))
+        waiting.write_text(claude_line("waiting history"))
+        live.write_text("".join(claude_line(f"live {index}") for index in range(6)))
+        os.utime(first, ns=(1_000_000_000, 1_000_000_000))
+        os.utime(waiting, ns=(2_000_000_000, 2_000_000_000))
+        os.utime(live, ns=(10_000_000_000, 10_000_000_000))
+        collector = self.collector()
+        collector.max_scan_records = 1
+        for _ in range(2):
+            collector.scan()
+            collector.flush()
+        first_event = next(event for batch in AckServer.received for event in batch["events"] if event["content"].get("message", {}).get("content") == "first history")
+        first.rename(self.root / "c-renamed.jsonl")
+        os.utime(waiting, ns=(3_000_000_000, 3_000_000_000))
+        collector.close()
+        collector = self.collector()
+        collector.max_scan_records = 1
+        for _ in range(2):
+            scan = collector.scan()
+            self.assertLessEqual(scan["records_queued"] + scan["tombstones_queued"], 1)
+            collector.flush()
+        delivered = [event for batch in AckServer.received for event in batch["events"]]
+        self.assertIn("waiting history", [event["content"].get("message", {}).get("content") for event in delivered])
+        self.assertFalse(any(event["kind"] == "tombstone" for event in delivered))
+        for _ in range(20):
+            scan = collector.scan()
+            collector.flush()
+            if scan["scan_complete"]:
+                break
+        self.assertTrue(scan["scan_complete"])
+        tombstones = [event for batch in AckServer.received for event in batch["events"] if event["kind"] == "tombstone"]
+        self.assertEqual(tombstones, [])
+        self.assertIn(first_event["native_id"], {row[0] for row in collector.db.execute("SELECT native_id FROM active_records")})
+        collector.close()
+
+    def test_time_budget_rotates_to_history_without_raising_record_limit(self) -> None:
+        older = self.root / "a-history.jsonl"
+        newest = self.root / "z-live.jsonl"
+        older.write_text(claude_line("old first") + claude_line("old second"))
+        newest.write_text(claude_line("live first") + claude_line("live second"))
+        os.utime(older, ns=(1_000_000_000, 1_000_000_000))
+        os.utime(newest, ns=(2_000_000_000, 2_000_000_000))
+        collector = self.collector()
+        collector.max_scan_records = 100
+        collector.max_scan_seconds = 0.1
+        elapsed = [0.0]
+        apply_privacy = collector.privacy.apply
+
+        def spend_scan_budget(value):
+            result = apply_privacy(value)
+            elapsed[0] += 0.2
+            return result
+
+        for _ in range(2):
+            with mock.patch("collector.collector.time.monotonic", side_effect=lambda: elapsed[0]), mock.patch.object(collector.privacy, "apply", side_effect=spend_scan_budget):
+                scan = collector.scan()
+            self.assertFalse(scan["scan_complete"])
+            self.assertEqual(scan["records_queued"], 1)
+            collector.flush()
+        delivered = [event["content"]["message"]["content"] for batch in AckServer.received for event in batch["events"]]
+        self.assertEqual(delivered, ["live first", "old first"])
         collector.close()
 
     def test_committed_cursor_waits_for_ack_and_survives_restart(self) -> None:
@@ -424,9 +674,9 @@ class CollectorTest(unittest.TestCase):
         scan = collector.scan()
         self.assertEqual(scan["records_queued"], 2 * MAX_IDENTICAL_RECORDS_PER_FILE)
         self.assertEqual(scan["records_collapsed"], 2)
-        # Every shipped record is tombstoned except the one at byte 0, whose
-        # native id the rewritten first line reuses as a content revision.
-        self.assertEqual(scan["tombstones_queued"], expected)
+        # Removed local lines retain their captured history. A reused byte-zero
+        # identity still follows the existing content revision path.
+        self.assertEqual(scan["tombstones_queued"], 0)
         collector.close()
 
     def test_repeat_counts_survive_a_bounded_scan_resume(self) -> None:
@@ -448,21 +698,21 @@ class CollectorTest(unittest.TestCase):
         self.assertEqual(collapsed, 60 - queued)
         collector.close()
 
-    def test_truncation_queues_tombstone_for_removed_record(self) -> None:
+    def test_truncation_retains_removed_record_without_resurrection(self) -> None:
         transcript = self.root / "session.jsonl"
         transcript.write_text(claude_line("first") + claude_line("removed"))
         collector = self.collector(); collector.scan(); collector.flush()
         transcript.write_text(claude_line("first"))
         scan = collector.scan()
-        self.assertEqual(scan["tombstones_queued"], 1)
+        self.assertEqual(scan["tombstones_queued"], 0)
         collector.flush()
         self.assertEqual(collector.doctor()["pending"], 0)
         transcript.write_text(claude_line("first") + claude_line("removed"))
         resurrect = collector.scan()
-        self.assertEqual(resurrect["records_queued"], 1)
+        self.assertEqual(resurrect["records_queued"], 0)
         collector.flush()
         transcript.write_text(claude_line("first"))
-        self.assertEqual(collector.scan()["tombstones_queued"], 1)
+        self.assertEqual(collector.scan()["tombstones_queued"], 0)
         collector.close()
 
     def test_scope_and_master_key_are_sanitized_and_unrelated_files_ignored(self) -> None:
@@ -694,7 +944,7 @@ class CollectorTest(unittest.TestCase):
         ))
         collector.close()
 
-    def test_missing_large_file_tombstones_are_bounded_and_bulk_archived(self) -> None:
+    def test_missing_large_file_retains_history_without_new_archive_work(self) -> None:
         transcript = self.root / "missing-large.jsonl"
         transcript.write_text(
             "".join(claude_line(f"private-record-{index}") for index in range(1201))
@@ -768,16 +1018,16 @@ class CollectorTest(unittest.TestCase):
             if result["scan_complete"]:
                 break
 
-        self.assertEqual(sum(item["tombstones_queued"] for item in slices), 1201)
-        self.assertEqual(len(slices), 5)
-        self.assertEqual(len(archived), 15)
+        self.assertEqual(sum(item["tombstones_queued"] for item in slices), 0)
+        self.assertEqual(len(slices), 1)
+        self.assertEqual(len(archived), 0)
         self.assertTrue(all(
             item["media_type"] == "application/vnd.recall.bulk-manifest+json"
             for item in archived
         ))
         self.assertEqual(
             collector.db.execute("SELECT count(*) FROM active_records").fetchone()[0],
-            0,
+            1201,
         )
         self.assertEqual(collector.doctor()["pending"], 0)
         collector.close()

@@ -19,6 +19,7 @@ from psycopg_pool import PoolTimeout
 
 from .actor_attribution import ACTOR_ID_RE, ACTOR_RELATIONS
 from .db import SearchDeadlineExceeded, bounded_search_text
+from .passage_projection import COMPLETE_SOURCE_UNITS
 from .fusion import (
     ARM_NAMES,
     DEFAULT_FUSION_ALPHAS,
@@ -31,6 +32,7 @@ from .rerank import (
     DEFAULT_RERANK_BLEND,
     DEFAULT_RERANK_MIN_BUDGET_SECONDS,
     MAX_CANDIDATES_CEILING,
+    MAX_DOC_CHARS_CEILING,
     RerankUnavailable,
 )
 from .temporal_hints import (
@@ -266,8 +268,9 @@ def collapse_document_candidates(
     the small-leg and recent-first fallbacks. ``fusion_report`` receives
     per-leg ``{"candidates", "documents", "normalized"}`` when given.
     ``nominate_per_arm`` > 0 appends, after the first ``limit`` rows, every
-    document some arm ranked within its top ``nominate_per_arm`` (see
-    ``arm_nominated``); the rows carry ``"nominated": True``.
+    document within an arm's first ``nominate_per_arm`` distinct documents;
+    repeated passages do not consume nominations. These rows carry
+    ``"nominated": True``.
     ``window_boost=(since, until, factor)`` (H2-h) multiplies the fused
     score of every document whose ``[first_occurred_at, last_occurred_at]``
     intersects the window by ``factor`` (after flooring it at the pool's
@@ -277,6 +280,7 @@ def collapse_document_candidates(
     """
 
     documents: dict[str, dict[str, Any]] = {}
+    nominated_documents: set[tuple[str, str]] = set()
     for leg_name, weight, rows in legs:
         leg_scores, normalized = leg_document_scores(rows, mode=fusion)
         leg_weight = (
@@ -313,6 +317,8 @@ def collapse_document_candidates(
                 },
             )
             if document_id not in seen_documents:
+                if len(seen_documents) < nominate_per_arm:
+                    nominated_documents.add((row["source_id"], document_id))
                 leg_entry = leg_scores[document_id]
                 value["_score"] += leg_weight * float(leg_entry["normalized"])
                 value["_arm_scores"][leg_name] = {
@@ -398,7 +404,7 @@ def collapse_document_candidates(
         ranked.extend(
             value
             for value in ordered[limit:]
-            if arm_nominated(value["_arm_scores"], nominate_per_arm)
+            if (value["source_id"], value["logical_document_id"]) in nominated_documents
         )
     results = []
     for value in ranked:
@@ -817,15 +823,6 @@ def group_near_duplicates(
     }
 
 
-def arm_nominated(arm_scores: dict[str, Any], nominate_per_arm: int) -> bool:
-    """True when any arm ranked the document within its top ``nominate_per_arm``."""
-
-    return any(
-        0 < int(entry.get("rank") or 0) <= nominate_per_arm
-        for entry in (arm_scores or {}).values()
-    )
-
-
 def focus_terms(*queries: str) -> list[str]:
     """Casefolded query words of four or more characters, first-seen order.
 
@@ -1074,6 +1071,7 @@ class PassageHintRetrieval:
         *,
         deadline_at: float,
         include_arms: bool = False,
+        collapse_options: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         """Fill the bodies of the collapsed ranges when the arms returned
         catalog rows (a plane whose rows are wide fetches bodies once, for
@@ -2401,8 +2399,7 @@ class PassageHintRetrieval:
             if rerank_runtime is not None
             else limit
         )
-        results = collapse_document_candidates(
-            legs,
+        collapse_options = dict(
             limit=collapse_limit,
             fusion=fusion_mode,
             alphas=fusion_alphas,
@@ -2413,9 +2410,11 @@ class PassageHintRetrieval:
             window_boost=window_boost,
             source_boost=source_boost,
         )
+        results = collapse_document_candidates(legs, **collapse_options)
         hydrate_started = time.monotonic()
         hydrate_diagnostics = self._hydrate_ranges(
             results, legs, deadline_at=deadline_at, include_arms=include_arms,
+            collapse_options=collapse_options,
         )
         if hydrate_diagnostics is not None:
             arm_elapsed_ms["hydrate"] = round((time.monotonic() - hydrate_started) * 1000, 3)
@@ -2570,11 +2569,17 @@ class PassageHintRetrieval:
         terms = focus_terms(lexical_query or query)
         width = int(getattr(runtime, "max_doc_chars", 0) or 0)
         texts: dict[str, str] = {}
+        complete_reports: set[str] = set()
         for _leg_name, _weight, rows in legs:
             for row in rows:
                 key = row.get("passage_id") or row.get("receipt")
                 if key and key not in texts:
-                    texts[key] = rerank_document(row, terms, width)
+                    complete = row.get("source_unit") in COMPLETE_SOURCE_UNITS
+                    whole = rerank_document(row, terms, 0) if complete else ""
+                    complete = complete and len(whole) <= MAX_DOC_CHARS_CEILING
+                    texts[key] = whole if complete else rerank_document(row, terms, width)
+                    if complete:
+                        complete_reports.add(key)
         # The same passage can reach the pool under two keys (a passage id
         # from one arm, a receipt from another); send its text once and let
         # both keys share the score.
@@ -2599,9 +2604,17 @@ class PassageHintRetrieval:
             return results, diagnostics
         started = time.monotonic()
         try:
+            # Preserve ordinary truncation *after* existing text deduplication.
+            # Only the canonical publication owner can mark a complete unit.
+            provider_documents = [
+                text if all(key in complete_reports for key in keys) or width <= 0
+                else text[:width]
+                for text, keys in zip(documents, keys_by_document, strict=True)
+            ]
+            runtime.max_doc_chars = max(width, max(map(len, provider_documents)))
             scored = runtime.rerank(
                 query,
-                documents,
+                provider_documents,
                 deadline_seconds=deadline_at - started,
             )
         except RerankUnavailable as error:

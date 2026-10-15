@@ -28,7 +28,7 @@ _DIAGNOSTIC_OPERATIONS = frozenset({
     "channels.list", "channels.join", "users.list", "messages.history", "messages.replies",
 })
 _DIAGNOSTIC_ERRORS = frozenset({
-    "not_in_channel", "channel_not_found", "is_archived", "missing_scope",
+    "not_in_channel", "channel_not_found", "thread_not_found", "is_archived", "missing_scope",
     "invalid_auth", "not_authed", "token_revoked", "token_expired", "account_inactive",
     "not_allowed_token_type", "access_denied", "no_permission", "restricted_action",
     "team_access_not_granted", "org_login_required", "ekm_access_denied", "ratelimited",
@@ -47,6 +47,14 @@ def _log_request_failure(operation: str, kind: str, error: Any) -> None:
         "slack request failed operation=%s kind=%s error=%s", operation, kind, code,
         extra={"slack_operation": operation, "slack_error_kind": kind, "slack_error_code": code},
     )
+
+
+class SlackChannelUnavailable(ConnectorUpstreamError):
+    """One historical channel cannot progress; other channels may still run."""
+
+
+class SlackThreadUnavailable(SlackChannelUnavailable):
+    """The saved historical thread position no longer exists."""
 
 
 class JsonRail(Protocol):
@@ -295,6 +303,7 @@ class SlackWorkspaceConnector:
         self.page_size = page_size
         self.public_history = getattr(rail, "public_history", False) is True
         self._checkpoint_db: sqlite3.Connection | None = None
+        self._reconciliation = None
 
     @property
     def _scope(self) -> tuple[str, str]:
@@ -321,6 +330,10 @@ class SlackWorkspaceConnector:
             PRIMARY KEY(workspace_id,authority))""")
         db.execute("""INSERT OR IGNORE INTO slack_discovery_coverage(workspace_id,authority)
                       VALUES (?,?)""", self._scope)
+        epoch = getattr(self, "reconciliation_epoch", None)
+        if epoch is not None and self.public_history:
+            from connectors.slack_reconciliation import SlackReconciliation
+            self._reconciliation = SlackReconciliation(self, db, epoch)
 
     def _channel_lower(self, state: dict[str, Any]) -> str:
         if state["channel_lower"] is not None:
@@ -340,6 +353,16 @@ class SlackWorkspaceConnector:
 
     def commit_checkpoint(self, previous: str | None, current: str) -> None:
         """Called only inside the runner's ACK/cursor transaction. No commit here."""
+        if self._reconciliation is not None:
+            self._reconciliation.commit(previous, current, self._commit_live_checkpoint)
+        else:
+            self._commit_live_checkpoint(previous, current)
+
+    def stage_checkpoint(self, current: str, records: tuple[ConnectorRecordV2, ...]) -> None:
+        if self._reconciliation is not None:
+            self._reconciliation.stage(current, records)
+
+    def _commit_live_checkpoint(self, previous: str | None, current: str) -> None:
         db = self._checkpoint_db
         assert db is not None
         before = _state(previous, self.channel_ids, self.public_history)
@@ -438,6 +461,8 @@ class SlackWorkspaceConnector:
             "discovery_in_progress": discovery[0] != discovery[1],
             "oldest_history_through": counts[4],
             "historical_mutations_verified": False,
+            **({"historical_reconciliation": self._reconciliation.status()}
+               if self._reconciliation is not None else {}),
         }
 
     def _request(self, operation: str, query: dict[str, Any]) -> dict[str, Any]:
@@ -455,11 +480,21 @@ class SlackWorkspaceConnector:
             _log_request_failure(operation, "response", "response_invalid")
         elif response.get("ok") is not True:
             _log_request_failure(operation, "response", response.get("error"))
+            if response.get("error") == "thread_not_found":
+                raise SlackThreadUnavailable("connector_upstream_error")
+            if response.get("error") in ("channel_not_found", "not_in_channel", "is_archived"):
+                raise SlackChannelUnavailable("connector_upstream_error")
         return _response(response)
 
     def pull(self, cursor: str | None) -> ConnectorPage:
+        if self._reconciliation is not None:
+            return self._reconciliation.pull(cursor, self._pull_live)
+        return self._pull_live(cursor)
+
+    def _pull_live(self, cursor: str | None, *, historical: bool = False) -> ConnectorPage:
         state = _state(cursor, self.channel_ids, self.public_history)
         pull = getattr(self, f"_pull_{state['phase']}")
+        options = {"historical": True} if historical else {}
         if state["phase"] == "discover":
             return pull(state)
         if state["phase"] == "history" and state["page"] is None:
@@ -467,13 +502,13 @@ class SlackWorkspaceConnector:
             if not do_not_join:
                 self._request("channels.join", {"channel": channel_id})
         try:
-            return pull(state, limit=self.page_size)
+            return pull(state, limit=self.page_size, **options)
         except ConnectorPageCapacityError:
             if self.page_size <= 20:
                 raise
             # Refetch the same uncommitted provider position, never truncate a page.
             # Auth, rate limits and malformed content do not enter this retry path.
-            return pull(state, limit=20)
+            return pull(state, limit=20, **options)
 
     def _page(self, records: list[ConnectorRecordV2], state: dict[str, Any], more: bool) -> ConnectorPage:
         return ConnectorPage(records=tuple(records), next_cursor=_cursor(state), has_more=more)
@@ -560,7 +595,7 @@ class SlackWorkspaceConnector:
         channel_id, do_not_join = encoded.rsplit(":", 1)
         return channel_id, do_not_join == "1"
 
-    def _pull_history(self, state: dict[str, Any], *, limit: int) -> ConnectorPage:
+    def _pull_history(self, state: dict[str, Any], *, limit: int, historical: bool = False) -> ConnectorPage:
         channel_id, _do_not_join = self._channel(state)
         state = {**state, "channel_lower": self._channel_lower(state)}
         if state["page"] is None:
@@ -569,11 +604,15 @@ class SlackWorkspaceConnector:
             "channel": channel_id, "inclusive": True, "limit": limit,
             "latest": _oldest(state["upper"]),
         }
-        if state["page"]:
+        if historical:
+            query.update(inclusive=False, latest=state["page"] or query["latest"])
+        elif state["page"]:
             query["cursor"] = state["page"]
         elif state["channel_lower"] != EPOCH:
             query["oldest"] = _oldest(state["channel_lower"])
         response = self._request("messages.history", query)
+        if historical and response.get("is_limited") not in (None, False):
+            raise SlackChannelUnavailable("slack_history_limited")
         messages = _items(response.get("messages"), "messages")
         threads = []
         for raw in messages:
@@ -584,7 +623,11 @@ class SlackWorkspaceConnector:
                 raise ConnectorContractError("slack reply count is invalid")
             if reply_count:
                 threads.append(raw["ts"])
-        next_page = _next(response)
+        if historical:
+            from connectors.slack_reconciliation import time_page
+            next_page = time_page(response, messages, query, descending=True)
+        else:
+            next_page = _next(response)
         if threads:
             next_state = {
                 **state, "phase": "threads", "page": next_page,
@@ -595,18 +638,32 @@ class SlackWorkspaceConnector:
             page = self._advance_channel([], state, next_page)
         return self._message_page(messages, channel_id, page)
 
-    def _pull_threads(self, state: dict[str, Any], *, limit: int) -> ConnectorPage:
+    def _pull_threads(self, state: dict[str, Any], *, limit: int, historical: bool = False) -> ConnectorPage:
         channel_id, _do_not_join = self._channel(state)
         thread_ts = state["threads"][state["thread_index"]]
         query: dict[str, Any] = {
             "channel": channel_id, "inclusive": True, "limit": limit,
             "ts": thread_ts, "latest": _oldest(state["upper"]),
         }
-        if state["thread_page"]:
+        if historical:
+            query["inclusive"] = False
+            if state["thread_page"]:
+                query["oldest"] = state["thread_page"]
+        elif state["thread_page"]:
             query["cursor"] = state["thread_page"]
         response = self._request("messages.replies", query)
+        if historical and response.get("is_limited") not in (None, False):
+            raise SlackChannelUnavailable("slack_history_limited")
         messages = _items(response.get("messages"), "replies")
-        next_thread_page = _next(response)
+        if historical:
+            if state["thread_page"] is None and not any(
+                isinstance(message, dict) and message.get("ts") == thread_ts for message in messages
+            ):
+                raise ConnectorContractError("slack historical thread root is missing")
+            from connectors.slack_reconciliation import time_page
+            next_thread_page = time_page(response, messages, query, descending=False)
+        else:
+            next_thread_page = _next(response)
         if next_thread_page:
             page = self._page([], {
                 **state, "thread_page": next_thread_page,
