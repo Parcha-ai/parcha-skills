@@ -48,7 +48,7 @@ class ExpectedSchemaVersionsTests(unittest.TestCase):
                     self.versions(latest, native_file)
 
     def test_unknown_latest_is_not_implicitly_allowed(self):
-        for latest in (69, 82):
+        for latest in (69, schema_versions.SCHEMA_VERSION + 1):
             with self.subTest(latest=latest):
                 with self.assertRaisesRegex(AssertionError, "unreviewed latest"):
                     self.versions(latest, False)
