@@ -6,7 +6,7 @@ import os
 import time
 from pathlib import Path
 
-from .collector import Collector
+from .collector import Collector, CollectorRuntimeError
 from .health import build_health_report
 from client.mac import (
     CanonicalArchiveClient,
@@ -21,8 +21,18 @@ def token_from_file(path: str) -> str:
 
 
 def _run_once(collector: Collector, canonical_writer, harness: str) -> dict:
-    scan = collector.scan()
-    flush = collector.flush()
+    try:
+        scan = collector.scan()
+    except CollectorRuntimeError as error:
+        if error.error_code != "archive_unavailable":
+            raise
+        # scan() already saved the failure and retained its durable cursor.
+        # Do not let a successful flush clear it before health is reported.
+        # watch retries at its ordinary interval, outside the request deadline.
+        scan = {"scan_complete": False, "error_code": error.error_code}
+        flush = {"status": "skipped", "reason": "scan_failed"}
+    else:
+        flush = collector.flush()
     doctor = collector.doctor(include_dead_letters=False, include_ack_latency=False)
     health_report = None
     if canonical_writer is not None:
@@ -180,16 +190,12 @@ def main() -> None:
         elif args.command == "flush":
             print(json.dumps(collector.flush(), sort_keys=True))
         elif args.command == "run":
-            print(
-                json.dumps(
-                    _run_once(
-                        collector,
-                        canonical[0] if canonical else None,
-                        args.harness,
-                    ),
-                    sort_keys=True,
-                )
+            result = _run_once(
+                collector, canonical[0] if canonical else None, args.harness,
             )
+            print(json.dumps(result, sort_keys=True))
+            if result["scan"].get("error_code"):
+                raise SystemExit(1)
         elif args.command == "doctor":
             print(json.dumps(collector.doctor(), sort_keys=True))
         elif args.command == "status":
