@@ -39,6 +39,7 @@ from .canonical import CanonicalArchiveGateway, CanonicalPlane
 from .canonical_retrieval import CanonicalRetrieval
 from .control import ControlError, SecretBox
 from .db import BrainStore
+from .evidence_projection import CanonicalEvidenceProjector, EvidenceProjectionStore
 from .logical_evidence import LogicalEvidenceProjectionStore
 from .logical_evidence_projection import CanonicalLogicalEvidenceProjector
 from .passage_index import CanonicalPassageProjector
@@ -341,7 +342,12 @@ class ManagedConnectorWorker:
             actor_identity_index=ActorIdentityIndex(secret_box.blind_index),
             chunk_body_archive=chunk_body_archive,
         )
-        self.retrieval = CanonicalRetrieval(store, archive)
+        # Keep managed ingest's existing history fallback. Explicit forget must
+        # also remove revision bundles created by a serving writer for this source.
+        history_forget_owner = (CanonicalEvidenceProjector(store,
+            EvidenceProjectionStore(chunk_body_archive)) if chunk_body_archive is not None else None)
+        self.retrieval = CanonicalRetrieval(store, archive,
+            evidence_projector=history_forget_owner)
 
     def _claim(self) -> dict[str, Any] | None:
         with self.store.connect() as connection:

@@ -363,6 +363,55 @@ class CanonicalEvidenceProjector:
         bundle.validate()
         return bundle
 
+    def admit_outgoing(self, connection, *, row, bundle, reference):
+        """Admit one staged revision inside its writer's native-locked transaction."""
+        from .archive_ownership import admit_references
+        from .canonical import CanonicalLifecycleError
+
+        self._tenant(row['tenant_id'])
+        current = connection.execute('''SELECT document.revision,document.text_sha256,document.native_id,
+                COALESCE(event.native_parent_id,event.native_id) AS native_parent_id
+            FROM canonical_documents document JOIN canonical_events event
+              USING(tenant_id,source_id,event_id)
+            WHERE document.tenant_id=%s AND document.source_id=%s AND document.document_id=%s
+              AND document.is_current AND document.deleted_at IS NULL AND NOT event.is_tombstone''',
+            (row['tenant_id'], row['source_id'], row['document_id'])).fetchone()
+        if (current is None or current['revision'] != bundle['revision']
+                or current['text_sha256'] != bundle['text_sha256']
+                or hashlib.sha256('\x1f'.join((row['tenant_id'], row['source_id'],
+                    current['native_parent_id'])).encode()).hexdigest() != bundle['session_sha256']):
+            raise EvidenceProjectionError('evidence_publication_stale')
+        identities = [hashlib.sha256('\x1f'.join((row['tenant_id'], row['source_id'], native)).encode()).hexdigest()
+                      for native in (current['native_id'], current['native_parent_id'])]
+        if connection.execute('''SELECT 1 FROM forget_tombstones
+            WHERE tenant_id=%s AND source_id=%s AND target_identity_sha256=ANY(%s) LIMIT 1''',
+            (row['tenant_id'], row['source_id'], identities)).fetchone():
+            raise CanonicalLifecycleError('canonical_identity_forgotten')
+        # Preserve the existing artifact lock + bounded HEAD race proof. Body
+        # reads and uploads happened before the writer acquired a connection.
+        admit_references(connection, self.projection.archive, [reference])
+        connection.execute('''INSERT INTO canonical_evidence_objects(
+                tenant_id,source_id,document_id,evidence_id,artifact_id,storage_backend,
+                object_key,content_sha256,size_bytes,media_type,encryption,version_id,
+                text_sha256,revision,receipt_count,created_at)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            ON CONFLICT(tenant_id,source_id,document_id) DO NOTHING''',
+            (row['tenant_id'], row['source_id'], row['document_id'], bundle['evidence_id'],
+             reference['artifact_id'], reference['storage_backend'], reference['object_key'],
+             reference['content_sha256'], reference['size_bytes'], reference['media_type'],
+             reference['encryption'], reference['version_id'], bundle['text_sha256'],
+             bundle['revision'], bundle['receipt_count'], reference['created_at']))
+        stored = connection.execute('''SELECT * FROM canonical_evidence_objects
+            WHERE tenant_id=%s AND source_id=%s AND document_id=%s''',
+            (row['tenant_id'], row['source_id'], row['document_id'])).fetchone()
+        expected = self._reference(stored)
+        if (any(expected[key] != reference[key] for key in expected)
+                or stored['evidence_id'] != bundle['evidence_id']
+                or stored['text_sha256'] != bundle['text_sha256']
+                or stored['revision'] != bundle['revision']
+                or stored['receipt_count'] != bundle['receipt_count']):
+            raise EvidenceProjectionError('evidence_projection_conflict')
+
     def project_pending(
         self,
         *,
