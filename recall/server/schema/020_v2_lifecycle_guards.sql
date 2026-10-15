@@ -64,7 +64,7 @@ RETURNS trigger
 LANGUAGE plpgsql
 AS $$
 DECLARE
-    target_sha256 text;
+    target_sha256 char(64);
 BEGIN
     target_sha256 := encode(
         sha256(convert_to(
