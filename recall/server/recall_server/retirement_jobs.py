@@ -1,4 +1,4 @@
-"""Host-persisted once-only Render maintenance jobs; no provider retries.
+"""Host-persisted once-only Render maintenance jobs; no mutation retries.
 
 Matches the supervised-chain lifecycle: preflight, durable intent, one POST,
 terminal status, complete logs, verified result. An exception leaves the campaign
@@ -23,6 +23,7 @@ from .retirement_campaign import _check, canonical, digest
 
 DIAGNOSTIC = "recall_retirement_job_v1"
 TERMINAL = {"succeeded", "failed", "canceled"}
+REQUEST_TIMEOUT_SECONDS = 40
 
 
 def encode_result(value, pin):
@@ -62,6 +63,44 @@ def decode_result(rows, pin):
     return json.loads(raw)
 
 
+def _result_is_pending(rows, pin):
+    """Recognize incomplete encoder frames; all other snapshots go to the decoder.
+
+    Each GET is independent. Never combine parts from different observations,
+    or catch a decoder failure and assume that more logs will repair it.
+    """
+    ends = [row for row in rows if row.get("finished")]
+    parts = [row for row in rows if "part" in row]
+    if len(ends) > 1 or (ends and ends[0].get("pin") != pin):
+        return False
+    if len(parts) + len(ends) != len(rows):
+        return False
+    if ends:
+        end = ends[0]
+        if (set(end) != {"diagnostic", "finished", "parts", "sha256", "pin"}
+                or end["finished"] is not True or type(end["parts"]) is not int
+                or not 1 <= end["parts"] <= 1000
+                or not isinstance(end["sha256"], str)
+                or not re.fullmatch(r"[0-9a-f]{64}", end["sha256"])):
+            return False
+        if len(parts) >= end["parts"]:
+            return False
+    indices = []
+    for part in parts:
+        if (set(part) != {"diagnostic", "part", "data"}
+                or type(part["part"]) is not int or part["part"] < 0
+                or not isinstance(part["data"], str) or not part["data"]):
+            return False
+        try:
+            base64.b64decode(part["data"], validate=True)
+        except ValueError:
+            return False
+        indices.append(part["part"])
+    if ends:
+        return indices == sorted(set(indices)) and all(n < ends[0]["parts"] for n in indices)
+    return indices == list(range(len(indices)))
+
+
 def request(method, path, body=None):
     data = canonical(body) if body is not None else None
     headers = {
@@ -75,7 +114,7 @@ def request(method, path, body=None):
             headers=headers,
             method=method,
         ),
-        timeout=40,
+        timeout=REQUEST_TIMEOUT_SECONDS,
     ) as response:
         return json.load(response)
 
@@ -202,7 +241,7 @@ class RenderJob:
                 break
             self.sleep(5)
         _check(status["status"] == "succeeded", "job_failed_requires_reconciliation")
-        return self._read_result(job, pin, service["ownerId"], emit)
+        return self._read_result(job, pin, service["ownerId"], emit, deadline=deadline)
 
     def reconcile(self, job_id, pin, owner_id, emit):
         """Inspect one existing job. No launch, polling, or mutation retry."""
@@ -214,7 +253,27 @@ class RenderJob:
         _check(job.get("status") == "succeeded", "job_failed_requires_reconciliation")
         return self._read_result(job, pin, owner_id, emit)
 
-    def _read_result(self, job, pin, owner_id, emit):
+    def _read_result(self, job, pin, owner_id, emit, *, deadline=None):
+        while True:
+            if deadline is not None:
+                # Reserve the configured HTTP timeout before this GET.
+                # A late response is refused below; the job deadline never resets.
+                _check(self.clock() + REQUEST_TIMEOUT_SECONDS < deadline,
+                       "remote_result_unavailable_before_deadline")
+            rows = self._read_result_rows(job, owner_id)
+            if deadline is not None:
+                _check(self.clock() < deadline, "remote_result_unavailable_before_deadline")
+            if deadline is None or not _result_is_pending(rows, pin):
+                break
+            self.sleep(5)
+        result = decode_result(rows, pin)
+        emit(
+            "verified_job_result",
+            dict(pin=pin, result_sha256=digest(result), result=result),
+        )
+        return result
+
+    def _read_result_rows(self, job, owner_id):
         query = urllib.parse.urlencode(
             dict(
                 ownerId=owner_id,
@@ -235,12 +294,7 @@ class RenderJob:
                 event = json.loads(message[message.index("{") :])
                 _check(event["diagnostic"] == DIAGNOSTIC, "log_contract")
                 rows.append(event)
-        result = decode_result(rows, pin)
-        emit(
-            "verified_job_result",
-            dict(pin=pin, result_sha256=digest(result), result=result),
-        )
-        return result
+        return rows
 
 
 def package_body(config, payload):
