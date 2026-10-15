@@ -1,5 +1,7 @@
 """Legacy cleanup ACKs record suppression while captured history stays current."""
 import unittest
+import hashlib
+import os
 import tempfile
 import threading
 from pathlib import Path
@@ -12,6 +14,7 @@ import psycopg
 import e2e_slack_deletion_ordering as fixture
 from fixtures.legacy_collector_flush import flush as old_flush
 from collector.collector import Collector
+from e2e_webhook_ingest import post_json
 from recall_server.app import Handler
 from recall_server.canonical import CanonicalArchiveGateway, REGISTRATION_CACHE
 
@@ -33,6 +36,142 @@ class LegacyCleanupAck(unittest.TestCase):
     def audit_count(self):
         with self.store.connect() as c:
             return c.execute("SELECT count(*) AS n FROM canonical_audit_events WHERE tenant_id=%s AND operation='ingest.filesystem_cleanup_suppressed'", (self.tenant,)).fetchone()['n']
+
+    @contextmanager
+    def canonical_http(self):
+        with patch.dict(os.environ, {
+            'RECALL_AUTH_REQUIRED': '1', 'RECALL_HTTP_PROFILE': 'public-edge',
+            'RECALL_CANONICAL_INGEST_PUBLIC': '1', 'RECALL_TRUST_TAILSCALE_HEADERS': '0',
+        }), patch.object(Handler, 'store', self.store, create=True), \
+             patch.object(Handler, 'canonical_plane', self.plane, create=True):
+            server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                yield server
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=3)
+
+    def test_canonical_http_logs_source_digest_only_after_suppressed_commit(self):
+        self.ingest(self.root, path='document', connector_id='claude.jsonl')
+        marker = self.marker()
+        live = self.ingest(self.reply, path='prepare', connector_id='claude.jsonl')['envelope']
+        token = self.store.create_collector_token(self.source, self.source, ['write'],
+            tenant_id=self.tenant, principal_id=self.principal)['token']
+        with self.canonical_http() as server, self.assertLogs('recall.brainstore', level='INFO') as logs:
+            status, ack = post_json(server, '/v2/ingest/canonical', token,
+                {**self.credential(), 'events': [marker, live]})
+        self.assertEqual(status, 201, ack)
+        self.assertEqual(ack['suppressed_filesystem_events'], 1)
+        self.assertEqual(self.audit_count(), 1)
+        messages = [r.getMessage() for r in logs.records
+                    if r.getMessage().startswith('canonical filesystem cleanup suppressed ')]
+        self.assertEqual(messages, [
+            'canonical filesystem cleanup suppressed '
+            f'tenant_sha256={hashlib.sha256(self.tenant.encode()).hexdigest()} '
+            f'source_sha256={hashlib.sha256(self.source.encode()).hexdigest()} '
+            'count=1 batch_size=2'])
+        for sensitive in (self.tenant, self.source, self.principal, token,
+                          marker['native_id'], marker['provenance']['artifact_ref']['artifact_id'],
+                          self.root['text'], self.reply['text']):
+            self.assertNotIn(sensitive, '\n'.join(logs.output))
+
+    def test_canonical_http_replay_logs_accepted_count_without_second_audit(self):
+        self.ingest(self.root, path='document', connector_id='claude.jsonl')
+        marker = self.marker()
+        token = self.store.create_collector_token(self.source, self.source, ['write'],
+            tenant_id=self.tenant, principal_id=self.principal)['token']
+        with self.canonical_http() as server, self.assertLogs('recall.brainstore', level='INFO') as logs:
+            first, _ = post_json(server, '/v2/ingest/canonical', token,
+                {**self.credential(), 'events': [marker]})
+            second, ack = post_json(server, '/v2/ingest/canonical', token,
+                {**self.credential(), 'events': [marker]})
+        self.assertEqual((first, second), (201, 200))
+        self.assertTrue(ack['replay'])
+        self.assertEqual(self.audit_count(), 1)
+        messages = [r.getMessage() for r in logs.records
+                    if r.getMessage().startswith('canonical filesystem cleanup suppressed ')]
+        self.assertEqual(len(messages), 2)
+        self.assertEqual(messages[0], messages[1])
+        self.assertTrue(messages[0].endswith('count=1 batch_size=1'))
+
+    def test_canonical_http_denied_revoked_and_live_requests_do_not_log_suppression(self):
+        self.ingest(self.root, path='document', connector_id='claude.jsonl')
+        marker = self.marker()
+        live = self.ingest(self.reply, path='prepare', connector_id='claude.jsonl')['envelope']
+        token = self.store.create_collector_token(self.source, self.source, ['write'],
+            tenant_id=self.tenant, principal_id=self.principal)['token']
+        with self.canonical_http() as server, self.assertLogs('recall.brainstore', level='INFO') as logs:
+            status, _ = post_json(server, '/v2/ingest/canonical', 'invalid-secret-token',
+                {**self.credential(), 'events': [marker]})
+            self.assertEqual(status, 401)
+            status, _ = post_json(server, '/v2/ingest/canonical', token,
+                {**self.credential(), 'source_id': 'source:foreign', 'events': [marker]})
+            self.assertEqual(status, 403)
+            status, ack = post_json(server, '/v2/ingest/canonical', token,
+                {**self.credential(), 'events': [live]})
+            self.assertEqual(status, 201, ack)
+            with self.store.connect() as connection:
+                connection.execute('DELETE FROM canonical_source_grants WHERE tenant_id=%s AND source_id=%s',
+                                   (self.tenant, self.source))
+            status, _ = post_json(server, '/v2/ingest/canonical', token,
+                {**self.credential(), 'events': [marker]})
+            self.assertEqual(status, 403)
+        self.assertEqual(self.audit_count(), 0)
+        self.assertFalse(any(r.getMessage().startswith('canonical filesystem cleanup suppressed ')
+                             for r in logs.records))
+        self.assertNotIn('invalid-secret-token', '\n'.join(logs.output))
+
+    def test_canonical_http_precommit_failure_cannot_log_success_or_leak_error(self):
+        self.ingest(self.root, path='document', connector_id='claude.jsonl')
+        marker = self.marker()
+        token = self.store.create_collector_token(self.source, self.source, ['write'],
+            tenant_id=self.tenant, principal_id=self.principal)['token']
+        original = self.plane.suppress_filesystem_cleanup
+        def fail(connection, **kwargs):
+            original(connection, **kwargs)
+            raise RuntimeError('PRIVATE_PRECOMMIT_ERROR')
+        with self.canonical_http() as server, self.assertLogs('recall.brainstore', level='INFO') as logs, \
+             patch.object(self.plane, 'suppress_filesystem_cleanup', fail):
+            status, _ = post_json(server, '/v2/ingest/canonical', token,
+                {**self.credential(), 'events': [marker]})
+        self.assertEqual(status, 500)
+        self.assertEqual(self.audit_count(), 0)
+        self.assertFalse(any(r.getMessage().startswith('canonical filesystem cleanup suppressed ')
+                             for r in logs.records))
+        self.assertNotIn('PRIVATE_PRECOMMIT_ERROR', '\n'.join(logs.output))
+
+    def test_canonical_http_lost_commit_ack_does_not_log_known_success(self):
+        self.ingest(self.root, path='document', connector_id='claude.jsonl')
+        marker = self.marker()
+        token = self.store.create_collector_token(self.source, self.source, ['write'],
+            tenant_id=self.tenant, principal_id=self.principal)['token']
+        touched = set()
+        original = self.plane.suppress_filesystem_cleanup
+        def recorded(connection, **kwargs):
+            result = original(connection, **kwargs)
+            touched.add(connection)
+            return result
+        transaction = psycopg.Connection.transaction
+        @contextmanager
+        def lost_ack(connection, *args, **kwargs):
+            with transaction(connection, *args, **kwargs) as tx:
+                yield tx
+            if connection in touched:
+                touched.remove(connection)
+                raise psycopg.OperationalError('PRIVATE_LOST_ACK')
+        with self.canonical_http() as server, self.assertLogs('recall.brainstore', level='INFO') as logs, \
+             patch.object(self.plane, 'suppress_filesystem_cleanup', recorded), \
+             patch.object(psycopg.Connection, 'transaction', lost_ack):
+            status, _ = post_json(server, '/v2/ingest/canonical', token,
+                {**self.credential(), 'events': [marker]})
+        self.assertEqual(status, 500)
+        self.assertEqual(self.audit_count(), 1)
+        self.assertFalse(any(r.getMessage().startswith('canonical filesystem cleanup suppressed ')
+                             for r in logs.records))
+        self.assertNotIn('PRIVATE_LOST_ACK', '\n'.join(logs.output))
 
     def test_mixed_batch_suppresses_cleanup_and_commits_following_live_record(self):
         original = self.ingest(self.root, path='document', connector_id='claude.jsonl')

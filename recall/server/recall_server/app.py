@@ -1502,6 +1502,17 @@ class Handler(BaseHTTPRequestHandler):
                     principal_id=principal_id,
                     events=events,
                 )
+                # The owner returned after COMMIT; count includes accepted replays.
+                suppressed = acknowledgement.get("suppressed_filesystem_events", 0)
+                if suppressed > 0:
+                    LOG.info(
+                        "canonical filesystem cleanup suppressed tenant_sha256=%s "
+                        "source_sha256=%s count=%s batch_size=%s",
+                        hashlib.sha256(tenant_id.encode()).hexdigest(),
+                        hashlib.sha256(source_id.encode()).hexdigest(),
+                        suppressed,
+                        len(events),
+                    )
                 with COUNTER_LOCK:
                     COUNTERS[
                         "ingest_replays"
