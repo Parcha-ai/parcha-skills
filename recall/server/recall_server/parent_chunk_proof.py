@@ -21,7 +21,7 @@ from .logical_body_proof import iter_parent_bodies
 
 # Metadata only: bodies remain in PostgreSQL/archive; the per-row and spool
 # budgets below still apply. A modest batch reduces capture round trips.
-_CAPTURE_FETCH_ROWS = 128
+_CAPTURE_FETCH_ROWS = 256
 
 # Attempted acquisition work only; none of these counters authorize mutation.
 CAPTURE_DETAIL_FIELDS = (
@@ -220,6 +220,9 @@ def _capture(store, spool, scope, limits, deadline_at, *, capture_metrics=None):
                                    pg_body_bytes=sum(chunk['pg_bytes'] for chunk in row['chunks']))
                         spool.add_document(row)
                         _check_deadline(deadline_at)
+                # Do not retain consumed metadata and membership maps while
+                # libpq decodes the next bounded batch. The spool owns the proof.
+                rows = proven = row = None
         spool.index.commit()
     return catalog, parts, count, chunk_count
 

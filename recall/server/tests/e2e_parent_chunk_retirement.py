@@ -371,7 +371,7 @@ def metadata_cursor_deadlines(store, root):
         def trace_client(cursor, statement, *args, **kwargs):
             text = statement.as_string() if isinstance(statement, psycopg.sql.Composable) else str(statement)
             if '; FETCH FORWARD' in text:
-                assert text.endswith('FETCH FORWARD 128 FROM "retirement_metadata"')
+                assert text.endswith('FETCH FORWARD 256 FROM "retirement_metadata"')
                 assert kwargs == {'prepare': False}
                 fetch_cursors.append(cursor)
                 statements.append(text)
@@ -381,7 +381,7 @@ def metadata_cursor_deadlines(store, root):
             rows = fetch(cursor)
             if any(cursor is item for item in fetch_cursors):
                 batches.append(len(rows))
-                assert len(rows) <= 128
+                assert len(rows) <= 256
             return rows
 
         try:
@@ -408,9 +408,9 @@ def metadata_cursor_deadlines(store, root):
                     snapshot = {key: value for key, value in proof.items() if key != 'spool'}
                     payloads = list(proof['spool'].index.execute(
                         'SELECT native,document,payload,ordinal,verified,proposed_count FROM documents ORDER BY native'))
-            assert batches == [128, 128, 14, 0]
-            # Initial catalog/parts/DECLARE, four FETCHes and final catalog.
-            assert sum("set_config('statement_timeout'" in sql for sql in statements) == 8
+            assert batches == [256, 14, 0]
+            # Initial catalog/parts/DECLARE, three FETCHes and final catalog.
+            assert sum("set_config('statement_timeout'" in sql for sql in statements) == 7
             return snapshot, payloads
         finally:
             if expired_at_entry:

@@ -11,6 +11,7 @@ import sys
 import tempfile
 import time
 import unittest
+import weakref
 from unittest.mock import patch
 
 import psycopg
@@ -71,14 +72,14 @@ class CaptureBatching(unittest.TestCase):
                     peak_rss_kib=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
                     fetches=len(fetches), elapsed_ms=(time.monotonic() - started) * 1000)
 
-    def test_257_rows_use_three_data_fetches_plus_eof(self):
+    def test_257_rows_use_two_data_fetches_plus_eof(self):
         result = self.capture()
         self.assertEqual(result['rows'], (257, 257))
-        self.assertEqual(result['fetches'], 4)
+        self.assertEqual(result['fetches'], 3)
 
     def test_same_spool_with_and_without_deadline_and_old_batch(self):
-        results = [self.capture(batch=32), self.capture(), self.capture(deadline=False)]
-        self.assertEqual([r['fetches'] for r in results], [10, 4, 4])
+        results = [self.capture(batch=32), self.capture(batch=128), self.capture(), self.capture(deadline=False)]
+        self.assertEqual([r['fetches'] for r in results], [10, 4, 3, 3])
         self.assertEqual(len({r['digest'] for r in results}), 1)
         self.assertEqual(len({r['payload_bytes'] for r in results}), 1)
         self.assertFalse(self.archive.reads)
@@ -107,7 +108,7 @@ class CaptureBatching(unittest.TestCase):
             print(json.dumps(dict(contract='capture-wide-metadata.v1', wide_rows=129,
                                   type_bytes=900 * 1024, old=old, new=new), sort_keys=True))
             widen(1024 * 1024)
-            for batch in (32, 128):
+            for batch in (32, 128, 256):
                 with self.subTest(batch=batch), self.assertRaises(ChunkRetirementError):
                     self.capture(batch=batch)
         finally:
@@ -116,15 +117,78 @@ class CaptureBatching(unittest.TestCase):
         self.assertFalse(self.archive.reads)
 
     def test_real_fetch_timeout_rolls_back_for_both_batches(self):
-        for batch in (32, 128):
+        for batch in (32, 128, 256):
             with self.subTest(batch=batch), self.assertRaises((SearchDeadlineExceeded, psycopg.errors.QueryCanceled)):
                 self.capture(batch=batch, cancel=True)
             self.assertEqual(self.store.active_connections, 0)
         self.assertFalse(self.archive.reads)
         self.assertEqual(self.capture()['rows'], (257, 257))
 
+    def test_chunk_dense_complete_metadata_and_archive_proof(self):
+        from e2e_receipt_membership import ReceiptMembershipTests
+        fixture = ReceiptMembershipTests('test_exact_metadata_survives_verified_singleton_row_removal_only_when_enabled')
+        fixture.store = self.store
+        fixture.setUp()
+        previous_scope, previous_archive = self.scope, self.archive
+        try:
+            # Actual canonical writer boundaries and long valid receipts. Handmade
+            # boundaries are correctly excluded by the full archive proof.
+            for index in range(257):
+                fixture.ingest('dense/'+'p'*120+str(index),'x'*(512*1024))
+            report = fixture.projector.project_pending(tenant_id=fixture.tenant,batch_size=1,max_batches=1,upload_concurrency=1)
+            self.assertEqual(report['failed'],0)
+            with self.store.connect() as connection:
+                for table in ('canonical_events','canonical_documents','canonical_chunks'):
+                    connection.execute('ANALYZE '+table)
+            self.scope = fixture.tenant, fixture.source, 'session'
+            self.archive = fixture.archive
+            with patch.object(self.store,'verified_singleton_receipts',True):
+                old = self.capture(batch=128,timeout=60)
+                new = self.capture(timeout=60)
+                self.assertEqual(old['digest'],new['digest'])
+                self.assertEqual(new['rows'][0],257)
+                self.assertGreater(new['rows'][1],4000)
+                with proof.prove_parent_chunks(self.store,self.archive,scope=self.scope,limits=ParentRetirementLimits(),deadline_at=time.monotonic()+60) as complete:
+                    self.assertEqual(complete['eligible_documents'],257)
+            print(json.dumps(dict(contract='capture-dense-metadata.v1',old=old,new=new),sort_keys=True))
+        finally:
+            self.scope, self.archive = previous_scope, previous_archive
+            fixture.doCleanups()
+
+    def test_consumed_batch_released_before_next_real_fetch(self):
+        from recall_server import receipt_membership
+        class Members(dict):
+            pass
+        class Rows(list):
+            pass
+        references = []
+        fetch_cursors = set()
+        original_execute, original_fetchall = psycopg.Cursor.execute, psycopg.Cursor.fetchall
+        original_member = receipt_membership.verified_document_chunks
+        def member(*args, **kwargs):
+            result = Members(original_member(*args, **kwargs))
+            references.append(weakref.ref(result))
+            return result
+        def execute(cursor, query, params=None, **kwargs):
+            rendered = query.as_string(cursor.connection) if isinstance(query, sql.Composable) else str(query)
+            if 'FETCH FORWARD ' in rendered and 'retirement_metadata' in rendered:
+                self.assertTrue(all(ref() is None for ref in references),
+                                'previous decoded batch survives into the next FETCH')
+                fetch_cursors.add(id(cursor))
+            return original_execute(cursor, query, params, **kwargs)
+        def fetchall(cursor):
+            rows = original_fetchall(cursor)
+            if id(cursor) in fetch_cursors:
+                fetch_cursors.remove(id(cursor))
+                rows = Rows(rows)
+                references.append(weakref.ref(rows))
+            return rows
+        with patch.object(psycopg.Cursor, 'execute', execute), patch.object(psycopg.Cursor, 'fetchall', fetchall), patch.object(self.store, 'verified_singleton_receipts', True), patch.object(receipt_membership, 'verified_document_chunks', member):
+            self.assertEqual(self.capture()['rows'], (257, 257))
+        self.assertTrue(all(ref() is None for ref in references))
+
     def test_document_budget_still_refuses_without_archive_reads(self):
-        for batch in (32, 128):
+        for batch in (32, 128, 256):
             with self.subTest(batch=batch), self.assertRaises(ChunkRetirementError):
                 self.capture(batch=batch, limits=ParentRetirementLimits(max_documents=256))
         self.assertFalse(self.archive.reads)
@@ -132,7 +196,7 @@ class CaptureBatching(unittest.TestCase):
     def test_controlled_rtt_same_rows_and_spool(self):
         old, new = self.capture(batch=32, delay=.02), self.capture(delay=.02)
         self.assertEqual(old['digest'], new['digest'])
-        self.assertEqual((old['fetches'], new['fetches']), (10, 4))
+        self.assertEqual((old['fetches'], new['fetches']), (10, 3))
         print(json.dumps(dict(contract='capture-batch-rtt.v1', simulated_rtt_ms=20, old=old, new=new), sort_keys=True))
 
 
@@ -169,7 +233,7 @@ class CaptureBatching(unittest.TestCase):
         new = self.capture(delay=.01, timeout=90)
         self.assertEqual(old['rows'], (46001, 46001))
         self.assertEqual(old['digest'], new['digest'])
-        self.assertEqual((old['fetches'], new['fetches']), (1439, 361))
+        self.assertEqual((old['fetches'], new['fetches']), (1439, 181))
         print(json.dumps(dict(contract='capture-scale-rtt.v1', simulated_rtt_ms=10, old=old, new=new), sort_keys=True))
 
 
