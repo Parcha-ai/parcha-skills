@@ -91,6 +91,31 @@ class _Scan:
 
 
 class ProjectionWorkerTest(unittest.TestCase):
+    def test_logical_admission_deadline_uses_scan_budget_only(self):
+        import time
+        for with_scan in (False, True):
+            calls = []
+            now = [0.0]
+            class Passages(_Passages):
+                def project_pending(self, **kwargs):
+                    now[0] = 301.0
+                    return super().project_pending(**kwargs)
+            logical = _Logical(calls, work=0, pending=12)
+            run_projection_worker(
+                logical, Passages(calls, work=0), _Scan(calls) if with_scan else None,
+                tenant_id='tenant:deadline', logical_batch_size=500,
+                passage_batch_size=2, embedding_batch_size=64,
+                max_batches_per_cycle=2, upload_concurrency=2,
+                passage_concurrency=2, interval_seconds=1, once=True,
+                skip_embedding=True, parquet_max_wait_seconds=300,
+                clock=lambda: now[0],
+            )
+            if with_scan:
+                self.assertLessEqual(logical.kwargs['admission_deadline_at'], time.monotonic())
+                self.assertIn('scan', calls)
+            else:
+                self.assertIsNone(logical.kwargs.get('admission_deadline_at'))
+
     def test_passage_wave_respects_smaller_batch_and_leaves_logical_budget(self):
         for batch, concurrency, expected in ((100, 2, 2), (1, 2, 1), (3, 8, 3)):
             with self.subTest(batch=batch, concurrency=concurrency):

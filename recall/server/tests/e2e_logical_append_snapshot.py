@@ -158,7 +158,8 @@ class AppendSnapshot(unittest.TestCase):
                 0,
             ),
         ):
-            result = self.publish()
+            result = self.logical.project_pending(
+                    tenant_id=self.tenant, batch_size=1, max_batches=1, upload_concurrency=1)
         self.assertEqual(triggered, [True])
         self.assertEqual(result["documents"], 1)
         self.assertEqual(self.catalog()["append_source_ordinal"], 10)
@@ -185,7 +186,8 @@ class AppendSnapshot(unittest.TestCase):
                     0,
                 ),
             ):
-                result = self.publish()
+                result = self.logical.project_pending(
+                    tenant_id=self.tenant, batch_size=1, max_batches=1, upload_concurrency=1)
             self.assertEqual(triggered, [True])
             self.assertEqual(result["documents"], 1)
             self.assertEqual(self.catalog()["record_count"], 4 + cycle)

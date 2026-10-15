@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gzip
 import logging
+import math
 import hashlib
 import io
 import json
@@ -2569,7 +2570,14 @@ class CanonicalLogicalEvidenceProjector:
         cleanup_concurrency: int | None = None,
         on_progress: Callable[[], None] | None = None,
         on_heartbeat: Callable[[], None] | None = None,
+        admission_deadline_at: float | None = None,
     ) -> dict[str, int | str]:
+        if admission_deadline_at is not None and (
+            isinstance(admission_deadline_at, bool)
+            or not isinstance(admission_deadline_at, (int, float))
+            or not math.isfinite(admission_deadline_at)
+        ):
+            raise LogicalEvidenceError("logical_evidence_budget_invalid")
         if cleanup_concurrency is None:
             cleanup_concurrency = upload_concurrency
         if (
@@ -2627,16 +2635,20 @@ class CanonicalLogicalEvidenceProjector:
         cleanup_failures += int(cleanup["failures"])
         cleanup_completed += int(cleanup["completed"])
         cleanup_pending = int(cleanup["pending"])
-        # Queue at most one fair batch beyond active owners. The executor can
-        # keep preparing while this coordinator publishes earlier completions.
-        # max_batches still bounds total admissions, including partial batches.
+        # Refresh fair admission whenever an upload slot becomes available.
+        # Batch settings bound total work, not stale executor backlog.
+        admission_limit = batch_size * max_batches
+        admitted = 0
         worker_count = min(upload_concurrency, batch_size)
-        # Include queued and completed-but-uncollected uploads in the 256-key
-        # hint budget. The coordinator only refills below worker_count futures.
+        # Retain the existing conservative 256-key hint allocation; reducing
+        # queued futures does not expand per-owner metadata capture here.
         hint_limit = min(32, 256 // (batch_size + worker_count - 1))
         pending = {}
         remaining_by_batch = {}
         deferred = set()
+        ordinary_sources_served = set()
+        round_remaining = None
+        notification_round = False
         stopping = threading.Event()
 
         def parent_key(candidate):
@@ -2701,9 +2713,19 @@ class CanonicalLogicalEvidenceProjector:
                           attempt_metrics["archive_prepare_wall_ms"],
                           attempt_metrics["commit_wall_ms"])
 
-        def fill_slots(executor):
-            nonlocal batches
-            while len(pending) < worker_count and batches < max_batches:
+        def can_admit():
+            return admitted < admission_limit and (
+                admission_deadline_at is None or time.monotonic() < admission_deadline_at
+            )
+
+        def fill_slots(executor, handoff_stop=None):
+            nonlocal batches, admitted, round_remaining, notification_round
+            def available():
+                return (not stopping.is_set() and can_admit()
+                        and (handoff_stop is None or not handoff_stop.is_set()))
+
+            while len(pending) < worker_count and available():
+                slots = min(worker_count - len(pending), admission_limit - admitted)
                 # Oldest rounds retain source floors; notification rounds keep
                 # forget first, then notification FIFO, then recent fallback.
                 # Exclude queued as well as running owners. Overscan only by
@@ -2712,32 +2734,111 @@ class CanonicalLogicalEvidenceProjector:
                 with _phase_timing("pending"):
                     candidates = self._pending(
                         tenant_id=tenant_id,
-                        limit=batch_size + len(excluded),
+                        limit=min(batch_size, admission_limit - admitted) + len(excluded),
                         quiet_seconds=float(quiet_seconds),
                         max_wait_seconds=float(max_wait_seconds),
                         prefer_recent=self._prefer_recent_admission,
                     )
-                candidates = [c for c in candidates if parent_key(c) not in excluded][:batch_size]
+                candidates = [c for c in candidates if parent_key(c) not in excluded][
+                    :min(batch_size, admission_limit - admitted)
+                ]
+                if round_remaining is None:
+                    # Keep one finite round across free-slot refills. Fresh
+                    # arrivals may enter, but cannot enlarge its initial budget.
+                    notification_round = self._prefer_recent_admission and any(
+                        c.admission_priority == 1 for c in candidates
+                    )
+                    round_remaining = sum(
+                        not notification_round or c.admission_priority <= 1
+                        for c in candidates
+                    )
+                    if not round_remaining:
+                        round_remaining = None
+                        break
+                if notification_round:
+                    candidates = [c for c in candidates if c.admission_priority <= 1]
                 if not candidates:
-                    break
-                # Reorder only the already admitted finite set. Sorting the
-                # overscanned SQL rows first would change which parents enter.
-                # Preserve notification FIFO through dispatch; cost ordering is
-                # only for ordinary work. Forget still goes first.
+                    # The admitted class disappeared or became ineligible.
+                    # Rotate once; an empty fresh round ends admission.
+                    round_remaining = None
+                    self._prefer_recent_admission = not self._prefer_recent_admission
+                    continue
+                active_sources = {(c.tenant_id, c.source_id) for c, _ in pending.values()}
+                # Keep source floors across one-slot refills, including a hot
+                # source that finishes and requeues while another owner is busy.
+                # This call-local round only orders ordinary bounded nominees;
+                # forget and notification FIFO retain their exact precedence.
+                ordinary = {
+                    (c.tenant_id, c.source_id) for c in candidates if c.admission_priority > 1
+                }
+                if ordinary and not ordinary - ordinary_sources_served - active_sources:
+                    ordinary_sources_served.clear()
+                # Order the same bounded eligible set before selecting free
+                # slots. Keep source rounds ahead of ordinary cost estimates;
+                # explicit forget and notification FIFO still come first.
                 candidates.sort(key=lambda c: (
                     c.admission_priority,
+                    c.admission_priority > 1 and (c.tenant_id, c.source_id)
+                    in ordinary_sources_served | active_sources,
                     c.notification_queued_at or datetime.max.replace(tzinfo=timezone.utc),
                     c.estimated_bytes,
                 ))
-                # Share capacity across calls, including one-slot rounds.
-                # Notification/recent rounds alternate with oldest backlog.
-                # Empty scans do not consume a turn. A new process starts old.
-                self._prefer_recent_admission = not self._prefer_recent_admission
-                batches += 1
-                remaining_by_batch[batches] = len(candidates)
+                candidates = candidates[:min(slots, round_remaining)]
+                if not candidates or not available():
+                    break
+                round_remaining -= len(candidates)
+                if round_remaining == 0:
+                    round_remaining = None
+                    self._prefer_recent_admission = not self._prefer_recent_admission
                 for candidate in candidates:
+                    if candidate.admission_priority > 1:
+                        ordinary_sources_served.add((candidate.tenant_id, candidate.source_id))
+                    batch = admitted // batch_size + 1
+                    admitted += 1
+                    batches = batch
+                    remaining_by_batch[batch] = remaining_by_batch.get(batch, 0) + 1
                     future = executor.submit(project_parent, candidate)
-                    pending[future] = candidate, batches
+                    pending[future] = candidate, batch
+
+        def publish_with_refill(executor, callback):
+            # Hand admission to one temporary feeder while this coordinator
+            # runs the sole downstream callback. Only the feeder touches pending
+            # until it is joined; accounting and body hints stay on this thread.
+            handoff_stop = threading.Event()
+            ready = {}
+            errors = []
+
+            def refill_during_publication():
+                try:
+                    while not handoff_stop.is_set() and not stopping.is_set() and can_admit():
+                        if not pending:
+                            break
+                        completed, _ = wait(pending, timeout=0.05, return_when=FIRST_COMPLETED)
+                        for future in completed:
+                            candidate, batch = pending.pop(future)
+                            ready[future] = candidate, batch
+                            _, status = future.result()
+                            if status in {"failed", "stale", "adopted"}:
+                                deferred.add(parent_key(candidate))
+                        fill_slots(executor, handoff_stop)
+                except BaseException as error:
+                    errors.append(error)
+                    stopping.set()
+
+            feeder = threading.Thread(
+                target=refill_during_publication, name="recall-logical-refill"
+            )
+            feeder.start()
+            try:
+                callback()
+            finally:
+                handoff_stop.set()
+                feeder.join()
+                # Completed futures retain the original bounded admission
+                # budget. Process them exactly once on the coordinator thread.
+                pending.update(ready)
+            if errors:
+                raise errors[0]
 
         try:
             with ThreadPoolExecutor(
@@ -2751,7 +2852,7 @@ class CanonicalLogicalEvidenceProjector:
                         # Also publish already committed outbox work while all
                         # owners are busy. The same coordinator wakes every five
                         # seconds; admission still requires a free slot/budget.
-                        idle_slot = len(pending) < worker_count and batches < max_batches
+                        idle_slot = len(pending) < worker_count and can_admit()
                         completed, _ = wait(
                             pending,
                             timeout=max(0.0, next_progress - time.monotonic())
@@ -2764,7 +2865,7 @@ class CanonicalLogicalEvidenceProjector:
                             candidate, batch = pending.pop(future)
                             upload, status = future.result()
                             remaining_by_batch[batch] -= 1
-                            if remaining_by_batch[batch] == 0:
+                            if remaining_by_batch[batch] == 0 and admitted >= batch * batch_size:
                                 del remaining_by_batch[batch]
                                 cleanup_rounds += 1
                             if status in {"failed", "stale", "adopted"}:
@@ -2809,13 +2910,13 @@ class CanonicalLogicalEvidenceProjector:
                         fill_slots(executor)
                         if publish:
                             if on_progress is not None:
-                                on_progress()
+                                publish_with_refill(executor, on_progress)
                             next_progress = time.monotonic() + PROJECTION_PROGRESS_INTERVAL_SECONDS
                         elif time.monotonic() >= next_progress:
                             # Idle publication must not retry missing passages:
                             # requeuing them would invalidate this rebuild.
                             if on_heartbeat is not None:
-                                on_heartbeat()
+                                publish_with_refill(executor, on_heartbeat)
                             next_progress = time.monotonic() + PROJECTION_PROGRESS_INTERVAL_SECONDS
                         for _ in range(cleanup_rounds):
                             cleanup = self.drain_cleanup(
@@ -2841,6 +2942,23 @@ class CanonicalLogicalEvidenceProjector:
                 concurrency=cleanup_concurrency,
             )
             raise
+        if round_remaining is not None:
+            # A deadline may interrupt even a large oldest round. The next
+            # call starts the other round instead of waiting for its remainder.
+            self._prefer_recent_admission = not self._prefer_recent_admission
+        # A non-full final batch is sealed only when admission stops. Earlier
+        # empty refills must not reap it repeatedly as later slots are admitted.
+        if remaining_by_batch:
+            assert len(remaining_by_batch) == 1 and all(
+                n == 0 for n in remaining_by_batch.values()
+            )
+            cleanup = self.drain_cleanup(
+                tenant_id=tenant_id, limit=5_000, concurrency=cleanup_concurrency,
+            )
+            old_objects_deleted += int(cleanup["deleted"])
+            cleanup_failures += int(cleanup["failures"])
+            cleanup_completed += int(cleanup["completed"])
+            cleanup_pending = int(cleanup["pending"])
         with _phase_timing("count"), self.store.connect() as connection:
             counts = connection.execute(
                 """SELECT count(*) AS queued,

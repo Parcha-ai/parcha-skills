@@ -441,6 +441,15 @@ def run_projection_worker(
                 cleanup_concurrency=cleanup_concurrency,
                 on_progress=publish_progress,
                 on_heartbeat=heartbeat if search_plane is not None or retirement_maintainer is not None or background_thinner is not None else None,
+                # Stop admitting at the existing scan cadence, then settle
+                # active owners. Translate the worker clock's remaining time
+                # into the projector's monotonic clock; callbacks are not killed.
+                admission_deadline_at=(
+                    time.monotonic() + max(
+                        0.0, last_parquet_started + parquet_max_wait_seconds - clock()
+                    )
+                    if scan is not None else None
+                ),
             )
             logical_elapsed_ms = elapsed_ms(phase_started)
             phase_elapsed["logical_elapsed_ms"] = logical_elapsed_ms

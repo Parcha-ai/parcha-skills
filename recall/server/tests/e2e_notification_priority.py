@@ -224,6 +224,75 @@ class NotificationPriority(unittest.TestCase):
         self.assertIsNone(self.queue(first['native_id']))
         self.assertIsNone(self.queue(second['native_id']))
 
+    def test_new_notifications_do_not_extend_initial_round(self):
+        older = self.history(400, 1, source='synthetic:peer')[0]
+        self.notify(401, 'Synthetic initial notification one.')
+        self.notify(402, 'Synthetic initial notification two.')
+        dispatched = []
+        prepare = self.logical._prepare_batch_and_upload
+        def observe(candidates, **kwargs):
+            candidate = candidates[0]
+            dispatched.append((candidate.source_id, candidate.native_parent_id))
+            self.notify(410 + len(dispatched), 'Synthetic arriving notification.')
+            return prepare(candidates, **kwargs)
+        self.logical._prefer_recent_admission = True
+        with patch.object(self.logical, '_prepare_batch_and_upload', observe):
+            result = self.logical.project_pending(batch_size=4, max_batches=1,
+                upload_concurrency=1)
+        self.assertEqual(result['documents'], 4)
+        self.assertEqual([parent for _, parent in dispatched[:2]], [
+            f'slack-thread:{SLACK_WORKSPACE}:C0E2E:1700000401.000100',
+            f'slack-thread:{SLACK_WORKSPACE}:C0E2E:1700000402.000100'])
+        self.assertEqual(dispatched[2], ('synthetic:peer', older['native_parent_id']))
+        self.assertIsNone(self.queue(older['native_id'], source='synthetic:peer'))
+        self.assertIsNotNone(self.queue(
+            f'slack:{SLACK_WORKSPACE}:C0E2E:1700000414.000100'))
+
+    def test_disappearing_notification_round_returns_to_oldest(self):
+        older = self.history(420, 1, source='synthetic:peer')[0]
+        self.notify(421, 'Synthetic first notification.')
+        self.notify(422, 'Synthetic disappearing notification.')
+        prepare = self.logical._prepare_batch_and_upload
+        dispatched = []
+        def observe(candidates, **kwargs):
+            dispatched.append(candidates[0].native_parent_id)
+            if len(dispatched) == 1:
+                with self.store.connect() as connection:
+                    connection.execute("""DELETE FROM canonical_evidence_document_queue
+                        WHERE tenant_id=%s AND source_id=%s AND native_parent_id=%s""",
+                        (TENANT, SLACK_SOURCE,
+                         f'slack-thread:{SLACK_WORKSPACE}:C0E2E:1700000422.000100'))
+            return prepare(candidates, **kwargs)
+        self.logical._prefer_recent_admission = True
+        with patch.object(self.logical, '_prepare_batch_and_upload', observe):
+            result = self.logical.project_pending(batch_size=3, max_batches=1,
+                upload_concurrency=1)
+        self.assertEqual(result['documents'], 2)
+        self.assertEqual(dispatched[1], older['native_parent_id'])
+        self.assertEqual(len(dispatched), 2)
+
+    def test_superseded_notifications_do_not_spin_or_block_oldest(self):
+        from recall_server.logical_evidence_projection import _LogicalWorkSuperseded
+        older = self.history(430, 1, source='synthetic:peer')[0]
+        self.notify(431, 'Synthetic superseded notification one.')
+        self.notify(432, 'Synthetic superseded notification two.')
+        dispatch = self.logical._candidate_at_dispatch
+        attempted = []
+        def supersede(candidate):
+            attempted.append(candidate.native_parent_id)
+            if candidate.admission_priority == 1:
+                raise _LogicalWorkSuperseded('synthetic_dispatch_superseded')
+            return dispatch(candidate)
+        self.logical._prefer_recent_admission = True
+        with patch.object(self.logical, '_candidate_at_dispatch', supersede):
+            result = self.logical.project_pending(batch_size=5, max_batches=1,
+                upload_concurrency=1)
+        self.assertEqual(result['documents'], 1)
+        self.assertEqual(len(attempted), 3)
+        self.assertEqual(len(set(attempted)), 3)
+        self.assertEqual(attempted[-1], older['native_parent_id'])
+        self.assertIsNone(self.queue(older['native_id'], source='synthetic:peer'))
+
     def test_duplicate_only_promotes_pending_work_and_history_cannot_demote(self):
         raw = self.notify(60, 'Synthetic notification duplicate.')
         native = f'slack:{SLACK_WORKSPACE}:C0E2E:1700000060.000100'

@@ -372,6 +372,11 @@ class PublicationTests(unittest.TestCase):
             for i in range(260)
         ]
         budgets = []
+        pending_rows = list(rows)
+
+        def commit(candidate, upload):
+            pending_rows.remove(candidate)
+            return "committed"
 
         def prepare(candidates, *, hint_limit, require_current_queue, attempt_metrics):
             self.assertEqual(attempt_metrics, dict(
@@ -391,9 +396,9 @@ class PublicationTests(unittest.TestCase):
 
         with (
             patch.object(p, "_check_candidate_current", return_value=None),
-            patch.object(p, "_pending", return_value=rows),
+            patch.object(p, "_pending", side_effect=lambda **kwargs: list(pending_rows)),
             patch.object(p, "_prepare_batch_and_upload", side_effect=prepare),
-            patch.object(p, "_commit_upload", return_value="committed"),
+            patch.object(p, "_commit_upload", side_effect=commit),
             patch.object(p, "_mark_failed") as mark_failed,
             patch.object(
                 p,
