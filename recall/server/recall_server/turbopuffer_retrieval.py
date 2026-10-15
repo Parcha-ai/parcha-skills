@@ -385,10 +385,11 @@ class TurbopufferHintRetrieval(PassageHintRetrieval):
             return [], status
         return self._scored(raw), "ok"
 
-    def _authorize_singletons(self, connection, requested, deadline_at):
+    def _authorize_singletons(self, connection, requested, deadline_at, *, stages=None):
         """Keep catalog and typed receipt membership in one request snapshot."""
         from .receipt_membership import lookup_current_search_membership
 
+        stages = {} if stages is None else stages
         with connection.transaction():
             # Set isolation before _execute_bounded issues SELECT set_config.
             # The first data statement and every following statement keep the
@@ -396,17 +397,30 @@ class TurbopufferHintRetrieval(PassageHintRetrieval):
             if time.monotonic() >= deadline_at:
                 raise SearchDeadlineExceeded()
             connection.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            stage_started = time.monotonic()
             selected = self.store._execute_bounded(connection, _SELECTED_AUTHORITY_SQL,
                 (self.tenant_id, self.sources, self.policy_fingerprint,
                  [source for source, _ in requested], [passage for _, passage in requested]),
                 deadline_at).fetchall()
+            stages['catalog_ms'] = round((time.monotonic() - stage_started) * 1000, 3)
+            stage_started = time.monotonic()
             receipts = tuple(dict.fromkeys(receipt for row in selected for receipt in row['receipts']))
+            stages['receipt_prepare_ms'] = round((time.monotonic() - stage_started) * 1000, 3)
+            stages['selected_passages'] = len(selected)
+            stages['receipt_references'] = sum(len(row['receipts']) for row in selected)
+            stages['unique_receipts'] = len(receipts)
+            stage_started = time.monotonic()
             members = lookup_current_search_membership(self.store, tenant_id=self.tenant_id,
                 authorized_sources=tuple(self.sources), receipts=receipts,
                 deadline_at=deadline_at, connection=connection)
-            return [row for row in selected if all(
+            stages['membership_ms'] = round((time.monotonic() - stage_started) * 1000, 3)
+            stages['allowed_receipts'] = len(members)
+            authoritative = [row for row in selected if all(
                 (row['source_id'], receipt) in members
                 for receipt in row['receipts'])]
+            stage_started = time.monotonic()
+        stages['transaction_exit_ms'] = round((time.monotonic() - stage_started) * 1000, 3)
+        return authoritative
 
     def _authorize_ranges(self, results, legs, *, deadline_at, include_arms=False):
         """Canonical receipt metadata fences asynchronous search-plane writes.
@@ -416,6 +430,12 @@ class TurbopufferHintRetrieval(PassageHintRetrieval):
         cached vendor body and diagnostic arm results.
         """
         started = time.monotonic()
+        # Completed stages only; null means unobserved, including failures.
+        # Membership includes helper preparation/fetch, not just SQL time.
+        stages = dict.fromkeys(('checkout_ms', 'catalog_ms', 'receipt_prepare_ms',
+                                'membership_ms', 'transaction_exit_ms', 'selected_passages',
+                                'receipt_references', 'unique_receipts', 'allowed_receipts'))
+        stages['path'] = 'unobserved'
         # Normal output and reranking consume only this already-collapsed
         # pool, including every nominated row and all its matching ranges.
         # Diagnostic arms have a separate collapse, so they require all IDs.
@@ -436,20 +456,26 @@ class TurbopufferHintRetrieval(PassageHintRetrieval):
                             if row.get("passage_id") in selected_ids
                             and isinstance(row.get("source_id"), str)})
         if not ids:
+            stages['path'] = 'empty'
             results.clear()
             for _name, _weight, rows in legs:
                 rows.clear()
             return {"authority_status": "ok", "authority_rejected": 0,
+                    "authority_stages": stages,
                     "authority_elapsed_ms": round((time.monotonic() - started) * 1000, 3)}
         status = "ok"
         authoritative = []
         try:
             if time.monotonic() >= deadline_at:
                 raise SearchDeadlineExceeded()
+            checkout_started = time.monotonic()
             with self.store.connect() as connection:
+                stages['checkout_ms'] = round((time.monotonic() - checkout_started) * 1000, 3)
                 if getattr(self.store, 'verified_singleton_receipts', False):
-                    authoritative = self._authorize_singletons(connection, requested, deadline_at)
+                    stages['path'] = 'singleton'
+                    authoritative = self._authorize_singletons(connection, requested, deadline_at, stages=stages)
                 else:
+                    stages['path'] = 'legacy'
                     authoritative = self.store._execute_bounded(
                         connection,
                         """WITH selected AS MATERIALIZED (
@@ -543,6 +569,7 @@ class TurbopufferHintRetrieval(PassageHintRetrieval):
                 item["receipts"] = list(canonical["receipts"])
                 row.update({field: canonical[field] for field in locator_fields})
         return {"authority_status": status,
+                "authority_stages": stages,
                 "authority_rejected": len(set(ids) - {key[2] for key in live}),
                 "authority_elapsed_ms": round((time.monotonic() - started) * 1000, 3)}
 
