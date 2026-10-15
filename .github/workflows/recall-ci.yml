@@ -121,6 +121,7 @@ jobs:
             e2e_turbopuffer_forget_fence.py \
             e2e_retained_passage_receipts.py \
             e2e_handback_projection.py \
+            e2e_report_unit_authority.py \
             e2e_passage_receipt_repair.py \
             e2e_turbopuffer_quantum.py \
             e2e_singleton_search_publication.py \

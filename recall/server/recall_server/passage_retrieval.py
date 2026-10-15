@@ -19,6 +19,7 @@ from psycopg_pool import PoolTimeout
 
 from .actor_attribution import ACTOR_ID_RE, ACTOR_RELATIONS
 from .db import SearchDeadlineExceeded, bounded_search_text
+from .passage_projection import COMPLETE_REPORT_UNIT
 from .fusion import (
     ARM_NAMES,
     DEFAULT_FUSION_ALPHAS,
@@ -31,6 +32,7 @@ from .rerank import (
     DEFAULT_RERANK_BLEND,
     DEFAULT_RERANK_MIN_BUDGET_SECONDS,
     MAX_CANDIDATES_CEILING,
+    MAX_DOC_CHARS_CEILING,
     RerankUnavailable,
 )
 from .temporal_hints import (
@@ -2565,11 +2567,17 @@ class PassageHintRetrieval:
         terms = focus_terms(lexical_query or query)
         width = int(getattr(runtime, "max_doc_chars", 0) or 0)
         texts: dict[str, str] = {}
+        complete_reports: set[str] = set()
         for _leg_name, _weight, rows in legs:
             for row in rows:
                 key = row.get("passage_id") or row.get("receipt")
                 if key and key not in texts:
-                    texts[key] = rerank_document(row, terms, width)
+                    complete = row.get("source_unit") == COMPLETE_REPORT_UNIT
+                    whole = rerank_document(row, terms, 0) if complete else ""
+                    complete = complete and len(whole) <= MAX_DOC_CHARS_CEILING
+                    texts[key] = whole if complete else rerank_document(row, terms, width)
+                    if complete:
+                        complete_reports.add(key)
         # The same passage can reach the pool under two keys (a passage id
         # from one arm, a receipt from another); send its text once and let
         # both keys share the score.
@@ -2594,9 +2602,17 @@ class PassageHintRetrieval:
             return results, diagnostics
         started = time.monotonic()
         try:
+            # Preserve ordinary truncation *after* existing text deduplication.
+            # Only the canonical publication owner can mark a complete unit.
+            provider_documents = [
+                text if all(key in complete_reports for key in keys) or width <= 0
+                else text[:width]
+                for text, keys in zip(documents, keys_by_document, strict=True)
+            ]
+            runtime.max_doc_chars = max(width, max(map(len, provider_documents)))
             scored = runtime.rerank(
                 query,
-                documents,
+                provider_documents,
                 deadline_seconds=deadline_at - started,
             )
         except RerankUnavailable as error:

@@ -48,7 +48,13 @@ _SELECTED_AUTHORITY_SQL = """
                             SELECT passage.tenant_id,passage.source_id,passage.passage_id,
                                    passage.logical_document_id,passage.text_sha256,passage.receipts,
                                    evidence.revision,evidence.manifest_object_key,
-                                   evidence.manifest_content_sha256
+                                   evidence.manifest_content_sha256,
+                                   CASE WHEN jsonb_array_length(passage.spans)=1
+                                     AND passage.token_count<=1024
+                                     AND passage.spans->0->>'source_byte_start'='0'
+                                     AND passage.spans->0->>'passage_byte_start'='0'
+                                     AND passage.spans->0->>'source_byte_end'=passage.spans->0->>'passage_byte_end'
+                                   THEN passage.spans->0->>'source_unit' END AS source_unit
                               FROM canonical_passages passage
                               JOIN canonical_passage_documents projected
                                 USING(tenant_id,source_id,logical_document_id,policy_fingerprint)
@@ -450,7 +456,13 @@ class TurbopufferHintRetrieval(PassageHintRetrieval):
                             SELECT passage.tenant_id,passage.source_id,passage.passage_id,
                                    passage.logical_document_id,passage.text_sha256,passage.receipts,
                                    evidence.revision,evidence.manifest_object_key,
-                                   evidence.manifest_content_sha256
+                                   evidence.manifest_content_sha256,
+                                   CASE WHEN jsonb_array_length(passage.spans)=1
+                                     AND passage.token_count<=1024
+                                     AND passage.spans->0->>'source_byte_start'='0'
+                                     AND passage.spans->0->>'passage_byte_start'='0'
+                                     AND passage.spans->0->>'source_byte_end'=passage.spans->0->>'passage_byte_end'
+                                   THEN passage.spans->0->>'source_unit' END AS source_unit
                               FROM canonical_passages passage
                               JOIN canonical_passage_documents projected
                                 USING(tenant_id,source_id,logical_document_id,policy_fingerprint)
@@ -482,7 +494,7 @@ class TurbopufferHintRetrieval(PassageHintRetrieval):
                         SELECT selected.tenant_id,selected.source_id,selected.passage_id,
                                selected.logical_document_id,selected.text_sha256,selected.receipts,
                                selected.revision,selected.manifest_object_key,
-                               selected.manifest_content_sha256
+                               selected.manifest_content_sha256,selected.source_unit
                           FROM selected
                           CROSS JOIN LATERAL unnest(selected.receipts) AS receipt(value)
                           LEFT JOIN live_receipts live
@@ -491,7 +503,7 @@ class TurbopufferHintRetrieval(PassageHintRetrieval):
                          GROUP BY selected.tenant_id,selected.source_id,selected.passage_id,
                                   selected.logical_document_id,selected.text_sha256,selected.receipts,
                                   selected.revision,selected.manifest_object_key,
-                                  selected.manifest_content_sha256
+                                  selected.manifest_content_sha256,selected.source_unit
                         HAVING bool_and(live.value IS NOT NULL)""",
                         (self.tenant_id, self.sources, self.policy_fingerprint,
                          [source for source, _passage in requested],
@@ -515,6 +527,7 @@ class TurbopufferHintRetrieval(PassageHintRetrieval):
             for row in rows:
                 canonical = allowed[identity(row)]
                 row["receipts"] = list(canonical["receipts"])
+                row["source_unit"] = canonical.get("source_unit")
                 row.update({field: canonical[field] for field in locator_fields})
                 live[(row["source_id"], row["logical_document_id"], row["passage_id"])] = canonical
         # A collapsed document can carry metadata from any of its selected
