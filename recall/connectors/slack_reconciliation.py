@@ -36,6 +36,13 @@ def time_page(response, messages, query, *, descending):
             raise ConnectorContractError('slack time pagination timestamp is invalid')
         lower, current, upper = (Decimal(query.get('oldest', '0')),
                                  Decimal(value), Decimal(query['latest']))
+        # Replies may echo only the requested parent after the last reply.
+        # Accept that explicit terminal page, never a truncated continuation.
+        if (not descending and 'oldest' in query and len(messages) == 1
+                and value == query.get('ts')
+                and current <= lower and current < upper
+                and response.get('has_more') is False and cursor is None):
+            continue
         if not lower < current < upper:
             relation = ('before_oldest' if current < lower else
                         'equal_oldest' if current == lower else
