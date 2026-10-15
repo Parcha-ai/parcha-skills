@@ -162,7 +162,7 @@ def _discover(archive, scope, manifest, parts, start, limits, deadline):
 
 
 def prepare_window(store, archive, *, scope, principal_id, limits, deadline_at, remaining_bytes=None, required_scope_epoch=None):
-    from .chunk_retirement import _parent_progress, require_retirement_owner
+    from .chunk_retirement import ChunkRetirementError, _parent_progress, require_retirement_owner
     remaining_bytes = limits.max_clear_bytes if remaining_bytes is None else remaining_bytes
     if type(remaining_bytes) is not int or not 0 <= remaining_bytes <= limits.max_clear_bytes:
         _fail('clear_budget')
@@ -174,7 +174,7 @@ def prepare_window(store, archive, *, scope, principal_id, limits, deadline_at, 
         progress = _parent_progress(store,c,scope,deadline_at)
         if (not progress or not progress['enabled'] or required_scope_epoch is not None
                 and progress['scope_epoch'] != required_scope_epoch):
-            _fail('disabled')
+            raise ChunkRetirementError('parent_retirement_disabled')
         if catalog['queue'] is not None:
             _fail('pending')
         manifest = catalog['manifest']
@@ -351,6 +351,14 @@ def retire_parent_windows(store, archive, *, tenant_id, source_id, native_parent
         _fail('claim')
     scope = _parent_scope(tenant_id,source_id,native_parent_id)
     deadline_at = _parent_deadline(deadline_at)
+    if reviewed_plan['manifest']['record_count'] <= min(MAX_DOCUMENTS,limits.batch_documents):
+        # Small catalogs avoid discovery/selected-reader rereads. The original
+        # owner still validates the exact plan, current manifest and authority.
+        from .chunk_retirement import retire_parent_chunks
+        return retire_parent_chunks(store,archive,tenant_id=tenant_id,source_id=source_id,
+            native_parent_id=native_parent_id,apply=apply,reviewed_plan=reviewed_plan,
+            limits=limits,deadline_at=deadline_at,required_scope_epoch=required_scope_epoch,
+            owner_principal_id=owner_principal_id,should_stop=should_stop,metadata_mode=metadata_mode)
     meter = RunArchive(archive,max_bytes=limits.max_archive_bytes)
     totals = dict(retired_metadata_chunks=0,cleared_documents=0,cleared_chunks=0,
         cleared_utf8_bytes=0,hashed_utf8_bytes=0,hash_ms=0.0,sql_ms=0.0,batches=0)

@@ -214,6 +214,7 @@ process.main()
         self.assertEqual(report['failed_parents'], 0, report)
         self.assertEqual(report['attempted_parents'], 12, report)
         self.assertEqual(report['completed_parent_proofs'], 12, report)
+        self.assertEqual(report['archive_gets'], 12, report)  # One original proof per small parent.
         self.assertEqual(report['cleared_documents'], 12, report)
         self.assertEqual(report['status'], 'no_ready_parents', report)
         self.assertLess(len(json.dumps(report)), 65536)

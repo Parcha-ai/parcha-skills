@@ -83,7 +83,7 @@ class RunnerWindows(unittest.TestCase):
             result=self.run_parent(max_batches=8)
         self.assertEqual(result['cleared_documents'],2)
         self.assertEqual(result['archive_gets'],4)
-        self.assertEqual(result['errors'],{'parent_retirement_window_disabled':1})
+        self.assertEqual(result['errors'],{'parent_retirement_disabled':1})
         self.assertFalse(result['commit_outcome_unknown'])
 
     def test_second_real_commit_lost_ack_preserves_only_first_ack(self):
