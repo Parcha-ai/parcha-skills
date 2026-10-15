@@ -87,6 +87,66 @@ def fingerprint(path: Path, size: int | None = None) -> str:
     return hashlib.sha256(first + last + str(size).encode()).hexdigest()
 
 
+def snapshot_identity(value) -> tuple[int, ...]:
+    return (value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns, value.st_ctime_ns)
+
+
+def snapshot_hashes(path: Path, observed, size: int, prefix_size: int | None,
+                    deadline: float) -> tuple[str, str | None]:
+    """Read a fixed snapshot; confirm its digest once if the same file grows."""
+    def check_deadline() -> None:
+        if time.monotonic() >= deadline:
+            raise CollectorRuntimeError("source_snapshot_deadline")
+
+    def check_stat(before, after) -> bool:
+        if snapshot_identity(before) == snapshot_identity(after):
+            return False
+        if (before.st_dev == after.st_dev and before.st_ino == after.st_ino
+                and after.st_size > before.st_size):
+            return True
+        raise CollectorRuntimeError("source_snapshot_changed")
+
+    def read_snapshot(source) -> tuple[str, str | None]:
+        digest = hashlib.sha256()
+        prefix = digest.hexdigest() if prefix_size == 0 else None
+        offset = 0
+        source.seek(0)
+        while offset < size:
+            check_deadline()
+            end = min(size, offset + 1024 * 1024)
+            if prefix_size is not None and offset < prefix_size < end:
+                end = prefix_size
+            block = source.read(end - offset)
+            check_deadline()
+            if not block:
+                raise CollectorRuntimeError("source_snapshot_changed")
+            digest.update(block)
+            offset += len(block)
+            if offset == prefix_size:
+                prefix = digest.copy().hexdigest()
+        return digest.hexdigest(), prefix
+
+    with path.open("rb") as source:
+        started = os.fstat(source.fileno())
+        grew = check_stat(observed, started)
+        result = read_snapshot(source)
+        finished = os.fstat(source.fileno())
+        grew = check_stat(started, finished) or grew
+        current = path.stat()
+        grew = check_stat(finished, current) or grew
+        if grew:
+            # An appender need not become idle. Read only the same observed
+            # bytes again, once; a differing prefix refuses the checkpoint.
+            confirmed = read_snapshot(source)
+            finished = os.fstat(source.fileno())
+            check_stat(current, finished)
+            check_stat(finished, path.stat())
+            if confirmed != result:
+                raise CollectorRuntimeError("source_snapshot_changed")
+        check_deadline()
+    return result
+
+
 def record_repeat_key(content: dict[str, Any]) -> str:
     """Content hash of a transcript record minus per-line identity fields."""
     stripped = {
@@ -257,6 +317,11 @@ class Collector:
           seen INTEGER NOT NULL, collapsed INTEGER NOT NULL DEFAULT 0,
           PRIMARY KEY(path,repeat_key));
         """)
+        file_columns = {row["name"] for row in self.db.execute("PRAGMA table_info(files)")}
+        if "snapshot_sha256" not in file_columns:
+            self.db.execute("ALTER TABLE files ADD COLUMN snapshot_sha256 TEXT")
+        if "snapshot_stat" not in file_columns:
+            self.db.execute("ALTER TABLE files ADD COLUMN snapshot_stat TEXT")
         columns = {row["name"] for row in self.db.execute("PRAGMA table_info(outbox)")}
         if "start_offset" not in columns:
             self.db.execute("ALTER TABLE outbox ADD COLUMN start_offset INTEGER NOT NULL DEFAULT 0")
@@ -1111,14 +1176,17 @@ class Collector:
         return cursor.rowcount == 1
 
     def _save_file_progress(self, path: str, stat, current_fingerprint: str, offset: int,
-                            status: str, scan_id: str) -> None:
+                            status: str, scan_id: str, snapshot_sha256: str | None = None,
+                            snapshot_verified: bool = True) -> None:
         self.db.execute(
-            """INSERT INTO files(path,size,mtime_ns,fingerprint,scanned_offset,committed_offset,status,last_scan_id)
-               VALUES (?,?,?,?,?,0,?,?)
+            """INSERT INTO files(path,size,mtime_ns,fingerprint,scanned_offset,committed_offset,status,last_scan_id,snapshot_sha256,snapshot_stat)
+               VALUES (?,?,?,?,?,0,?,?,?,?)
                ON CONFLICT(path) DO UPDATE SET size=excluded.size,mtime_ns=excluded.mtime_ns,
                fingerprint=excluded.fingerprint,scanned_offset=excluded.scanned_offset,
-               status=excluded.status,last_scan_id=excluded.last_scan_id""",
-            (path, stat.st_size, stat.st_mtime_ns, current_fingerprint, offset, status, scan_id),
+               status=excluded.status,last_scan_id=excluded.last_scan_id,
+               snapshot_sha256=excluded.snapshot_sha256,snapshot_stat=excluded.snapshot_stat""",
+            (path, stat.st_size, stat.st_mtime_ns, current_fingerprint, offset, status, scan_id,
+             snapshot_sha256, json.dumps(snapshot_identity(stat)) if snapshot_sha256 and snapshot_verified else None),
         )
 
     def scan(self) -> dict:
@@ -1142,7 +1210,7 @@ class Collector:
         self._set_meta("last_scan_complete", "1" if summary["scan_complete"] else "0")
         self.db.execute(
             "DELETE FROM meta WHERE key='last_error_code' "
-            "AND value IN ('archive_unavailable','scan_failed','source_unavailable','inventory_incomplete')"
+            "AND value IN ('archive_unavailable','scan_failed','source_unavailable','inventory_incomplete','source_snapshot_changed','source_snapshot_deadline')"
         )
         self.db.commit()
         return summary
@@ -1213,20 +1281,60 @@ class Collector:
                 path_text = str(path)
                 row = self.db.execute("SELECT * FROM files WHERE path=?", (path_text,)).fetchone()
                 current_fingerprint = fingerprint(path, stat.st_size)
+                current_snapshot_stat = json.dumps(snapshot_identity(stat))
                 restoring_tombstone = bool(
                     row and row["status"] in {"tombstone", "scanning-restore"}
                 )
-                if row and not restoring_tombstone and not row["status"].startswith("scanning-") and row["size"] == stat.st_size and row["mtime_ns"] == stat.st_mtime_ns and row["fingerprint"] == current_fingerprint:
+                if (
+                    row and not restoring_tombstone
+                    and not row["status"].startswith("scanning-")
+                    and row["size"] == stat.st_size
+                    and row["mtime_ns"] == stat.st_mtime_ns
+                    and row["fingerprint"] == current_fingerprint
+                    and (not row["snapshot_sha256"]
+                         or row["snapshot_stat"] == current_snapshot_stat)
+                ):
+                    # Unchanged completed legacy rows retain the prior skip
+                    # contract; this does not retroactively certify their bytes.
                     self.db.execute("UPDATE files SET last_scan_id=? WHERE path=?", (scan_id, path_text))
                     continue
+                same_snapshot = bool(
+                    row and row["snapshot_sha256"]
+                    and row["snapshot_stat"] == current_snapshot_stat
+                    and row["size"] == stat.st_size
+                    and row["mtime_ns"] == stat.st_mtime_ns
+                    and row["fingerprint"] == current_fingerprint
+                )
+                if same_snapshot:
+                    snapshot_sha256 = saved_prefix = row["snapshot_sha256"]
+                else:
+                    snapshot_sha256, saved_prefix = snapshot_hashes(
+                        path, stat, stat.st_size,
+                        row["size"] if row and row["size"] <= stat.st_size else None,
+                        scan_started + self.max_scan_seconds,
+                    )
+                prefix_matches = bool(row and row["snapshot_sha256"]
+                                      and saved_prefix == row["snapshot_sha256"])
                 resume_mode = row["status"].removeprefix("scanning-") if row and row["status"].startswith("scanning-") else None
-                if resume_mode and (
-                    stat.st_size < row["size"]
-                    or fingerprint(path, row["size"]) != row["fingerprint"]
-                ):
-                    # Recheck the saved file fingerprint before resuming. A
-                    # rewrite needs a fresh walk while retaining captured history.
+                if resume_mode and not prefix_matches:
+                    # Missing legacy proof or a rewrite requires a fresh walk;
+                    # previously captured records and acknowledgements remain.
                     resume_mode = None
+
+                def save_progress(offset: int, status: str, progress_scan_id: str) -> None:
+                    nonlocal bounded
+                    verified = snapshot_identity(path.stat()) == snapshot_identity(stat)
+                    if not verified:
+                        # Keep the original digest as a reference, not a proof
+                        # of changed bytes. NULL stat forbids both skip paths;
+                        # the next scan must hash before reusing this cursor.
+                        status = "scanning-" + mode
+                        bounded = True
+                    self._save_file_progress(
+                        path_text, stat, current_fingerprint, offset, status,
+                        progress_scan_id, snapshot_sha256, snapshot_verified=verified,
+                    )
+
                 if resume_mode:
                     mode = resume_mode
                     file_scan_id = row["last_scan_id"]
@@ -1237,7 +1345,7 @@ class Collector:
                         else "append"
                         if row
                         and stat.st_size > row["size"]
-                        and fingerprint(path, row["size"]) == row["fingerprint"]
+                        and prefix_matches
                         else "full"
                         if row
                         else "new"
@@ -1466,7 +1574,7 @@ class Collector:
                                 while pending:
                                     commit_pending()
                             save_repeats()
-                            self._save_file_progress(path_text, stat, current_fingerprint, complete_end, "scanning-" + mode, file_scan_id)
+                            save_progress(complete_end, "scanning-" + mode, file_scan_id)
                             self.db.commit()
                             if (
                                 self.brain_writer is not None
@@ -1480,14 +1588,7 @@ class Collector:
                         commit_pending()
                 save_repeats()
                 if bounded and complete_end < stat.st_size:
-                    self._save_file_progress(
-                        path_text,
-                        stat,
-                        current_fingerprint,
-                        complete_end,
-                        "scanning-" + mode,
-                        file_scan_id,
-                    )
+                    save_progress(complete_end, "scanning-" + mode, file_scan_id)
                     if not self.db.execute(
                         "SELECT 1 FROM outbox WHERE path=? AND state='pending' LIMIT 1",
                         (path_text,),
@@ -1500,12 +1601,21 @@ class Collector:
                     break
                 # Rewrites may remove local lines without revoking captured history.
                 status = "partial" if complete_end < stat.st_size else "ok"
-                self._save_file_progress(path_text, stat, current_fingerprint, complete_end, status, scan_id)
+                save_progress(complete_end, status, scan_id)
                 if not self.db.execute("SELECT 1 FROM outbox WHERE path=? AND state='pending' LIMIT 1", (path_text,)).fetchone():
                     self.db.execute("UPDATE files SET committed_offset=scanned_offset WHERE path=?", (path_text,))
                 self.db.execute("DELETE FROM scan_members WHERE path=?", (path_text,))
                 # Bound crash recovery to one source file; acknowledged offsets still move only in flush().
                 self.db.commit()
+        except CollectorRuntimeError as error:
+            if (error.error_code in {"source_snapshot_changed", "source_snapshot_deadline"}
+                    and last_visited_path is not None):
+                # A hot or oversized snapshot must not repeatedly prevent the
+                # next file from being visited. Keep this scan visibly failed.
+                self._set_meta("scan_resume_after_path", last_visited_path)
+                self._set_meta("scan_next_lane", "fair")
+                self.db.commit()
+            raise
         finally:
             if executor is not None:
                 executor.shutdown(wait=True, cancel_futures=True)
