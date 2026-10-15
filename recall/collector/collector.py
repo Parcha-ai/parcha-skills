@@ -1220,6 +1220,13 @@ class Collector:
                     self.db.execute("UPDATE files SET last_scan_id=? WHERE path=?", (scan_id, path_text))
                     continue
                 resume_mode = row["status"].removeprefix("scanning-") if row and row["status"].startswith("scanning-") else None
+                if resume_mode and (
+                    stat.st_size < row["size"]
+                    or fingerprint(path, row["size"]) != row["fingerprint"]
+                ):
+                    # Recheck the saved file fingerprint before resuming. A
+                    # rewrite needs a fresh walk while retaining captured history.
+                    resume_mode = None
                 if resume_mode:
                     mode = resume_mode
                     file_scan_id = row["last_scan_id"]
