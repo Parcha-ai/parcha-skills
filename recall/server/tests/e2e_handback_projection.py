@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 import e2e_retained_passage_receipts as retained_fixture
 from recall_server.canonical_retrieval import BoundCanonicalRetrieval
-from recall_server.passage_projection import visible_message_text
+from recall_server.passage_projection import _visible_message
 from recall_server.projectors import canonical_json
 
 
@@ -18,7 +18,9 @@ class HandbackPublication(unittest.TestCase):
     project = retained_fixture.RetainedPassageReceipts.project
     rows = retained_fixture.RetainedPassageReceipts.rows
 
-    def ingest(self, native, *, report=None, text=None):
+    def ingest(
+        self, native, *, report=None, text=None, occurred="2026-10-13T12:00:00Z"
+    ):
         content = (
             [{"type": "text", "text": text}]
             if text
@@ -36,7 +38,6 @@ class HandbackPublication(unittest.TestCase):
             "message": {"role": "assistant", "content": content},
         }
         payload = canonical_json(value)
-        occurred = "2026-10-13T12:00:00Z"
         artifact = self.gateway.put_raw(
             tenant_id=self.tenant,
             source_id=self.source,
@@ -127,16 +128,22 @@ class HandbackPublication(unittest.TestCase):
             "event-before", text="Earlier visible context remains unchanged."
         )
         report = "Verified café: two checks passed. Deployment remains untested."
-        report_text = self.ingest("event-report", report=report)
+        report_text = self.ingest(
+            "event-report", report=report, occurred="2026-10-13T12:00:01Z"
+        )
         after_text = self.ingest(
-            "event-after", text="Later visible context remains unchanged."
+            "event-after",
+            text="Later visible context remains unchanged.",
+            occurred="2026-10-13T12:00:02Z",
         )
 
         def old_visibility(text):
-            return None if "SubagentHandback" in text else visible_message_text(text)
+            return (
+                (None, None) if "SubagentHandback" in text else _visible_message(text)
+            )
 
         with patch(
-            "recall_server.passage_projection.visible_message_text",
+            "recall_server.passage_projection._visible_message",
             side_effect=old_visibility,
         ):
             self.project()
