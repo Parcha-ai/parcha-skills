@@ -1,7 +1,7 @@
 manifest_version: 1
 name: tether
 version: 0.4.0
-description: Slack-thread continuation for Claude Code and Codex sessions. Bound threads are driven through the schema-18 domain runtime and exact-turn driver; the local broker serves the tether CLI.
+description: Configurable colleagues and exact-session Slack continuation for Claude Code and Codex through Hermes. SQLite stores bindings and attempts; the local broker serves the tether CLI.
 author: Parcha
 license: MIT
 homepage: https://github.com/Parcha-ai/parcha-skills

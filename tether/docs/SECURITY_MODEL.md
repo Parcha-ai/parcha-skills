@@ -1,327 +1,73 @@
-# Tether Security Model
-
-This document describes the security boundary of Tether `0.3.0-beta.1`,
-binding protocol 3, and database schema 17. The implementation and tests are
-authoritative.
-
-## Scope
-
-Tether connects an authorized Slack message to one Hermes or native
-continuation and returns the result to Slack. It protects:
-
-- Slack admission and writer selection;
-- binding and endpoint identity;
-- local broker access;
-- durable ingress, delivery attempts, and Slack outboxes;
-- native process and working-directory selection; and
-- file installation and rollback.
-
-Tether does not sandbox the agent, grant tool permissions, isolate processes
-that share a Unix UID, or provide formal exactly-once delivery across Slack or
-a terminal.
-
-## Trust boundaries
-
-```text
-Slack user or peer bot
-  -> Slack Events API / Hermes Socket Mode
-  -> allowlists, identity resolution, pure routing
-  -> durable ingress and selected writer
-       -> Hermes gateway
-       -> native attempt and verified endpoint
-
-Local CLI
-  -> owner-only Unix socket with peer-UID check
-  -> broker
-  -> durable Slack outbox
-  -> Slack API
-```
-
-The intended deployment has one dedicated, non-root Unix account for Hermes
-and Tether. Processes under that UID are mutually trusted. Put mutually
-untrusted agents in separate accounts or hosts.
-
-The local SQLite database is the coordination boundary. One-writer routing and
-endpoint-wide turn serialization are not distributed across databases, hosts,
-or unrelated Slack integrations.
-
-## Principals
-
-| Principal | Accepted authority | Not implied |
-| --- | --- | --- |
-| Authorized human | Address an allowed bot and continue an eligible thread | Channel membership alone |
-| Trusted peer bot | Address this bot when explicitly mentioned | Ambient bot messages, unless one exact bot/channel automation route is configured |
-| Hermes gateway | Hold Slack credentials and dispatch admitted Hermes turns | Root or Docker authority |
-| Broker peer | Request operations as the broker's Unix UID | Isolation from other same-UID processes |
-| Bound native process | Receive one generation-bound attempt | Any process with the same command name or pane label |
-| Operator | Inspect and explicitly resolve uncertain work | Permission to replay blindly |
-
-Unknown actors, unresolved identities, competing owners, and stale generations
-fail closed.
-
-## Slack admission and ownership
-
-Slack Events API callbacks delivered through Hermes Socket Mode are the
-authoritative ingress path. Every event is normalized, authorized, routed, and
-claimed in `thread_ingress` before execution.
-
-The `conversations.replies` poller is best-effort recovery for recent active
-threads. It is not an authoritative ingress service. Slack can rate-limit it,
-and bot tokens may be unable to read channel threads depending on token type,
-scopes, and channel membership. A healthy deployment therefore requires
-working Socket Mode; polling only reduces some missed-event windows.
-
-Thread-root ownership is deliberately narrow:
-
-- A root posted through Tether's durable root outbox gives that bridge durable
-  ownership of the accepted thread. Ambient replies can use that local proof
-  without reading Slack history.
-- `tether attach` and `tether rebind` are owner-UID local operations that claim
-  one exact existing thread for one binding generation. That claim admits only
-  allowlisted humans; it does not claim authorship of the Slack root and does
-  not weaken peer-bot mention gates.
-
-Human and peer-bot allowlists are explicit. A peer bot must explicitly mention
-this bot unless an administrator separately grants one exact bot identity and
-shared channel through `TETHER_AMBIENT_BOT_CHANNELS`. The same bot remains
-silent everywhere else. If another bot is mentioned and this bot is not, this
-instance stays silent. Each named bot may independently handle a message that
-explicitly mentions multiple bots.
-
-Evidence:
-[`runtime/routing.py`](../runtime/routing.py),
-[`runtime/plugin/__init__.py`](../runtime/plugin/__init__.py), and
-[`tests/test_routing_plugin.py`](../tests/test_routing_plugin.py).
-
-## Binding and writer integrity
-
-A binding identifies one source, one continuation endpoint, one Slack thread,
-and a monotonic generation. It begins pending at generation 1 and becomes
-active after a Tether-created root is accepted or an existing thread is
-explicitly attached.
-
-Rebind and close increment the generation. Admitted ingress, native events,
-and attempts carry the generation they were created under, so stale workers
-cannot complete work against a newer binding. Active or uncertain work blocks
-rebind and close until it reaches a safe terminal state.
-
-The pure router selects one of `SILENT`, `HERMES`, or `NATIVE` and one writer
-ID. Tether persists that choice before dispatch. Native admission and queue
-insertion are one SQLite transaction. A lease ID and monotonic fence epoch
-prevent an expired ingress worker from committing over a newer claim.
-
-These controls prevent two Tether paths in one installation from executing the
-same admitted message. They cannot prevent an independent Slack app or a second
-Tether database from acting on the same message.
-
-Evidence:
-[`tests/test_bridge_lifecycle.py`](../tests/test_bridge_lifecycle.py),
-[`tests/test_attempt_recovery.py`](../tests/test_attempt_recovery.py), and
-[`tests/test_routing.py`](../tests/test_routing.py).
-
-## Durable delivery
-
-Tether writes state before external I/O:
-
-| Operation | Durable controls |
-| --- | --- |
-| Hermes ingress | Slack message deduplication key, selected writer, lease, fence epoch, dispatch state |
-| Native attempt | Binding generation, ordered event IDs, exact attempt/reply key, one open attempt per bridge |
-| Slack root | Immutable payload, bridge ID, deterministic `client_msg_id`, lease |
-| Native reply | Exact reply key, immutable payload and hash, deterministic `client_msg_id`, lease |
-| Generic reply | Caller idempotency key bound to destination and immutable payload, deterministic `client_msg_id`, lease |
-| Hermes text post | Ingress identity, per-turn sequence, immutable chunks, deterministic `client_msg_id`, lease |
-| Hermes text edit | Ingress identity, per-turn sequence, immutable payload, exact target message, lease |
-
-Slack outboxes reconcile uncertain writes against paginated history using
-persisted metadata, client identity, cursors, pacing, and terminal state.
-Reusing an idempotency or reply key with changed text or destination fails
-closed.
-
-Slack remains external. Tether provides durable at-least-once recovery and
-duplicate reduction, not formal exactly-once delivery.
-
-Ephemeral messages and native media uploads are not in the durable text
-outbox. Tether redacts their text and applies the attachment guard to local
-files, but Slack offers no equivalent recoverable idempotency boundary for
-those operations.
-
-Evidence:
-[`tests/test_outbox_recovery.py`](../tests/test_outbox_recovery.py),
-[`tests/test_outbox_process_safety.py`](../tests/test_outbox_process_safety.py),
-[`tests/test_generic_outbox.py`](../tests/test_generic_outbox.py), and
-[`tests/test_reconciliation_recovery.py`](../tests/test_reconciliation_recovery.py).
-
-## Native continuation
-
-### Process and directory identity
-
-A native binding records the real working-directory path, device, inode, and
-owner. Delivery reopens and validates it, then starts the child from a pinned
-descriptor. Replacing a path cannot redirect execution.
-
-Zellij identity includes host boot ID, PID and start ticks, executable identity
-and path hash, terminal, session, pane, and adapter. Tether re-resolves the
-foreground process instead of trusting a pane label or stale PID.
-
-Herdr identity includes a private same-user socket, protocol, terminal and pane
-IDs, an occupant-bound agent name, the official native session reference, and
-the same process-incarnation evidence. Tether does not trust Herdr display
-titles or a reusable pane ID as authorization.
-
-### Verified Zellij delivery
-
-Tether writes the request to a private inbox, stages an instruction, verifies
-its marker on screen, rechecks process identity immediately before Enter,
-sends Enter, and verifies screen and process state afterward. Cancellation
-also revalidates the exact process and attempt.
-
-This narrows but cannot eliminate a terminal time-of-check/time-of-use window.
-The foreground process can change between the last check and Enter, and a
-screen marker cannot prove semantic consumption. An ambiguous submission
-becomes `uncertain` and is not retried automatically.
-
-### Verified Herdr delivery
-
-Tether revalidates the named agent, official native session, terminal, adapter,
-and process before calling Herdr `agent.prompt`, then validates the returned
-agent and process again. A live handoff may rotate only Herdr's internal
-terminal ID; Tether accepts that rotation only when the occupant name, native
-session, and remaining process-incarnation evidence are unchanged. Prompt text
-stays in the private socket request body.
-Cancellation uses `agent.send_keys` only after the same endpoint check.
-
-Herdr has no conditional expected-revision prompt or durable Tether turn ID.
-The occupant-bound name prevents a replacement agent from inheriting the old
-target, while ambiguous acceptance remains durable `uncertain` state requiring
-operator resolution.
-
-Herdr plugin commands run unsandboxed as the current Unix user. Tether treats
-their pane, selection, and clicked-link context only as a hint and revalidates
-the exact endpoint. Selected Slack links cross into the popup through a
-single-use owner-only file; message bodies use stdin and neither appears in
-Herdr's plugin command argv or command log.
-
-### Detached continuation
-
-Detached Codex and Claude Code continuations use configured binaries, pinned
-working directories, new process groups, bounded output, timeouts, and an
-allowlisted child environment. Tether does not pass its Slack credential to
-the child.
-
-Evidence:
-[`tests/test_process_identity_hardening.py`](../tests/test_process_identity_hardening.py),
-[`tests/test_cwd_identity.py`](../tests/test_cwd_identity.py),
-[`tests/test_native_delivery_safety.py`](../tests/test_native_delivery_safety.py),
-[`tests/test_herdr_endpoint.py`](../tests/test_herdr_endpoint.py), and
-[`tests/test_zellij_cancellation.py`](../tests/test_zellij_cancellation.py).
-
-## Credentials and sensitive data
-
-The Hermes process owns the Slack token. Local clients call an owner-only
-mode-`0600` Unix socket; the broker rejects UID 0 and peers whose UID differs
-from its own.
-
-Native child environments are built from an allowlist. An optional credential
-helper must be an absolute, owner-private, regular, singly linked executable;
-its bounded JSON output is restricted to approved keys. The helper itself is
-trusted code.
-
-CLI text should use `--text-stdin` or `--text-fd FD`. Deprecated `--text`
-places message content in process arguments, where other local diagnostics may
-observe it.
-
-The SQLite database contains Slack text and identifiers, native session
-identifiers, working-directory and process metadata, outbox payloads, and
-bounded errors. Files and sockets are owner-only, but Tether does not encrypt
-the database. Protect backups as sensitive operational data.
-
-Redaction and upload scanning match known credential patterns. They are not
-semantic DLP. Attachments additionally require approved private roots,
-owner-matching regular files, stable inode and hash checks, size limits, and
-private staging. Operators remain responsible for deciding whether content is
-appropriate for Slack.
-
-Tether supports Hermes only from the exact audited Git commit and requires the
-checkout to have no tracked changes, non-ignored untracked files, or ignored
-Python overlays in source trees. This prevents local source overlays from
-weakening the verified adapter and gateway behavior.
-
-Evidence:
-[`runtime/security.py`](../runtime/security.py),
-[`tests/test_security_integration.py`](../tests/test_security_integration.py),
-and [`tests/test_file_upload_protocol.py`](../tests/test_file_upload_protocol.py).
-
-## Failure semantics
-
-| Boundary | Proven not started | May have started |
-| --- | --- | --- |
-| Hermes dispatch | Return ingress to pending after backoff | Mark ingress uncertain |
-| Native submission | Requeue event or attempt | Mark attempt uncertain |
-| Slack write | Retain immutable pending outbox | Mark uncertain and reconcile before retry |
-| Ephemeral or native media send | No durable acceptance record | Best-effort only; do not infer delivery |
-| Install or upgrade | Stop before commit | Recover journal or restore snapshot |
-
-Tether never silently routes failed native work to Hermes or another session.
-Unknown outcomes remain durable and can block rebind or close.
-
-## Operator recovery
-
-List uncertain Hermes ingress and native attempts:
-
-```bash
-tether unresolved --team T12345678
-```
-
-Inspect the exact Slack thread and bound native session, then keep the endpoint
-blocked. The legacy same-UID mutation is disabled because an endpoint/model
-process can share that UID. The schema-18 domain accepts fenced `complete` or
-`abandon` decisions only when an attested, OS-distinguishable operator
-authority channel is enabled; that transport is not exposed in this release.
-Blind retry is never a native-attempt action. Once the authority channel
-exists, `complete` requires proof of completion; otherwise `abandon` starts a
-new explicit operation. Repeating the same terminal resolution is idempotent;
-conflicting resolution fails closed.
-
-Evidence:
-[`tests/test_operator_recovery.py`](../tests/test_operator_recovery.py) and
-[`tests/test_cli.py`](../tests/test_cli.py).
-
-## Install and schema boundary
-
-Install and upgrade use an owner-only lifecycle lock, trusted managed roots,
-complete staging, checksums, snapshots, atomic renames, and a durable
-transaction journal. A failed requested gateway restart restores the prior
-managed files and plugin state.
-
-The active runtime database schema is 17. Startup rejects a newer schema and upgrades
-older supported state in one immediate transaction. Legacy or incomplete
-native bindings become `rebind_required`; Tether does not guess a replacement
-endpoint.
-
-File rollback does not downgrade the database or restore Slack app settings.
-Back up the database before crossing a schema boundary.
-
-Evidence:
-[`install.sh`](../install.sh),
-[`tests/test_bridge.py`](../tests/test_bridge.py), and
-[`tests/test_release_install.sh`](../tests/test_release_install.sh).
-
-## Residual risks and non-goals
-
-- Slack and terminal operations retain unavoidable ambiguity windows.
-- Slack ephemeral notices and native media uploads are best-effort.
-- Same-UID code can access Tether's local authority and owner-only state.
-- SQLite availability and integrity are required for coordination.
-- One-writer and endpoint-wide turn serialization do not span hosts or databases.
-- Polling may recover slowly or not at all under Slack limits and token
-  restrictions.
-- State is private by filesystem permissions, not encrypted by Tether.
-- Secret detection is pattern-based and may miss sensitive business data.
-- Tether does not sandbox agent tools, containers, the host, or model
-  providers.
-- File rollback does not reverse database migrations or external Slack
-  configuration.
-
-Report vulnerabilities through the repository
-[Security Policy](../../.github/SECURITY.md), not a public issue.
+# Tether security boundary
+
+This describes the current `0.4.0` source. It does not claim the retired
+schema-17/18 isolation or migration design is active. The
+[architecture](ARCHITECTURE.md) names the actual implementation modules.
+
+## Local authority
+
+Hermes and Tether run as a non-root Unix user. The broker uses a private
+Unix-domain socket and verifies peer identity. The installer rejects root and
+records owner-private managed state. Processes sharing the same UID share the
+local authority boundary; a private socket does not isolate a model process
+from another process under that user.
+
+Use separate OS accounts or hosts when computers must not share that local
+authority. Tool execution permissions and sandboxing belong to the host and
+native runtime. Tether's launcher context describes the actual execution
+boundary to the continued session; it does not create a new sandbox.
+
+## Slack identity and instruction authority
+
+The gateway owns Slack credentials. CLI clients send bounded, newline-framed
+JSON through the broker, not direct Slack calls. Native child environments are
+allowlisted and do not need the gateway's Slack credential.
+
+Admission uses the configured workspace, explicit human operator identities,
+trusted peer identities, thread association and mentions. A colleague roster
+is prompt context and grants no authority. Owned thread replies from allowed
+humans can continue without a mention. Tether admits authenticated trusted
+peers on bound threads; Hermes's configured mention-aware ingress supplies an
+upstream filter. Tether's current admission layer does not independently require
+a peer mention.
+
+A thread is attached to an exact computer session. Binding generations fence
+queued work when it is intentionally rebound or closed. A replacement session
+must be explicit; a fresh session or another account is not invisible recovery.
+Provider authentication and model selection remain computer configuration.
+
+## Persistence and external effects
+
+The current Store persists endpoints, bindings, turns, attempts and thread
+origins. The session driver stores terminal response blobs separately from
+platform delivery. SQLite writes, native actions and Slack acknowledgment are
+different boundaries. Ambiguous external actions must not be interpreted as
+safe-to-repeat work solely because a local receipt is absent.
+
+Several gateway paths still perform direct Slack operations through
+`SlackEgress`; the roadmap consolidates delivery under supported Hermes APIs.
+The source does not provide exactly-once Slack effects, a schema migration
+orchestrator or an independently isolated privileged recovery writer. The
+legacy `resolve` mutation remains unavailable.
+
+## Context and diagnostics
+
+Team manifests are operator-controlled context: names, roles, project references
+and computer preferences. They must not contain secrets. Strict type/reference
+validation prevents malformed configuration from silently becoming another
+team; rendered-size validation prevents truncating identity or the shared
+contract. It is not sanitization of an untrusted prompt or access control.
+
+Slack content, attachments, source metadata, saved replies and error text can
+contain private work. Keep credentials and sensitive findings out of messages,
+and restrict access to runtime state. Redaction is a diagnostic aid, not a
+complete data-classification system. A model's claim that a task is done is not
+independent verification of the artifact.
+
+## Offline development
+
+The demo uses scripted fake computers and fake delivery. It never discovers
+Herdr, launches a native process or calls a provider. Tests run per file with
+private HOME and an explicit environment; regressions patch process/network
+operations to fail if the demo crosses that boundary. This proves tested
+mechanics, not a live host's configuration or a model's security behavior.

@@ -22,6 +22,8 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from .task_context import TaskContext, TaskRef
+
 NO_REPLY_TOKEN = "NO_REPLY"  # nosec B105 - a reply marker, not a credential
 
 _SCHEMA = """
@@ -133,6 +135,17 @@ class Store:
         self._db.execute("PRAGMA synchronous=NORMAL")
         self._db.execute("PRAGMA foreign_keys=ON")
         self._db.executescript(_SCHEMA)
+        # These columns hold associations and execution evidence, not task state.
+        # Serialize additive upgrades with other Store instances on this database.
+        self._db.execute("BEGIN IMMEDIATE")
+        for table, columns in (
+            ("bindings", ("task_ref_json",)),
+            ("attempts", ("task_ref_json", "task_context_json")),
+        ):
+            present = {row[1] for row in self._db.execute(f"PRAGMA table_info({table})")}
+            for column in columns:
+                if column not in present:
+                    self._db.execute(f"ALTER TABLE {table} ADD COLUMN {column} TEXT NOT NULL DEFAULT ''")
         self._db.commit()
         try:
             self.path.chmod(0o600)
@@ -315,8 +328,96 @@ class Store:
             "state": row["state"], "generation": row["generation"], "team_id": row["team_id"],
             "channel_id": row["channel_id"], "thread_ts": row["thread_ts"],
             "owner_user_id": row["owner_user_id"],
+            "task_ref": json.loads(row["task_ref_json"]) if row["task_ref_json"] else None,
             "active": row["state"] == "active", "pending_root": row["state"] == "pending_root",
         }
+
+    def task_binding(self, binding_id: str) -> dict[str, Any]:
+        with self._lock:
+            row = self._db.execute("SELECT * FROM bindings WHERE binding_id=?", (binding_id,)).fetchone()
+            if row is None:
+                raise StoreError("binding_unknown")
+            return self._binding_view(row)
+
+    def latest_task_attempt(self, binding_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._db.execute(
+                "SELECT * FROM attempts WHERE binding_id=? ORDER BY rowid DESC LIMIT 1", (binding_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            snapshot = json.loads(row["task_context_json"]) if row["task_context_json"] else None
+            return {"attempt_id": row["attempt_id"], "state": row["state"], "error_code": row["error_code"],
+                    "task_ref": json.loads(row["task_ref_json"]) if row["task_ref_json"] else None,
+                    "context_digest": snapshot["digest"] if snapshot else None}
+
+    def set_task_ref(
+        self, binding_id: str, ref: TaskRef | None, *, expected_generation: int,
+    ) -> dict[str, Any]:
+        """Change an idle conversation's association, fenced by its generation."""
+        if type(expected_generation) is not int or expected_generation < 1:
+            raise StoreError("generation_required", "Supply the current positive binding generation")
+        payload = json.dumps(ref.as_dict(), sort_keys=True) if ref else ""
+        with self._lock:
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._db.execute("SELECT * FROM bindings WHERE binding_id=?", (binding_id,)).fetchone()
+                if row is None:
+                    raise StoreError("binding_unknown")
+                if row["state"] != "active":
+                    raise StoreError("binding_not_active")
+                if row["generation"] != expected_generation:
+                    raise StoreError("binding_generation_conflict", "Read the current binding before changing its task")
+                busy = self._db.execute(
+                    "SELECT 1 FROM turns WHERE binding_id=? AND state IN ('ready','running') "
+                    "UNION ALL SELECT 1 FROM attempts WHERE binding_id=? AND state='accepted' LIMIT 1",
+                    (binding_id, binding_id),
+                ).fetchone()
+                if busy:
+                    raise StoreError("task_binding_busy", "Finish queued or running turns before changing the linked task")
+                if row["task_ref_json"] != payload:
+                    self._db.execute(
+                        "UPDATE bindings SET task_ref_json=?,generation=generation+1,updated_at=? WHERE binding_id=?",
+                        (payload, _now(), binding_id),
+                    )
+                result = self._binding_view(self._db.execute(
+                    "SELECT * FROM bindings WHERE binding_id=?", (binding_id,),
+                ).fetchone())
+                self._db.commit()
+            except BaseException:
+                self._db.rollback()
+                raise
+            return result
+
+    def save_task_context(self, attempt_id: str, snapshot: TaskContext) -> None:
+        """Record the exact projection before execution; a changed binding invalidates it."""
+        payload = json.dumps(snapshot.as_dict(), ensure_ascii=False, sort_keys=True)
+        with self._lock:
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._db.execute(
+                    "SELECT a.*,b.state AS binding_state,b.task_ref_json AS binding_ref,b.generation "
+                    "FROM attempts a JOIN bindings b ON b.binding_id=a.binding_id WHERE a.attempt_id=?",
+                    (attempt_id,),
+                ).fetchone()
+                if row is None:
+                    raise StoreError("attempt_unknown")
+                stale = self._db.execute(
+                    "SELECT 1 FROM turns WHERE attempt_id=? AND binding_generation!=? LIMIT 1",
+                    (attempt_id, row["generation"]),
+                ).fetchone()
+                if (row["state"] != "accepted" or row["binding_state"] != "active" or stale
+                        or row["task_ref_json"] != row["binding_ref"]):
+                    raise StoreError("task_context_stale", "The task association changed before execution")
+                if not row["task_ref_json"] or TaskRef.from_dict(json.loads(row["task_ref_json"])) != snapshot.ref:
+                    raise StoreError("task_context_scope_mismatch")
+                if row["task_context_json"] and row["task_context_json"] != payload:
+                    raise StoreError("task_context_already_recorded")
+                self._db.execute("UPDATE attempts SET task_context_json=? WHERE attempt_id=?", (payload, attempt_id))
+                self._db.commit()
+            except BaseException:
+                self._db.rollback()
+                raise
 
     # -- turns ----------------------------------------------------------------------
 
@@ -335,26 +436,33 @@ class Store:
         if not event_key:
             raise StoreError("event_key_required")
         with self._lock:
-            existing = self._db.execute(
-                "SELECT * FROM turns WHERE event_key=?", (event_key,)).fetchone()
-            if existing is not None:
-                if existing["binding_id"] != binding_id:
-                    raise StoreError("event_binding_conflict")
-                return self._turn_view(existing)
-            binding = self._db.execute(
-                "SELECT * FROM bindings WHERE binding_id=?", (binding_id,)).fetchone()
-            if binding is None:
-                raise StoreError("binding_unknown")
-            if binding["state"] != "active":
-                raise StoreError("binding_not_admitting")
-            now = _now()
-            self._db.execute(
-                "INSERT INTO turns(event_key,binding_id,binding_generation,ordered_at,payload_inline,state,"
-                "created_at,updated_at) VALUES(?,?,?,?,?,'ready',?,?)",
-                (event_key, binding_id, binding["generation"], ordered_at, payload_inline, now, now))
-            self._db.commit()
-            return self._turn_view(self._db.execute(
-                "SELECT * FROM turns WHERE event_key=?", (event_key,)).fetchone())
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                existing = self._db.execute(
+                    "SELECT * FROM turns WHERE event_key=?", (event_key,)).fetchone()
+                if existing is not None:
+                    if existing["binding_id"] != binding_id:
+                        raise StoreError("event_binding_conflict")
+                    self._db.commit()
+                    return self._turn_view(existing)
+                binding = self._db.execute(
+                    "SELECT * FROM bindings WHERE binding_id=?", (binding_id,)).fetchone()
+                if binding is None:
+                    raise StoreError("binding_unknown")
+                if binding["state"] != "active":
+                    raise StoreError("binding_not_admitting")
+                now = _now()
+                self._db.execute(
+                    "INSERT INTO turns(event_key,binding_id,binding_generation,ordered_at,payload_inline,state,"
+                    "created_at,updated_at) VALUES(?,?,?,?,?,'ready',?,?)",
+                    (event_key, binding_id, binding["generation"], ordered_at, payload_inline, now, now))
+                admitted = self._db.execute(
+                    "SELECT * FROM turns WHERE event_key=?", (event_key,)).fetchone()
+                self._db.commit()
+                return self._turn_view(admitted)
+            except BaseException:
+                self._db.rollback()
+                raise
 
     def _turn_view(self, row: sqlite3.Row) -> dict[str, Any]:
         return {
@@ -442,28 +550,42 @@ class Store:
     def schedule_next(self, endpoint_id: str, **_: Any) -> dict[str, Any] | None:
         """Bundle every ready turn of the endpoint's oldest busy binding into one attempt."""
         with self._lock:
-            running = self._db.execute(
-                "SELECT attempt_id FROM attempts WHERE endpoint_id=? AND state='accepted'",
-                (endpoint_id,)).fetchone()
-            if running is not None:
-                return None
-            turn = self._db.execute(
-                "SELECT t.* FROM turns t JOIN bindings b ON b.binding_id=t.binding_id "
-                "WHERE b.endpoint_id=? AND t.state='ready' AND b.state='active' "
-                "ORDER BY t.ordered_at LIMIT 1", (endpoint_id,)).fetchone()
-            if turn is None:
-                return None
-            attempt_id = _id("att")
-            now = _now()
-            self._db.execute(
-                "INSERT INTO attempts(attempt_id,endpoint_id,binding_id,state,created_at) "
-                "VALUES(?,?,?,'accepted',?)", (attempt_id, endpoint_id, turn["binding_id"], now))
-            self._db.execute(
-                "UPDATE turns SET state='running', attempt_id=?, updated_at=? "
-                "WHERE binding_id=? AND state='ready'", (attempt_id, now, turn["binding_id"]))
-            self._db.commit()
-            return {"attempt_id": attempt_id, "endpoint_id": endpoint_id,
-                    "binding_id": turn["binding_id"], "state": "accepted"}
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                # Old writers or persisted rows may predate today's task association.
+                # Fence them even when the current binding has no linked task.
+                self._db.execute(
+                    "UPDATE turns SET state='failed',error_code='binding_generation_conflict',updated_at=? "
+                    "WHERE state='ready' AND EXISTS (SELECT 1 FROM bindings b "
+                    "WHERE b.binding_id=turns.binding_id AND b.endpoint_id=? "
+                    "AND b.generation!=turns.binding_generation)", (_now(), endpoint_id))
+                running = self._db.execute(
+                    "SELECT attempt_id FROM attempts WHERE endpoint_id=? AND state='accepted'",
+                    (endpoint_id,)).fetchone()
+                if running is not None:
+                    self._db.commit()
+                    return None
+                turn = self._db.execute(
+                    "SELECT t.*,b.task_ref_json AS current_task_ref FROM turns t JOIN bindings b ON b.binding_id=t.binding_id "
+                    "WHERE b.endpoint_id=? AND t.state='ready' AND b.state='active' "
+                    "ORDER BY t.ordered_at LIMIT 1", (endpoint_id,)).fetchone()
+                if turn is None:
+                    self._db.commit()
+                    return None
+                attempt_id = _id("att")
+                now = _now()
+                self._db.execute(
+                    "INSERT INTO attempts(attempt_id,endpoint_id,binding_id,state,created_at,task_ref_json) "
+                    "VALUES(?,?,?,'accepted',?,?)", (attempt_id, endpoint_id, turn["binding_id"], now, turn["current_task_ref"]))
+                self._db.execute(
+                    "UPDATE turns SET state='running', attempt_id=?, updated_at=? "
+                    "WHERE binding_id=? AND state='ready'", (attempt_id, now, turn["binding_id"]))
+                self._db.commit()
+                return {"attempt_id": attempt_id, "endpoint_id": endpoint_id,
+                        "binding_id": turn["binding_id"], "state": "accepted"}
+            except BaseException:
+                self._db.rollback()
+                raise
 
     def attempt_context(self, attempt_id: str) -> dict[str, Any]:
         with self._lock:
@@ -480,6 +602,8 @@ class Store:
         return {
             "attempt_id": attempt_id, "state": attempt["state"], "error_code": attempt["error_code"],
             "response_ref": attempt["response_ref"],
+            "task_ref": json.loads(attempt["task_ref_json"]) if attempt["task_ref_json"] else None,
+            "task_context": json.loads(attempt["task_context_json"]) if attempt["task_context_json"] else None,
             "source_kind": endpoint["source_kind"], "source": json.loads(endpoint["source_json"] or "{}"),
             "team_id": binding["team_id"], "channel_id": binding["channel_id"],
             "thread_ts": binding["thread_ts"], "owner_user_id": binding["owner_user_id"],

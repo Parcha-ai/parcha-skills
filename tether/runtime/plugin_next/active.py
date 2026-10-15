@@ -1,14 +1,13 @@
-"""Active slice: bound Slack thread -> schema-18 turn -> exact-turn driver -> reply.
+"""Bound conversations, durable turn scheduling and native-session operations.
 
-This is the one path that makes an agent a coworker instead of a notifier.
-Everything durable lives in the domain database (single writer: this plugin);
-every terminal outcome is a fenced driver receipt; the reply leaves through
-whatever egress callable the host hands us (Hermes ``send_message``), never a
-Slack SDK of our own.
+The Store owns bindings and attempts. SessionDriver continues their native
+computers; egress sends results and notices. Several broker operations also
+use the plugin's direct Slack client. Task ownership and platform receipts are
+separate from an execution attempt's terminal state.
 
-The scheduler is a plain daemon thread. ``reap`` blocks on the harness process
-for up to ``native_timeout_seconds``, so it must never run on the gateway's
-event loop.
+The scheduler runs in a daemon thread; blocking native execution must stay
+off the gateway event loop. Hermes and native prompts share team.py's
+portable collaboration context.
 """
 
 from __future__ import annotations
@@ -28,6 +27,8 @@ from typing import Any, Callable
 
 from .broker import BrokerRefused
 from .herdr import Herdr, HerdrError, agent_name_for
+from . import team as team_module
+from .task_context import TaskContext, TaskContextError, TaskRef, build_task_context
 
 
 logger = logging.getLogger("hermes_plugins.tether_next.active")
@@ -326,6 +327,7 @@ class ActiveSettings:
     done_emoji: str = "white_check_mark"
     fail_emoji: str = "warning"
     blocked_emoji: str = "raised_hand"
+    team: team_module.TeamManifest = field(default_factory=team_module.TeamManifest)
     extra: dict[str, Any] = field(default_factory=dict)
 
 
@@ -344,6 +346,7 @@ def load_active_settings(path: Path) -> ActiveSettings:
         return int(value) if isinstance(value, int) and not isinstance(value, bool) else default
 
     return ActiveSettings(
+        team=team_module.load_team(path),
         enabled=bool(raw.get("active", False)),
         claude_binary=str(raw.get("claude_binary") or "claude"),
         claude_resume_args=strings("claude_resume_args"),
@@ -362,6 +365,8 @@ def load_active_settings(path: Path) -> ActiveSettings:
         codex_driver=str(raw.get("codex_driver") or "app-server"),
         presence=bool(raw.get("presence", True)),
         extra={"default_channel": str(raw.get("default_channel") or ""),
+               "task_boards": raw.get("task_boards", {}),
+               "task_tenant": raw.get("task_tenant"),
                "herdr_workspace": str(raw.get("herdr_workspace") or ""),
                "herdr_session": str(raw.get("herdr_session") or ""),
                "herdr_required": bool(raw.get("herdr_required", False)),
@@ -408,7 +413,12 @@ def compose_prompt(context: dict[str, Any], settings: ActiveSettings, launcher: 
         f"{os.uname().nodename}). New messages arrived in the Slack thread bound to this "
         "session:",
         "",
+        team_module.render_team(settings.team),
+        "",
     ]
+    snapshot = context.get("task_context")
+    if snapshot:
+        lines += [TaskContext(TaskRef.from_dict(snapshot["task_ref"]), snapshot["data"], snapshot["digest"]).render(), ""]
     for turn in context["turns"]:
         payload: dict[str, Any] = {}
         if turn.get("payload_inline"):
@@ -432,12 +442,13 @@ def compose_prompt(context: dict[str, Any], settings: ActiveSettings, launcher: 
         "Reply contract: whatever you print is posted verbatim into the thread by Tether. Do "
         "not call tether reply/post/notify, do not mention bridge ids or reply keys, do not "
         "write 'Reply to' headers or any note to your operator; the thread is your reader. "
-        "Your message is only the reply: start it with the <@USERID> of the person you answer, "
-        "no preamble, no account of what you just did or thought. Lead with the answer, then "
+        "Your message is only the reply. Mention the recipient when their actual Slack user ID is known. "
+        "No preamble, hidden reasoning or tool-by-tool narration. Lead with the answer, then "
         "evidence. If you cannot do part of it, say so in one clause and do the rest; do not "
         "offer a menu of options.",
-        f"Reply in at most {max(settings.max_reply_sentences, 3)} short sentences, as a colleague: "
-        "no meta-narration, no restating the question. Mention people as <@USERID>. If the "
+        f"Keep routine replies within {max(settings.max_reply_sentences, 3)} short sentences; "
+        "give more detail when the human requests it or the answer requires it. "
+        "No meta-narration, no restating the question. Mention people as <@USERID>. If the "
         "messages need no reply from you, respond with exactly NO_REPLY.",
     ]
     return "\n".join(lines)
@@ -550,6 +561,7 @@ class ActiveSlice:
         egress: Egress,
         descriptor: Any,
         slack: Any = None,
+        task_reader: Any = None,
     ):
         self.runtime = runtime
         self.driver = driver
@@ -557,6 +569,7 @@ class ActiveSlice:
         self.egress = egress
         self.descriptor = descriptor
         self.slack: Any = slack
+        self.task_reader = task_reader
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._workers: dict[str, threading.Thread] = {}
@@ -738,6 +751,29 @@ class ActiveSlice:
     def _drive(self, attempt: dict[str, Any]) -> None:
         context = self.runtime.attempt_context(attempt["attempt_id"])
         launcher = resolve_launcher(self.settings)
+        if context.get("task_ref"):
+            try:
+                snapshot = self._read_task(TaskRef.from_dict(context["task_ref"]))
+                if self._stop.is_set():
+                    raise TaskContextError("task_context_interrupted", "Gateway stopped during task preparation")
+                self.runtime.save_task_context(attempt["attempt_id"], snapshot)
+                context["task_context"] = snapshot.as_dict()
+            except Exception as exc:
+                code = str(getattr(exc, "code", "task_context_unavailable"))
+                if not re.fullmatch(r"[a-z_]{1,64}", code):
+                    code = "task_context_unavailable"
+                self.runtime.finish_attempt(attempt["attempt_id"], state="failed", error_code=code)
+                logger.warning("tether: task preparation refused attempt %s (%s)", attempt["attempt_id"], code)
+                for ts in self._turn_message_ids(context):
+                    self._unreact(context["channel_id"], ts, self.settings.ack_emoji)
+                    self._react(context["channel_id"], ts, self.settings.fail_emoji)
+                try:
+                    self.egress(context["channel_id"], context["thread_ts"],
+                        f"I could not load current context for the linked task ({code}). "
+                        "The coding session was not started. Check the task link and configured board before retrying.")
+                except Exception:
+                    logger.warning("tether: task preparation failure notice was not delivered")
+                return
         prompt = compose_prompt(context, self.settings, launcher)
         try:
             cwd = Path(str(context["source"].get("cwd") or os.getcwd()))
@@ -928,6 +964,39 @@ class ActiveSlice:
 
     def op_identity(self, request: dict[str, Any]) -> dict[str, Any]:
         return dict(self._identity())
+
+    def _read_task(self, ref: TaskRef) -> TaskContext:
+        if self.task_reader is None:
+            raise TaskContextError("task_capability_unavailable", "Configure an explicit task board before linking a task")
+        try:
+            return build_task_context(ref, self.task_reader.read(ref))
+        except TaskContextError:
+            raise
+        except Exception as exc:
+            raise TaskContextError("task_context_unavailable", "The linked task could not be read") from exc
+
+    def op_task_show(self, request: dict[str, Any]) -> dict[str, Any]:
+        binding = self.runtime.task_binding(str(request.get("bridge_id") or ""))
+        snapshot = self._read_task(TaskRef.from_dict(binding["task_ref"])) if binding["task_ref"] else None
+        last = self.runtime.latest_task_attempt(binding["binding_id"])
+        changed = None
+        if snapshot and last and last["task_ref"] == snapshot.ref.as_dict() and last["context_digest"]:
+            changed = last["context_digest"] != snapshot.digest
+        return {"binding": binding, "task_context": snapshot.as_dict() if snapshot else None,
+                "last_attempt": last, "context_changed_since_last_attempt": changed}
+
+    def op_task_link(self, request: dict[str, Any]) -> dict[str, Any]:
+        binding = self.runtime.task_binding(str(request.get("bridge_id") or ""))
+        ref = TaskRef.from_dict(request.get("task_ref"))
+        snapshot = self._read_task(ref)
+        binding = self.runtime.set_task_ref(binding["binding_id"], ref,
+            expected_generation=request.get("expected_generation"))
+        return {"binding": binding, "task_context": snapshot.as_dict()}
+
+    def op_task_unlink(self, request: dict[str, Any]) -> dict[str, Any]:
+        binding = self.runtime.set_task_ref(str(request.get("bridge_id") or ""), None,
+            expected_generation=request.get("expected_generation"))
+        return {"binding": binding, "task_context": None}
 
     def op_maintenance(self, request: dict[str, Any]) -> dict[str, Any]:
         return {"performed": []}

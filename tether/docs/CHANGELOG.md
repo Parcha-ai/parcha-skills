@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased — portable colleague workspace
+
+- Adds an offline demo through the real Store, admission, session driver and
+  delivery path with fake computers: artifact, failing review, correction,
+  passing review and follow-up in the same simulated session.
+- Adds a strict portable TOML team manifest and a neutral collaboration
+  contract shared by Hermes and native context, replacing the private roster.
+- Validates setup/help before mutation; removes unshipped schema/cockpit
+  quickstart promises and adds source/installed demo commands.
+- Includes new modules in package/installer/CI and isolates test files from
+  live operator configuration. Installed lint failures now propagate.
+- Publishes the architecture audit and broad product roadmap. Durable Hermes
+  task/review orchestration remains the next product slice.
+
+Older entries below describe previous runtime designs and historical plans;
+consult current Architecture and Compatibility for this source tree.
+
 ## 0.3.0-beta.1
 
 - Adds BindingV3 Herdr protocol-19 live endpoints with official native-session

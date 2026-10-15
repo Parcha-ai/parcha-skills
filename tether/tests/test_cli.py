@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import pathlib
+import shutil
 import socket
 import subprocess
 import tempfile
@@ -102,7 +103,11 @@ class TetherCliTest(unittest.TestCase):
             **os.environ,
             "HOME": str(self.home),
             "XDG_DATA_HOME": str(self.root / "data"),
+            "XDG_STATE_HOME": str(self.home / ".local" / "state"),
+            "XDG_CONFIG_HOME": str(self.root / "config"),
             "HERMES_HOME": str(self.root / "hermes"),
+            "TETHER_HERDR": "off",
+            "PYTHONDONTWRITEBYTECODE": "1",
         }
         for key in (
             "TETHER_BROKER_SOCKET",
@@ -137,6 +142,7 @@ class TetherCliTest(unittest.TestCase):
         input_text: str | None = None,
         pass_fds: tuple[int, ...] = (),
         timeout: float = 4,
+        cli_path: pathlib.Path = CLI,
     ) -> subprocess.CompletedProcess[str]:
         env = dict(self.base_env)
         if socket_path is not None:
@@ -144,7 +150,7 @@ class TetherCliTest(unittest.TestCase):
         if extra_env:
             env.update(extra_env)
         return subprocess.run(
-            ["node", str(CLI), *arguments],
+            ["node", str(cli_path), *arguments],
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -182,6 +188,10 @@ class TetherCliTest(unittest.TestCase):
             plugin / "session_driver.py": 0o600,
             plugin / "notices.py": 0o600,
             plugin / "herdr.py": 0o600,
+            plugin / "demo.py": 0o600,
+            plugin / "team.py": 0o600,
+            plugin / "task_context.py": 0o600,
+            plugin / "hermes_tasks.py": 0o600,
             plugin / "team.md": 0o600,
             plugin / "plugin.yaml": 0o644,
             local_bin / "tether": 0o700,
@@ -237,6 +247,304 @@ class TetherCliTest(unittest.TestCase):
         manifest.write_text(metadata + rows, encoding="utf-8")
         manifest.chmod(0o600)
         return manifest, candidates
+
+    def setup_child_fixtures(self) -> tuple[pathlib.Path, pathlib.Path]:
+        """Exercise the real CLI with counted offline installer/notifier children."""
+        package = self.root / "source"
+        copied_cli = package / "bin" / "tether.js"
+        copied_cli.parent.mkdir(parents=True)
+        copied_cli.write_bytes(CLI.read_bytes())
+        (package / "package.json").write_text('{"version":"0.4.0"}\n')
+        skill = package / "skills" / "tether" / "SKILL.md"
+        skill.parent.mkdir(parents=True)
+        skill.write_text("Fixture skill, no gateway.\n")
+        log = self.root / "child-calls.jsonl"
+        self.base_env["TETHER_TEST_CHILD_LOG"] = str(log)
+
+        def child(label: str) -> str:
+            return (
+                "#!/usr/bin/env python3\nimport json, os, sys\n"
+                "with open(os.environ['TETHER_TEST_CHILD_LOG'], 'a') as stream:\n"
+                f"    stream.write(json.dumps([{label!r}, *sys.argv[1:]]) + '\\n')\n"
+                "sys.exit(int(os.environ.get('TETHER_TEST_INSTALL_EXIT', '0')) "
+                f"if {label!r} == 'installer' else 0)\n"
+            )
+
+        installer = package / "install.sh"
+        installer.write_text(child("installer"))
+        installer.chmod(0o700)
+        notifier = self.root / "data" / "tether" / "tether_notify.py"
+        notifier.parent.mkdir(parents=True)
+        notifier.write_text(child("notifier"))
+        return copied_cli, log
+
+    def tree_snapshot(self) -> dict[str, str]:
+        return {
+            str(path.relative_to(self.root)): (
+                hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else "directory"
+            )
+            for path in self.root.rglob("*")
+        }
+
+    def test_setup_help_never_runs_children_or_changes_files(self) -> None:
+        cli, log = self.setup_child_fixtures()
+        before = self.tree_snapshot()
+        for flag in ("--help", "-h"):
+            with self.subTest(flag=flag):
+                result = self.run_cli("setup", flag, cli_path=cli)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("--non-interactive", result.stdout)
+                self.assertIn("--no-restart", result.stdout)
+                self.assertIn("--team-id T012ABCDEF", result.stdout)
+                self.assertIn("existing configured IDs", result.stdout)
+                self.assertNotIn("--herdr", result.stdout)
+                self.assertFalse(log.exists())
+                self.assertEqual(self.tree_snapshot(), before)
+
+    def test_invalid_setup_options_never_run_children_or_change_files(self) -> None:
+        cli, log = self.setup_child_fixtures()
+        before = self.tree_snapshot()
+        invalid = (
+            ("--herdr",), ("--harness=unsupported",), ("--harness",),
+            ("--harness=codex", "--both"), ("--codex", "--claude-code"),
+            ("--non-interactive", "--non-interactive"), ("--no-restart=false",),
+            ("--harness=codex", "--harness=both"), ("unexpected-positional",),
+            ("--team-id",), ("--team-id=",), ("--team-id", "T1"),
+            ("--team-id", "t012ABCDEF"), ("--team-id", "U012ABCDEF"),
+            ("--team-id", "T012 ABC"), ("--team-id", "T" + "A" * 32),
+            ("--team-id=T012ABCDEF", "--team-id=T012ABCDEF"),
+        )
+        for arguments in invalid:
+            with self.subTest(arguments=arguments):
+                result = self.run_cli("setup", *arguments, cli_path=cli)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertFalse(log.exists())
+                self.assertEqual(self.tree_snapshot(), before)
+
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "setup refuses root")
+    def test_setup_validates_and_forwards_harness_and_notifier_flags(self) -> None:
+        cli, log = self.setup_child_fixtures()
+        for selection, harness in (
+            (("--codex",), "codex"), (("--claude-code",), "claude-code"),
+            (("--both",), "both"), (("--harness=auto",), "auto"),
+            (("--harness", "both"), "both"),
+        ):
+            with self.subTest(selection=selection):
+                log.unlink(missing_ok=True)
+                result = self.run_cli(
+                    "setup", *selection, "--non-interactive", "--no-restart", cli_path=cli,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(
+                    [json.loads(line) for line in log.read_text().splitlines()],
+                    [["installer", "install", f"--harness={harness}"],
+                     ["notifier", "setup", "--non-interactive", "--no-restart"]],
+                )
+
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "setup refuses root")
+    def test_setup_forwards_workspace_only_to_notifier(self) -> None:
+        cli, log = self.setup_child_fixtures()
+        for arguments, workspace in (
+            (("--team-id", "T012ABCDEF"), "T012ABCDEF"),
+            (("--team-id=T99",), "T99"),
+        ):
+            with self.subTest(arguments=arguments):
+                log.unlink(missing_ok=True)
+                result = self.run_cli("setup", "--both", *arguments, cli_path=cli)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(
+                    [json.loads(line) for line in log.read_text().splitlines()],
+                    [["installer", "install", "--harness=both"],
+                     ["notifier", "setup", "--team-id", workspace]],
+                )
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "setup refuses root")
+    def test_failed_setup_install_never_runs_notifier(self) -> None:
+        cli, log = self.setup_child_fixtures()
+        result = self.run_cli("setup", "--both", cli_path=cli,
+                              extra_env={"TETHER_TEST_INSTALL_EXIT": "7"})
+        self.assertEqual(result.returncode, 7)
+        self.assertEqual([json.loads(line) for line in log.read_text().splitlines()],
+                         [["installer", "install", "--harness=both"]])
+
+    def test_help_advertises_demo_and_omits_unshipped_schema(self) -> None:
+        result = self.run_cli("--help")
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("tether demo [--json]", result.stdout)
+        self.assertIn("tether task link|show|unlink", result.stdout)
+        self.assertNotIn("tether schema", result.stdout)
+        for flag in ("--help", "-h"):
+            result = self.run_cli("demo", flag)
+            self.assertEqual(result.returncode, 0)
+            self.assertIn("offline", result.stdout)
+
+    def test_task_help_never_uses_broker_or_installer(self) -> None:
+        cli, log = self.setup_child_fixtures()
+        before = self.tree_snapshot()
+        for arguments in (("--help",), ("-h",), ("link", "--help"), ("show", "-h"), ("unlink", "--help")):
+            with self.subTest(arguments=arguments):
+                result = self.run_cli("task", *arguments, cli_path=cli)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("--expected-generation N", result.stdout)
+                self.assertIn("tether task show --bridge-id ID", result.stdout)
+                self.assertEqual(self.tree_snapshot(), before)
+                self.assertFalse(log.exists())
+
+    @unittest.skipIf(os.geteuid() == 0, "task mutations intentionally refuse root")
+    def test_task_commands_send_exact_contract_from_source_and_installed_cli(self) -> None:
+        source_cli, log = self.setup_child_fixtures()
+        installed_cli = self.root / "installed" / "bin" / "tether"
+        installed_cli.parent.mkdir(parents=True)
+        installed_cli.write_bytes(CLI.read_bytes())
+        examples = (
+            (("link", "--bridge-id", "bnd_example", "--board", "engineering", "--task-id", "t_0123abcd",
+              "--expected-generation", "2"),
+             {"op": "task_link", "bridge_id": "bnd_example", "task_ref": {"board": "engineering", "task_id": "t_0123abcd"},
+              "expected_generation": 2}),
+            (("show", "--bridge-id", "bnd_example"), {"op": "task_show", "bridge_id": "bnd_example"}),
+            (("unlink", "--bridge-id", "bnd_example", "--expected-generation", "3"),
+             {"op": "task_unlink", "bridge_id": "bnd_example", "expected_generation": 3}),
+            (("link", "--bridge-id", "bnd.example:1-2", "--board", "0" + "b" * 63,
+              "--task-id", "T.review:42-" + "x" * 116, "--expected-generation", "1"),
+             {"op": "task_link", "bridge_id": "bnd.example:1-2", "task_ref": {"board": "0" + "b" * 63,
+              "task_id": "T.review:42-" + "x" * 116}, "expected_generation": 1}),
+        )
+        for cli in (source_cli, installed_cli):
+            for arguments, expected in examples:
+                with self.subTest(cli=cli, verb=arguments[0]):
+                    payload = {"ok": True, "bridge_id": "bnd_example", "generation": 3,
+                               "task_ref": {"board": "engineering", "task_id": "t_0123abcd"}}
+                    with FakeBroker(self.root, lambda _request: self.response(payload)) as broker:
+                        result = self.run_cli("task", *arguments, "--json", socket_path=broker.path, cli_path=cli)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(broker.requests, [expected])
+                    self.assertEqual(json.loads(result.stdout), payload)
+                    self.assertFalse(log.exists(), "task commands never install or run a notifier")
+
+    def test_task_show_default_output_exposes_context_and_binding_generation(self) -> None:
+        payload = {"ok": True, "bridge_id": "bnd_example", "generation": 4, "task_ref": None}
+        with FakeBroker(self.root, lambda _request: self.response(payload)) as broker:
+            result = self.run_cli("task", "show", "--bridge-id", "bnd_example", socket_path=broker.path)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), payload)
+
+    def test_task_invalid_arguments_never_connect_or_install(self) -> None:
+        cli, log = self.setup_child_fixtures()
+        cases = (
+            (), ("create",), ("create", "--help"),
+            ("link", "--bridge-id", "bnd_example", "--board", "engineering", "--task-id", "t_0123abcd"),
+            ("link", "--bridge-id", "bnd_example", "--board", "engineering", "--expected-generation", "1"),
+            ("link", "--bridge-id", "bnd_example", "--task-id", "t_0123abcd", "--expected-generation", "1"),
+            ("unlink", "--bridge-id", "bnd_example"), ("show",),
+            ("show", "--bridge-id", "bnd_example", "--expected-generation", "1"),
+            ("show", "--bridge-id", "bnd_example", "--board", "engineering"),
+            ("show", "--bridge-id", "bnd_example", "--unknown"),
+            ("show", "--bridge-id", "bnd_example", "--bridge-id", "bnd_other"),
+            ("show", "--bridge-id="), ("show", "--help", "--unknown"),
+        )
+        mutation = ("link", "--bridge-id", "bnd_example", "--board", "engineering", "--task-id", "t_0123abcd")
+        cases += tuple((*mutation, "--expected-generation", value) for value in ("0", "-1", "1.5", "abc", "9007199254740992"))
+        for name, invalid in (
+            ("bridge-id", ("../binding", "bnd example", "bnd\nother", "bnd\n", "bnd\r\n", "b" * 129)),
+            ("board", ("Engineering", "../board", "bad.board", "board with spaces", "board\n", "b" * 65)),
+            ("task-id", ("../task", "t bad", "t\tbad", "t/123", "task\n", "t" * 129)),
+        ):
+            for value in invalid:
+                arguments = list(mutation)
+                arguments[arguments.index("--" + name) + 1] = value
+                cases += ((*arguments, "--expected-generation", "1"),)
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+            address = self.root / "untouched.sock"
+            listener.bind(str(address))
+            listener.listen()
+            listener.setblocking(False)
+            before = self.tree_snapshot()
+            for arguments in cases:
+                with self.subTest(arguments=arguments):
+                    result = self.run_cli("task", *arguments, socket_path=address, cli_path=cli)
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    with self.assertRaises(BlockingIOError):
+                        listener.accept()
+                    self.assertFalse(log.exists())
+                    self.assertEqual(self.tree_snapshot(), before)
+
+    def test_task_broker_error_is_rendered_without_retry(self) -> None:
+        payload = {"ok": False, "code": "task_context_unavailable", "message": "Host task capability unavailable.",
+                   "status": "unavailable", "retryable": False}
+        with FakeBroker(self.root, lambda _request: self.response(payload)) as broker:
+            result = self.run_cli("task", "show", "--bridge-id", "bnd_example", "--json", socket_path=broker.path)
+        self.assertEqual(result.returncode, 4)
+        self.assertEqual(json.loads(result.stderr)["code"], "task_context_unavailable")
+        self.assertFalse(json.loads(result.stderr)["retryable"])
+        self.assertEqual(len(broker.requests), 1)
+
+    def test_demo_runs_without_an_installed_runtime(self) -> None:
+        result = self.run_cli("demo", "--json", timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["schema"], "tether-offline-demo/v1")
+        self.assertTrue(payload["ok"])
+        self.assertTrue(payload["simulated"])
+        self.assertEqual(payload["actual_model_calls"], 0)
+        self.assertEqual(payload["actual_slack_calls"], 0)
+        self.assertEqual(payload["native_processes"], 0)
+        human = self.run_cli("demo", timeout=10)
+        self.assertEqual(human.returncode, 0, human.stderr)
+        self.assertIn("Offline simulation", human.stdout)
+        self.assertFalse((self.root / "hermes").exists())
+        self.assertFalse((self.root / "data").exists())
+
+    def test_standalone_installed_cli_runs_adjacent_plugin_demo(self) -> None:
+        cli = self.home / ".local" / "bin" / "tether"
+        cli.parent.mkdir(parents=True)
+        cli.write_bytes(CLI.read_bytes())
+        plugin = self.root / "hermes" / "plugins" / "tether"
+        shutil.copytree(PACKAGE_ROOT / "runtime" / "plugin_next", plugin,
+                        ignore=shutil.ignore_patterns("__pycache__"))
+        before = self.tree_snapshot()
+        result = self.run_cli("demo", "--json", cli_path=cli, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(json.loads(result.stdout)["ok"])
+        self.assertEqual(self.tree_snapshot(), before)
+        self.assertFalse((self.root / "data").exists())
+
+    def test_demo_invalid_flags_do_not_start_python(self) -> None:
+        result = self.run_cli("demo", "--socket=unexpected",
+                              extra_env={"PYTHON_BIN": str(self.root / "nonexistent-python")})
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("Unknown option", result.stderr)
+
+    def test_demo_team_config_uses_custom_names_with_simulated_computers(self) -> None:
+        manifest = self.root / "custom team.toml"
+        manifest.write_text(
+            'version = 1\nself = "ada"\n'
+            '[[colleagues]]\nid = "lin"\nname = "Lin"\nrole = "Reviewer"\n'
+            'slack_id = "U11111111"\ncomputer = "never-launch-this-computer"\n'
+            '[[colleagues]]\nid = "ada"\nname = "Ada"\nrole = "Engineer"\n'
+            'slack_id = "U22222222"\ncomputer = "also-never-launch-this-computer"\n',
+        )
+        before = self.tree_snapshot()
+        result = self.run_cli("demo", "--json", "--team-config", str(manifest), timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertTrue(payload["ok"])
+        self.assertTrue(payload["simulated"])
+        self.assertEqual(payload["colleagues"], {"implementer": "Ada", "reviewer": "Lin"})
+        self.assertEqual(payload["actual_model_calls"], 0)
+        self.assertEqual(payload["actual_slack_calls"], 0)
+        self.assertEqual(payload["native_processes"], 0)
+        self.assertNotIn("U11111111", result.stdout)
+        self.assertNotIn("U22222222", result.stdout)
+        self.assertEqual(self.tree_snapshot(), before)
+
+    def test_missing_installed_demo_returns_a_typed_error_without_installing(self) -> None:
+        cli = self.home / ".local" / "bin" / "tether"
+        cli.parent.mkdir(parents=True)
+        cli.write_bytes(CLI.read_bytes())
+        before = self.tree_snapshot()
+        result = self.run_cli("demo", "--json", cli_path=cli)
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(json.loads(result.stderr)["code"], "demo_unavailable")
+        self.assertEqual(self.tree_snapshot(), before)
 
     def test_malformed_response_is_a_nonzero_protocol_error(self) -> None:
         with FakeBroker(self.root, lambda _request: b"{not-json}\n") as broker:
@@ -737,7 +1045,7 @@ class TetherCliTest(unittest.TestCase):
         self.assertTrue(payload["ok"])
         self.assertIn("ok broker socket is private", payload["checks"])
         self.assertIn(
-            "ok managed install integrity verified (21 files; harness=codex)",
+            "ok managed install integrity verified (25 files; harness=codex)",
             payload["checks"],
         )
         self.assertEqual(payload["status"]["protocol_version"], 6)
@@ -875,7 +1183,7 @@ class TetherCliTest(unittest.TestCase):
             result = self.run_cli("doctor", socket_path=broker.path)
         self.assertEqual(result.returncode, 0, result.stdout)
         self.assertIn(
-            "ok managed install integrity verified (28 files; harness=both)",
+            "ok managed install integrity verified (32 files; harness=both)",
             result.stdout,
         )
 
