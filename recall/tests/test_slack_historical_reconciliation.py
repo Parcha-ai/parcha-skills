@@ -108,6 +108,73 @@ class SlackHistoricalReconciliation(unittest.TestCase):
             finally:
                 active.close()
 
+    def test_parent_only_terminal_reply_page_completes_acknowledged_window(self):
+        self._parent_terminal_window()
+
+    def test_parent_only_terminal_reply_page_waits_for_lost_ack(self):
+        self._parent_terminal_window(lose_ack=True)
+
+    def _parent_terminal_window(self, *, lose_ack=False):
+        rail = HistoricalRail()
+        brain = FakeBrain()
+        with tempfile.TemporaryDirectory() as directory:
+            connector = SlackWorkspaceConnector(
+                rail=rail, source_id='synthetic:slack:terminal-parent', workspace_id='T111',
+            )
+            connector.reconciliation_epoch = 'a' * 64
+            active = ConnectorRunner(connector=connector, brain=brain,
+                                     spool_path=Path(directory) / 'spool.db')
+            try:
+                for _ in range(3):
+                    active.run_once()
+                rail.root['reply_count'] = 1
+                rail.messages.append({'ts': '1784332900', 'user': 'U111',
+                                      'thread_ts': rail.root['ts'], 'text': 'Completed reply'})
+                original = rail.request
+                terminal_queries = []
+
+                def parent_terminal(operation, **arguments):
+                    response = original(operation, **arguments)
+                    query = arguments.get('query', {})
+                    if operation == 'messages.replies' and query.get('inclusive') is False:
+                        if 'oldest' in query:
+                            terminal_queries.append(query)
+                            parent = dict(rail.root, text='Refreshed parent')
+                            brain.fail_after_commit = lose_ack
+                            return {'ok': True, 'messages': [parent], 'has_more': False,
+                                    'response_metadata': {'next_cursor': ''}}
+                        # The provider's continuation may contain only the parent.
+                        response.update(has_more=True, response_metadata={'next_cursor': 'opaque'})
+                    return response
+
+                lost_acknowledgements = 0
+                with patch.object(rail, 'request', side_effect=parent_terminal):
+                    for _ in range(40):
+                        try:
+                            active.run_once()
+                        except ConnectorRunError:
+                            lost_acknowledgements += 1
+                            self.assertTrue(lose_ack and terminal_queries)
+                            pending = active.doctor()['coverage']['historical_reconciliation']
+                            self.assertEqual(pending['completed_channel_visits'], 0)
+                            self.assertTrue(pending['pending_checkpoint'])
+                            active.run_once()
+                        if terminal_queries:
+                            break
+                self.assertEqual(lost_acknowledgements, int(lose_ack))
+                self.assertEqual(len(terminal_queries), 1)
+                self.assertEqual(terminal_queries[0]['oldest'], '1784332900')
+                status = active.doctor()['coverage']['historical_reconciliation']
+                self.assertEqual(status['completed_channel_visits'], 1)
+                self.assertEqual(status['historical_failures'], 0)
+                self.assertFalse(status['pending_checkpoint'])
+                self.assertIn('Completed reply', {event['content'].get('text')
+                                                 for event in brain.events.values()})
+                self.assertFalse(active.doctor()['coverage']['historical_mutations_verified'])
+                self.assertFalse(any(event['kind'] == 'tombstone' for event in brain.events.values()))
+            finally:
+                active.close()
+
     def test_channel_selection_change_restarts_discovery_without_fetching_removed_channel(self):
         rail = HistoricalRail()
         rail.channel_messages['C222'] = [{'ts': '1784332801.000100', 'user': 'U111', 'text': 'Selected channel'}]

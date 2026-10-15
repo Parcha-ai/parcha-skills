@@ -30,6 +30,28 @@ class SlackPaginationBoundary(unittest.TestCase):
                         + f' relation={relation} root=True more=True cursor=True count=1'
                     ])
 
+    def test_parent_echo_cannot_hide_more_pages_or_nonparent_boundary_errors(self):
+        query = {'oldest': '200.000002', 'latest': '400.000004', 'ts': '100.000001'}
+        parent = {'ts': query['ts']}
+        terminal = {'has_more': False, 'response_metadata': {'next_cursor': ''}}
+        cases = [
+            (terminal, [{'ts': '150.000001'}], query, False),
+            ({'has_more': True}, [parent], query, False),
+            ({'has_more': False, 'response_metadata': {'next_cursor': 'opaque'}},
+             [parent], query, False),
+            ({}, [parent], query, False),
+            (terminal, [parent, parent], query, False),
+            (terminal, [parent, {'ts': '250.000001'}], query, False),
+            (terminal, [parent], query, True),
+            (terminal, [{'ts': '400.000004'}], dict(query, ts='400.000004'), False),
+            (terminal, [{'ts': '500.000005'}], dict(query, ts='500.000005'), False),
+        ]
+        for response, messages, params, descending in cases:
+            with self.subTest(response=response, messages=messages, descending=descending):
+                with self.assertLogs('connectors.slack_reconciliation', level='WARNING'):
+                    with self.assertRaisesRegex(ConnectorContractError, 'did not advance'):
+                        time_page(response, messages, params, descending=descending)
+
     def test_valid_pages_keep_their_original_boundary_and_emit_no_warning(self):
         messages = [{'ts': '250.000001'}, {'ts': '350.000001'}]
         query = {'oldest': '200.000002', 'latest': '400.000004'}
