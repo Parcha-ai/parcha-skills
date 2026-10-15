@@ -472,8 +472,14 @@ class CanonicalPlane:
                 candidates.append({key: event[key] for key in
                                    ("source_id", "native_id", "content_sha256", "principal_id")})
         try:
+            from .evidence_projection import CanonicalEvidenceProjector
+            history_projector = self.evidence_projector
+            if (not isinstance(history_projector, CanonicalEvidenceProjector)
+                    or history_projector.projection.archive is not self.chunk_body_archive):
+                history_projector = None
             with prepare_history(self.store, self.chunk_body_archive,
-                                 tenant_id=tenant_id, candidates=candidates) as staged:
+                                 tenant_id=tenant_id, candidates=candidates,
+                                 projector=history_projector) as staged:
                 yield staged
         except HistoryAuthorityError:
             raise CanonicalLifecycleError("canonical_authority_forbidden") from None
@@ -486,6 +492,14 @@ class CanonicalPlane:
                              source_id=source_id, native_ids=native_ids, store=self.store)
         except HistoryUnavailable:
             raise CanonicalLifecycleError("canonical_history_unavailable") from None
+
+    @staticmethod
+    def _lock_history_sources(connection, staged, *, tenant_id, principal_id):
+        if staged is not None:
+            try:
+                staged.lock_sources(connection, tenant_id=tenant_id, principal_id=principal_id)
+            except HistoryAuthorityError:
+                raise CanonicalLifecycleError('canonical_authority_forbidden') from None
 
     def authorize_filesystem_cleanup(self, connection, *, tenant_id, principal_id,
                                      event, connector_id=None):
@@ -705,6 +719,7 @@ class CanonicalPlane:
                 conn.transaction() if _connection is None else nullcontext()
             )
             with transaction_context:
+                self._lock_history_sources(conn, history, tenant_id=tenant_id, principal_id=principal_id)
                 if _filesystem_cleanup(event, connector_id):
                     # Do not let register_source recreate a revoked owner grant.
                     self.authorize_filesystem_cleanup(conn, tenant_id=tenant_id,
@@ -1048,6 +1063,7 @@ class CanonicalPlane:
             with connection.transaction():
                 # Lock cleanup authority before any ordinary member can register
                 # a source, regardless of input order or registration-cache state.
+                self._lock_history_sources(connection, history, tenant_id=tenant_id, principal_id=principal_id)
                 for envelope in events:
                     if _filesystem_cleanup(envelope):
                         self.authorize_filesystem_cleanup(connection, tenant_id=tenant_id,
@@ -1392,6 +1408,7 @@ class CanonicalPlane:
                 tenant_id=tenant_id, principal_id=principal_id, events=events))
             connection = stack.enter_context(self.store.connect())
             with connection.transaction():
+                self._lock_history_sources(connection, history, tenant_id=tenant_id, principal_id=principal_id)
                 self.register_source(
                     connection,
                     tenant_id=tenant_id,
@@ -2064,6 +2081,17 @@ class CanonicalPlane:
                     source_id=source_id,
                     native_ids=native_ids,
                 )
+            # A caller without the revision archive owner may revoke reads, but
+            # must leave this forget resumable rather than hit a late FK failure.
+            with self.store.connect() as connection:
+                retained_history = connection.execute('''SELECT 1
+                    FROM canonical_evidence_objects evidence JOIN canonical_documents document
+                      USING(tenant_id,source_id,document_id)
+                    WHERE document.tenant_id=%s AND document.source_id=%s
+                      AND document.native_id=ANY(%s) LIMIT 1''',
+                    (tenant_id, source_id, native_ids)).fetchone()
+                if retained_history:
+                    raise HistoryUnavailable()
         except Exception:
             with self.store.connect() as conn:
                 conn.execute(

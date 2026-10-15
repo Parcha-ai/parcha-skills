@@ -1,4 +1,4 @@
-"""Restore outgoing revisions before their current-only archive proof can expire.
+"""Preserve outgoing revisions before their current-only archive proof expires.
 
 Preparation owns no connection during object reads. The writer must hold its
 existing native advisory locks before restore_outgoing; a current-body clearer
@@ -41,6 +41,8 @@ class StagedHistory:
         self.file = None
         self.offsets = {}
         self.size = 0
+        self.projector = None
+        self.references = {}
 
     def __enter__(self):
         return self
@@ -101,6 +103,56 @@ class StagedHistory:
         except (KeyError, OSError, ValueError, AttributeError):
             raise HistoryUnavailable() from None
 
+    def archive_outgoing(self, projector, rows):
+        """Publish exact staged revisions through the existing 035 archive owner."""
+        self.projector = projector
+        for row in rows:
+            projector._tenant(row['tenant_id'])
+            bundle = projector._bundle(row, self.read(row))
+            reference = projector.projection.put(tenant_id=row['tenant_id'],
+                source_id=row['source_id'], document_id=row['document_id'], bundle=bundle)
+            metadata = {key: getattr(bundle, key) for key in
+                        ('evidence_id', 'revision', 'text_sha256', 'session_sha256')}
+            metadata['receipt_count'] = len(bundle.chunks)
+            self.references[self.key(row)] = (metadata, reference)
+
+    def cleanup_unowned(self):
+        if self.projector is not None:
+            references = [reference for _, reference in self.references.values()]
+            self.projector._schedule_cleanup(references)
+
+    def lock_sources(self, connection, *, tenant_id, principal_id):
+        """An archived edit cannot recreate a grant revoked during staging."""
+        sources = sorted({key[1] for key in self.references})
+        if not sources:
+            return
+        rows = connection.execute('''SELECT source.source_id
+            FROM canonical_sources source JOIN canonical_source_grants grant_row
+              ON grant_row.tenant_id=source.tenant_id AND grant_row.source_id=source.source_id
+             AND grant_row.principal_id=source.owner_principal_id
+            WHERE source.tenant_id=%s AND source.source_id=ANY(%s)
+              AND source.owner_principal_id=%s AND grant_row.permission='owner'
+            ORDER BY source.source_id FOR SHARE OF source,grant_row''',
+            (tenant_id, sources, principal_id)).fetchall()
+        if [row['source_id'] for row in rows] != sources:
+            raise HistoryAuthorityError()
+        # Commit cleanup intent with the write, including a replay won by a
+        # fallback writer. Queue locks precede the existing artifact admission
+        # locks; the cleaner rechecks durable ownership after commit.
+        from .logical_evidence_projection import CanonicalLogicalEvidenceProjector
+        CanonicalLogicalEvidenceProjector._enqueue_cleanup(connection,
+            tuple(reference for _, reference in self.references.values()))
+
+    def admit_outgoing(self, connection, row):
+        entry = self.references.get(self.key(row))
+        if entry is None:
+            return False
+        bundle, reference = entry
+        if bundle['revision'] != row['revision'] or bundle['text_sha256'] != row['text_sha256']:
+            raise HistoryUnavailable()
+        self.projector.admit_outgoing(connection, row=row, bundle=bundle, reference=reference)
+        return True
+
 
 def _stage_history_rows(store, archive, staged, *, tenant_id, rows, deadline_at=None):
     # Share immutable parts within each parent and retain only eight documents
@@ -136,7 +188,7 @@ def stage_history_rows(store, archive, *, tenant_id, rows, deadline_at):
 
 
 @contextmanager
-def prepare_history(store, archive, *, tenant_id: str, candidates: list[dict[str, Any]]):
+def prepare_history(store, archive, *, tenant_id: str, candidates: list[dict[str, Any]], projector=None):
     """Stage only missing current bodies that a genuinely new revision replaces."""
     with StagedHistory() as staged:
         if not candidates:
@@ -158,7 +210,7 @@ def prepare_history(store, archive, *, tenant_id: str, candidates: list[dict[str
                     raise HistoryAuthorityError()
                 rows = connection.execute(f'''
                     SELECT DISTINCT document.tenant_id,document.source_id,document.document_id,
-                           document.revision,document.text_sha256,
+                           document.revision,document.text_sha256,document.native_id,event.occurred_at,
                            COALESCE(event.native_parent_id,event.native_id) AS native_parent_id
                       FROM jsonb_to_recordset(%s::jsonb) incoming(
                           source_id text,native_id text,content_sha256 text,principal_id text)
@@ -176,14 +228,44 @@ def prepare_history(store, archive, *, tenant_id: str, candidates: list[dict[str
                               AND chunk.text_redacted='' AND chunk.text_sha256<>%s))
                      ORDER BY document.source_id,native_parent_id,document.document_id
                 ''', (encoded, tenant_id, EMPTY_SHA256)).fetchall()
+                if projector is not None and rows:
+                    sources = sorted({row['source_id'] for row in rows})
+                    granted = connection.execute('''SELECT source.source_id
+                        FROM canonical_sources source JOIN canonical_source_grants grant_row
+                          ON grant_row.tenant_id=source.tenant_id AND grant_row.source_id=source.source_id
+                         AND grant_row.principal_id=source.owner_principal_id
+                        WHERE source.tenant_id=%s AND source.source_id=ANY(%s)
+                          AND grant_row.permission='owner' ORDER BY source.source_id''',
+                        (tenant_id, sources)).fetchall()
+                    if [row['source_id'] for row in granted] != sources:
+                        raise HistoryAuthorityError()
+                    identities = [hashlib.sha256('\x1f'.join((tenant_id, row['source_id'], native)).encode()).hexdigest()
+                                  for row in rows for native in (row['native_id'], row['native_parent_id'])]
+                    if connection.execute('''SELECT 1 FROM forget_tombstones
+                        WHERE tenant_id=%s AND source_id=ANY(%s)
+                          AND target_identity_sha256=ANY(%s) LIMIT 1''',
+                        (tenant_id, sources, identities)).fetchone():
+                        raise HistoryUnavailable()
             if rows and archive is None:
                 raise HistoryUnavailable()
             _stage_history_rows(store, archive, staged, tenant_id=tenant_id, rows=rows)
+            if projector is not None:
+                staged.archive_outgoing(projector, rows)
         except HistoryAuthorityError:
             raise
         except Exception:
+            staged.cleanup_unowned()
             raise HistoryUnavailable() from None
-        yield staged
+        try:
+            yield staged
+        except BaseException as error:
+            # The transaction may have committed before its acknowledgement was
+            # lost. The existing cleanup queue rechecks durable catalogue owners.
+            try:
+                staged.cleanup_unowned()
+            except Exception:
+                error.add_note('outgoing history cleanup scheduling failed')
+            raise
 
 
 def restore_outgoing(connection, staged, *, tenant_id, source_id, native_ids, store=None, deadline_at=None, restore_mode="body"):
@@ -211,6 +293,8 @@ def restore_outgoing(connection, staged, *, tenant_id, source_id, native_ids, st
          ORDER BY document.document_id FOR UPDATE
     ''', (tenant_id, source_id, native_ids, EMPTY_SHA256)).fetchall()
     for row in rows:
+        archived = (restore_mode == 'body' and staged is not None
+                    and staged.admit_outgoing(connection, row))
         if restore_mode == 'metadata' and row['chunk_receipt_profile'] is None:
             raise HistoryUnavailable()
         if row['chunk_receipt_profile'] is not None:
@@ -232,7 +316,7 @@ def restore_outgoing(connection, staged, *, tenant_id, source_id, native_ids, st
                 tenant_id,source_id,chunk_id,document_id,ordinal,receipt,text_redacted,text_sha256,created_at)
                 VALUES (%s,%s,%s,%s,0,%s,%s,%s,%s)''',
                 (tenant_id, source_id, member['chunk_id'], row['document_id'], receipt,
-                 restored[0]['text_redacted'] if restore_mode == 'body' else '', member['text_sha256'], row['created_at']))
+                 restored[0]['text_redacted'] if restore_mode == 'body' and not archived else '', member['text_sha256'], row['created_at']))
             changed = execute('''UPDATE canonical_documents SET chunk_receipt_profile=NULL
                 WHERE tenant_id=%s AND source_id=%s AND document_id=%s AND chunk_receipt_profile=1''',
                 (tenant_id, source_id, row['document_id']))
@@ -258,6 +342,8 @@ def restore_outgoing(connection, staged, *, tenant_id, source_id, native_ids, st
             for candidate, chunk in zip(restored, chunks, strict=True)
         ):
             raise HistoryUnavailable()
+        if archived:
+            continue
         payload = [{**candidate, 'text_sha256': chunk['text_sha256']}
                    for candidate, chunk in zip(restored, chunks, strict=True) if chunk['missing']]
         updated = execute('''
