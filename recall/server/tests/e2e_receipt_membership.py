@@ -25,14 +25,8 @@ class ReceiptMembershipTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.store=BrainStore(os.environ['RECALL_DATABASE_URL']);cls.store.migrate()
-        # Compatibility fixtures also support the optional profile column before
-        # migration 080 is applied; no rows are admitted by migration.
-        with cls.store.connect() as connection:
-            connection.execute('ALTER TABLE canonical_documents ADD COLUMN IF NOT EXISTS chunk_receipt_profile smallint')
     @classmethod
     def tearDownClass(cls):
-        with cls.store.connect() as connection:
-            connection.execute('ALTER TABLE canonical_documents DROP COLUMN chunk_receipt_profile')
         cls.store.close()
     def setUp(self):
         nonce=uuid.uuid4().hex
