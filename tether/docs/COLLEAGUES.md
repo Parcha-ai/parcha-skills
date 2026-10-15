@@ -78,3 +78,64 @@ remain in the receipt after temporary files are cleaned up.
 This is a repeatable engineering example. A real implementer/reviewer task
 service, stable Hermes task references, current artifact context and dependency
 wakes belong to the [next product slice](ROADMAP.md).
+
+
+## Link work to an existing Hermes task
+
+Configure only the existing boards this instance should read. In Tether's
+config.toml, place top-level settings before the task_boards table:
+
+```toml
+# Optional exact tenant guard, including linked dependencies.
+task_tenant = "my-team"
+
+[task_boards]
+project = "/absolute/path/to/existing/kanban.db"
+```
+
+The path is an operator setting, not a value accepted from a Slack message.
+Tether never discovers a current board or falls back to HERMES_KANBAN_DB. It
+opens the configured database read-only and requires the host's canonical
+Hermes task read functions. Missing functions or an incompatible schema give
+a task-context error. The local contract checks use Hermes 0.21.1 source;
+this does not establish compatibility with every stock host release.
+
+After attaching a coding session, use its actual bridge ID and existing Hermes
+task ID. Inspect the current generation, then link it explicitly:
+
+```bash
+tether task show --bridge-id "$BRIDGE_ID" --json
+tether task link --bridge-id "$BRIDGE_ID" --board project \
+  --task-id "$TASK_ID" --expected-generation "$GENERATION" --json
+```
+
+Set GENERATION from the binding returned by show. Changing the association
+advances it. A stale generation or queued/running turns prevents reassociation;
+read the current binding again after the active work finishes. To remove the
+link, use task unlink with the current generation.
+
+Before each linked continuation, Tether reads the current task, relevant
+comments, runs, review events, attachments and direct dependency summaries.
+It records a digest and the exact projected evidence on that attempt. A later
+review finding or artifact reference appears on the next turn, including after
+a Store restart. The latest human message follows the task context in the
+prompt so the current request remains explicit.
+
+Task show returns fresh context and the last attempt's context digest. Its
+context_changed_since_last_attempt field tells you when the evidence has
+changed. It does not imply that a new review has happened or invalidate a host
+review automatically. Artifact pointers and acceptance receipts are evidence to
+inspect; a local path is not automatically accessible on another computer.
+
+The rendered context is limited to 32 KiB of UTF-8. Recent history is retained
+with explicit omission counts. Essential task text is not silently truncated;
+if it exceeds the budget, the linked turn fails before starting the computer.
+An unavailable task or scope mismatch also prevents execution and produces a
+failure notice. Unlinked conversations keep their existing continuation path.
+
+A task link grants no dispatcher claim or run ownership. It does not inject
+HERMES_KANBAN_TASK, complete a task from a sent answer, change the model, or
+start another computer. Hermes remains responsible for task writes, review
+state, scheduling and dependency wakes. Linking and showing context are the
+implemented connection; exact-session wakes and a live two-colleague task
+completion episode remain the next build.

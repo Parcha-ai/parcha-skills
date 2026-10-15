@@ -587,6 +587,7 @@ def _build_session_slice(
 ) -> active_module.ActiveSlice:
     from . import session_driver as session_driver_module
     from . import store as store_module
+    from .hermes_tasks import HermesTaskReader
 
     root = home / "plugin-data" / "tether"
     root.mkdir(parents=True, exist_ok=True)
@@ -614,6 +615,8 @@ def _build_session_slice(
             active_settings.persona_id, active_settings.policy_generation,
         ),
         slack=slack,
+        task_reader=HermesTaskReader(active_settings.extra.get("task_boards", {}),
+            tenant=active_settings.extra.get("task_tenant")),
     )
     server = broker_module.BrokerServer(home / "bridge.sock", slice_.handle)
     slice_.broker = server

@@ -28,6 +28,7 @@ from typing import Any, Callable
 from .broker import BrokerRefused
 from .herdr import Herdr, HerdrError, agent_name_for
 from . import team as team_module
+from .task_context import TaskContext, TaskContextError, TaskRef, build_task_context
 
 
 logger = logging.getLogger("hermes_plugins.tether_next.active")
@@ -364,6 +365,8 @@ def load_active_settings(path: Path) -> ActiveSettings:
         codex_driver=str(raw.get("codex_driver") or "app-server"),
         presence=bool(raw.get("presence", True)),
         extra={"default_channel": str(raw.get("default_channel") or ""),
+               "task_boards": raw.get("task_boards", {}),
+               "task_tenant": raw.get("task_tenant"),
                "herdr_workspace": str(raw.get("herdr_workspace") or ""),
                "herdr_session": str(raw.get("herdr_session") or ""),
                "herdr_required": bool(raw.get("herdr_required", False)),
@@ -413,6 +416,9 @@ def compose_prompt(context: dict[str, Any], settings: ActiveSettings, launcher: 
         team_module.render_team(settings.team),
         "",
     ]
+    snapshot = context.get("task_context")
+    if snapshot:
+        lines += [TaskContext(TaskRef.from_dict(snapshot["task_ref"]), snapshot["data"], snapshot["digest"]).render(), ""]
     for turn in context["turns"]:
         payload: dict[str, Any] = {}
         if turn.get("payload_inline"):
@@ -555,6 +561,7 @@ class ActiveSlice:
         egress: Egress,
         descriptor: Any,
         slack: Any = None,
+        task_reader: Any = None,
     ):
         self.runtime = runtime
         self.driver = driver
@@ -562,6 +569,7 @@ class ActiveSlice:
         self.egress = egress
         self.descriptor = descriptor
         self.slack: Any = slack
+        self.task_reader = task_reader
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._workers: dict[str, threading.Thread] = {}
@@ -743,6 +751,29 @@ class ActiveSlice:
     def _drive(self, attempt: dict[str, Any]) -> None:
         context = self.runtime.attempt_context(attempt["attempt_id"])
         launcher = resolve_launcher(self.settings)
+        if context.get("task_ref"):
+            try:
+                snapshot = self._read_task(TaskRef.from_dict(context["task_ref"]))
+                if self._stop.is_set():
+                    raise TaskContextError("task_context_interrupted", "Gateway stopped during task preparation")
+                self.runtime.save_task_context(attempt["attempt_id"], snapshot)
+                context["task_context"] = snapshot.as_dict()
+            except Exception as exc:
+                code = str(getattr(exc, "code", "task_context_unavailable"))
+                if not re.fullmatch(r"[a-z_]{1,64}", code):
+                    code = "task_context_unavailable"
+                self.runtime.finish_attempt(attempt["attempt_id"], state="failed", error_code=code)
+                logger.warning("tether: task preparation refused attempt %s (%s)", attempt["attempt_id"], code)
+                for ts in self._turn_message_ids(context):
+                    self._unreact(context["channel_id"], ts, self.settings.ack_emoji)
+                    self._react(context["channel_id"], ts, self.settings.fail_emoji)
+                try:
+                    self.egress(context["channel_id"], context["thread_ts"],
+                        f"I could not load current context for the linked task ({code}). "
+                        "The coding session was not started. Check the task link and configured board before retrying.")
+                except Exception:
+                    logger.warning("tether: task preparation failure notice was not delivered")
+                return
         prompt = compose_prompt(context, self.settings, launcher)
         try:
             cwd = Path(str(context["source"].get("cwd") or os.getcwd()))
@@ -933,6 +964,39 @@ class ActiveSlice:
 
     def op_identity(self, request: dict[str, Any]) -> dict[str, Any]:
         return dict(self._identity())
+
+    def _read_task(self, ref: TaskRef) -> TaskContext:
+        if self.task_reader is None:
+            raise TaskContextError("task_capability_unavailable", "Configure an explicit task board before linking a task")
+        try:
+            return build_task_context(ref, self.task_reader.read(ref))
+        except TaskContextError:
+            raise
+        except Exception as exc:
+            raise TaskContextError("task_context_unavailable", "The linked task could not be read") from exc
+
+    def op_task_show(self, request: dict[str, Any]) -> dict[str, Any]:
+        binding = self.runtime.task_binding(str(request.get("bridge_id") or ""))
+        snapshot = self._read_task(TaskRef.from_dict(binding["task_ref"])) if binding["task_ref"] else None
+        last = self.runtime.latest_task_attempt(binding["binding_id"])
+        changed = None
+        if snapshot and last and last["task_ref"] == snapshot.ref.as_dict() and last["context_digest"]:
+            changed = last["context_digest"] != snapshot.digest
+        return {"binding": binding, "task_context": snapshot.as_dict() if snapshot else None,
+                "last_attempt": last, "context_changed_since_last_attempt": changed}
+
+    def op_task_link(self, request: dict[str, Any]) -> dict[str, Any]:
+        binding = self.runtime.task_binding(str(request.get("bridge_id") or ""))
+        ref = TaskRef.from_dict(request.get("task_ref"))
+        snapshot = self._read_task(ref)
+        binding = self.runtime.set_task_ref(binding["binding_id"], ref,
+            expected_generation=request.get("expected_generation"))
+        return {"binding": binding, "task_context": snapshot.as_dict()}
+
+    def op_task_unlink(self, request: dict[str, Any]) -> dict[str, Any]:
+        binding = self.runtime.set_task_ref(str(request.get("bridge_id") or ""), None,
+            expected_generation=request.get("expected_generation"))
+        return {"binding": binding, "task_context": None}
 
     def op_maintenance(self, request: dict[str, Any]) -> dict[str, Any]:
         return {"performed": []}

@@ -145,9 +145,13 @@ tether unresolved
 
 These inspect runtime state, thread history and unresolved attempts through
 the local broker. An execution finishing, a reply being sent and the whole
-task being accepted are different outcomes. Durable task/review ownership
-through Hermes is the next product slice; the offline demo is its acceptance
-example, not a live task-management service.
+task being accepted are different outcomes. You can now link a conversation to an existing Hermes task with
+`tether task link`, inspect its current evidence with `tether task show`, and
+carry fresh review findings into subsequent continuations. Task references and
+per-attempt snapshots survive a Store restart. Configure explicit read-only
+boards as described in [Colleagues](docs/COLLEAGUES.md#link-work-to-an-existing-hermes-task).
+Hermes owns task state and completion. Task/review mutations and exact-session
+dependency wakes remain the next product increment.
 
 The broker checks the local Unix user and uses a mode-`0600` socket. The gateway
 holds Slack credentials, and native child environments are allowlisted.

@@ -83,8 +83,17 @@ providers, authenticate accounts, change models or replace a bound session.
 The [team manifest](COLLEAGUES.md) and neutral collaboration contract render
 one shared section for Hermes and native prompts. The active prompt adds
 source/session identity, incoming turns, attachments and reply guidance.
-This is not yet a versioned task context carrying every latest decision,
-artifact revision and unresolved finding; that is a next-slice requirement.
+Linked conversations now receive a fresh, bounded task-only snapshot from an
+explicit Hermes board. The existing Store records the board/task association
+and the exact snapshot/digest used by each attempt. It does not duplicate task
+state or scheduling. Read-only host projection excludes unrelated role history
+and private host workspace/attachment paths. Canonical PR acceptance evidence
+retains the artifact URL, head SHA and verdict.
+
+Association changes require the current binding generation and an idle binding.
+Admission and scheduling serialize with those changes across SQLite connections;
+stale generations cannot execute, even after unlinking. A failed required task
+read becomes a terminal failed attempt before the native computer starts.
 
 Gateway wiring currently uses `SlackEgress` for several direct Slack operations
 while host APIs handle other delivery paths. The desired architecture makes
@@ -112,8 +121,9 @@ extend the episode and regression tests without our fleet or credentials.
 
 ## Next architectural boundary
 
-Stable Hermes task references will connect owners, dependencies, artifact
-revisions and review findings across attempts. Tether will prepare context and
+Stable Hermes task references now connect current task evidence to attempts.
+The next increment connects actual task/review actions and verified dependency
+wakes to the owning native session. Tether will prepare context and
 associate conversation with execution; Hermes task services will remain the
 task authority. Jev can then provide optional contextual judgments over that
 evidence, while identity, permissions and cancellation stay deterministic.

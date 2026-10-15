@@ -160,6 +160,21 @@ increment connects stable Hermes task references, artifact revisions, review
 findings and dependency continuation to a real implementer/reviewer episode.
 That remains part of slice A/B rather than being declared complete by a demo.
 
+### Task context increment, 15 October
+
+The next branch adds explicit existing-board/task links, a read-only canonical
+Hermes task adapter, and fresh task/review evidence before each linked native
+turn. Associations and attempt snapshots persist in the existing Store.
+Task show compares current evidence with the last attempt's digest. Atomic
+admission/scheduling and generation checks prevent reassociation races.
+
+Temporary actual Hermes schema and acceptance-producer tests verify the
+connection without touching a live board or computer. The first public PR767
+was still open with all seven checks passed at this increment's start. These
+changes extend that candidate; they are not evidence of fleet installation.
+Actual task/review actions, exact-session dependency wakes and a live
+implementer/reviewer completion episode remain next.
+
 Work proceeds in visible slices; documentation, evaluation and architecture support each slice rather than forming a long prerequisite campaign.
 
 | Slice | Ship | Work that can proceed together | Depends on |

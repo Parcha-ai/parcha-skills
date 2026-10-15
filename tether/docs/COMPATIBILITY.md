@@ -70,3 +70,17 @@ Keep explicit operator and trusted-bot allowlists in the host/runtime settings.
 The team roster grants no permission. Same-UID local processes share the
 broker's authority boundary. Model and account authentication remain the
 native computer's configuration, not a Slack credential supplied by the CLI.
+
+
+## Linked task context
+
+The task-context extension requires the new Store columns and canonical Hermes
+read APIs. Columns are added transactionally without changing existing binding
+identities. Actual local contract tests use Hermes0.21.1 read functions and
+schema in temporary databases; missing capabilities fail visibly. No host
+schema migration or board creation occurs during a context read.
+
+An older Tether payload ignores task links and snapshots. Stop linked work
+before a code rollback and verify the restored runtime's context capabilities
+before continuing. Installer rollback preserves the database; it does not make
+an older execution engine understand newly added context.

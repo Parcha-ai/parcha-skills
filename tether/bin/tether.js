@@ -191,6 +191,8 @@ function expectedManagedTargetModes(metadata) {
     [path.join(pluginRoot, "herdr.py"), 0o600],
     [path.join(pluginRoot, "demo.py"), 0o600],
     [path.join(pluginRoot, "team.py"), 0o600],
+    [path.join(pluginRoot, "task_context.py"), 0o600],
+    [path.join(pluginRoot, "hermes_tasks.py"), 0o600],
     [path.join(pluginRoot, "team.md"), 0o600],
     [path.join(pluginRoot, "plugin.yaml"), 0o644],
     [path.join(localBin, "tether"), 0o700],
@@ -398,6 +400,7 @@ function printHelp(command = "") {
   const commandHelp = {
     setup: "tether setup [--harness=auto|codex|claude-code|both | --codex | --claude-code | --both] [--team-id T012ABCDEF] [--non-interactive] [--no-restart]\nSupply your Slack workspace ID for fresh interactive setup; existing configured IDs are reused.\nWorkspace IDs start with T and contain 2–31 uppercase letters or digits after it.",
     demo: "tether demo [--json] [--team-config PATH]\nRun a simulated colleague workflow offline; no Slack credentials, model, or gateway required.\nTeam config supplies display names only; Slack IDs and computers remain simulated.",
+    task: "tether task link --bridge-id ID --board SLUG --task-id ID --expected-generation N [--json]\ntether task show --bridge-id ID [--json]\ntether task unlink --bridge-id ID --expected-generation N [--json]\nUse the binding generation returned by show for link and unlink. Task commands use the local broker.",
     status: "tether status [--json] [--socket PATH] [--timeout-ms MS]",
     doctor: "tether doctor [--json] [--socket PATH] [--timeout-ms MS]",
     identity: "tether identity [--json] [--socket PATH] [--timeout-ms MS]",
@@ -423,6 +426,7 @@ function printHelp(command = "") {
 Usage:
   tether setup [--harness=auto|codex|claude-code|both] [--team-id T012ABCDEF] [--non-interactive] [--no-restart]
   tether demo [--json] [--team-config PATH]
+  tether task link|show|unlink [options]
   tether install|upgrade [installer options]
   tether rollback|uninstall [--dry-run] [--restart]
   tether doctor|status|identity|maintenance [--json]
@@ -873,6 +877,7 @@ function assertNonRoot(command) {
   const mutating = new Set([
     "setup", "install", "upgrade", "rollback", "uninstall", "maintenance",
     "notify", "reply", "attach", "rebind", "close", "unbind", "post", "spawn",
+    "task_link", "task_unlink",
   ]);
   if (
     mutating.has(command) &&
@@ -1095,7 +1100,7 @@ function emitResult(command, result, options) {
   const safe = safeValue(result);
   if (
     options.json ||
-    ["identity", "maintenance", "close", "unbind", "unresolved"].includes(command)
+    ["identity", "maintenance", "close", "unbind", "unresolved", "task_link", "task_show", "task_unlink"].includes(command)
   ) {
     writeJson(process.stdout, safe);
     return;
@@ -1255,6 +1260,53 @@ async function runDoctor(options) {
     process.stdout.write(`${checks.join("\n")}\n`);
   }
   return healthy ? 0 : 1;
+}
+
+async function runTaskCommand(argv) {
+  const arguments_ = argv.map((argument) => argument === "-h" ? "--help" : argument);
+  if (arguments_.length === 1 && arguments_[0] === "--help") {
+    printHelp("task");
+    return 0;
+  }
+  const verb = arguments_.shift();
+  if (!["link", "show", "unlink"].includes(verb)) {
+    throw new CliError("Choose a task command: link, show, or unlink. Use `tether task --help` for syntax.");
+  }
+  const definitions = optionDefinitions({
+    help: { type: "flag" },
+    "bridge-id": { type: "value" },
+    ...(verb === "link" ? { board: { type: "value" }, "task-id": { type: "value" } } : {}),
+    ...(verb !== "show" ? { "expected-generation": { type: "value" } } : {}),
+  });
+  const options = parseOptions(arguments_, definitions);
+  if (options.help) {
+    printHelp("task");
+    return 0;
+  }
+  const identifier = (name, pattern, format) => {
+    const value = requireOption(options, name);
+    const match = pattern.exec(value);
+    if (!match || match[0] !== value) throw new CliError(`--${name} must be ${format}.`);
+    return value;
+  };
+  const token = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/;
+  const request = {
+    op: `task_${verb}`,
+    bridge_id: identifier("bridge-id", token, "a 1–128 character identifier using letters, digits, '_', '.', ':' or '-', starting with a letter or digit"),
+  };
+  if (verb !== "show") {
+    request.expected_generation = parseGeneration(requireOption(options, "expected-generation"));
+  }
+  if (verb === "link") {
+    request.task_ref = {
+      board: identifier("board", /^[a-z0-9][a-z0-9_-]{0,63}$/, "a 1–64 character lowercase board slug using letters, digits, '_' or '-', starting with a letter or digit"),
+      task_id: identifier("task-id", token, "a 1–128 character identifier using letters, digits, '_', '.', ':' or '-', starting with a letter or digit"),
+    };
+  }
+  assertNonRoot(request.op);
+  const result = await brokerCall(request, options);
+  emitResult(request.op, result, options);
+  return 0;
 }
 
 async function runBrokerCommand(command, argv) {
@@ -1541,6 +1593,7 @@ async function main() {
   }
 
   if (command === "demo") return runDemo(argv);
+  if (command === "task") return runTaskCommand(argv);
   if (command === "setup") {
     const args = setupArguments(argv);
     if (args.help) {

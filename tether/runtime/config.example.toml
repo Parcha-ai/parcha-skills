@@ -41,3 +41,12 @@ zellij_agent_commands = ["claude", "codex", "gemini", "hermes", "pi"]
 # JSON object containing short-lived environment values on stdout.
 credential_command = []
 credential_env_allowlist = []
+
+# Optional exact tenant guard for every linked task and its dependencies.
+# task_tenant = "my-team"
+
+# Read-only task context. Each board must name an existing Hermes task database.
+# No ambient board/database fallback, creation, migration or task claim occurs.
+# Keep all top-level settings above this table.
+[task_boards]
+# project = "/home/you/.hermes/kanban/boards/project/kanban.db"
