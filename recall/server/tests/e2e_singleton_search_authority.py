@@ -55,6 +55,16 @@ class SingletonSearchTests(fixtures.ReceiptMembershipTests):
         self.assertEqual(result['diagnostics']['authority_status'], 'ok')
         self.assertEqual(result['results'], original['results'])
         self.assertEqual(result['arms'], original['arms'])
+        stages = result['diagnostics']['authority_stages']
+        self.assertEqual(stages['path'], 'singleton')
+        self.assertEqual(stages['unique_receipts'], 1)
+        self.assertEqual(stages['allowed_receipts'], 1)
+        self.assertGreaterEqual(stages['receipt_references'], 1)
+        self.assertGreaterEqual(stages['selected_passages'], 1)
+        for key in ('checkout_ms', 'catalog_ms', 'receipt_prepare_ms',
+                    'membership_ms', 'transaction_exit_ms'):
+            self.assertGreaterEqual(stages[key], 0)
+        self.assertEqual(original['diagnostics']['authority_stages']['path'], 'legacy')
 
     def test_search_mixed_profile_keeps_physical_deletion_fence(self):
         self.prepare_search(mixed=True)
@@ -68,6 +78,8 @@ class SingletonSearchTests(fixtures.ReceiptMembershipTests):
         self.assertEqual(result['diagnostics']['authority_status'], 'ok')
         self.assertEqual(result['results'], [])
         self.assertTrue(all(not rows for rows in result['arms'].values()))
+        self.assertEqual(result['diagnostics']['authority_stages']['unique_receipts'], 2)
+        self.assertEqual(result['diagnostics']['authority_stages']['allowed_receipts'], 1)
 
     def test_search_atomic_admission_snapshot_has_physical_or_profile_proof(self):
         from recall_server.chunk_retirement import retire_current_chunks
@@ -118,6 +130,8 @@ class SingletonSearchTests(fixtures.ReceiptMembershipTests):
         self.assertEqual(result['results'], [])
         self.assertTrue(all(not rows for rows in result['arms'].values()))
         self.assertFalse(any(query['rank_by'] == ('id', 'asc') for query in self.namespace.queries))
+        self.assertIsNone(result['diagnostics']['authority_stages']['membership_ms'])
+        self.assertIsNone(result['diagnostics']['authority_stages']['allowed_receipts'])
 
     def test_search_profile_cannot_override_wrong_physical_ordinal(self):
         self.prepare_search()
