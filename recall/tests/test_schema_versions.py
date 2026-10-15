@@ -25,6 +25,8 @@ class ExpectedSchemaVersionsTests(unittest.TestCase):
         self.assertEqual(self.versions(79, False), [*range(1, 71), 72, 73, 74, 75, 76, 77, 78, 79])
         self.assertEqual(self.versions(80, False), [*range(1, 71), 72, 73, 74, 75, 76, 77, 78, 79, 80])
 
+        self.assertEqual(self.versions(81, False), [*range(1, 71), *range(72, 82)])
+
     def test_known_071_can_ship_without_creating_a_gap(self):
         self.assertEqual(self.versions(71, True), list(range(1, 72)))
         self.assertEqual(self.versions(72, True), list(range(1, 73)))
@@ -37,6 +39,8 @@ class ExpectedSchemaVersionsTests(unittest.TestCase):
         self.assertEqual(self.versions(79, True), list(range(1, 80)))
         self.assertEqual(self.versions(80, True), list(range(1, 81)))
 
+        self.assertEqual(self.versions(81, True), list(range(1, 82)))
+
     def test_declared_latest_must_equal_last_shipped_version(self):
         for latest, native_file in ((71, False), (70, True)):
             with self.subTest(latest=latest, native_file=native_file):
@@ -44,7 +48,7 @@ class ExpectedSchemaVersionsTests(unittest.TestCase):
                     self.versions(latest, native_file)
 
     def test_unknown_latest_is_not_implicitly_allowed(self):
-        for latest in (69, 81):
+        for latest in (69, schema_versions.SCHEMA_VERSION + 1):
             with self.subTest(latest=latest):
                 with self.assertRaisesRegex(AssertionError, "unreviewed latest"):
                     self.versions(latest, False)

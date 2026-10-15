@@ -221,7 +221,7 @@ class DatabaseCapabilityContractTest(unittest.TestCase):
                     snapshot["postgres_vector_plane_present"] = not retired
                     result = assess_snapshot(snapshot)
                     self.assertEqual(result["schema_version"], 79 if marker else 69)
-                    snapshot["migration_versions"].append(81)
+                    snapshot["migration_versions"].append(SCHEMA_VERSION + 1)
                     with self.assertRaisesRegex(CapabilityError, "schema_drift"):
                         assess_snapshot(snapshot)
 
@@ -235,11 +235,24 @@ class DatabaseCapabilityContractTest(unittest.TestCase):
             with self.assertRaisesRegex(CapabilityError, "schema_drift"):
                 assess_snapshot(snapshot)
 
+    def test_forgotten_digest_type_marker_is_optional_and_keeps_exact_schema_fences(self) -> None:
+        for marker in (False, True):
+            snapshot = healthy_snapshot()
+            snapshot["migration_versions"] = list(range(1, 70)) + ([81] if marker else [])
+            snapshot["postgres_vector_plane_present"] = False
+            self.assertEqual(assess_snapshot(snapshot)["schema_version"], 81 if marker else 69)
+            for versions in (snapshot["migration_versions"] + [SCHEMA_VERSION + 1],
+                             snapshot["migration_versions"] + [81, 81],
+                             [v for v in snapshot["migration_versions"] if v != 69]):
+                snapshot["migration_versions"] = versions
+                with self.assertRaisesRegex(CapabilityError, "schema_drift"):
+                    assess_snapshot(snapshot)
+
     def test_native_conversation_marker_cannot_hide_gaps_or_unknown_versions(self) -> None:
         complete = list(range(1, 72))
         for versions in ([n for n in complete if n != 69],
                          [n for n in complete if n != 68],
-                         complete + [81], complete + [71],
+                         complete + [SCHEMA_VERSION + 1], complete + [71],
                          complete[:-2] + [71, 70]):
             with self.subTest(versions=versions):
                 snapshot = healthy_snapshot()
@@ -252,7 +265,7 @@ class DatabaseCapabilityContractTest(unittest.TestCase):
         complete = list(range(1, 71))
         for versions in ([n for n in complete if n != 68],
                          [n for n in complete if n != 69],
-                         complete + [81], complete + [70],
+                         complete + [SCHEMA_VERSION + 1], complete + [70],
                          complete[:-2] + [70, 69]):
             with self.subTest(versions=versions):
                 snapshot = healthy_snapshot()
