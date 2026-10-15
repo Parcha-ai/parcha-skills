@@ -87,7 +87,8 @@ class MonthTimingTest(unittest.TestCase):
         metrics = self.fields(captured)
         self.assertEqual(result['rows'], 1)
         self.assertEqual(metrics, {
-            'month_ms': 2500, 'catalog_ms': 250, 'catalog_calls': 1,
+            # Existing phases plus return of the publication lease connection.
+            'month_ms': 2625, 'catalog_ms': 250, 'catalog_calls': 1,
             'commit_ms': 250, 'commit_calls': 1,
             'page_ms': 750, 'page_calls': 1, 'pacer_ms': 250, 'pacer_calls': 1,
             'sdk_ms': 1000, 'sdk_calls': 1, 'backoff_ms': 0, 'backoff_calls': 0,
