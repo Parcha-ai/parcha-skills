@@ -10,6 +10,8 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest.mock import patch
+from types import SimpleNamespace
 import uuid
 
 RECALL = Path(__file__).resolve().parents[2]
@@ -368,8 +370,13 @@ class SlotBounds(AdmissionSharing):
             return uploads
 
         self.logical._prepare_batch_and_upload = prepare
-        deadline = time.monotonic() + 0.2
-        with ThreadPoolExecutor(max_workers=1) as executor:
+        now = [time.monotonic()]
+        deadline = now[0] + 1000
+        module = sys.modules[CanonicalLogicalEvidenceProjector.__module__]
+        with (
+            patch.object(module, "time", SimpleNamespace(monotonic=lambda: now[0])),
+            ThreadPoolExecutor(max_workers=1) as executor,
+        ):
             future = executor.submit(
                 self.logical.project_pending,
                 batch_size=500,
@@ -379,7 +386,7 @@ class SlotBounds(AdmissionSharing):
             )
             try:
                 self.assertTrue(started.wait(2))
-                time.sleep(max(0, deadline - time.monotonic()) + 0.02)
+                now[0] = deadline + 1
                 self.assertFalse(
                     future.done(), "active proof was cancelled on admission expiry"
                 )
