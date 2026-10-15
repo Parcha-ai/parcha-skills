@@ -418,6 +418,11 @@ def run_projection_worker(
                     previous_started += clock() - publication_started
                 active_phase, phase_started = previous_phase, previous_started
 
+            def publish_progress():
+                # Frequent completions can prevent the idle heartbeat entirely.
+                maintain_retirement(True)
+                publish_ready()
+
             # Drain existing work first, then publish completed parents while
             # unrelated preparation continues in the bounded logical executor.
             publish_ready()
@@ -431,7 +436,7 @@ def run_projection_worker(
                 quiet_seconds=quiet_seconds,
                 max_wait_seconds=max_wait_seconds,
                 cleanup_concurrency=cleanup_concurrency,
-                on_progress=publish_ready,
+                on_progress=publish_progress,
                 on_heartbeat=heartbeat if search_plane is not None or retirement_maintainer is not None or background_thinner is not None else None,
             )
             logical_elapsed_ms = elapsed_ms(phase_started)
