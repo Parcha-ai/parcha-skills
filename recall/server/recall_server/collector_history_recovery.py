@@ -17,11 +17,19 @@ from psycopg.pq import PipelineStatus, TransactionStatus
 from contracts.v2 import IDENTITY_RE, validate_contract
 
 from .canonical import _identity_sha256, _opaque, _source_ordinal
+from .canonical_text import MAX_CANONICAL_CHUNK_BYTES, MAX_CANONICAL_TEXT_BYTES
 from .chunk_retirement import require_retirement_owner
 from .canonical_thinning import _compact_event_expression
 from .control import ControlPlane
 from .logical_evidence_projection import _validate_source_body
 from .projectors import canonical_json, item_receipt, validate_envelope
+
+
+# canonical_text_chunks can back off three UTF-8 bytes, then split within its
+# final 2,048 characters (at most four bytes each). Every nonfinal chunk is at
+# least this large, including paragraph-aware splits; the last may be smaller.
+_MIN_NONFINAL_CHUNK_BYTES = MAX_CANONICAL_CHUNK_BYTES - 3 - 4 * 2_048
+_MAX_RECOVERY_CHUNKS = (MAX_CANONICAL_TEXT_BYTES - 1) // _MIN_NONFINAL_CHUNK_BYTES + 1
 
 
 class CollectorHistoryRecoveryError(RuntimeError):
@@ -125,21 +133,22 @@ def _read(plane, connection, tenant_id, principal_id, expected, deadline, *, loc
     chunks = query('''SELECT ordinal,receipt,text_sha256,deleted_at,
         octet_length(text_redacted) AS text_bytes
         FROM canonical_chunks WHERE tenant_id=%s AND source_id=%s AND document_id=%s
-        ORDER BY ordinal LIMIT 129''' + (' FOR UPDATE NOWAIT' if lock else ''),
-        (*scope, expected['document_id'])).fetchall()
-    if (not 1 <= len(chunks) <= 128
+        ORDER BY ordinal LIMIT %s''' + (' FOR UPDATE NOWAIT' if lock else ''),
+        (*scope, expected['document_id'], _MAX_RECOVERY_CHUNKS + 1)).fetchall()
+    if (not 1 <= len(chunks) <= _MAX_RECOVERY_CHUNKS
             or documents[0]['text_sha256'] != expected['text_sha256']
             or len(chunks) == 1 and chunks[0]['text_sha256'] != expected['text_sha256']
             or any(chunk['ordinal'] != ordinal or chunk['deleted_at'] is None
                    or type(chunk['text_bytes']) is not int or chunk['text_bytes'] <= 0
                    or chunk['receipt'] != item_receipt(source, native, 1, ordinal)
                    for ordinal, chunk in enumerate(chunks))
-            or not 0 < sum(chunk['text_bytes'] for chunk in chunks) == expected['text_bytes'] <= 65536):
+            or not 0 < sum(chunk['text_bytes'] for chunk in chunks) == expected['text_bytes'] <= MAX_CANONICAL_TEXT_BYTES):
         _refuse('chunk_changed')
     bodies = query('''SELECT ordinal,
-        CASE WHEN octet_length(text_redacted)<=65536 THEN text_redacted END AS text_redacted
+        CASE WHEN octet_length(text_redacted)<=%s THEN text_redacted END AS text_redacted
         FROM canonical_chunks WHERE tenant_id=%s AND source_id=%s AND document_id=%s
-        ORDER BY ordinal LIMIT 129''', (*scope, expected['document_id'])).fetchall()
+        ORDER BY ordinal LIMIT %s''', (MAX_CANONICAL_TEXT_BYTES, *scope,
+            expected['document_id'], _MAX_RECOVERY_CHUNKS + 1)).fetchall()
     if (len(bodies) != len(chunks)
             or any(body['ordinal'] != chunk['ordinal']
                    or not isinstance(body['text_redacted'], str)
@@ -209,7 +218,7 @@ def recover_collector_history(plane, *, tenant_id, principal_id, expected, opera
     if (not isinstance(expected, dict) or set(expected) != fields
             or any(not isinstance(v, str) or not IDENTITY_RE.fullmatch(v)
                    for v in (tenant_id, principal_id, *(expected[k] for k in fields - {'text_bytes','text_sha256'})))
-            or type(expected['text_bytes']) is not int or not 0 < expected['text_bytes'] <= 65536
+            or type(expected['text_bytes']) is not int or not 0 < expected['text_bytes'] <= MAX_CANONICAL_TEXT_BYTES
             or not isinstance(expected['text_sha256'], str) or len(expected['text_sha256']) != 64):
         _refuse('scope_invalid')
     operation_id = str(uuid.UUID(operation_id))
@@ -228,13 +237,16 @@ def recover_collector_history(plane, *, tenant_id, principal_id, expected, opera
     if type(generation) is not int or generation < 0:
         _refuse('generation_invalid')
     content['_recall_collector_generation'] = generation + 1
+    encoded_content = canonical_json(content)
+    if len(encoded_content) > MAX_CANONICAL_TEXT_BYTES:
+        _refuse('content_too_large')
     metadata = before['publication_metadata']
     event = dict(schema_version=1, source_id=expected['source_id'], native_id=expected['native_id'],
         kind=original['kind'], occurred_at=original['occurred_at'].isoformat(),
         observed_at=original['observed_at'].isoformat(), principal_id=metadata['principal_id'],
         visibility=metadata['visibility'], content_type='application/json', content=content,
         provenance={**metadata['provenance'], 'artifact_ref': before['artifact']},
-        content_sha256=hashlib.sha256(canonical_json(content)).hexdigest())
+        content_sha256=hashlib.sha256(encoded_content).hexdigest())
     if original['native_parent_id'] is not None:
         event['native_parent_id'] = original['native_parent_id']
     validate_envelope(event)
@@ -251,7 +263,7 @@ def recover_collector_history(plane, *, tenant_id, principal_id, expected, opera
                     if after != before:
                         _refuse('snapshot_changed')
                     result = plane._write_authorized_document(conn, tenant_id=tenant_id, connector_id='claude.jsonl',
-                        artifact=before['artifact'], event=event, text_redacted=canonical_json(content).decode())
+                        artifact=before['artifact'], event=event, text_redacted=encoded_content.decode())
                     if result['revision'] != 3 or result['inserted'] != 1:
                         _refuse('revision_changed')
                     conn.execute('''INSERT INTO control_audit_events(id,principal_id,operation,status,target_sha256)
