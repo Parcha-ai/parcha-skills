@@ -286,12 +286,15 @@ class AuthorityIndexOperationTest(unittest.TestCase):
         with psycopg.connect(self.dsn) as holder:
             holder.execute('SELECT pg_current_xact_id()')
             original = vacuum_authority_fixture
-            started = time.monotonic()
-            with patch(__name__ + '.vacuum_authority_fixture',
-                       side_effect=lambda connection: original(connection, timeout=0.15)):
+            def bounded_setup(connection):
+                started = time.monotonic()
+                try:
+                    return original(connection, timeout=0.15)
+                finally:
+                    self.assertLess(time.monotonic() - started, 3)
+            with patch(__name__ + '.vacuum_authority_fixture', side_effect=bounded_setup):
                 with self.assertRaisesRegex(AssertionError, 'fixture_visibility_not_ready') as error:
                     self.test_current_authority_query_uses_covering_indexes_without_heap_fetches()
-            self.assertLess(time.monotonic() - started, 3)
             self.assertIn('backend_xid', str(error.exception))
             self.assertNotIn('query', str(error.exception))
             self.assertEqual(self.conn.execute('SHOW statement_timeout').fetchone()['statement_timeout'], '0')
