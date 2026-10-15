@@ -26,6 +26,7 @@ PASSAGE_CONTRACT = "recall.lossless-message-passage.v4:actor-aware"
 PASSAGE_SEPARATOR = "\n"
 # H2-a contextual header: embedding input only, never part of the passage
 # text, spans, receipts, text_sha256, or passage id.
+COMPLETE_REPORT_UNIT = "subagent_handback.complete.v1"
 MAX_PASSAGE_HEADER_BYTES = 512
 PASSAGE_HEADER_OPEN = "[context]"
 PASSAGE_HEADER_CLOSE = "[passage]"
@@ -79,17 +80,17 @@ def _text_blocks(value: object) -> tuple[str, ...]:
     return _text_blocks(content) if content is not None else ()
 
 
-def visible_message_text(text: str) -> str | None:
+def _visible_message(text: str) -> tuple[str | None, str | None]:
     """Project harness envelopes to their exact human-visible message text."""
 
     try:
         value = orjson.loads(text)
     except orjson.JSONDecodeError:
-        return text if text.strip() else None
+        return (text if text.strip() else None), None
     if isinstance(value, str):
-        return value if value.strip() else None
+        return (value if value.strip() else None), None
     if not isinstance(value, dict):
-        return None
+        return None, None
 
     candidates: list[object] = []
     payload = value.get("payload")
@@ -108,7 +109,7 @@ def visible_message_text(text: str) -> str | None:
         for block in _text_blocks(candidate)
     ))
     if blocks:
-        return "\n".join(blocks)
+        return "\n".join(blocks), None
     # Claude can deliver its final report through this named tool instead of a
     # text block. Keep existing visible projections (and their offsets) intact.
     if (
@@ -117,7 +118,7 @@ def visible_message_text(text: str) -> str | None:
         or message.get("role") != "assistant"
         or not isinstance(message.get("content"), list)
     ):
-        return None
+        return None, None
     reports = []
     for block in message["content"]:
         if (
@@ -134,7 +135,11 @@ def visible_message_text(text: str) -> str | None:
             and report["message"].strip()
         ):
             reports.append(report["message"])
-    return "\n".join(dict.fromkeys(reports)) if reports else None
+    return ("\n".join(dict.fromkeys(reports)), COMPLETE_REPORT_UNIT) if reports else (None, None)
+
+
+def visible_message_text(text: str) -> str | None:
+    return _visible_message(text)[0]
 
 
 @dataclass(frozen=True)
@@ -181,6 +186,7 @@ class PassageMessage:
     text: str
     record_count: int = 1
     actor_links: tuple[ActorLink, ...] = ()
+    source_unit: str | None = None
 
     def validate(self) -> None:
         if (
@@ -205,6 +211,7 @@ class PassageMessage:
             or isinstance(self.record_count, bool)
             or not isinstance(self.record_count, int)
             or self.record_count < 1
+            or self.source_unit not in (None, COMPLETE_REPORT_UNIT)
             or actor_links(self.actor_links) != self.actor_links
         ):
             raise ValueError(
@@ -229,6 +236,7 @@ class PassageSpan:
     source_byte_end: int
     passage_byte_start: int
     passage_byte_end: int
+    source_unit: str | None = None
 
 
 @dataclass(frozen=True)
@@ -485,7 +493,8 @@ def canonical_spans_json(spans: tuple[PassageSpan, ...]) -> str:
     """Canonical JSON for a passage's record windows (sorted keys, no spaces)."""
 
     return json.dumps(
-        [asdict(span) for span in spans],
+        [{key: value for key, value in asdict(span).items()
+          if key != "source_unit" or value is not None} for span in spans],
         sort_keys=True,
         separators=(",", ":"),
     )
@@ -524,6 +533,47 @@ def passage_identity(
 
 
 def build_passages(
+    *, tenant_id: str, source_id: str, logical_document_id: str,
+    revision: int, messages: tuple[PassageMessage, ...], policy: PassagePolicy,
+) -> tuple[LosslessPassage, ...]:
+    """Keep typed report boundaries while retaining ordinary token windows."""
+    arguments = dict(tenant_id=tenant_id, source_id=source_id,
+                     logical_document_id=logical_document_id, revision=revision,
+                     policy=policy)
+    if not isinstance(messages, tuple) or not all(isinstance(m, PassageMessage) for m in messages):
+        return _build_passages(messages=messages, **arguments)
+    reports = [i for i, message in enumerate(messages) if message.source_unit == COMPLETE_REPORT_UNIT]
+    if not reports:
+        return _build_passages(messages=messages, **arguments)
+    if any(b.record_ordinal < a.record_ordinal + a.record_count for a, b in zip(messages, messages[1:])):
+        raise ValueError("lossless passage records must be unique and ordered")
+    groups = []
+    start = 0
+    for index in reports:
+        if start < index:
+            groups.append((start, index, False))
+        groups.append((index, index + 1, True))
+        start = index + 1
+    if start < len(messages):
+        groups.append((start, len(messages), False))
+    output = []
+    for start, end, report in groups:
+        built = _build_passages(messages=messages[start:end], **arguments)
+        for passage in built:
+            complete = (report and len(built) == 1
+                        and passage.token_count <= DEFAULT_PASSAGE_POLICY.target_tokens
+                        and passage.text == messages[start].text)
+            spans = tuple(replace(span, message_index=span.message_index + start,
+                                  source_unit=COMPLETE_REPORT_UNIT if complete else None)
+                          for span in passage.spans)
+            identity = passage_identity(tenant_id=tenant_id, source_id=source_id,
+                logical_document_id=logical_document_id, policy_fingerprint=policy.fingerprint,
+                text_sha256=passage.text_sha256, spans=spans)
+            output.append(replace(passage, passage_id=identity, ordinal=len(output), spans=spans))
+    return tuple(output)
+
+
+def _build_passages(
     *,
     tenant_id: str,
     source_id: str,
@@ -774,7 +824,7 @@ def visible_messages(
             or not set(dense_roles) <= VISIBLE_DENSE_ROLES
         ):
             continue
-        text = visible_message_text(source_text)
+        text, source_unit = _visible_message(source_text)
         if text is None:
             continue
         message = PassageMessage(
@@ -785,6 +835,7 @@ def visible_messages(
             receipts=first.receipts,
             text=text,
             actor_links=first.actor_links,
+            source_unit=source_unit,
         )
         message.validate()
         messages.append(message)
