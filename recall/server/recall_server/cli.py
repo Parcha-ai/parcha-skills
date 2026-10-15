@@ -50,6 +50,7 @@ from .passage_projection import PassagePolicy
 from .parquet_scan import CanonicalParquetScanProjector
 from .passage_worker import run_passage_worker
 from .projection_worker import BackgroundBodyThinner, run_embedding_worker, run_projection_worker
+from .worker_connections import WorkerWriteStore
 from .federation import QUALITY_SCORES, SOURCE_FAMILIES
 from .live_providers import (
     LiveProviderError,
@@ -2578,8 +2579,9 @@ def main() -> None:
             pending = search_outbox_pending(connection, tenant_id=args.tenant)
         print(json.dumps({"seeded": seeded, "pending": pending}, sort_keys=True))
     elif args.command == "projection-worker":
+        background_store = WorkerWriteStore(store)
         logical = CanonicalLogicalEvidenceProjector(
-            store,
+            background_store,
             LogicalEvidenceProjectionStore(
                 build_evidence_archive_store(),
                 part_upload_concurrency=min(4, args.upload_concurrency),
@@ -2602,7 +2604,7 @@ def main() -> None:
             store,
             LogicalEvidenceProjectionStore(build_evidence_archive_store()),
         )
-        body_thinner = CanonicalBodyThinner(store, tenant_id=args.tenant)
+        body_thinner = CanonicalBodyThinner(background_store, tenant_id=args.tenant)
         retirement = None
         if args.retirement == "on":
             metadata_options = {"metadata_mode": args.retirement_metadata} if args.retirement_metadata != "keep" else {}
