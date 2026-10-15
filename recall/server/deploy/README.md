@@ -285,7 +285,7 @@ are supported: versions through 69 are required except optional migration 67,
 which retires the Postgres vector plane and is applied explicitly from the
 turbopuffer plane. Migration 70 adds only a reconciliation performance index;
 serving accepts both schema 69 and 70 and reports the actual recorded version.
-The latest shipped migration is 80; migration 71 remains optional and reserved
+The latest shipped migration is 81; migration 71 remains optional and reserved
 for native-conversation metadata. Migration 72 adds nullable
 `canonical_evidence_document_queue.notification_queued_at`, with no default,
 index, or historical reclassification. Apply it before deploying the notification
@@ -1714,3 +1714,8 @@ The existing queue upsert/delete statements return the capability check; an abse
 ingest performs one additional indexed classification statement and full publication
 performs one frontier-binding statement. This preparatory change alone does not reduce
 full-parent reads, and that overhead must be included in the append-reader acceptance.
+
+Migration 81 changes only the forgotten-identity trigger digest variable to
+`char(64)`, matching the existing tombstone primary key. Its rejection rule is
+unchanged. Apply the exact migration through the reviewed migration owner; image
+deployment does not run it. The marker is optional for capability admission.

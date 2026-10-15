@@ -25,6 +25,8 @@ RETIREMENT_MAINTENANCE_VERSION = 78
 LOGICAL_APPEND_CAPABILITY_VERSION = 79
 # Optional exact singleton profile; no row is admitted by its migration.
 SINGLETON_RECEIPT_PROFILE_VERSION = 80
+# Optional type correction for the existing forgotten-identity trigger.
+FORGOTTEN_EVENT_DIGEST_TYPE_VERSION = 81
 # Optional until a delayed Slack body needs a terminal-identity ACK.
 SUPPRESSED_ARTIFACT_SCHEMA_VERSION = 77
 MANDATORY_SCHEMA_VERSION = 69
