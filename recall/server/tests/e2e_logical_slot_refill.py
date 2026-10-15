@@ -355,6 +355,53 @@ class SlotBounds(AdmissionSharing):
             self.assertEqual(future.result(timeout=10)["documents"], 7)
             self.assertEqual(len(hot_arrivals), 3)
 
+    def test_fresh_third_source_enters_during_held_publication(self):
+        for name, source in (("slow-a", "source:a"), ("first-b", "source:b"),
+                             ("second-b", "source:b")):
+            self.add(name, age=90000, source=source)
+        held, release, third = (threading.Event() for _ in range(3))
+        started = []
+        original = self.logical._prepare_batch_and_upload
+
+        def prepare(candidates, **kwargs):
+            uploads = original(candidates, **kwargs)
+            name = candidates[0].native_parent_id
+            started.append(name)
+            if name == "slow-a" and not release.wait(10):
+                raise AssertionError("slow_owner_not_released")
+            if name == "second-b" and not held.wait(10):
+                raise AssertionError("publication_not_started")
+            if name == "third-c":
+                third.set()
+            return uploads
+
+        callbacks = []
+
+        def publish():
+            callbacks.append(True)
+            if len(callbacks) == 1:
+                self.add("third-c", age=100, source="source:c")
+                self.add("hot-b", age=80000, source="source:b")
+                held.set()
+                self.assertTrue(third.wait(3), "refill stopped behind publication")
+
+        self.logical._prepare_batch_and_upload = prepare
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(self.logical.project_pending, batch_size=500,
+                max_batches=2, upload_concurrency=2, on_progress=publish)
+            try:
+                self.assertTrue(third.wait(5))
+                self.assertLess(started.index("third-c"),
+                                started.index("hot-b") if "hot-b" in started else 999)
+            finally:
+                held.set()
+                release.set()
+            result = future.result(timeout=10)
+        self.assertEqual(result["documents"], 5)
+        self.assertEqual(result["pending"], 0)
+        self.assertEqual(result["batches"], 1)
+        self.assertEqual(len(started), len(set(started)))
+
     def test_expiring_deadline_settles_active_owner_without_more_admission(self):
         for name in ("first", "second"):
             self.add(name, age=100)
