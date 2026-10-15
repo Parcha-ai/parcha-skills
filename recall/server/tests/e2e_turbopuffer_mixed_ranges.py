@@ -136,6 +136,43 @@ class MixedRanges(unittest.TestCase):
         self.assertTrue(after.issubset(set(before)))
         self.assertTrue(arm_parents - {current['logical_document_id']})
 
+    def test_authorized_range_keeps_prior_nominee_after_its_nominating_range_is_rejected(self):
+        from e2e_logical_evidence_projection import insert_record
+        from recall_server.logical_evidence_projection import mark_logical_evidence_dirty
+        from recall_server.passage_retrieval import collapse_document_candidates
+        from recall_server.turbopuffer_retrieval import arm_row
+        ns, first, stale = self.seed()
+        ns.rows.pop(stale['id'])
+        with self.store.connect() as c:
+            insert_record(c, tenant=self.tenant, source=self.source,
+                parent='nominee-parent', native='nominee-current',
+                text='Current nominee evidence survives.', role='user', byte_start=0)
+            mark_logical_evidence_dirty(c, tenant_id=self.tenant, source_id=self.source,
+                native_ids=['nominee-current'], reason='ingest')
+        self.project()
+        self.writer.drain(tenant_id=self.tenant, max_months=20)
+        second = next(r for r in ns.rows.values() if r['logical_document_id'] != first['logical_document_id'])
+        stale_nomination = dict(second, id='psg_stale_nomination', text='STALE_PRIVATE_NOMINATION',
+            text_sha256=hashlib.sha256(b'STALE_PRIVATE_NOMINATION').hexdigest())
+        ns.write(upsert_rows=[stale_nomination])
+        legs = (('dense', .8, [arm_row(first, 10), arm_row(second, 9)]),
+                ('passage-lexical', .2, [arm_row(stale_nomination, 10), arm_row(first, 1)]))
+        options = dict(limit=1, fusion='convex', alphas={'dense': .8, 'passage-lexical': .2},
+                       nominate_per_arm=1)
+        results = collapse_document_candidates(legs, **options)
+        self.assertEqual(len(results), 2)
+        self.assertTrue(results[1]['nominated'])
+        admitted = {r['logical_document_id'] for r in results}
+        self.retrieval._hydrate_ranges(results, legs, deadline_at=time.monotonic()+5,
+                                       collapse_options=options)
+        self.assertEqual({r['logical_document_id'] for r in results}, admitted)
+        nominee = next(r for r in results if r['logical_document_id'] == second['logical_document_id'])
+        self.assertTrue(nominee['nominated'])
+        self.assertEqual(nominee['reasons'], ['dense'])
+        self.assertEqual(set(nominee['arm_scores']), {'dense'})
+        self.assertEqual({r['passage_id'] for r in nominee['matching_ranges']}, {second['id']})
+        self.assertNotIn('STALE_PRIVATE', json.dumps(results))
+
     def test_authority_deadline_still_fails_closed(self):
         ns, current, stale = self.seed()
         execute = self.store._execute_bounded

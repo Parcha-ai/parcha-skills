@@ -569,12 +569,19 @@ class TurbopufferHintRetrieval(PassageHintRetrieval):
                 live[(row["source_id"], row["logical_document_id"], row["passage_id"])] = canonical
         if rebuild:
             # Rebuild every field from authorized rows, never the stale collapsed
-            # metadata. Keep the original admitted ranges and fusion settings;
-            # diagnostic arms may contain additional authorized candidates.
+            # metadata. Admission is already decided: preserve its parent set
+            # and nomination priority, not a rejected arm's evidence or scores.
+            # Diagnostic arms may contain additional authorized candidates.
+            nominees = {(row["source_id"], row["logical_document_id"])
+                        for row in results if row.get("nominated")}
             surviving = tuple((name, weight, [row for row in rows if
                 (row["source_id"], row["logical_document_id"], row["passage_id"]) in admitted])
                 for name, weight, rows in legs)
-            results[:] = collapse_document_candidates(surviving, **collapse_options)
+            rebuild_options = {**collapse_options, "limit": len(results), "nominate_per_arm": 0}
+            results[:] = collapse_document_candidates(surviving, **rebuild_options)
+            for row in results:
+                if (row["source_id"], row["logical_document_id"]) in nominees:
+                    row["nominated"] = True
             if time.monotonic() >= deadline_at:
                 status = "deadline-exceeded"
                 results.clear()
