@@ -8,6 +8,8 @@ from pathlib import Path
 import ast
 import os
 import sys
+import time
+from unittest.mock import patch
 import unittest
 import uuid
 
@@ -36,6 +38,52 @@ def authority_params(query, tenant, allowed_sources, pairs):
     if query.count('%s') == 4:
         return tenant, allowed_sources, 'policy', passages
     return tenant, allowed_sources, 'policy', sources, passages
+
+
+def vacuum_authority_fixture(connection, *, timeout=5.0):
+    """Establish the all-visible fixture before asserting an index-only plan.
+
+    VACUUM can finish without setting visibility bits while an unrelated older
+    transaction is open. Retry only this setup condition, never the query plan.
+    """
+    deadline = time.monotonic() + timeout
+    original_timeout = connection.execute('SHOW statement_timeout').fetchone()['statement_timeout']
+    pages = []
+
+    def bounded(statement, values=()):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError
+        connection.execute("SELECT set_config('statement_timeout',%s,false)",
+                           (str(max(1, min(1000, int(remaining * 1000)))) + 'ms',))
+        return connection.execute(statement, values)
+
+    try:
+        try:
+            while time.monotonic() < deadline:
+                for table in ('canonical_chunks', 'canonical_documents', 'canonical_passages',
+                              'canonical_passage_documents', 'canonical_evidence_documents'):
+                    bounded(sql.SQL('VACUUM ANALYZE {}').format(sql.Identifier(table)))
+                pages = bounded("""SELECT relname,relpages,relallvisible FROM pg_class
+                    WHERE oid IN ('canonical_chunks'::regclass,'canonical_documents'::regclass)
+                    ORDER BY relname""").fetchall()
+                if len(pages) == 2 and all(row['relpages'] > 0 and
+                                          row['relallvisible'] == row['relpages'] for row in pages):
+                    return
+                time.sleep(min(0.05, max(0, deadline - time.monotonic())))
+        except (TimeoutError, psycopg.errors.QueryCanceled):
+            # A setup query timeout also stops here; it is never retried.
+            pass
+        # Fixed metadata only; no SQL text, users, client addresses or bodies.
+        connection.execute("SET statement_timeout='250ms'")
+        backends = connection.execute("""SELECT pid,backend_type,state,
+                backend_xid::text,backend_xmin::text,wait_event_type,wait_event
+            FROM pg_stat_activity WHERE datname=current_database() AND pid<>pg_backend_pid()
+              AND (backend_xid IS NOT NULL OR backend_xmin IS NOT NULL)
+            ORDER BY pid LIMIT 8""").fetchall()
+        raise AssertionError(f'fixture_visibility_not_ready: pages={pages!r}, backends={backends!r}')
+    finally:
+        connection.execute("SELECT set_config('statement_timeout',%s,false)", (original_timeout,))
 
 
 class AuthorityIndexOperationTest(unittest.TestCase):
@@ -204,9 +252,7 @@ class AuthorityIndexOperationTest(unittest.TestCase):
         before = self.conn.execute(query,params).fetchall()
         self.assertEqual({row['passage_id'] for row in before},{'live-retired','bulk-live'})
         self.apply()
-        for table in ('canonical_chunks','canonical_documents','canonical_passages',
-                      'canonical_passage_documents','canonical_evidence_documents'):
-            self.conn.execute(sql.SQL('VACUUM ANALYZE {}').format(sql.Identifier(table)))
+        vacuum_authority_fixture(self.conn)
         after = self.conn.execute(query,params).fetchall()
         self.assertEqual(sorted(before,key=lambda row: row['passage_id']),
                          sorted(after,key=lambda row: row['passage_id']))
@@ -223,6 +269,32 @@ class AuthorityIndexOperationTest(unittest.TestCase):
             self.assertEqual(node['Node Type'],'Index Only Scan',(name,node))
             self.assertEqual(node['Heap Fetches'],0,(name,node))
             self.assertGreater(node['Actual Loops'],0,(name,node))
+
+    def test_visibility_setup_waits_for_older_transaction_then_keeps_plan_assertions(self):
+        with psycopg.connect(self.dsn) as holder:
+            holder.execute('SELECT pg_current_xact_id()')
+            def release(_seconds):
+                state = self.conn.execute("""SELECT relpages,relallvisible FROM pg_class
+                    WHERE oid='canonical_chunks'::regclass""").fetchone()
+                self.assertLess(state['relallvisible'], state['relpages'])
+                holder.rollback()
+            with patch('time.sleep', side_effect=release) as waited:
+                self.test_current_authority_query_uses_covering_indexes_without_heap_fetches()
+            self.assertEqual(waited.call_count, 1)
+
+    def test_visibility_setup_persistent_transaction_fails_before_plan(self):
+        with psycopg.connect(self.dsn) as holder:
+            holder.execute('SELECT pg_current_xact_id()')
+            original = vacuum_authority_fixture
+            started = time.monotonic()
+            with patch(__name__ + '.vacuum_authority_fixture',
+                       side_effect=lambda connection: original(connection, timeout=0.15)):
+                with self.assertRaisesRegex(AssertionError, 'fixture_visibility_not_ready') as error:
+                    self.test_current_authority_query_uses_covering_indexes_without_heap_fetches()
+            self.assertLess(time.monotonic() - started, 3)
+            self.assertIn('backend_xid', str(error.exception))
+            self.assertNotIn('query', str(error.exception))
+            self.assertEqual(self.conn.execute('SHOW statement_timeout').fetchone()['statement_timeout'], '0')
 
     def create_authority_catalog(self):
         self.conn.execute('''
