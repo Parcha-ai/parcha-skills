@@ -5,7 +5,13 @@ import json
 import unittest
 import os
 import time
+import sys
+from pathlib import Path
 from unittest.mock import patch
+
+RECALL = Path(__file__).resolve().parents[2]
+sys.path[:0] = [str(RECALL), str(RECALL / 'server')]
+
 from recall_server.rerank import RerankRuntime
 from recall_server.db import SearchDeadlineExceeded
 from recall_server.temporal_hints import TemporalHintSettings
