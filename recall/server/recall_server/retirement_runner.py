@@ -470,6 +470,7 @@ def run_retirement(
     before_parent=None,
     parent_limits_for=None,
     metadata_mode="keep",
+    failure_diagnostic=None,
 ):
     """Sequential enabled-only maintenance; bounded selected proofs within each claim."""
     limits = RunnerLimits() if limits is None else limits
@@ -537,6 +538,8 @@ def run_retirement(
             )
         except Exception as error:
             if not attempted:
+                if failure_diagnostic is not None:
+                    failure_diagnostic.update(claim_diagnostic)
                 raise
             errors[
                 error.error_code

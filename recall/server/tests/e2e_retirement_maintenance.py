@@ -55,6 +55,32 @@ class MaintenanceTests(unittest.TestCase):
         with self.store.connect() as c:
             return c.execute('SELECT * FROM canonical_retirement_source_policy WHERE tenant_id=%s AND source_id=%s', self.key[:2]).fetchone()
 
+    def test_first_parent_claim_sql_timeout_retains_safe_stage(self):
+        self.activate()
+        self.ready()
+        worker = self.worker(seconds=10)
+        original = self.store._execute_bounded
+        timed_out = []
+
+        def bounded(connection, sql, args, deadline):
+            if sql.startswith('SELECT progress.source_id,progress.native_parent_id,'):
+                timed_out.append(True)
+                return original(connection, 'SELECT pg_sleep(1)', (), time.monotonic()+0.05)
+            return original(connection, sql, args, deadline)
+
+        with patch.object(self.store, '_execute_bounded', side_effect=bounded):
+            result = worker.cycle(busy=False)
+        self.assertEqual(timed_out, [True])
+        self.assertEqual(result['status'], 'deferred')
+        self.assertEqual(result['maintenance_phase'], 'parent_claim')
+        self.assertEqual(result['claim_phase'], 'candidate_select')
+        self.assertEqual(result['error_class'], 'SearchDeadlineExceeded')
+        self.assertEqual(result['sqlstate'], '57014')
+        self.assertFalse(result['commit_outcome_unknown'])
+        self.assertEqual(result['cleared_utf8_bytes'], 0)
+        self.assertEqual(self.state()['cumulative_cleared_documents'], 0)
+        self.assertIsNone(self.policy_state()['maintenance_intent'])
+
     def test_round_reserves_batch_commit_and_intent_finalization(self):
         self.activate()
         self.ready()

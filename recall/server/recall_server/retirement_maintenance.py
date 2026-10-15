@@ -8,7 +8,33 @@ from .chunk_retirement import ChunkRetirementError, ParentRetirementLimits
 from .db import SearchDeadlineExceeded
 from .retirement_policy import enroll_published_parent
 from .parent_chunk_proof import read_parent_catalog
-from .retirement_runner import RetirementScope, RunnerLimits, _authorize, _cohort_entry, run_retirement
+from .retirement_runner import RetirementScope, RunnerLimits, _authorize, _cohort_entry, _CLAIM_PHASES, _CLAIM_SQLSTATES, run_retirement
+
+
+_ERROR_CLASSES = frozenset({
+    'ChunkRetirementError', 'SearchDeadlineExceeded', 'PoolTimeout',
+    'OperationalError', 'InterfaceError', 'QueryCanceled', 'LockNotAvailable',
+    'SerializationFailure', 'DeadlockDetected', 'InsufficientPrivilege',
+    'ReadOnlySqlTransaction',
+})
+
+
+def _failure_details(error, phase, claim):
+    # Fixed identifiers only. Wrapped pipeline cancellation keeps its SQLSTATE;
+    # exception text, query parameters and source identifiers are never rendered.
+    name = type(error).__name__
+    state = None
+    try:
+        for candidate in (error, error.__cause__):
+            value = getattr(candidate, 'sqlstate', None)
+            if value in _CLAIM_SQLSTATES:
+                state = value
+                break
+    except Exception:
+        pass
+    return dict(maintenance_phase=phase,
+        claim_phase=claim.get('phase') if claim.get('phase') in _CLAIM_PHASES else None,
+        error_class=name if name in _ERROR_CLASSES else 'other', sqlstate=state)
 
 
 class RetirementMaintenance:
@@ -147,18 +173,24 @@ class RetirementMaintenance:
         reserve = min(5, budget / 4)
         owner_deadline = self.deadline - reserve
         stop_admitting_at = owner_deadline - reserve
+        phase = 'source_claim'
+        claim_diagnostic = {}
         try:
             source = self._claim_source()
             if source is None:
                 return dict(report, status='no_ready_sources')
             scope = RetirementScope(source['tenant_id'], source['principal_id'], (source['source_id'],))
+            phase = 'source_authorize'
             with self.store.connect() as c, c.transaction():
                 _authorize(self.store, c, scope, self.deadline)
+            phase = 'intent_reconcile'
             report.update(self._reconcile_intent(source))
+            phase = 'publication_enroll'
             report['enrolled_parents'] = self._reconcile_publications(source)
+            phase = 'parent_claim'
             result = run_retirement(self.store, self.archive, scope=scope, apply=True,
                 limits=self.limits, parent_limits=ParentRetirementLimits(batch_documents=256),
-                deadline_at=owner_deadline,
+                deadline_at=owner_deadline, failure_diagnostic=claim_diagnostic,
                 should_stop=lambda: time.monotonic() >= stop_admitting_at,
                 before_parent=lambda candidate: self._record_intent(source, candidate),
                 parent_limits_for=(lambda candidate: self._parent_limits(source, candidate))
@@ -166,6 +198,7 @@ class RetirementMaintenance:
                 **({"metadata_mode": self.metadata_mode} if self.metadata_mode != "keep" else {}))
             report.update(result)
             if not result['commit_outcome_unknown']:
+                phase = 'intent_finalize'
                 with self.store.connect() as c, c.transaction():
                     self._execute(c, '''UPDATE canonical_retirement_source_policy SET maintenance_intent=NULL
                         WHERE tenant_id=%s AND source_id=%s AND maintenance_epoch=%s''',
@@ -173,6 +206,8 @@ class RetirementMaintenance:
             return report
         except ChunkRetirementError as error:
             return dict(report, status='owner_refused' if error.error_code == 'retirement_owner_required'
-                        else 'deferred', error=error.error_code)
-        except (SearchDeadlineExceeded, psycopg.Error):
-            return dict(report, status='deferred')
+                        else 'deferred', error=error.error_code,
+                        **_failure_details(error, phase, claim_diagnostic))
+        except (SearchDeadlineExceeded, psycopg.Error) as error:
+            return dict(report, status='deferred',
+                        **_failure_details(error, phase, claim_diagnostic))

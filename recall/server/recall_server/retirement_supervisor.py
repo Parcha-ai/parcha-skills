@@ -106,7 +106,8 @@ class RetirementSupervisor:
                 "committed_sql_ms=%s committed_hash_ms=%s archive_read_ms=%s "
                 "claim_wall_ms=%s parent_wall_ms=%s metadata_capture_ms=%s retired_metadata_chunks=%s "
                 "metadata_rows=%s metadata_fetches=%s metadata_fetch_ms=%s "
-                "metadata_membership_calls=%s metadata_membership_ms=%s metadata_spool_ms=%s",
+                "metadata_membership_calls=%s metadata_membership_ms=%s metadata_spool_ms=%s "
+                "maintenance_phase=%s claim_phase=%s sqlstate=%s",
                 result["status"],
                 result.get("elapsed_ms"),
                 result.get("cpu_seconds"),
@@ -130,6 +131,9 @@ class RetirementSupervisor:
                 result.get("metadata_membership_calls"),
                 result.get("metadata_membership_ms"),
                 result.get("metadata_spool_ms"),
+                result.get("maintenance_phase"),
+                result.get("claim_phase"),
+                result.get("sqlstate"),
 
             )
             return result
