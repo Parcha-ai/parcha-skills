@@ -89,24 +89,40 @@ def _read(plane, connection, tenant_id, principal_id, expected, deadline, *, loc
             or documents[0]['revision'] != 1 or documents[0]['is_current']
             or documents[0]['deleted_at'] is None):
         _refuse('document_changed')
+    # Capture metadata before bodies; reject overflow without fetching its text.
     chunks = query('''SELECT ordinal,receipt,text_sha256,deleted_at,
-        octet_length(text_redacted) AS text_bytes,
+        octet_length(text_redacted) AS text_bytes
+        FROM canonical_chunks WHERE tenant_id=%s AND source_id=%s AND document_id=%s
+        ORDER BY ordinal LIMIT 129''' + (' FOR UPDATE NOWAIT' if lock else ''),
+        (*scope, expected['document_id'])).fetchall()
+    if (not 1 <= len(chunks) <= 128
+            or documents[0]['text_sha256'] != expected['text_sha256']
+            or len(chunks) == 1 and chunks[0]['text_sha256'] != expected['text_sha256']
+            or any(chunk['ordinal'] != ordinal or chunk['deleted_at'] is None
+                   or type(chunk['text_bytes']) is not int or chunk['text_bytes'] <= 0
+                   or chunk['receipt'] != item_receipt(source, native, 1, ordinal)
+                   for ordinal, chunk in enumerate(chunks))
+            or not 0 < sum(chunk['text_bytes'] for chunk in chunks) == expected['text_bytes'] <= 65536):
+        _refuse('chunk_changed')
+    bodies = query('''SELECT ordinal,
         CASE WHEN octet_length(text_redacted)<=65536 THEN text_redacted END AS text_redacted
         FROM canonical_chunks WHERE tenant_id=%s AND source_id=%s AND document_id=%s
-        ORDER BY ordinal LIMIT 2''' + (' FOR UPDATE NOWAIT' if lock else ''),
-        (*scope, expected['document_id'])).fetchall()
-    if (len(chunks) != 1 or chunks[0]['ordinal'] != 0 or chunks[0]['deleted_at'] is None
-            or chunks[0]['text_bytes'] != expected['text_bytes']
-            or chunks[0]['text_sha256'] != expected['text_sha256']
-            or documents[0]['text_sha256'] != expected['text_sha256']
-            or chunks[0]['receipt'] != item_receipt(source, native, 1, 0)):
+        ORDER BY ordinal LIMIT 129''', (*scope, expected['document_id'])).fetchall()
+    if (len(bodies) != len(chunks)
+            or any(body['ordinal'] != chunk['ordinal']
+                   or not isinstance(body['text_redacted'], str)
+                   or len(body['text_redacted'].encode()) != chunk['text_bytes']
+                   for chunk, body in zip(chunks, bodies, strict=True))):
         _refuse('chunk_changed')
-    chunk = chunks[0]
-    _validate_source_body(dict(event_text=chunk['text_redacted'], document_text_sha256=expected['text_sha256'],
-        source_chunks=[dict(ordinal=0, size_bytes=expected['text_bytes'], text_sha256=expected['text_sha256'])],
-        chunk_receipts=[chunk['receipt']], chunk_count=1))
-    content = json.loads(chunk['text_redacted'])
-    if (not isinstance(content, dict) or canonical_json(content).decode() != chunk['text_redacted']
+    for chunk, body in zip(chunks, bodies, strict=True):
+        chunk['text_redacted'] = body['text_redacted']
+    text = ''.join(chunk['text_redacted'] for chunk in chunks)
+    _validate_source_body(dict(event_text=text, document_text_sha256=expected['text_sha256'],
+        source_chunks=[dict(ordinal=chunk['ordinal'], size_bytes=chunk['text_bytes'],
+                            text_sha256=chunk['text_sha256']) for chunk in chunks],
+        chunk_receipts=[chunk['receipt'] for chunk in chunks], chunk_count=len(chunks)))
+    content = json.loads(text)
+    if (not isinstance(content, dict) or canonical_json(content).decode() != text
             or original['content_sha256'] != expected['text_sha256']
             or documents[0]['content_sha256'] != expected['text_sha256']):
         _refuse('content_changed')
@@ -150,7 +166,7 @@ def _read(plane, connection, tenant_id, principal_id, expected, deadline, *, loc
     artifact['created_at'] = artifact['created_at'].isoformat()
     artifact.update(contract='recall.artifact-ref.v1', schema_version=1)
     validate_contract(artifact, expected='recall.artifact-ref.v1')
-    return dict(original=original, marker=marker, document=documents[0], chunk=chunk,
+    return dict(original=original, marker=marker, document=documents[0], chunks=chunks,
                 artifact=artifact, content=content, publication_metadata=publication_metadata)
 
 
