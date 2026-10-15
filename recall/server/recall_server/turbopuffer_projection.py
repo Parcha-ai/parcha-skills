@@ -48,6 +48,7 @@ from .turbopuffer_plane import (
     passage_row,
     EMBED_TEXT_ATTRIBUTE,
 )
+from .search_outbox import _month, record_passage_deletions
 
 LOG = logging.getLogger(__name__)
 
@@ -373,13 +374,55 @@ class TurbopufferProjector:
 
     # -- catalog reads -------------------------------------------------------
 
+    @contextmanager
+    def _publication_lease(self, tenant_id: str, source_id: str, month: date):
+        """Serialize one active vendor step; canonical writers never take this lock.
+
+        Like the parquet publisher lease, this owns one database session while
+        external work runs. No connection or lock survives a cooperative yield.
+        A remote write completing after process death still needs reconciliation.
+        """
+        identity = "search-publication\x1f" + tenant_id + "\x1f" + source_id + "\x1f" + month.isoformat()
+        with self.store.connect() as connection:
+            try:
+                acquired = connection.execute(
+                    "SELECT pg_try_advisory_lock(hashtextextended(%s,0)) AS acquired", (identity,),
+                ).fetchone()["acquired"]
+            except BaseException:
+                # The server may have acquired it before the response was lost.
+                connection.close()
+                raise
+            try:
+                connection.commit()
+                yield acquired is True
+            finally:
+                if acquired is True:
+                    try:
+                        connection.execute("SELECT pg_advisory_unlock(hashtextextended(%s,0))", (identity,))
+                        connection.commit()
+                    except BaseException:
+                        # Pool rollback does not release session advisory locks.
+                        # Discard this backend if cleanup cannot be confirmed.
+                        connection.close()
+                        raise
+
+    @staticmethod
+    def _present_ids(connection: Any, tenant_id: str, passage_ids: list[str]) -> set[str]:
+        # An exact point check across every policy/source protects an ID that
+        # appeared behind an earlier reconciliation cursor. Presence is enough
+        # to defer deletion; this is not a new serving-authority predicate.
+        return {row["passage_id"] for row in connection.execute(
+            "SELECT passage_id FROM canonical_passages WHERE tenant_id=%s AND passage_id=ANY(%s::text[])",
+            (tenant_id, passage_ids),
+        ).fetchall()}
+
     def claim_months(self, connection: Any, *, tenant_id: str, limit: int) -> list[dict[str, Any]]:
         """Oldest-queued outbox rows of the tenant; the claim is the generation read."""
 
         return [
             dict(row)
             for row in connection.execute(
-                """SELECT tenant_id,source_id,month,generation,reason
+                """SELECT tenant_id,source_id,month,generation,reason,queued_at
                      FROM search_projection_outbox
                     WHERE tenant_id=%s
                     ORDER BY queued_at,source_id,month
@@ -492,21 +535,72 @@ class TurbopufferProjector:
                     connection.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
                 page = self.passages_by_id(connection, tenant_id, chunk)
                 connection.commit()
-            rows = [
-                passage_row({**passage, "actors": [tuple(actor) for actor in passage["actors"]]})
-                for passage in page
-            ]
-            for batch in byte_bounded_batches(rows, max_rows=self.batch_rows, max_bytes=self.max_batch_bytes):
-                self.pacer.wait_for(estimated_tokens(batch))
-                self._write(namespace, budget, upsert_rows=batch)
-                written += len(batch)
+            groups: dict[tuple[str, date], list[str]] = {}
+            for passage in page:
+                groups.setdefault((passage["source_id"], _month(passage["first_occurred_at"])), []).append(passage["passage_id"])
+            for (source_id, month), ids in sorted(groups.items()):
+                with self._publication_lease(tenant_id, source_id, month) as acquired:
+                    if not acquired:
+                        raise ValueError("search_publication_busy")
+                    # The nomination may predate the lease. Re-read authority
+                    # under it before the external write, just like month pages.
+                    with self.store.connect() as connection:
+                        if getattr(self.store, "verified_singleton_receipts", False):
+                            connection.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+                        current = self.passages_by_id(connection, tenant_id, ids)
+                        connection.commit()
+                    page = [row for row in current if row["source_id"] == source_id
+                            and _month(row["first_occurred_at"]) == month]
+                    written += self._write_page(namespace, budget, page, _MonthTiming())
         return written
 
-    def tombstone_ids(self, connection: Any, claim: dict[str, Any]) -> list[str]:
+    def queue_stale_passages(self, tenant_id: str, passage_ids: list[str]) -> int:
+        """Turn observed orphan IDs into durable cleanup after an exact recheck.
+
+        Vendor metadata supplies routing only. Any current canonical row under
+        any source/policy keeps the ID, and the normal drain checks again before
+        deletion. Concurrent publishers share the source/month lease. A caller
+        still reports stale observations unresolved until a later verification.
+        """
+        if not passage_ids:
+            return 0
+        namespace = self.client.namespace(self.settings.namespace(tenant_id))
+        queued = 0
+        for start in range(0, len(passage_ids), self.page_rows):
+            ids = passage_ids[start:start + self.page_rows]
+            response = namespace.query(rank_by=("id", "asc"), filters=("id", "In", ids),
+                limit=len(ids), include_attributes=["source_id", "first_occurred_at"])
+            rows = response.get("rows", []) if isinstance(response, dict) else response.rows
+            groups: dict[tuple[str, date], list[dict[str, Any]]] = {}
+            seen: set[str] = set()
+            for raw in rows:
+                row = raw if isinstance(raw, dict) else raw.model_dump()
+                passage_id, source_id = row.get("id"), row.get("source_id")
+                if passage_id not in ids or passage_id in seen or not isinstance(source_id, str) or not source_id:
+                    raise ValueError("search_reconcile_identity_invalid")
+                seen.add(passage_id)
+                first = row["first_occurred_at"]
+                month = _month(first)
+                groups.setdefault((source_id, month), []).append(dict(passage_id=passage_id,
+                    first_occurred_at=first, last_occurred_at=first))
+            for (source_id, month), candidates in sorted(groups.items()):
+                with self._publication_lease(tenant_id, source_id, month) as acquired:
+                    if not acquired:
+                        continue
+                    with self.store.connect() as connection, connection.transaction():
+                        present = self._present_ids(connection, tenant_id, [row["passage_id"] for row in candidates])
+                        absent = [row for row in candidates if row["passage_id"] not in present]
+                        if absent:
+                            record_passage_deletions(connection, tenant_id=tenant_id, source_id=source_id,
+                                                     passages=absent, reason="logical-update")
+                            queued += len(absent)
+        return queued
+
+    def capture_tombstones(self, connection: Any, claim: dict[str, Any]) -> list[dict[str, Any]]:
         return [
-            str(row["passage_id"])
+            dict(row)
             for row in connection.execute(
-                """SELECT passage_id FROM search_projection_tombstones
+                """SELECT passage_id,deleted_at FROM search_projection_tombstones
                     WHERE tenant_id=%s AND source_id=%s AND month=%s
                     ORDER BY deleted_at,passage_id""",
                 (claim["tenant_id"], claim["source_id"], claim["month"]),
@@ -522,7 +616,7 @@ class TurbopufferProjector:
         *,
         namespace: str,
         rows_written: int,
-        tombstones: list[str],
+        tombstones: list[dict[str, Any]],
         watermark: datetime,
     ) -> bool:
         """Retire the claim; ``False`` when the generation moved meanwhile."""
@@ -532,8 +626,11 @@ class TurbopufferProjector:
                 connection.execute(
                     """DELETE FROM search_projection_tombstones
                         WHERE tenant_id=%s AND source_id=%s
-                          AND passage_id=ANY(%s::text[])""",
-                    (claim["tenant_id"], claim["source_id"], tombstones),
+                          AND (passage_id,deleted_at) IN (
+                              SELECT * FROM unnest(%s::text[],%s::timestamptz[]))""",
+                    (claim["tenant_id"], claim["source_id"],
+                     [row["passage_id"] for row in tombstones],
+                     [row["deleted_at"] for row in tombstones]),
                 )
             connection.execute(
                 """INSERT INTO search_projection_shards(
@@ -555,10 +652,11 @@ class TurbopufferProjector:
             retired = connection.execute(
                 """DELETE FROM search_projection_outbox
                     WHERE tenant_id=%s AND source_id=%s AND month=%s
-                      AND generation=%s""",
+                      AND generation=%s AND queued_at=%s""",
                 (
                     claim["tenant_id"], claim["source_id"], claim["month"],
                     claim["generation"],
+                    claim["queued_at"],
                 ),
             )
             if max(0, retired.rowcount) != 1 and claim["reason"] == "backfill":
@@ -641,6 +739,25 @@ class TurbopufferProjector:
         return sum(write_batch(batch) for batch in batches)
 
     def _month_steps(self, claim: dict[str, Any], *, cooperative: bool = False, timing: _MonthTiming | None = None) -> Generator[dict[str, Any], None, None]:
+        steps = self._month_steps_owned(claim, cooperative=cooperative, timing=timing)
+        try:
+            while True:
+                with self._publication_lease(claim["tenant_id"], claim["source_id"], claim["month"]) as acquired:
+                    if acquired:
+                        try:
+                            step = next(steps)
+                        except StopIteration:
+                            return
+                if not acquired:
+                    yield {"rows": 0, "deleted": 0, "rate_limited": 0, "retired": False}
+                    return
+                yield step
+                if "retired" in step:
+                    return
+        finally:
+            steps.close()
+
+    def _month_steps_owned(self, claim: dict[str, Any], *, cooperative: bool = False, timing: _MonthTiming | None = None) -> Generator[dict[str, Any], None, None]:
         """One page/delete batch per step; acknowledge only a complete month.
 
         Paused state retains metadata and exact captured tombstone IDs, never
@@ -659,12 +776,17 @@ class TurbopufferProjector:
                 since = (self.shard_watermark(connection, claim)
                          if claim["reason"] in INCREMENTAL_REASONS else None)
                 watermark = self.read_watermark(connection)
-                tombstones = self.tombstone_ids(connection, claim)
+                tombstones = self.capture_tombstones(connection, claim)
                 connection.commit()
             rate_reported = 0
-            for batch in delete_id_batches(tombstones, max_bytes=self.max_batch_bytes):
+            for batch in delete_id_batches([row["passage_id"] for row in tombstones], max_bytes=self.max_batch_bytes):
+                with self.store.connect() as connection:
+                    present = self._present_ids(connection, tenant_id, batch)
+                    connection.commit()
+                batch = [passage_id for passage_id in batch if passage_id not in present]
                 try:
-                    self._write(namespace, budget, timing=timing, deletes=batch)
+                    if batch:
+                        self._write(namespace, budget, timing=timing, deletes=batch)
                 except Exception as error:  # noqa: BLE001 - class checked below
                     if type(error).__name__ != "NotFoundError":
                         raise

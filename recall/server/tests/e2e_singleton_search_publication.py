@@ -98,15 +98,39 @@ class SingletonSearchPublication(SingletonPassageReads):
         self.prepare_passages()
         doc=self.baseline(self.receipt)['document_id'];self.admit_fixture(doc)
         writer,namespace=self.writer();owner=writer._authorized_publication_rows
+        snapshots=[]
         def delete_between(connection,tenant,rows,**kwargs):
-            with self.store.connect() as other:
-                other.execute('UPDATE canonical_documents SET deleted_at=now(),is_current=false WHERE tenant_id=%s AND document_id=%s',(self.tenant,doc))
+            snapshots.append(connection)
+            # The first read only nominates routes. Exercise the final snapshot
+            # after the publisher takes its source/month lease.
+            if len(snapshots)==2:
+                with self.store.connect() as other:
+                    other.execute('UPDATE canonical_documents SET deleted_at=now(),is_current=false WHERE tenant_id=%s AND document_id=%s',(self.tenant,doc))
             return owner(connection,tenant,rows,**kwargs)
         with patch.object(self.store,'verified_singleton_receipts',True):
             with patch.object(writer,'_authorized_publication_rows',delete_between):
                 self.assertEqual(writer.upsert_passages(self.tenant,self.args['passage_ids']),1)
+            self.assertEqual(len(snapshots),2)
+            self.assertEqual(len(namespace.rows),1)
             namespace.rows.clear()
             self.assertEqual(writer.upsert_passages(self.tenant,self.args['passage_ids']),0)
+        self.assertEqual(namespace.rows,{})
+
+    def test_publication_rechecks_deletion_after_route_nomination(self):
+        self.prepare_passages()
+        doc=self.baseline(self.receipt)['document_id'];self.admit_fixture(doc)
+        writer,namespace=self.writer();owner=writer._authorized_publication_rows
+        snapshots=[]
+        def delete_between(connection,tenant,rows,**kwargs):
+            with self.store.connect() as other:
+                other.execute('UPDATE canonical_documents SET deleted_at=now(),is_current=false WHERE tenant_id=%s AND document_id=%s',(self.tenant,doc))
+            allowed=owner(connection,tenant,rows,**kwargs)
+            snapshots.append(len(allowed))
+            return allowed
+        with patch.object(self.store,'verified_singleton_receipts',True):
+            with patch.object(writer,'_authorized_publication_rows',delete_between):
+                self.assertEqual(writer.upsert_passages(self.tenant,self.args['passage_ids']),0)
+        self.assertEqual(snapshots,[1,0])
         self.assertEqual(namespace.rows,{})
 
     def test_publication_lost_vendor_ack_keeps_outbox_and_replays_exact_row(self):

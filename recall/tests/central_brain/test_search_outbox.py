@@ -158,7 +158,7 @@ class EnqueueTest(unittest.TestCase):
 
 
 class TombstoneTest(unittest.TestCase):
-    def test_tombstones_are_keyed_by_first_month_and_never_rewritten(self) -> None:
+    def test_tombstones_are_keyed_by_first_month_and_refresh_delivery_token(self) -> None:
         connection = _Connection(rowcount=2)
         written = write_search_tombstones(
             connection,
@@ -172,7 +172,8 @@ class TombstoneTest(unittest.TestCase):
         self.assertEqual(written, 2)
         (sql, params), = connection.statements
         self.assertIn("INSERT INTO search_projection_tombstones(", sql)
-        self.assertIn("ON CONFLICT(tenant_id,source_id,passage_id) DO NOTHING", sql)
+        self.assertIn("ON CONFLICT(tenant_id,source_id,passage_id) DO UPDATE", sql)
+        self.assertIn("deleted_at=excluded.deleted_at", sql)
         self.assertEqual(params[2], ["psg_" + "a" * 32, "psg_" + "b" * 32])
         self.assertEqual(params[3], [date(2026, 7, 1), date(2026, 8, 1)])
 

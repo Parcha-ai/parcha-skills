@@ -122,7 +122,10 @@ class QuantumTests(unittest.TestCase):
 
     def test_tombstone_batches_yield_and_only_exact_captured_ids_finish(self):
         catalog, projector, client = self.fixture(max_batch_bytes=1024)
-        ids = [f"psg_{index:032x}" for index in range(30)]
+        # This test batches absent targets; current IDs are protected by the
+        # native point check and covered by the reappearance regression.
+        ids = [f"psg_{index:032x}" for index in range(100, 130)]
+        self.assertTrue(set(ids).isdisjoint(row['passage_id'] for row in catalog.passages))
         catalog.tombstones = [dict(source_id=SOURCE, passage_id=value, month=JULY) for value in ids]
         client.namespace(SETTINGS.namespace(TENANT)).write(
             upsert_rows=[dict(id=ids[0], text='synthetic tombstone target')])
