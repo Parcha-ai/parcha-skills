@@ -197,7 +197,7 @@ class CanonicalRetrieval:
             return frozenset({"recall_exec", "recall_exec_map", "recall_scan"})
         return frozenset()
 
-    def bind(self, principal: dict[str, Any]) -> BoundCanonicalRetrieval:
+    def bind(self, principal: dict[str, Any], *, read_only: bool = False) -> BoundCanonicalRetrieval:
         tenant_id = principal.get("tenant_id")
         principal_id = principal.get("principal_id")
         audience = principal.get("audience")
@@ -219,7 +219,7 @@ class CanonicalRetrieval:
         ):
             raise PermissionError("canonical MCP source grants invalid")
         return BoundCanonicalRetrieval(
-            self.store,
+            self.store.read_only_view() if read_only else self.store,
             tenant_id=tenant_id,
             principal_id=principal_id,
             authorized_sources=sources,
