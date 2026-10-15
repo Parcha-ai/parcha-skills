@@ -21,6 +21,7 @@ from .db import SearchDeadlineExceeded, bounded_search_text
 from .passage_retrieval import (
     DENSE_NEAREST_LIMIT,
     PassageHintRetrieval,
+    collapse_document_candidates,
     identifier_tokens,
 )
 from .turbopuffer_plane import EMBED_TEXT_ATTRIBUTE, TEXT_ATTRIBUTE, TurbopufferSettings
@@ -422,7 +423,8 @@ class TurbopufferHintRetrieval(PassageHintRetrieval):
         stages['transaction_exit_ms'] = round((time.monotonic() - stage_started) * 1000, 3)
         return authoritative
 
-    def _authorize_ranges(self, results, legs, *, deadline_at, include_arms=False):
+    def _authorize_ranges(self, results, legs, *, deadline_at, include_arms=False,
+                          collapse_options=None):
         """Canonical receipt metadata fences asynchronous search-plane writes.
 
         Body retirement clears text, retaining the receipt rows. A deleting or
@@ -546,6 +548,15 @@ class TurbopufferHintRetrieval(PassageHintRetrieval):
         allowed = {identity(row): row for row in authoritative
                    if row.get("tenant_id") == self.tenant_id
                    and row.get("source_id") in self.sources}
+        admitted = {
+            (row["source_id"], row["logical_document_id"], item.get("passage_id"))
+            for row in results for item in row.get("matching_ranges", ())
+        }
+        rebuild = collapse_options is not None and any(
+            (row.get("source_id"), row.get("logical_document_id"), row.get("passage_id")) in admitted
+            and identity(row) not in allowed
+            for _name, _weight, rows in legs for row in rows
+        )
         locator_fields = ("revision", "manifest_object_key", "manifest_content_sha256")
         live = {}
         for _name, _weight, rows in legs:
@@ -556,6 +567,26 @@ class TurbopufferHintRetrieval(PassageHintRetrieval):
                 row["source_unit"] = canonical.get("source_unit")
                 row.update({field: canonical[field] for field in locator_fields})
                 live[(row["source_id"], row["logical_document_id"], row["passage_id"])] = canonical
+        if rebuild:
+            # Rebuild every field from authorized rows, never the stale collapsed
+            # metadata. Admission is already decided: preserve its parent set
+            # and nomination priority, not a rejected arm's evidence or scores.
+            # Diagnostic arms may contain additional authorized candidates.
+            nominees = {(row["source_id"], row["logical_document_id"])
+                        for row in results if row.get("nominated")}
+            surviving = tuple((name, weight, [row for row in rows if
+                (row["source_id"], row["logical_document_id"], row["passage_id"]) in admitted])
+                for name, weight, rows in legs)
+            rebuild_options = {**collapse_options, "limit": len(results), "nominate_per_arm": 0}
+            results[:] = collapse_document_candidates(surviving, **rebuild_options)
+            for row in results:
+                if (row["source_id"], row["logical_document_id"]) in nominees:
+                    row["nominated"] = True
+            if time.monotonic() >= deadline_at:
+                status = "deadline-exceeded"
+                results.clear()
+                for _name, _weight, rows in legs:
+                    rows.clear()
         # A collapsed document can carry metadata from any of its selected
         # ranges. Drop the whole collapsed row if any range lost authority;
         # never preserve a forgotten range's receipts, title, or body.
@@ -580,6 +611,7 @@ class TurbopufferHintRetrieval(PassageHintRetrieval):
         *,
         deadline_at: float,
         include_arms: bool = False,
+        collapse_options: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Fetch the bodies of the collapsed head's ranges in one pass.
 
@@ -593,6 +625,7 @@ class TurbopufferHintRetrieval(PassageHintRetrieval):
 
         authority = self._authorize_ranges(
             results, legs, deadline_at=deadline_at, include_arms=include_arms,
+            collapse_options=collapse_options,
         )
         wanted: dict[str, list[dict[str, Any]]] = {}
         for row in results:

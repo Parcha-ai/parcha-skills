@@ -1071,6 +1071,7 @@ class PassageHintRetrieval:
         *,
         deadline_at: float,
         include_arms: bool = False,
+        collapse_options: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         """Fill the bodies of the collapsed ranges when the arms returned
         catalog rows (a plane whose rows are wide fetches bodies once, for
@@ -2398,8 +2399,7 @@ class PassageHintRetrieval:
             if rerank_runtime is not None
             else limit
         )
-        results = collapse_document_candidates(
-            legs,
+        collapse_options = dict(
             limit=collapse_limit,
             fusion=fusion_mode,
             alphas=fusion_alphas,
@@ -2410,9 +2410,11 @@ class PassageHintRetrieval:
             window_boost=window_boost,
             source_boost=source_boost,
         )
+        results = collapse_document_candidates(legs, **collapse_options)
         hydrate_started = time.monotonic()
         hydrate_diagnostics = self._hydrate_ranges(
             results, legs, deadline_at=deadline_at, include_arms=include_arms,
+            collapse_options=collapse_options,
         )
         if hydrate_diagnostics is not None:
             arm_elapsed_ms["hydrate"] = round((time.monotonic() - hydrate_started) * 1000, 3)
