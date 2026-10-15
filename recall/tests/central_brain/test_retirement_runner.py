@@ -91,7 +91,7 @@ class RunnerTests(unittest.TestCase):
         )
         with (
             patch.object(runner, "_claim", side_effect=[self.candidate(), None]),
-            patch.object(runner, "retire_parent_chunks", return_value=result) as retire,
+            patch.object(runner, "retire_parent_windows", return_value=result) as retire,
         ):
             report = runner.run_retirement(
                 Mock(), Mock(), scope=self.scope(), apply=True
@@ -105,7 +105,7 @@ class RunnerTests(unittest.TestCase):
     def test_byte_limited_partial_stops_before_proving_another_parent(self):
         partial = dict(status='partial', complete=False, batches=1,
                        cleared_documents=1, cleared_chunks=1, cleared_utf8_bytes=47)
-        with patch.object(runner, '_claim', side_effect=[self.candidate(), self.candidate('tail'), None]) as claim, patch.object(runner, 'retire_parent_chunks', return_value=partial) as retire:
+        with patch.object(runner, '_claim', side_effect=[self.candidate(), self.candidate('tail'), None]) as claim, patch.object(runner, 'retire_parent_windows', return_value=partial) as retire:
             report = runner.run_retirement(Mock(), Mock(), scope=self.scope(), apply=True,
                 limits=runner.RunnerLimits(max_clear_bytes=64))
         self.assertEqual(report['status'], 'clear_budget_limited')
@@ -122,7 +122,7 @@ class RunnerTests(unittest.TestCase):
                                cleared_documents=1, cleared_chunks=1, cleared_utf8_bytes=47)
                 complete = dict(status='applied', complete=True, batches=1,
                                 cleared_documents=1, cleared_chunks=1, cleared_utf8_bytes=5)
-                with patch.object(runner, '_claim', side_effect=[self.candidate(), self.candidate('tail'), None]), patch.object(runner, 'retire_parent_chunks', side_effect=[partial, complete]):
+                with patch.object(runner, '_claim', side_effect=[self.candidate(), self.candidate('tail'), None]), patch.object(runner, 'retire_parent_windows', side_effect=[partial, complete]):
                     report = runner.run_retirement(Mock(), Mock(), scope=self.scope(), apply=True,
                         limits=runner.RunnerLimits(max_clear_bytes=200), parent_limits=parent_limits)
                 self.assertEqual(report['attempted_parents'], 2)
@@ -153,7 +153,7 @@ class RunnerTests(unittest.TestCase):
                 "_claim",
                 side_effect=[self.candidate("bad"), self.candidate("good"), None],
             ),
-            patch.object(runner, "retire_parent_chunks", side_effect=[bad, good]),
+            patch.object(runner, "retire_parent_windows", side_effect=[bad, good]),
         ):
             result = runner.run_retirement(
                 Mock(), Mock(), scope=self.scope(), apply=True
@@ -164,7 +164,7 @@ class RunnerTests(unittest.TestCase):
         bad.committed = {"cleared_utf8_bytes": 2}
         with (
             patch.object(runner, "_claim", return_value=self.candidate()) as claim,
-            patch.object(runner, "retire_parent_chunks", side_effect=bad),
+            patch.object(runner, "retire_parent_windows", side_effect=bad),
         ):
             result = runner.run_retirement(
                 Mock(), Mock(), scope=self.scope(), apply=True
@@ -204,7 +204,7 @@ class RunnerTests(unittest.TestCase):
                         metadata_membership_calls=1, metadata_membership_ms=200., metadata_spool_ms=50.)
         with patch.object(runner.time, 'monotonic', side_effect=lambda:clock[0]), \
              patch.object(runner, '_claim', side_effect=claim), \
-             patch.object(runner, 'retire_parent_chunks', side_effect=retire):
+             patch.object(runner, 'retire_parent_windows', side_effect=retire):
             result = runner.run_retirement(Mock(), Mock(), scope=self.scope(), apply=True,
                                            deadline_at=200.)
         self.assertTrue(result['commit_outcome_unknown'])

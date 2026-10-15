@@ -63,7 +63,7 @@ class RetirementMaintenance:
         needed = current['manifest_size_bytes'] + parts['bytes']
         if parts['count'] != current['part_count'] or not 0 < needed <= self.limits.max_archive_bytes:
             raise ChunkRetirementError('retirement_budget_catalog_invalid')
-        return ParentRetirementLimits(batch_documents=256, max_archive_bytes=needed)
+        return ParentRetirementLimits(batch_documents=256, max_archive_bytes=self.limits.max_archive_bytes)
 
     def _record_intent(self, source, candidate):
         intent = dict(parent=candidate['native_parent_id'], scope_epoch=candidate['scope_epoch'],

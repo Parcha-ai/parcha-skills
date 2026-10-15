@@ -197,6 +197,9 @@ jobs:
             e2e_chunk_retirement.py \
             e2e_chunk_vector_retirement.py \
             e2e_parent_chunk_retirement.py \
+            e2e_selective_retirement_experiment.py \
+            e2e_parent_retirement_window.py \
+            e2e_retirement_window_runner.py \
             e2e_optional_reconcile_index.py \
             e2e_context_time_index.py \
             e2e_streaming_locators.py \

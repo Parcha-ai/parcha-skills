@@ -18,8 +18,8 @@ from .chunk_retirement import (
     ParentRetirementLimits,
     _parent_deadline,
     require_retirement_owner,
-    retire_parent_chunks,
 )
+from .parent_chunk_window import retire_parent_windows
 from .logical_evidence import IDENTITY_RE
 from .parent_chunk_proof import (
     CAPTURE_DETAIL_FIELDS,
@@ -471,7 +471,7 @@ def run_retirement(
     parent_limits_for=None,
     metadata_mode="keep",
 ):
-    """Sequential enabled-only maintenance; fresh whole-parent proof once per claim."""
+    """Sequential enabled-only maintenance; bounded selected proofs within each claim."""
     limits = RunnerLimits() if limits is None else limits
     parent_limits = ParentRetirementLimits() if parent_limits is None else parent_limits
     if (
@@ -565,7 +565,7 @@ def run_retirement(
             selected_limits = parent_limits if parent_limits_for is None else parent_limits_for(candidate)
             if not isinstance(selected_limits, ParentRetirementLimits):
                 raise ChunkRetirementError("parent_retirement_limits_invalid")
-            result = retire_parent_chunks(
+            result = retire_parent_windows(
                 store,
                 meter,
                 tenant_id=key[0],
@@ -620,6 +620,9 @@ def run_retirement(
         ):
             report[field] += result.get(field, 0)
         if report["commit_outcome_unknown"] or "retirement_owner_required" in errors:
+            break
+        if result.get("archive_budget_limited"):
+            report["status"] = "archive_budget_limited"
             break
         if (
             result.get("status") == "partial"
