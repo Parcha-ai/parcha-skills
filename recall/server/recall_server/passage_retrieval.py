@@ -19,7 +19,7 @@ from psycopg_pool import PoolTimeout
 
 from .actor_attribution import ACTOR_ID_RE, ACTOR_RELATIONS
 from .db import SearchDeadlineExceeded, bounded_search_text
-from .passage_projection import COMPLETE_REPORT_UNIT
+from .passage_projection import COMPLETE_SOURCE_UNITS
 from .fusion import (
     ARM_NAMES,
     DEFAULT_FUSION_ALPHAS,
@@ -2572,7 +2572,7 @@ class PassageHintRetrieval:
             for row in rows:
                 key = row.get("passage_id") or row.get("receipt")
                 if key and key not in texts:
-                    complete = row.get("source_unit") == COMPLETE_REPORT_UNIT
+                    complete = row.get("source_unit") in COMPLETE_SOURCE_UNITS
                     whole = rerank_document(row, terms, 0) if complete else ""
                     complete = complete and len(whole) <= MAX_DOC_CHARS_CEILING
                     texts[key] = whole if complete else rerank_document(row, terms, width)
