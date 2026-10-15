@@ -215,9 +215,10 @@ def run_projection_worker(
     ``search_plane`` (H3-b) drains the search projection outbox into
     turbopuffer before logical work and on ready parent completions; ``None`` (no
     turbopuffer settings, or ``--search-plane off``) skips the phase and the
-    cycle reports zeros for it. Each publication tick retains the configured
-    passage batch/concurrency and one bounded search drain. Completions are
-    coalesced by the logical coordinator; downstream calls never overlap.
+    cycle reports zeros for it. Each publication tick admits at most one
+    concurrent passage wave, capped by the configured batch size, and one
+    bounded search drain. Completions are coalesced by the logical coordinator;
+    downstream calls never overlap.
 
     With ``skip_embedding`` (H5-2) the embedding phase is left to the
     dedicated ``embedding-worker`` process: the cycle reports
@@ -402,8 +403,10 @@ def run_projection_worker(
                 before_search_ticks = search_ticks
                 tick = passages.project_pending(
                     tenant_id=tenant_id,
-                    batch_size=passage_batch_size,
-                    max_batches=max_batches_per_cycle,
+                    # Yield to logical admission after one active wave, even
+                    # when a large passage backlog remains.
+                    batch_size=min(passage_batch_size, passage_concurrency),
+                    max_batches=1,
                     concurrency=passage_concurrency,
                     on_progress=publish_search if search_plane is not None else None,
                 )

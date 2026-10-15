@@ -91,6 +91,32 @@ class _Scan:
 
 
 class ProjectionWorkerTest(unittest.TestCase):
+    def test_passage_wave_respects_smaller_batch_and_leaves_logical_budget(self):
+        for batch, concurrency, expected in ((100, 2, 2), (1, 2, 1), (3, 8, 3)):
+            with self.subTest(batch=batch, concurrency=concurrency):
+                calls = []
+                admitted = []
+
+                class Passages(_Passages):
+                    def project_pending(self, **kwargs):
+                        admitted.append(kwargs)
+                        return super().project_pending(**kwargs)
+
+                logical = _Logical(calls)
+                run_projection_worker(
+                    logical, Passages(calls), once=True, skip_embedding=True,
+                    tenant_id="tenant:company:test", logical_batch_size=500,
+                    passage_batch_size=batch, embedding_batch_size=64,
+                    max_batches_per_cycle=2, upload_concurrency=2,
+                    passage_concurrency=concurrency, interval_seconds=30,
+                )
+                self.assertEqual(len(admitted), 1)
+                self.assertEqual(admitted[0]["batch_size"], expected)
+                self.assertEqual(admitted[0]["max_batches"], 1)
+                self.assertEqual(admitted[0]["concurrency"], concurrency)
+                self.assertEqual(logical.kwargs["batch_size"], 500)
+                self.assertEqual(logical.kwargs["max_batches"], 2)
+
     def test_passage_phase_numbers_reach_cycle_log_without_private_values(self):
         calls = []
 
