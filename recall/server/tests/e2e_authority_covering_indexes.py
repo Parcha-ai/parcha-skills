@@ -178,6 +178,8 @@ class AuthorityIndexOperationTest(unittest.TestCase):
             CREATE TABLE canonical_passages(
                 tenant_id text,source_id text,logical_document_id text,passage_id text,
                 text_sha256 text,receipts text[],policy_fingerprint text,
+                spans jsonb NOT NULL DEFAULT '[]'::jsonb,
+                token_count integer NOT NULL DEFAULT 1,
                 PRIMARY KEY(tenant_id,source_id,passage_id));
         """)
         receipts = {
@@ -236,6 +238,8 @@ class AuthorityIndexOperationTest(unittest.TestCase):
             CREATE TABLE canonical_passages(
                 tenant_id text,source_id text,logical_document_id text,passage_id text,
                 text_sha256 text,receipts text[],policy_fingerprint text,
+                spans jsonb NOT NULL DEFAULT '[]'::jsonb,
+                token_count integer NOT NULL DEFAULT 1,
                 PRIMARY KEY(tenant_id,source_id,passage_id));
         ''')
         module = ast.parse((SERVER/'recall_server/turbopuffer_retrieval.py').read_text())
