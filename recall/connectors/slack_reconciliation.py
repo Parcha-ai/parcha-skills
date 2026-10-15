@@ -34,7 +34,19 @@ def time_page(response, messages, query, *, descending):
         value = message.get('ts') if isinstance(message, dict) else None
         if not isinstance(value, str) or not re.fullmatch(r'[0-9]{1,16}(?:\.[0-9]{1,6})?', value):
             raise ConnectorContractError('slack time pagination timestamp is invalid')
-        if not Decimal(query.get('oldest', '0')) < Decimal(value) < Decimal(query['latest']):
+        lower, current, upper = (Decimal(query.get('oldest', '0')),
+                                 Decimal(value), Decimal(query['latest']))
+        if not lower < current < upper:
+            relation = ('before_oldest' if current < lower else
+                        'equal_oldest' if current == lower else
+                        'equal_latest' if current == upper else 'after_latest')
+            LOG.warning(
+                'slack historical boundary refused direction=%s relation=%s '
+                'root=%s more=%s cursor=%s count=%s',
+                'descending' if descending else 'ascending', relation,
+                value == query.get('ts'), response.get('has_more') is True,
+                cursor is not None, len(messages),
+            )
             raise ConnectorContractError('slack time pagination did not advance')
         timestamps.append(value)
     if response.get('has_more') is not True and cursor is None:
