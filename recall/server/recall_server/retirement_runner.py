@@ -376,6 +376,8 @@ def _claim(store, *, scope, limits, deadline_at, attempted, diagnostic=None):
         diagnostic["phase"] = "authorize"
         _authorize(store, connection, scope, deadline_at)
         diagnostic["phase"] = "candidate_select"
+        # ANY on progress is not propagated across the join by the planner.
+        # The redundant catalog predicate keeps both sides source-scoped.
         row = store._execute_bounded(
             connection,
             """SELECT progress.source_id,progress.native_parent_id,
@@ -386,6 +388,7 @@ def _claim(store, *, scope, limits, deadline_at, attempted, diagnostic=None):
             + " WHERE "
             + _ELIGIBLE
             + """
+            AND evidence.source_id=ANY(%s)
             AND progress.updated_at <= clock_timestamp() - (%s * interval '1 second')
             AND NOT EXISTS(SELECT 1 FROM unnest(%s::text[],%s::text[]) seen(source,parent)
                 WHERE seen.source=progress.source_id AND seen.parent=progress.native_parent_id)
@@ -393,6 +396,7 @@ def _claim(store, *, scope, limits, deadline_at, attempted, diagnostic=None):
             FOR UPDATE OF progress SKIP LOCKED""",
             (
                 scope.tenant_id,
+                list(scope.source_ids),
                 list(scope.source_ids),
                 limits.cooldown_seconds,
                 [p[0] for p in attempted],
