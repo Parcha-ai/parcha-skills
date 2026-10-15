@@ -533,7 +533,7 @@ def retire_parent_chunks(store, archive, *, tenant_id, source_id, native_parent_
     Only attempt-local proof authorizes body updates. The persistent cursor is
     scheduling metadata; a restart proves every parent part again exactly once.
     """
-    from .parent_chunk_proof import prove_parent_chunks
+    from .parent_chunk_proof import CAPTURE_DETAIL_FIELDS, prove_parent_chunks
     scope = _parent_scope(tenant_id, source_id, native_parent_id)
     limits = ParentRetirementLimits() if limits is None else limits
     if not isinstance(limits, ParentRetirementLimits) or type(apply) is not bool:
@@ -551,7 +551,7 @@ def retire_parent_chunks(store, archive, *, tenant_id, source_id, native_parent_
     deadline_at = _parent_deadline(deadline_at)
     totals = dict(retired_metadata_chunks=0, cleared_documents=0, cleared_chunks=0, cleared_utf8_bytes=0, hashed_utf8_bytes=0,
                   hash_ms=0.0, sql_ms=0.0, batches=0)
-    attempt_metrics = dict(metadata_capture_ms=0.0)
+    attempt_metrics = dict(metadata_capture_ms=0.0, **{field: 0 for field in CAPTURE_DETAIL_FIELDS})
     try:
         with store.connect() as connection:
             schema = store._execute_bounded(connection, 'SELECT 1 FROM schema_migrations WHERE version=69', (), deadline_at).fetchone()

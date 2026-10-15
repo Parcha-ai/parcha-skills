@@ -194,10 +194,14 @@ class RunnerTests(unittest.TestCase):
             if kwargs['native_parent_id'] == 'unknown':
                 error = ChunkRetirementError('parent_retirement_unavailable')
                 error.committed = dict(cleared_utf8_bytes=3, sql_ms=200., hash_ms=50.)
-                error.attempt_metrics = dict(metadata_capture_ms=600.)
+                error.attempt_metrics = dict(metadata_capture_ms=600., metadata_rows=7, metadata_fetches=2,
+                                             metadata_fetch_ms=300., metadata_membership_calls=1,
+                                             metadata_membership_ms=100., metadata_spool_ms=25.)
                 raise error
             return dict(complete=True, batches=1, cleared_utf8_bytes=10,
-                        sql_ms=500., hash_ms=100., metadata_capture_ms=800.)
+                        sql_ms=500., hash_ms=100., metadata_capture_ms=800.,
+                        metadata_rows=10, metadata_fetches=2, metadata_fetch_ms=400.,
+                        metadata_membership_calls=1, metadata_membership_ms=200., metadata_spool_ms=50.)
         with patch.object(runner.time, 'monotonic', side_effect=lambda:clock[0]), \
              patch.object(runner, '_claim', side_effect=claim), \
              patch.object(runner, 'retire_parent_chunks', side_effect=retire):
@@ -210,6 +214,9 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(result['parent_wall_ms'], 4000.)
         self.assertEqual(result['claim_wall_ms'], 500.)
         self.assertEqual(result['metadata_capture_ms'], 1400.)
+        self.assertEqual({key: result[key] for key in runner.CAPTURE_DETAIL_FIELDS}, dict(
+            metadata_rows=17, metadata_fetches=4, metadata_fetch_ms=700.,
+            metadata_membership_calls=2, metadata_membership_ms=300., metadata_spool_ms=75.))
 
     def test_archive_wall_includes_failed_reads_but_not_budget_refusal(self):
         clock = [100.0]
