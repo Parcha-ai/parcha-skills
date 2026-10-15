@@ -27,6 +27,8 @@ PASSAGE_SEPARATOR = "\n"
 # H2-a contextual header: embedding input only, never part of the passage
 # text, spans, receipts, text_sha256, or passage id.
 COMPLETE_REPORT_UNIT = "subagent_handback.complete.v1"
+COMPLETE_ASSISTANT_FINAL_UNIT = "assistant_final.complete.v1"
+COMPLETE_SOURCE_UNITS = (COMPLETE_REPORT_UNIT, COMPLETE_ASSISTANT_FINAL_UNIT)
 MAX_PASSAGE_HEADER_BYTES = 512
 PASSAGE_HEADER_OPEN = "[context]"
 PASSAGE_HEADER_CLOSE = "[passage]"
@@ -109,7 +111,22 @@ def _visible_message(text: str) -> tuple[str | None, str | None]:
         for block in _text_blocks(candidate)
     ))
     if blocks:
-        return "\n".join(blocks), None
+        # Provider-declared final text, not an inferred summary or a vendor hint.
+        # Refuse mixed block types and competing envelope text: only the exact
+        # complete visible payload can receive the producer-owned marker.
+        final = (
+            value.get("type") == "response_item"
+            and isinstance(payload, dict)
+            and payload.get("type") == "message"
+            and payload.get("role") == "assistant"
+            and payload.get("phase") == "final_answer"
+            and isinstance(payload.get("content"), list)
+            and bool(payload["content"])
+            and all(isinstance(block, dict) and block.get("type") == "output_text"
+                    and isinstance(block.get("text"), str) for block in payload["content"])
+            and tuple(dict.fromkeys(_text_blocks(payload["content"]))) == blocks
+        )
+        return "\n".join(blocks), COMPLETE_ASSISTANT_FINAL_UNIT if final else None
     # Claude can deliver its final report through this named tool instead of a
     # text block. Keep existing visible projections (and their offsets) intact.
     if (
@@ -211,7 +228,7 @@ class PassageMessage:
             or isinstance(self.record_count, bool)
             or not isinstance(self.record_count, int)
             or self.record_count < 1
-            or self.source_unit not in (None, COMPLETE_REPORT_UNIT)
+            or (self.source_unit is not None and self.source_unit not in COMPLETE_SOURCE_UNITS)
             or actor_links(self.actor_links) != self.actor_links
         ):
             raise ValueError(
@@ -542,7 +559,7 @@ def build_passages(
                      policy=policy)
     if not isinstance(messages, tuple) or not all(isinstance(m, PassageMessage) for m in messages):
         return _build_passages(messages=messages, **arguments)
-    reports = [i for i, message in enumerate(messages) if message.source_unit == COMPLETE_REPORT_UNIT]
+    reports = [i for i, message in enumerate(messages) if message.source_unit in COMPLETE_SOURCE_UNITS]
     if not reports:
         return _build_passages(messages=messages, **arguments)
     if any(b.record_ordinal < a.record_ordinal + a.record_count for a, b in zip(messages, messages[1:])):
@@ -564,7 +581,7 @@ def build_passages(
                         and passage.token_count <= DEFAULT_PASSAGE_POLICY.target_tokens
                         and passage.text == messages[start].text)
             spans = tuple(replace(span, message_index=span.message_index + start,
-                                  source_unit=COMPLETE_REPORT_UNIT if complete else None)
+                                  source_unit=messages[start].source_unit if complete else None)
                           for span in passage.spans)
             identity = passage_identity(tenant_id=tenant_id, source_id=source_id,
                 logical_document_id=logical_document_id, policy_fingerprint=policy.fingerprint,
@@ -825,6 +842,8 @@ def visible_messages(
         ):
             continue
         text, source_unit = _visible_message(source_text)
+        if source_unit == COMPLETE_ASSISTANT_FINAL_UNIT and first.roles != ("assistant",):
+            source_unit = None
         if text is None:
             continue
         message = PassageMessage(
