@@ -1315,6 +1315,19 @@ class Collector:
                     )
                 prefix_matches = bool(row and row["snapshot_sha256"]
                                       and saved_prefix == row["snapshot_sha256"])
+                if (
+                    row and row["status"] == "ok" and row["snapshot_stat"]
+                    and row["scanned_offset"] == row["committed_offset"] == row["size"] == stat.st_size
+                    and prefix_matches
+                    and snapshot_identity(path.stat()) == snapshot_identity(stat)
+                ):
+                    # A fresh strong hash proves a completed, acknowledged file
+                    # only changed metadata. Refresh its witness without replay.
+                    self._save_file_progress(
+                        path_text, stat, current_fingerprint, row["scanned_offset"],
+                        "ok", scan_id, snapshot_sha256,
+                    )
+                    continue
                 resume_mode = row["status"].removeprefix("scanning-") if row and row["status"].startswith("scanning-") else None
                 if resume_mode and not prefix_matches:
                     # Missing legacy proof or a rewrite requires a fresh walk;

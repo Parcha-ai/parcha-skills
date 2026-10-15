@@ -141,6 +141,8 @@ class ArchiveDedupTest(unittest.TestCase):
                 collector.flush()
                 before = len(self.archive.calls)
                 rows = [tuple(r) for r in collector.db.execute('SELECT * FROM outbox')]
+                # Exercise per-record ACK reuse, not the completed-file skip.
+                self.path.write_text(self.path.read_text().replace('": ', '" :', 1))
                 self.touch()
                 summary = collector.scan()
                 self.assertEqual(len(self.archive.calls), before)
@@ -226,6 +228,8 @@ class ArchiveDedupTest(unittest.TestCase):
             collector.flush()
             self.assertEqual(self.writer.events[-1]['content']['content_fidelity'], 'head_tail')
             before = len(self.archive.calls)
+            # Force a real rescan while preserving parsed content and offsets.
+            self.path.write_text(self.path.read_text().replace('": ', '" :', 1))
             self.touch()
             self.assertEqual(collector.scan()['records_queued'], 0)
             self.assertEqual(len(self.archive.calls), before + 2)
@@ -240,6 +244,8 @@ class ArchiveDedupTest(unittest.TestCase):
                 collector.db.execute(corruption)
                 collector.db.commit()
                 before = len(self.archive.calls)
+                # Same record/hash/offsets; only the whole-file digest changes.
+                self.path.write_text(self.path.read_text().replace('": ', '" :', 1))
                 self.touch()
                 collector.scan()
                 self.assertEqual(len(self.archive.calls), before + 1)
