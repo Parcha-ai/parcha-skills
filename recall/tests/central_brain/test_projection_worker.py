@@ -1266,6 +1266,137 @@ class RetirementWorkerTests(unittest.TestCase):
 
 
 class RetirementHeartbeatTests(unittest.TestCase):
+    def test_continuous_publication_launches_and_reaps_one_retirement_child(self):
+        import io
+        import json
+        from recall_server.retirement_supervisor import RetirementSupervisor
+
+        calls, children, invocations = [], [], []
+        clock = _FakeClock()
+
+        class Child:
+            stdin = None
+            returncode = 0
+
+            def __init__(self):
+                self.done = False
+                self.stdout = io.BytesIO(json.dumps(dict(
+                    status='bounded', cleared_documents=2, cleared_utf8_bytes=456,
+                )).encode())
+
+            def poll(self):
+                return 0 if self.done else None
+
+        def launch(_configuration):
+            child = Child()
+            children.append(child)
+            return child
+
+        supervisor = RetirementSupervisor('synthetic', launch=launch)
+
+        def retire(busy):
+            self.assertTrue(busy)
+            invocations.append(clock())
+            return supervisor.cycle(busy=busy)
+
+        class Logical(_Logical):
+            def project_pending(inner, **kwargs):
+                # A successful completion every second prevents the executor's
+                # five-second idle heartbeat from firing during this batch.
+                for i in range(91):
+                    clock.advance(1)
+                    kwargs['on_progress']()
+                    self.assertEqual(len(children), 1)
+                    if i == 60:
+                        children[0].done = True
+                    calls.append('foreground')
+                self.assertIsNone(supervisor.child)
+                self.assertTrue(children[0].stdout.closed)
+                return super().project_pending(**kwargs)
+
+        result = run_projection_worker(
+            Logical(calls, pending=1000), _Passages(calls),
+            tenant_id='tenant:company:test', logical_batch_size=500,
+            passage_batch_size=100, embedding_batch_size=64,
+            max_batches_per_cycle=2, upload_concurrency=2, passage_concurrency=2,
+            interval_seconds=30, retirement_maintainer=retire, clock=clock, once=True,
+        )
+        self.assertEqual(invocations, [101, 131, 161, 191])
+        self.assertEqual(calls.count('foreground'), 91)
+        self.assertEqual(result['retirement_cleared_documents'], 2)
+        self.assertEqual(result['retirement_cleared_utf8_bytes'], 456)
+        self.assertEqual(len(children), 1)
+        supervisor.close()
+
+    def test_progress_services_retirement_before_synchronous_publication(self):
+        calls, invocations = [], []
+        clock = _FakeClock()
+
+        def retire(busy):
+            self.assertTrue(busy)
+            invocations.append(clock())
+            return dict(status='no_ready_sources', cleared_documents=0, cleared_utf8_bytes=0)
+
+        class Passages(_Passages):
+            def project_pending(inner, **kwargs):
+                if calls.count('passages') == 1:
+                    # The progress callback must service the supervisor before
+                    # entering potentially slow synchronous downstream work.
+                    self.assertEqual(invocations, [101])
+                    clock.advance(90)
+                return super().project_pending(**kwargs)
+
+        class Logical(_Logical):
+            def project_pending(inner, **kwargs):
+                clock.advance(1)
+                kwargs['on_progress']()
+                return super().project_pending(**kwargs)
+
+        result = run_projection_worker(
+            Logical(calls, pending=1000), Passages(calls),
+            tenant_id='tenant:company:test', logical_batch_size=500,
+            passage_batch_size=100, embedding_batch_size=64,
+            max_batches_per_cycle=2, upload_concurrency=2, passage_concurrency=2,
+            interval_seconds=30, retirement_maintainer=retire, clock=clock, once=True,
+        )
+        self.assertEqual(invocations, [101, 191])
+        self.assertEqual(result['retirement_cleared_utf8_bytes'], 0)
+        self.assertEqual(result['retirement_unknown'], 0)
+
+    def test_progress_retirement_counters_survive_downstream_failure(self):
+        calls, invocations = [], []
+        clock = _FakeClock()
+
+        class Logical(_Logical):
+            def project_pending(inner, **kwargs):
+                kwargs['on_progress']()
+                return super().project_pending(**kwargs)
+
+        class Passages(_Passages):
+            def project_pending(inner, **kwargs):
+                result = super().project_pending(**kwargs)
+                if calls.count('passages') == 2:
+                    raise RuntimeError('synthetic publication failure')
+                return result
+
+        def retire(busy):
+            invocations.append(clock())
+            return dict(status='bounded', cleared_documents=3, cleared_utf8_bytes=321)
+
+        with self.assertLogs('recall_server.projection_worker', level='ERROR') as logs:
+            result = run_projection_worker(
+                Logical(calls, pending=1000), Passages(calls),
+                tenant_id='tenant:company:test', logical_batch_size=500,
+                passage_batch_size=100, embedding_batch_size=64,
+                max_batches_per_cycle=2, upload_concurrency=2, passage_concurrency=2,
+                interval_seconds=30, retirement_maintainer=retire, clock=clock,
+                max_cycles=2, sleep=lambda _: None,
+            )
+        self.assertIn('failed_phase=passage', logs.output[0])
+        self.assertEqual(invocations, [100])
+        self.assertEqual(result['retirement_cleared_documents'], 3)
+        self.assertEqual(result['retirement_cleared_utf8_bytes'], 321)
+
     def test_long_logical_batch_services_retirement_and_keeps_all_results(self):
         calls, invocations = [], []
         clock = _FakeClock()
