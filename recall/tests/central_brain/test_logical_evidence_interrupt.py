@@ -227,6 +227,7 @@ class PoisonedGroupIsolationTests(TestCase):
                         revision=1,
                     )
                     for parent in ("good-a", "poison", "good-b")
+                    if parent not in self.committed
                 ]
 
             def _prepare_batch_and_upload(self, candidates, **kwargs):

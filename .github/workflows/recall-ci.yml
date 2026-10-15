@@ -82,6 +82,7 @@ jobs:
             e2e_logical_backlog_admission.py \
             e2e_logical_parent_progress.py \
             e2e_passage_callback_quantum.py \
+            e2e_logical_slot_refill.py \
             e2e_logical_admission_isolation.py \
             e2e_passage_parent_progress.py \
             e2e_passage_dispatch_order.py \

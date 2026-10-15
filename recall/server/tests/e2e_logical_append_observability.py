@@ -73,18 +73,45 @@ class AppendObservability(unittest.TestCase):
             return original(candidate, upload)
 
         with patch.object(self.logical, "_commit_upload", append_later):
-            result, log = self.completion(self.publish)
+            result, log = self.completion(lambda: self.logical.project_pending(
+                tenant_id=self.tenant, batch_size=1, max_batches=1, upload_concurrency=1))
         self.assertEqual(result["documents"], 1)
         self.assertEqual(result["records"], 2)
         self.assertEqual(log["status"], "committed")
         self.assertEqual(log.get("append_used"), "True")
         self.assertEqual(log.get("input_sql_rows"), "1")
-        result, log = self.completion(self.publish)
+        result, log = self.completion(lambda: self.logical.project_pending(
+                tenant_id=self.tenant, batch_size=1, max_batches=1, upload_concurrency=1))
         self.assertEqual(result["documents"], 1)
         self.assertEqual(result["records"], 3)
         self.assertEqual(log["status"], "committed")
         self.assertEqual(log.get("append_used"), "True")
         self.assertEqual(log.get("input_sql_rows"), "1")
+
+    def test_two_fresh_admissions_log_both_captured_append_inputs(self):
+        self.ingest("old", 1)
+        self.publish()
+        self.ingest("new", 2)
+        self.logical.append_enabled = True
+        original = self.logical._commit_upload
+        def append_later(candidate, upload):
+            self.ingest("later", 3)
+            return original(candidate, upload)
+        with patch.object(self.logical, "_commit_upload", append_later), self.assertLogs(
+            LOG.name, level="INFO"
+        ) as captured:
+            result = self.publish()
+        lines = [line for line in captured.output if "logical owner completed " in line]
+        self.assertEqual(len(lines), 2)
+        logs = [dict(item.split("=", 1) for item in line.split() if "=" in item)
+                for line in lines]
+        self.assertEqual(result["documents"], 2)
+        self.assertEqual(result["records"], 5)
+        self.assertEqual([log["status"] for log in logs], ["committed", "committed"])
+        self.assertEqual([log["input_sql_rows"] for log in logs], ["1", "1"])
+        self.assertEqual([log["append_used"] for log in logs], ["True", "True"])
+        self.assertTrue(all("An exact archived body" not in line for line in lines))
+        self.assertEqual(self.publish()["documents"], 0)
 
     def test_preparation_failure_does_not_report_zero_or_success(self):
         self.ingest("old", 1)
