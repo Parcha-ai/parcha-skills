@@ -208,6 +208,7 @@ jobs:
             e2e_context_neighbor_plan.py \
             e2e_located_public_reads.py \
             e2e_retirement_runner.py \
+            e2e_retirement_claim_source.py \
             e2e_retirement_capture_timing.py \
             e2e_retirement_capture_observability.py \
             e2e_retirement_error_cause.py \
