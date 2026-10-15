@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+import json
 import re
 import unittest
 from contextlib import contextmanager
@@ -339,6 +340,8 @@ def statement_kinds(connection: FakeConnection) -> list[str]:
             kinds.append("PLACE moved")
         elif head.startswith("UPDATE canonical_passages SET revision="):
             kinds.append("BUMP revision")
+        elif head.startswith("UPDATE canonical_passages passage SET revision="):
+            kinds.append("REFRESH metadata")
         elif head.startswith("INSERT INTO canonical_passage_embeddings"):
             kinds.append("REATTACH embeddings")
         elif head.startswith("CREATE TEMP TABLE"):
@@ -376,8 +379,8 @@ class DifferentialCommitTests(unittest.TestCase):
         self.assertEqual(kinds[0], "CAPTURE embeddings")
         if result["deleted"]:
             self.assertLess(kinds.index("DELETE passages"), kinds.index("UPSERT pointer"))
-        self.assertLess(kinds.index("UPSERT pointer"), kinds.index("BUMP revision"))
-        self.assertLess(kinds.index("BUMP revision"), kinds.index("COPY canonical_passages"))
+        self.assertLess(kinds.index("UPSERT pointer"), kinds.index("REFRESH metadata"))
+        self.assertLess(kinds.index("REFRESH metadata"), kinds.index("COPY canonical_passages"))
         self.assertLess(kinds.index("COPY canonical_passages"), kinds.index("REATTACH embeddings"))
         self.assertNotIn("PARK moved", kinds)
         # Only new passages hit COPY; text of retained rows is never written.
@@ -388,10 +391,13 @@ class DifferentialCommitTests(unittest.TestCase):
                 self.assertNotIn("text_redacted", sql)
         bump = next(
             params for kind, sql, params in connection.statements
-            if kind == "SQL" and " ".join(sql.split()).startswith("UPDATE canonical_passages SET revision=")
+            if kind == "SQL" and " ".join(sql.split()).startswith("UPDATE canonical_passages passage SET revision=")
         )
         self.assertEqual(bump[0], 2)
-        self.assertEqual(set(bump[3]), set(result and {p.passage_id for p in before} & {p.passage_id for p in after}))
+        self.assertEqual(
+            {row["passage_id"] for row in json.loads(bump[1])},
+            {p.passage_id for p in before} & {p.passage_id for p in after},
+        )
 
     def test_shifted_windows_are_deleted_then_moved_rows_are_parked_before_placement(self) -> None:
         passages = build(4, revision=3)
@@ -418,6 +424,7 @@ class DifferentialCommitTests(unittest.TestCase):
                 "UPSERT pointer",
                 "PARK moved",
                 "PLACE moved",
+                "REFRESH metadata",
                 "COPY canonical_passages",
                 "REATTACH embeddings",
             ],
@@ -437,7 +444,7 @@ class DifferentialCommitTests(unittest.TestCase):
         # separate revision bump is issued for them.
         self.assertNotIn("BUMP revision", kinds)
 
-    def test_unchanged_document_touches_nothing_but_the_pointer(self) -> None:
+    def test_unchanged_document_keeps_rows_in_place(self) -> None:
         passages = build(4, revision=2)
         existing = [
             {"passage_id": p.passage_id, "ordinal": p.ordinal, "revision": 2, **times(p)}
@@ -448,7 +455,7 @@ class DifferentialCommitTests(unittest.TestCase):
         result = self.projector(connection)._commit(prepared_for(passages, 2))
 
         self.assertEqual(result, {"status": "committed", "inserted": 0, "deleted": 0, "retained": 4})
-        self.assertEqual(statement_kinds(connection), ["UPSERT pointer"])
+        self.assertEqual(statement_kinds(connection), ["UPSERT pointer", "REFRESH metadata"])
         self.assertEqual(connection.copied, [])
 
     def test_stale_candidate_returns_stale_without_writes(self) -> None:

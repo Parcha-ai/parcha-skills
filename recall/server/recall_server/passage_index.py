@@ -932,8 +932,8 @@ class CanonicalPassageProjector:
                 #      then set their final ordinal + revision (two phases,
                 #      so a moved row never lands on an ordinal another
                 #      retained row still holds);
-                #   5. bump revision on the other retained rows (HOT update:
-                #      no indexed column changes, text_redacted untouched);
+                #   5. refresh retained revisions and receipts together;
+                #      text_redacted and embedding input stay untouched;
                 #   6. COPY to_insert passages + actors into the freed
                 #      ordinals;
                 #   7. re-attach embeddings for to_insert by content hash.
@@ -1046,25 +1046,6 @@ class CanonicalPassageProjector:
                             candidate.source_id,
                         ),
                     )
-                moved_ids = {passage_id for passage_id, _ in diff.moved}
-                revision_stale = [
-                    passage_id
-                    for passage_id in diff.revision_stale
-                    if passage_id not in moved_ids
-                ]
-                if revision_stale:
-                    connection.execute(
-                        """UPDATE canonical_passages
-                              SET revision=%s
-                            WHERE tenant_id=%s AND source_id=%s
-                              AND passage_id=ANY(%s::text[])""",
-                        (
-                            candidate.revision,
-                            candidate.tenant_id,
-                            candidate.source_id,
-                            revision_stale,
-                        ),
-                    )
                 # Stable passage IDs cover text and spans, not receipts. A
                 # canonical metadata revision can replace a receipt without
                 # changing the visible body or its embedding input.
@@ -1077,15 +1058,16 @@ class CanonicalPassageProjector:
                 if retained_receipts:
                     connection.execute(
                         """UPDATE canonical_passages passage
-                              SET receipts=current.receipts
+                              SET revision=%s,receipts=current.receipts
                              FROM jsonb_to_recordset(%s::jsonb)
                                   AS current(passage_id text,receipts text[])
                             WHERE passage.tenant_id=%s AND passage.source_id=%s
                               AND passage.logical_document_id=%s
                               AND passage.passage_id=current.passage_id
-                              AND passage.receipts IS DISTINCT FROM current.receipts""",
-                        (json.dumps(retained_receipts), candidate.tenant_id,
-                         candidate.source_id, candidate.logical_document_id),
+                              AND (passage.revision IS DISTINCT FROM %s
+                                   OR passage.receipts IS DISTINCT FROM current.receipts)""",
+                        (candidate.revision,json.dumps(retained_receipts), candidate.tenant_id,
+                         candidate.source_id, candidate.logical_document_id,candidate.revision),
                     )
                 if retained_unheaded:
                     self._write_headers(
