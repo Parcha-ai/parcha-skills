@@ -294,6 +294,64 @@ class CollectorTest(unittest.TestCase):
         self.assertEqual(collector.discover(), [newer, older])
         collector.close()
 
+    def test_rewrite_during_bounded_scan_revisits_already_scanned_prefix(self) -> None:
+        transcript = self.root / "session.jsonl"
+        transcript.write_text(claude_line("old prefix") + claude_line("tail evidence"))
+        collector = self.collector()
+        collector.max_scan_records = 1
+        self.assertFalse(collector.scan()["scan_complete"])
+        collector.flush()
+        collector.close()
+
+        transcript.write_text(claude_line("new prefix") + claude_line("tail evidence"))
+        collector = self.collector()
+        self.addCleanup(collector.close)
+        for _ in range(3):
+            collector.scan()
+            collector.flush()
+        delivered = [event for batch in AckServer.received for event in batch["events"]]
+        self.assertIn("new prefix", [event["content"]["message"]["content"] for event in delivered])
+        self.assertIn("old prefix", [event["content"]["message"]["content"] for event in delivered])
+        self.assertFalse(any(event["kind"] == "tombstone" for event in delivered))
+
+    def test_append_during_bounded_scan_keeps_existing_progress(self) -> None:
+        transcript = self.root / "session.jsonl"
+        transcript.write_text(claude_line("first evidence") + claude_line("second evidence"))
+        collector = self.collector()
+        self.addCleanup(collector.close)
+        collector.max_scan_records = 1
+        collector.scan()
+        collector.flush()
+        with transcript.open("a") as output:
+            output.write(claude_line("third evidence"))
+        collector.scan()
+        collector.flush()
+        delivered = [event["content"]["message"]["content"]
+                     for batch in AckServer.received for event in batch["events"]]
+        self.assertEqual(delivered, ["first evidence", "second evidence"])
+        collector.scan()
+        collector.flush()
+        delivered = [event["content"]["message"]["content"]
+                     for batch in AckServer.received for event in batch["events"]]
+        self.assertEqual(delivered, ["first evidence", "second evidence", "third evidence"])
+
+    def test_truncation_during_bounded_scan_keeps_old_history_and_reads_replacement(self) -> None:
+        transcript = self.root / "session.jsonl"
+        transcript.write_text(claude_line("first evidence") + claude_line("second evidence")
+                              + claude_line("third evidence"))
+        collector = self.collector()
+        self.addCleanup(collector.close)
+        collector.max_scan_records = 2
+        collector.scan()
+        collector.flush()
+        transcript.write_text(claude_line("short"))
+        self.assertTrue(collector.scan()["scan_complete"])
+        collector.flush()
+        delivered = [event for batch in AckServer.received for event in batch["events"]]
+        self.assertEqual([event["content"]["message"]["content"] for event in delivered],
+                         ["first evidence", "second evidence", "short"])
+        self.assertFalse(any(event["kind"] == "tombstone" for event in delivered))
+
     def test_busy_newest_file_does_not_starve_history_across_restart(self) -> None:
         older = self.root / "a-history.jsonl"
         newer = self.root / "z-live.jsonl"
