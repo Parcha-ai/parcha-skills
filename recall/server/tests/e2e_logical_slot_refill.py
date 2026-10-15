@@ -443,6 +443,20 @@ class SlotBounds(AdmissionSharing):
         self.assertEqual(result["documents"], 1)
         self.assertEqual(result["pending"], 1)
         self.assertEqual(result["batches"], 1)
+        self.assertTrue(self.logical._prefer_recent_admission)
+        self.add("fresh-notification", age=0)
+        with self.store.connect() as connection:
+            connection.execute("""UPDATE canonical_evidence_document_queue
+                SET notification_queued_at=clock_timestamp()
+                WHERE tenant_id=%s AND native_parent_id='fresh-notification'""", (self.tenant,))
+        dispatched = []
+        def record(candidates, **kwargs):
+            dispatched.extend(c.native_parent_id for c in candidates)
+            return original(candidates, **kwargs)
+        self.logical._prepare_batch_and_upload = record
+        self.assertEqual(self.logical.project_pending(
+            batch_size=1, max_batches=1, upload_concurrency=1)["documents"], 1)
+        self.assertEqual(dispatched, ["fresh-notification"])
 
     def test_due_admission_deadline_preserves_all_pending_work(self):
         self.add("still-pending", age=100)

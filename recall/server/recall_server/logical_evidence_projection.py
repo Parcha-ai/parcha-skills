@@ -2647,6 +2647,8 @@ class CanonicalLogicalEvidenceProjector:
         remaining_by_batch = {}
         deferred = set()
         ordinary_sources_served = set()
+        round_remaining = None
+        notification_round = False
         stopping = threading.Event()
 
         def parent_key(candidate):
@@ -2717,7 +2719,7 @@ class CanonicalLogicalEvidenceProjector:
             )
 
         def fill_slots(executor, handoff_stop=None):
-            nonlocal batches, admitted
+            nonlocal batches, admitted, round_remaining, notification_round
             def available():
                 return (not stopping.is_set() and can_admit()
                         and (handoff_stop is None or not handoff_stop.is_set()))
@@ -2740,6 +2742,27 @@ class CanonicalLogicalEvidenceProjector:
                 candidates = [c for c in candidates if parent_key(c) not in excluded][
                     :min(batch_size, admission_limit - admitted)
                 ]
+                if round_remaining is None:
+                    # Keep one finite round across free-slot refills. Fresh
+                    # arrivals may enter, but cannot enlarge its initial budget.
+                    notification_round = self._prefer_recent_admission and any(
+                        c.admission_priority == 1 for c in candidates
+                    )
+                    round_remaining = sum(
+                        not notification_round or c.admission_priority <= 1
+                        for c in candidates
+                    )
+                    if not round_remaining:
+                        round_remaining = None
+                        break
+                if notification_round:
+                    candidates = [c for c in candidates if c.admission_priority <= 1]
+                if not candidates:
+                    # The admitted class disappeared or became ineligible.
+                    # Rotate once; an empty fresh round ends admission.
+                    round_remaining = None
+                    self._prefer_recent_admission = not self._prefer_recent_admission
+                    continue
                 active_sources = {(c.tenant_id, c.source_id) for c, _ in pending.values()}
                 # Keep source floors across one-slot refills, including a hot
                 # source that finishes and requeues while another owner is busy.
@@ -2760,13 +2783,13 @@ class CanonicalLogicalEvidenceProjector:
                     c.notification_queued_at or datetime.max.replace(tzinfo=timezone.utc),
                     c.estimated_bytes,
                 ))
-                candidates = candidates[:slots]
+                candidates = candidates[:min(slots, round_remaining)]
                 if not candidates or not available():
                     break
-                # Share capacity across calls, including one-slot rounds.
-                # Notification/recent rounds alternate with oldest backlog.
-                # Empty scans do not consume a turn. A new process starts old.
-                self._prefer_recent_admission = not self._prefer_recent_admission
+                round_remaining -= len(candidates)
+                if round_remaining == 0:
+                    round_remaining = None
+                    self._prefer_recent_admission = not self._prefer_recent_admission
                 for candidate in candidates:
                     if candidate.admission_priority > 1:
                         ordinary_sources_served.add((candidate.tenant_id, candidate.source_id))
@@ -2919,6 +2942,10 @@ class CanonicalLogicalEvidenceProjector:
                 concurrency=cleanup_concurrency,
             )
             raise
+        if round_remaining is not None:
+            # A deadline may interrupt even a large oldest round. The next
+            # call starts the other round instead of waiting for its remainder.
+            self._prefer_recent_admission = not self._prefer_recent_admission
         # A non-full final batch is sealed only when admission stops. Earlier
         # empty refills must not reap it repeatedly as later slots are admitted.
         if remaining_by_batch:
