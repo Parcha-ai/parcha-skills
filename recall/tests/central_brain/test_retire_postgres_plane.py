@@ -621,6 +621,10 @@ class SearchPlaneReconcileTest(unittest.TestCase):
             cursor = mock.MagicMock()
             if "passage.passage_id AS passage_id" in sql:
                 cursor.fetchall.return_value = [{"passage_id": value} for value in live_ids]
+            elif "SELECT passage_id FROM canonical_passages" in sql:
+                cursor.fetchall.return_value = [{"passage_id": value} for value in live_ids if value in params[1]]
+            elif "pg_try_advisory_lock" in sql:
+                cursor.fetchone.return_value = {"acquired": True}
             else:
                 cursor.fetchall.return_value = []
             return cursor
@@ -631,7 +635,8 @@ class SearchPlaneReconcileTest(unittest.TestCase):
 
     def _seed(self, client, settings, ids):
         ns = client.namespace(settings.namespace("tenant:test"))
-        ns.write(upsert_rows=[{"id": value, "text": "t", "source_id": "codex:linux:test", "policy_fingerprint": "fp"} for value in ids])
+        ns.write(upsert_rows=[{"id": value, "text": "t", "source_id": "codex:linux:test", "policy_fingerprint": "fp",
+                              "first_occurred_at": "2026-07-01T00:00:00Z"} for value in ids])
         return ns
 
     def test_live_ids_use_restartable_keyset_pages_and_collapse_duplicates(self) -> None:
@@ -697,6 +702,11 @@ class SearchPlaneReconcileTest(unittest.TestCase):
         self.assertFalse(any(isinstance(value, str) and value.startswith("psg_") for value in report.values()))
         class _Projector:
             calls: list[tuple[str, list[str]]] = []
+            stale_calls: list[tuple[str, list[str]]] = []
+
+            def queue_stale_passages(self, tenant_id, passage_ids):
+                self.stale_calls.append((tenant_id, list(passage_ids)))
+                return len(passage_ids)
 
             def upsert_passages(self, tenant_id, passage_ids):
                 self.calls.append((tenant_id, list(passage_ids)))
@@ -714,6 +724,7 @@ class SearchPlaneReconcileTest(unittest.TestCase):
         self.assertEqual(applied["unresolved_stale"], 2)
         self.assertEqual(applied["status"], "unresolved")
         self.assertEqual(_Projector.calls, [("tenant:test", [live[3]])])
+        self.assertEqual(applied['queued_stale'], 2)
         self.assertEqual(set(ns.rows), set(live + stale))
         with self.assertRaises(ValueError):
             search_plane_reconcile(
@@ -736,14 +747,17 @@ class SearchPlaneReconcileTest(unittest.TestCase):
             self._seed(client, settings, [new_id])
             return original_query(**kwargs)
 
+        store = self._store(live)
         with mock.patch.object(ns, "query", side_effect=publish_then_query):
             result = search_plane_reconcile(
-                self._store(live), settings, tenant_id="tenant:test",
+                store, settings, tenant_id="tenant:test",
                 policy_fingerprint="fp", client=client, apply=True,
+                projector=TurbopufferProjector(store, settings, client=client),
             )
         self.assertIn(new_id, live)
         self.assertIn(new_id, ns.rows)
         self.assertEqual(result["deleted"], 0)
+        self.assertEqual(result["queued_stale"], 0)
         self.assertEqual((result["stale"], result["unresolved_stale"]), (1, 1))
 
     def test_missing_then_forgotten_is_not_reinserted_by_repair(self) -> None:

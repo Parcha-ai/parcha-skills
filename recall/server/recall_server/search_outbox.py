@@ -114,7 +114,8 @@ def write_search_tombstones(
     """Record one tombstone per deleted passage (keyed by its first month).
 
     ``passages`` rows carry ``passage_id`` and ``first_occurred_at``. A
-    passage already tombstoned keeps its original ``deleted_at``.
+    repeated deletion refreshes ``deleted_at``: an older vendor ACK must not
+    consume newer deletion work for the same stable passage ID.
     """
 
     ids: list[str] = []
@@ -130,7 +131,8 @@ def write_search_tombstones(
            )
            SELECT %s,%s,dead.passage_id,dead.month,clock_timestamp()
              FROM unnest(%s::text[],%s::date[]) AS dead(passage_id,month)
-           ON CONFLICT(tenant_id,source_id,passage_id) DO NOTHING""",
+           ON CONFLICT(tenant_id,source_id,passage_id) DO UPDATE
+               SET deleted_at=excluded.deleted_at,month=excluded.month""",
         (tenant_id, source_id, ids, months),
     )
     return max(0, result.rowcount)
