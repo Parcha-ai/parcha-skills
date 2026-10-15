@@ -97,14 +97,18 @@ print(json.dumps({'status':'complete','cleared_documents':3,'cleared_utf8_bytes'
             cleared_utf8_bytes=99, commit_outcome_unknown=True,
             committed_sql_ms=15., committed_hash_ms=3., archive_read_ms=8.,
             claim_wall_ms=2., parent_wall_ms=31., metadata_capture_ms=5., error_class="LogicalEvidenceError",
-            cause_error_code="logical_evidence_record_invalid", phase="maintenance")
+            cause_error_code="logical_evidence_record_invalid", phase="maintenance",
+            metadata_rows=3, metadata_fetches=2, metadata_fetch_ms=2.,
+            metadata_membership_calls=1, metadata_membership_ms=1., metadata_spool_ms=.5)
         self.worker.child = Mock(returncode=0, stdout=BytesIO(json.dumps(result).encode()))
         self.worker.child.poll.return_value = 0
         with self.assertLogs('recall_server.retirement_supervisor', level='INFO') as logs:
             observed = self.worker.cycle()
         self.assertTrue(observed['commit_outcome_unknown'])
         for field in ('committed_sql_ms','committed_hash_ms','archive_read_ms',
-                      'claim_wall_ms','parent_wall_ms','metadata_capture_ms','cause_error_code'):
+                      'claim_wall_ms','parent_wall_ms','metadata_capture_ms','cause_error_code',
+                      'metadata_rows','metadata_fetches','metadata_fetch_ms',
+                      'metadata_membership_calls','metadata_membership_ms','metadata_spool_ms'):
             self.assertIn(f'{field}={result[field]}', logs.output[0])
 
     def test_shutdown_reaps_exact_child_and_refuses_another_launch(self):

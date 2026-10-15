@@ -23,6 +23,26 @@ from .logical_body_proof import iter_parent_bodies
 # budgets below still apply. A modest batch reduces capture round trips.
 _CAPTURE_FETCH_ROWS = 128
 
+# Attempted acquisition work only; none of these counters authorize mutation.
+CAPTURE_DETAIL_FIELDS = (
+    'metadata_rows', 'metadata_fetches', 'metadata_fetch_ms',
+    'metadata_membership_calls', 'metadata_membership_ms', 'metadata_spool_ms',
+)
+
+
+@contextmanager
+def _capture_stage(metrics, timer, counter=None):
+    if metrics is None:
+        yield
+        return
+    started = time.monotonic()
+    if counter is not None:
+        metrics[counter] += 1
+    try:
+        yield
+    finally:
+        metrics[timer] += (time.monotonic() - started) * 1000
+
 _METADATA_FIELDS = frozenset({'tenant_id', 'source_id', 'document_id', 'native_id', 'revision',
     'text_sha256', 'body_record_ordinal', 'body_record_count', 'kind', 'raw_media_type',
     'structural_types', 'chunks', 'pending', 'pg_body_bytes'})
@@ -131,7 +151,10 @@ def read_parent_catalog(store, connection, scope, deadline_at, *, lock=False):
     return found
 
 
-def _capture(store, spool, scope, limits, deadline_at):
+def _capture(store, spool, scope, limits, deadline_at, *, capture_metrics=None):
+    if capture_metrics is not None:
+        for field in CAPTURE_DETAIL_FIELDS:
+            capture_metrics.setdefault(field, 0.0 if field.endswith('_ms') else 0)
     with store.connect() as connection, connection.transaction():
         connection.execute('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY')
         catalog = read_parent_catalog(store, connection, scope, deadline_at)
@@ -151,44 +174,52 @@ def _capture(store, spool, scope, limits, deadline_at):
             store._set_statement_deadline(connection, deadline_at)
             cursor.execute(sql, (*scope, limits.max_documents + 1, limits.batch_chunks + 1))
             while True:
-                if deadline_at is None:
-                    rows = cursor.fetchmany(_CAPTURE_FETCH_ROWS)
-                else:
-                    remaining_ms = int((deadline_at - time.monotonic()) * 1000)
-                    if remaining_ms <= 0:
-                        raise SearchDeadlineExceeded('search deadline exceeded')
-                    # Keep a fixed metadata-row bound; update the timeout and fetch
-                    # in one request rather than paying a second round trip.
-                    with connection.cursor() as fetch:
-                        fetch.execute(pg_sql.SQL(
-                            "SELECT set_config('statement_timeout', {}, true); "
-                            'FETCH FORWARD {} FROM {}'
-                        ).format(pg_sql.Literal(f'{remaining_ms}ms'),
-                                 pg_sql.Literal(_CAPTURE_FETCH_ROWS), pg_sql.Identifier('retirement_metadata')), prepare=False)
-                        setting = fetch.fetchone()
-                        if (not isinstance(setting, dict) or set(setting) != {'set_config'}
-                                or not isinstance(setting['set_config'], str) or not fetch.nextset()):
-                            raise _error('parent_retirement_metadata_invalid')
-                        rows = fetch.fetchall()
-                        if len(rows) > _CAPTURE_FETCH_ROWS or fetch.nextset():
-                            raise _error('parent_retirement_metadata_invalid')
+                # Attempts include EOF and a deadline refusal before sending FETCH.
+                with _capture_stage(capture_metrics, 'metadata_fetch_ms', 'metadata_fetches'):
+                    if deadline_at is None:
+                        rows = cursor.fetchmany(_CAPTURE_FETCH_ROWS)
+                    else:
+                        remaining_ms = int((deadline_at - time.monotonic()) * 1000)
+                        if remaining_ms <= 0:
+                            raise SearchDeadlineExceeded('search deadline exceeded')
+                        # Keep a fixed metadata-row bound; update the timeout and fetch
+                        # in one request rather than paying a second round trip.
+                        with connection.cursor() as fetch:
+                            fetch.execute(pg_sql.SQL(
+                                "SELECT set_config('statement_timeout', {}, true); "
+                                'FETCH FORWARD {} FROM {}'
+                            ).format(pg_sql.Literal(f'{remaining_ms}ms'),
+                                     pg_sql.Literal(_CAPTURE_FETCH_ROWS), pg_sql.Identifier('retirement_metadata')), prepare=False)
+                            setting = fetch.fetchone()
+                            if (not isinstance(setting, dict) or set(setting) != {'set_config'}
+                                    or not isinstance(setting['set_config'], str) or not fetch.nextset()):
+                                raise _error('parent_retirement_metadata_invalid')
+                            rows = fetch.fetchall()
+                            if len(rows) > _CAPTURE_FETCH_ROWS or fetch.nextset():
+                                raise _error('parent_retirement_metadata_invalid')
                 if not rows:
                     break
+                if capture_metrics is not None:
+                    capture_metrics['metadata_rows'] += len(rows)
                 if getattr(store, 'verified_singleton_receipts', False):
                     from .receipt_membership import verified_document_chunks
-                    proven = verified_document_chunks(store, connection, tenant_id=scope[0], source_id=scope[1],
-                        documents=rows, deadline_at=deadline_at)
+                    with _capture_stage(capture_metrics, 'metadata_membership_ms', 'metadata_membership_calls'):
+                        proven = verified_document_chunks(store, connection, tenant_id=scope[0], source_id=scope[1],
+                            documents=rows, deadline_at=deadline_at)
                     for row in rows:
                         row['chunks'] = proven[row['document_id']]
-                for row in rows:
-                    count += 1
-                    chunk_count += len(row['chunks'])
-                    if count > limits.max_documents or chunk_count > limits.max_chunks or len(row['chunks']) > limits.batch_chunks:
-                        raise _error('parent_retirement_metadata_budget')
-                    row.update(pending=catalog['queue'] is not None,
-                               pg_body_bytes=sum(chunk['pg_bytes'] for chunk in row['chunks']))
-                    spool.add_document(row)
-                    _check_deadline(deadline_at)
+                # Row validation/serialization and SQLite adds; final index commit
+                # and catalog/portal setup remain in total capture time only.
+                with _capture_stage(capture_metrics, 'metadata_spool_ms'):
+                    for row in rows:
+                        count += 1
+                        chunk_count += len(row['chunks'])
+                        if count > limits.max_documents or chunk_count > limits.max_chunks or len(row['chunks']) > limits.batch_chunks:
+                            raise _error('parent_retirement_metadata_budget')
+                        row.update(pending=catalog['queue'] is not None,
+                                   pg_body_bytes=sum(chunk['pg_bytes'] for chunk in row['chunks']))
+                        spool.add_document(row)
+                        _check_deadline(deadline_at)
         spool.index.commit()
     return catalog, parts, count, chunk_count
 
@@ -201,7 +232,7 @@ def prove_parent_chunks(store, archive, *, scope, limits, deadline_at, purpose="
     with ParentMetadataSpool(max_bytes=limits.max_spool_bytes) as spool:
         capture_started = time.monotonic() if capture_metrics is not None else None
         try:
-            catalog, parts, count, chunk_count = _capture(store, spool, scope, limits, deadline_at)
+            catalog, parts, count, chunk_count = _capture(store, spool, scope, limits, deadline_at, capture_metrics=capture_metrics)
         finally:
             if capture_metrics is not None:
                 # Attempt wall time includes failed reads and local metadata spooling.
