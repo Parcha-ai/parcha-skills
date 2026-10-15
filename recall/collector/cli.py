@@ -23,7 +23,7 @@ def token_from_file(path: str) -> str:
 def _run_once(collector: Collector, canonical_writer, harness: str) -> dict:
     scan = collector.scan()
     flush = collector.flush()
-    doctor = collector.doctor(include_dead_letters=False)
+    doctor = collector.doctor(include_dead_letters=False, include_ack_latency=False)
     health_report = None
     if canonical_writer is not None:
         try:

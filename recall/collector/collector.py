@@ -1942,7 +1942,10 @@ class Collector:
             maximum = min(maximum, advertised)
         return maximum
 
-    def doctor(self, *, include_dead_letters: bool = True) -> dict:
+    def doctor(
+        self, *, include_dead_letters: bool = True, include_ack_latency: bool = True,
+    ) -> dict:
+        """Report collector state, optionally omitting the all-history ACK percentile."""
         inventory_error = None
         if self.harness == "codex":
             active_disk = {
@@ -1969,8 +1972,6 @@ class Collector:
         ledger = {row["path"] for row in self.db.execute("SELECT path FROM files WHERE status != 'tombstone'")}
         total_lines = self.db.execute("SELECT count(*) AS n FROM active_records").fetchone()["n"]
         parse_errors = self.db.execute("SELECT count(*) AS n FROM dead_letters").fetchone()["n"]
-        latencies = [row["acked_at"] - row["queued_at"] for row in self.db.execute("SELECT queued_at,acked_at FROM outbox WHERE acked_at IS NOT NULL ORDER BY acked_at-queued_at")]
-        p95 = latencies[max(0, int(len(latencies) * 0.95 + 0.999999) - 1)] if latencies else None
         metadata = dict(self.db.execute(
             "SELECT key,value FROM meta WHERE key IN "
             "('last_success_epoch','last_error_code','running_started_epoch',"
@@ -1993,7 +1994,6 @@ class Collector:
             "acked": self.db.execute("SELECT count(*) AS n FROM outbox WHERE state='acked'").fetchone()["n"],
             "dead": self.db.execute("SELECT count(*) AS n FROM outbox WHERE state='dead'").fetchone()["n"],
             "committed_files": self.db.execute("SELECT count(*) AS n FROM files WHERE status != 'tombstone' AND committed_offset=scanned_offset").fetchone()["n"],
-            "ack_latency_p95_seconds": p95,
             "dead_letter_count": parse_errors,
             "privacy_mode": self.privacy.mode,
             "privacy_policy_version": self.privacy.apply({}).policy_version,
@@ -2002,6 +2002,9 @@ class Collector:
             "running": "running_started_epoch" in metadata,
             "scan_complete": not inventory_error and metadata.get("last_scan_complete") == "1",
         }
+        if include_ack_latency:
+            latencies = [row["acked_at"] - row["queued_at"] for row in self.db.execute("SELECT queued_at,acked_at FROM outbox WHERE acked_at IS NOT NULL ORDER BY acked_at-queued_at")]
+            result["ack_latency_p95_seconds"] = latencies[max(0, int(len(latencies) * 0.95 + 0.999999) - 1)] if latencies else None
         if self.harness == "codex":
             locations = {
                 row["path"]: row
