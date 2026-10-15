@@ -6,12 +6,12 @@ from contextlib import contextmanager
 from unittest.mock import patch
 
 import psycopg
+
+from e2e_collector_history_recovery import CollectorHistoryRecovery
 from recall_server.collector_history_recovery import (
     CollectorHistoryRecoveryNotApplied, recover_collector_history,
     inspect_collector_history_recovery,
 )
-
-from e2e_collector_history_recovery import CollectorHistoryRecovery
 
 
 class RecoveryLockOutcome(unittest.TestCase):
