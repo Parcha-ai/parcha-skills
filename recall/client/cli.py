@@ -19,7 +19,7 @@ from client.mac import (
     store_keychain_token,
 )
 from collector.collector import Collector
-from collector.health import build_health_report
+from collector.cli import _run_once
 from client.capture import CaptureClient, ORIGIN
 from client.mcp import McpServer, serve as serve_mcp
 from client.macos_utility import (
@@ -1039,25 +1039,7 @@ def main() -> None:
             max_scan_seconds=args.max_scan_seconds,
         )
         try:
-            scan = collector.scan()
-            flush = collector.flush()
-            doctor = collector.doctor(include_dead_letters=False, include_ack_latency=False)
-            health_report = None
-            if canonical:
-                report = build_health_report(args.harness, doctor)
-                try:
-                    health_report = canonical[0].report_health(report)
-                except Exception:
-                    health_report = {
-                        "schema_version": 1,
-                        "status": "unavailable",
-                    }
-            result = {
-                "scan": scan,
-                "flush": flush,
-                "doctor": doctor,
-                "health_report": health_report,
-            }
+            result = _run_once(collector, canonical[0] if canonical else None, args.harness)
         finally:
             collector.close()
     elif args.command == "cowork-local-sync":
@@ -1295,6 +1277,8 @@ def main() -> None:
     else:
         result = BrainClient(**common).doctor()
     print(json.dumps(result, sort_keys=True))
+    if args.command == "collect" and result["scan"].get("error_code"):
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
