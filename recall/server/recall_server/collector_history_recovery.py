@@ -11,6 +11,9 @@ import math
 import time
 import uuid
 
+from psycopg.errors import LockNotAvailable
+from psycopg.pq import PipelineStatus, TransactionStatus
+
 from contracts.v2 import IDENTITY_RE, validate_contract
 
 from .canonical import _identity_sha256, _opaque, _source_ordinal
@@ -23,6 +26,35 @@ from .projectors import canonical_json, item_receipt, validate_envelope
 
 class CollectorHistoryRecoveryError(RuntimeError):
     pass
+
+
+class CollectorHistoryRecoveryNotApplied(CollectorHistoryRecoveryError):
+    """This invocation refused a lock before commit and acknowledged rollback."""
+    status = 'known_not_applied'
+    rollback_acknowledged = True
+    automatic_retry = False
+
+    def __init__(self, operation_id, target_sha256, *, native_busy):
+        super().__init__('collector_history_native_busy' if native_busy
+                         else 'collector_history_lock_busy_not_applied')
+        self.operation_id = operation_id
+        self.target_sha256 = target_sha256
+
+
+def _rollback_acknowledged(connection, deadline):
+    # Public execute forces a server roundtrip; Connection.rollback() can be a
+    # local no-op. These checks reject late responses, not a hard network timer.
+    if (time.monotonic() >= deadline or connection.closed
+            or connection.info.transaction_status != TransactionStatus.IDLE
+            or connection.info.pipeline_status != PipelineStatus.OFF):
+        return False
+    try:
+        cursor = connection.execute('ROLLBACK')
+        return (cursor.statusmessage == 'ROLLBACK' and not connection.closed
+                and connection.info.transaction_status == TransactionStatus.IDLE
+                and time.monotonic() < deadline)
+    except Exception:
+        return False
 
 
 def _refuse(code):
@@ -209,19 +241,34 @@ def recover_collector_history(plane, *, tenant_id, principal_id, expected, opera
     if _source_ordinal(event) != original['source_ordinal']:
         _refuse('source_order_changed')
     target_sha256 = hashlib.sha256(canonical_json(dict(tenant_id=tenant_id, expected=expected))).hexdigest()
-    with plane.store.connect() as conn, conn.transaction():
-        conn.execute("SET LOCAL lock_timeout='250ms'")
-        after = _read(plane, conn, tenant_id, principal_id, expected, deadline, lock=True)
-        if after != before:
-            _refuse('snapshot_changed')
-        result = plane._write_authorized_document(conn, tenant_id=tenant_id, connector_id='claude.jsonl',
-            artifact=before['artifact'], event=event, text_redacted=canonical_json(content).decode())
-        if result['revision'] != 3 or result['inserted'] != 1:
-            _refuse('revision_changed')
-        conn.execute('''INSERT INTO control_audit_events(id,principal_id,operation,status,target_sha256)
+    with plane.store.connect() as conn:
+        lock_refusal = None
+        try:
+            with conn.transaction():
+                try:
+                    conn.execute("SET LOCAL lock_timeout='250ms'")
+                    after = _read(plane, conn, tenant_id, principal_id, expected, deadline, lock=True)
+                    if after != before:
+                        _refuse('snapshot_changed')
+                    result = plane._write_authorized_document(conn, tenant_id=tenant_id, connector_id='claude.jsonl',
+                        artifact=before['artifact'], event=event, text_redacted=canonical_json(content).decode())
+                    if result['revision'] != 3 or result['inserted'] != 1:
+                        _refuse('revision_changed')
+                    conn.execute('''INSERT INTO control_audit_events(id,principal_id,operation,status,target_sha256)
             VALUES(%s,%s,'collector.history.recover','success',%s)''', (operation_id, principal_id, target_sha256))
-        if time.monotonic() >= deadline:
-            _refuse('deadline')
+                    if time.monotonic() >= deadline:
+                        _refuse('deadline')
+                except (LockNotAvailable, CollectorHistoryRecoveryError) as error:
+                    if (isinstance(error, LockNotAvailable)
+                            or str(error) == 'collector_history_native_busy'):
+                        lock_refusal = error
+                    raise
+        except Exception as error:
+            if (error is lock_refusal
+                    and _rollback_acknowledged(conn, deadline)):
+                raise CollectorHistoryRecoveryNotApplied(operation_id, target_sha256,
+                    native_busy=not isinstance(error, LockNotAvailable)) from error
+            raise
     return dict(result, operation_id=operation_id, target_sha256=target_sha256)
 
 
