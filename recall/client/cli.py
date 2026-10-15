@@ -1041,7 +1041,7 @@ def main() -> None:
         try:
             scan = collector.scan()
             flush = collector.flush()
-            doctor = collector.doctor(include_dead_letters=False)
+            doctor = collector.doctor(include_dead_letters=False, include_ack_latency=False)
             health_report = None
             if canonical:
                 report = build_health_report(args.harness, doctor)
