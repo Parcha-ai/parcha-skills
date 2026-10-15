@@ -24,7 +24,9 @@ def _run_once(collector: Collector, canonical_writer, harness: str) -> dict:
     try:
         scan = collector.scan()
     except CollectorRuntimeError as error:
-        if error.error_code != "archive_unavailable":
+        if error.error_code not in {
+            "archive_unavailable", "source_snapshot_deadline", "source_snapshot_changed",
+        }:
             raise
         # scan() already saved the failure and retained its durable cursor.
         # Do not let a successful flush clear it before health is reported.
