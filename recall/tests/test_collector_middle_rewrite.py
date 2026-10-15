@@ -9,6 +9,143 @@ class MiddleRewriteTest(unittest.TestCase):
     tearDown = test_collector.CollectorTest.tearDown
     collector = test_collector.CollectorTest.collector
 
+    def test_completed_touched_snapshot_keeps_acked_cursor_and_refreshes_witness(self):
+        from unittest.mock import patch
+        from collector import collector as module
+        transcript = self.root / "session.jsonl"
+        payload = "".join(claude_line(str(i)) for i in range(3)).encode()
+        transcript.write_bytes(payload)
+        collector = self.collector()
+        self.addCleanup(collector.close)
+        self.assertTrue(collector.scan()["scan_complete"])
+        collector.flush()
+        acknowledgements = list(AckServer.received)
+        collector.max_scan_records = 1
+        stat = transcript.stat()
+        os.utime(transcript, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000))
+        with patch.object(module, "snapshot_hashes", wraps=module.snapshot_hashes) as hashes:
+            result = collector.scan()
+            self.assertTrue(result["scan_complete"])
+            row = collector.db.execute("SELECT * FROM files").fetchone()
+            self.assertEqual(row["scanned_offset"], len(payload))
+            self.assertEqual(row["committed_offset"], len(payload))
+            self.assertEqual(row["status"], "ok")
+            self.assertEqual(row["mtime_ns"], transcript.stat().st_mtime_ns)
+            self.assertEqual(row["snapshot_stat"], module.json.dumps(module.snapshot_identity(transcript.stat())))
+            self.assertEqual(hashes.call_count, 1)
+            self.assertTrue(collector.scan()["scan_complete"])
+            self.assertEqual(hashes.call_count, 1)
+        collector.flush()
+        self.assertEqual(AckServer.received, acknowledgements)
+        self.assertEqual(transcript.read_bytes(), payload)
+
+    def _completed_snapshot(self):
+        transcript = self.root / "session.jsonl"
+        payload = "".join(claude_line(str(i)) for i in range(3)).encode()
+        transcript.write_bytes(payload)
+        collector = self.collector()
+        self.addCleanup(collector.close)
+        self.assertTrue(collector.scan()["scan_complete"])
+        collector.flush()
+        return transcript, payload, collector
+
+    def test_completed_identical_rewrite_and_replacement_do_not_replay(self):
+        transcript, payload, collector = self._completed_snapshot()
+        requests = AckServer.requests
+        collector.max_scan_records = 1
+        for replacement in (False, True):
+            with self.subTest(replacement=replacement):
+                if replacement:
+                    other = self.root / "replacement.tmp"
+                    other.write_bytes(payload)
+                    other.replace(transcript)
+                else:
+                    transcript.write_bytes(payload)
+                self.assertTrue(collector.scan()["scan_complete"])
+                collector.flush()
+                row = collector.db.execute("SELECT * FROM files").fetchone()
+                self.assertEqual(row["committed_offset"], len(payload))
+                self.assertEqual(row["scanned_offset"], len(payload))
+                self.assertEqual(AckServer.requests, requests)
+        self.assertEqual(transcript.read_bytes(), payload)
+
+    def test_completed_changed_middle_is_delivered_despite_same_size(self):
+        transcript, payload, collector = self._completed_snapshot()
+        changed = payload.replace(b'"1"', b'"x"')
+        self.assertEqual(len(changed), len(payload))
+        transcript.write_bytes(changed)
+        collector.max_scan_records = 1
+        self.assertFalse(collector.scan()["scan_complete"])
+        collector.flush()
+        for _ in range(3):
+            collector.scan()
+            collector.flush()
+        delivered = [e["content"]["message"]["content"] for b in AckServer.received for e in b["events"]]
+        self.assertEqual(delivered, ["0", "1", "2", "x"])
+        self.assertEqual(transcript.read_bytes(), changed)
+
+    def test_completed_missing_weak_or_unsealed_proof_requires_scan(self):
+        transcript, payload, collector = self._completed_snapshot()
+        for field, value in (("snapshot_sha256", None), ("snapshot_sha256", "weak"), ("snapshot_stat", None)):
+            with self.subTest(field=field, value=value):
+                collector.max_scan_records = 100
+                collector.scan()
+                collector.flush()
+                collector.db.execute(f"UPDATE files SET {field}=?", (value,))
+                collector.db.commit()
+                stat = transcript.stat()
+                os.utime(transcript, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000))
+                collector.max_scan_records = 1
+                self.assertFalse(collector.scan()["scan_complete"])
+                row = collector.db.execute("SELECT * FROM files").fetchone()
+                self.assertEqual(row["scanned_offset"], len(claude_line("0").encode()))
+                self.assertEqual(row["status"], "scanning-full")
+        self.assertEqual(transcript.read_bytes(), payload)
+
+    def test_completed_unacked_or_incomplete_cursor_cannot_be_advanced_by_hash(self):
+        transcript, payload, collector = self._completed_snapshot()
+        for scanned, committed in ((len(payload), 0), (0, 0)):
+            with self.subTest(scanned=scanned, committed=committed):
+                collector.max_scan_records = 100
+                collector.scan()
+                collector.flush()
+                collector.db.execute("UPDATE files SET status='ok',scanned_offset=?,committed_offset=?", (scanned, committed))
+                collector.db.commit()
+                stat = transcript.stat()
+                os.utime(transcript, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000))
+                collector.max_scan_records = 1
+                self.assertFalse(collector.scan()["scan_complete"])
+                row = collector.db.execute("SELECT * FROM files").fetchone()
+                self.assertEqual(row["scanned_offset"], len(claude_line("0").encode()))
+                self.assertLess(row["committed_offset"], len(payload))
+        self.assertEqual(transcript.read_bytes(), payload)
+
+    def test_completed_append_delivers_tail_without_replaying_prefix(self):
+        transcript, payload, collector = self._completed_snapshot()
+        tail = claude_line("tail").encode()
+        with transcript.open("ab") as output:
+            output.write(tail)
+        collector.max_scan_records = 1
+        self.assertTrue(collector.scan()["scan_complete"])
+        collector.flush()
+        delivered = [e["content"]["message"]["content"] for b in AckServer.received for e in b["events"]]
+        self.assertEqual(delivered, ["0", "1", "2", "tail"])
+        row = collector.db.execute("SELECT * FROM files").fetchone()
+        self.assertEqual(row["committed_offset"], len(payload + tail))
+        self.assertEqual(transcript.read_bytes(), payload + tail)
+
+    def test_completed_truncation_keeps_captured_history_without_phantom_offset(self):
+        transcript, _, collector = self._completed_snapshot()
+        short = claude_line("0").encode()
+        transcript.write_bytes(short)
+        self.assertTrue(collector.scan()["scan_complete"])
+        collector.flush()
+        row = collector.db.execute("SELECT * FROM files").fetchone()
+        self.assertEqual(row["scanned_offset"], len(short))
+        self.assertEqual(row["committed_offset"], len(short))
+        self.assertEqual(collector.db.execute("SELECT COUNT(*) FROM active_records").fetchone()[0], 3)
+        self.assertEqual([e["kind"] for b in AckServer.received for e in b["events"]], ["transcript_record"] * 3)
+
     def test_same_size_middle_rewrite_during_scan_revisits_changed_records(self) -> None:
         transcript = self.root / "session.jsonl"
         first, last = claude_line("a" * 5000), claude_line("z" * 5000)
