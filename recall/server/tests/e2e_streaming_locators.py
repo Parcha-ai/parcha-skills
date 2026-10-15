@@ -74,7 +74,7 @@ def metadata_fetch_protocol(store, root):
         if text.startswith("SELECT set_config('statement_timeout',") and '; FETCH FORWARD' in text:
             statements.append(text)
             assert kwargs == {'prepare': False}
-            assert text.endswith('FETCH FORWARD 128 FROM "retirement_metadata"')
+            assert text.endswith('FETCH FORWARD 256 FROM "retirement_metadata"')
         return execute(cursor, query, *args, **kwargs)
 
     def capture(deadline):
@@ -94,7 +94,7 @@ def metadata_fetch_protocol(store, root):
 
     with patch.object(psycopg.Cursor, 'execute', observed):
         capture(time.monotonic() + 30)
-    assert len(statements) == 4  # Three bounded data FETCHes and one empty FETCH.
+    assert len(statements) == 3  # Two bounded data FETCHes and one empty FETCH.
     assert state(store, scope) == before
 
     for stage in ('setting', 'fetch'):
@@ -111,7 +111,7 @@ def metadata_fetch_protocol(store, root):
                         query = psycopg.sql.SQL(
                             "SELECT set_config('statement_timeout','50ms',true) "
                             'FROM (SELECT pg_sleep(2)) delayed; '
-                            'FETCH FORWARD 128 FROM "retirement_metadata"'
+                            'FETCH FORWARD 256 FROM "retirement_metadata"'
                         )
                     else:
                         execute(control, 'CLOSE "retirement_metadata"; '

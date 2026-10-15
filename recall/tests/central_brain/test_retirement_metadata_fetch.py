@@ -66,8 +66,8 @@ class Connection:
                 return (self.result == 1 and connection.result_mode != 'missing-fetch') or connection.result_mode == 'extra-result'
 
             def fetchall(self):
-                batch, connection.rows = connection.rows[:128], connection.rows[128:]
-                return batch if connection.result_mode != 'oversized-fetch' else [metadata(i) for i in range(129)]
+                batch, connection.rows = connection.rows[:256], connection.rows[256:]
+                return batch if connection.result_mode != 'oversized-fetch' else [metadata(i) for i in range(257)]
 
         return Cursor()
 
@@ -95,13 +95,13 @@ class MetadataFetchTests(unittest.TestCase):
                 return proof._capture(Store(connection), spool, ('tenant', 'source', 'parent'),
                                       ParentRetirementLimits(**limits), deadline or time.monotonic() + 60)
 
-    def test_fixed_128_rows_and_one_request_per_fetch(self):
+    def test_fixed_256_rows_and_one_request_per_fetch(self):
         connection = Connection([metadata(i) for i in range(257)])
         self.assertEqual(self.capture(connection)[2:], (257, 257))
-        self.assertEqual(len(connection.requests), 4)
+        self.assertEqual(len(connection.requests), 3)
         self.assertEqual(connection.deadline_calls, 1)  # Before DECLARE only.
         for query, options in connection.requests:
-            self.assertIn('FETCH FORWARD 128 FROM "retirement_metadata"', query)
+            self.assertIn('FETCH FORWARD 256 FROM "retirement_metadata"', query)
             self.assertIn("set_config('statement_timeout'", query)
             self.assertEqual(options, {'prepare': False})
         self.assertFalse(self.spool_path.exists())
@@ -119,7 +119,7 @@ class MetadataFetchTests(unittest.TestCase):
         self.assertFalse(self.spool_path.exists())
 
     def test_remaining_deadline_recomputed_without_extending_it(self):
-        connection = Connection([metadata(i) for i in range(129)])
+        connection = Connection([metadata(i) for i in range(257)])
         start = time.monotonic()
         ticks = iter((start, start + .25, start + .49))
         with patch.object(proof, 'time', types.SimpleNamespace(monotonic=lambda: next(ticks))):
