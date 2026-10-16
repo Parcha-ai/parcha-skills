@@ -84,7 +84,7 @@ class HistoricalMembershipSeedTests(ParentMembershipPublicationTests):
             )
         self.assertEqual(before[0]["reason"], "logical-update")
 
-    def test_normal_publication_wins_between_seed_read_and_insert(self):
+    def test_normal_publication_wins_during_seed_admission(self):
         original = enrollment._query
         interleaved = []
 
@@ -284,6 +284,51 @@ class HistoricalMembershipSeedTests(ParentMembershipPublicationTests):
         self.assertEqual(final["scanned"], 0)
         self.assertEqual(len(self.queued()), 2)
         self.assertEqual(self.seed()["queued"], 1)
+
+    def test_default_page_progress_with_twenty_ms_query_latency(self):
+        original_ingest = self.plane.ingest_document
+        for ordinal in range(127):
+
+            def ingest(**kwargs):
+                kwargs["envelope"]["native_parent_id"] = "history-" + str(ordinal)
+                return original_ingest(**kwargs)
+
+            with patch.object(self.plane, "ingest_document", side_effect=ingest):
+                self.ingest(
+                    "turn/history-" + str(ordinal), "Synthetic historical publication"
+                )
+        logical = self.projector.project_pending(
+            tenant_id=self.tenant, batch_size=200, max_batches=1, upload_concurrency=4
+        )
+        self.assertEqual(logical["failed"], 0)
+        published = self.publisher(self.settings(enabled=False)).project_pending(
+            tenant_id=self.tenant, batch_size=200, max_batches=1, concurrency=4
+        )
+        self.assertEqual(published["documents"], 127)
+        native = enrollment._query
+        calls = []
+
+        def delayed(*args):
+            calls.append(True)
+            time.sleep(0.02)
+            return native(*args)
+
+        started = time.monotonic()
+        with patch.object(enrollment, "_query", side_effect=delayed):
+            result = self.seed()
+        print(
+            json.dumps(
+                dict(
+                    seed_parents=result["queued"],
+                    query_calls=len(calls),
+                    injected_query_ms=20,
+                    elapsed_ms=round((time.monotonic() - started) * 1000),
+                )
+            )
+        )
+        self.assertEqual(result["scanned"], 128)
+        self.assertEqual(result["queued"], 128)
+        self.assertLess(len(calls), 10)
 
     def test_cli_dispatch_uses_native_metadata_seed_only(self):
         from recall_server import cli

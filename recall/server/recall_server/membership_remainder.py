@@ -16,7 +16,7 @@ FIELDS = (
     "policy",
     "authority_generation",
 )
-CURRENT = """SELECT evidence.revision,evidence.document_content_sha256 AS source_sha256,
+_CURRENT = """SELECT evidence.revision,evidence.document_content_sha256 AS source_sha256,
     evidence.manifest_content_sha256 AS manifest_sha256,projected.policy_fingerprint AS policy,
     authority.generation AS authority_generation,
     EXISTS(SELECT 1 FROM canonical_evidence_document_queue dirty
@@ -36,9 +36,10 @@ CURRENT = """SELECT evidence.revision,evidence.document_content_sha256 AS source
   LEFT JOIN canonical_parent_authority authority
     ON authority.tenant_id=evidence.tenant_id AND authority.source_id=evidence.source_id
       AND authority.native_parent_id=evidence.native_parent_id
- WHERE evidence.tenant_id=%s AND evidence.source_id=%s AND evidence.logical_document_id=%s
+ WHERE evidence.tenant_id={tenant} AND evidence.source_id={source} AND evidence.logical_document_id={logical}
    AND projected.revision=evidence.revision
    AND projected.source_document_sha256=evidence.document_content_sha256"""
+CURRENT = _CURRENT.format(tenant="%s", source="%s", logical="%s")
 
 
 def key(row):
@@ -318,32 +319,62 @@ def seed_history(
                 through = [upper["source_id"], upper["logical_document_id"]]
                 result["through"] = through
         if through is not None:
+            scope_sql = _CURRENT.format(
+                tenant="%s",
+                source="selected.source_id",
+                logical="selected.logical_document_id",
+            )
             rows = native._query(
                 store,
                 connection,
-                """SELECT source_id,logical_document_id
-                FROM canonical_passage_documents WHERE tenant_id=%s
-                  AND (%s::text IS NULL OR (source_id,logical_document_id)>(%s,%s))
-                  AND (source_id,logical_document_id)<=(%s,%s)
-                ORDER BY source_id,logical_document_id LIMIT %s""",
+                f"""WITH page AS MATERIALIZED (
+                  SELECT source_id,logical_document_id
+                  FROM canonical_passage_documents WHERE tenant_id=%s
+                    AND (%s::text IS NULL OR (source_id,logical_document_id)>(%s,%s))
+                    AND (source_id,logical_document_id)<=(%s,%s)
+                  ORDER BY source_id,logical_document_id LIMIT %s
+                ), selected AS MATERIALIZED (
+                  SELECT * FROM page ORDER BY source_id,logical_document_id LIMIT %s
+                ), scoped AS MATERIALIZED (
+                  SELECT selected.*,current_scope.* FROM selected
+                  LEFT JOIN LATERAL ({scope_sql}) current_scope ON true
+                ), inserted AS (
+                  INSERT INTO canonical_passage_projection_queue
+                    (tenant_id,source_id,logical_document_id,revision,reason,certification_checkpoint)
+                  SELECT %s,source_id,logical_document_id,revision,'certification',
+                    jsonb_build_object('version',1,'epoch',%s::text,'after','',
+                      'revision',revision,'source_sha256',source_sha256,
+                      'manifest_sha256',manifest_sha256,'policy',policy,
+                      'authority_generation',authority_generation)
+                  FROM scoped WHERE revision IS NOT NULL AND authority_generation IS NOT NULL
+                    AND NOT logical_pending AND NOT retirement_pending AND NOT retirement_intent
+                  ON CONFLICT(tenant_id,source_id,logical_document_id) DO NOTHING
+                  RETURNING source_id,logical_document_id
+                )
+                SELECT scoped.*,inserted.source_id IS NOT NULL AS queued,
+                  (SELECT count(*) FROM page)>%s AS more
+                FROM scoped LEFT JOIN inserted USING(source_id,logical_document_id)
+                ORDER BY source_id,logical_document_id""",
                 (
                     tenant_id,
                     after[0] if after else None,
                     *(after or (None, None)),
                     *through,
                     limit + 1,
+                    limit,
+                    tenant_id,
+                    tenant_id,
+                    settings.binding_epoch,
+                    limit,
                 ),
                 deadline_at,
             ).fetchall()
-            result["status"] = "bounded" if len(rows) > limit else "completed"
-            for row in rows[:limit]:
+            result["status"] = "bounded" if rows and rows[0]["more"] else "completed"
+            for row in rows:
                 identity = [row["source_id"], row["logical_document_id"]]
-                scope = native._query(
-                    store, connection, CURRENT, (tenant_id, *identity), deadline_at
-                ).fetchone()
                 reasons = (
                     ["publication_changed"]
-                    if scope is None
+                    if row["revision"] is None
                     else [
                         name
                         for name in (
@@ -351,36 +382,15 @@ def seed_history(
                             "retirement_pending",
                             "retirement_intent",
                         )
-                        if scope[name]
+                        if row[name]
                     ]
                 )
-                if scope is not None and scope["authority_generation"] is None:
+                if row["revision"] is not None and row["authority_generation"] is None:
                     reasons.append("authority_generation_missing")
-                if not reasons:
-                    checkpoint = dict(
-                        version=1,
-                        epoch=settings.binding_epoch,
-                        after="",
-                        **{name: scope[name] for name in FIELDS},
-                    )
-                    inserted = native._query(
-                        store,
-                        connection,
-                        """INSERT INTO canonical_passage_projection_queue
-                        (tenant_id,source_id,logical_document_id,revision,reason,certification_checkpoint)
-                        VALUES(%s,%s,%s,%s,'certification',%s::jsonb)
-                        ON CONFLICT(tenant_id,source_id,logical_document_id) DO NOTHING""",
-                        (
-                            tenant_id,
-                            *identity,
-                            scope["revision"],
-                            json.dumps(checkpoint),
-                        ),
-                        deadline_at,
-                    )
-                    result["queued"] += inserted.rowcount
-                    if not inserted.rowcount:
-                        reasons.append("already_queued")
+                if row["queued"]:
+                    result["queued"] += 1
+                elif not reasons:
+                    reasons.append("already_queued")
                 if reasons:
                     result["deferred"].append(dict(key=identity, reasons=reasons))
                 result["scanned"] += 1

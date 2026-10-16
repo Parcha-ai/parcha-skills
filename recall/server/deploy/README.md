@@ -1807,10 +1807,13 @@ python -m recall_server.cli membership-certification-seed --tenant "$tenant" --l
 
 Reuse the first response's `through` JSON pair and each completed response's
 `after` JSON pair with `--through` and `--after`. Each call examines at most 1,000
-parents within a five-second database budget; the default is 128. Selection uses
+parents within a five-second database budget; the default is 128. One set-based
+statement checks and admits the page, avoiding a database round trip per parent. Selection uses
 the existing parent primary key, independent of search queries. Busy or changed
 parents appear in `deferred` with their exact keys and reasons. Preserve that list
 for a later finite pass after their publication or retirement work completes.
+The upper bound fixes the key range. New parents created behind the cursor need
+ordinary writer handling or a later finite pass.
 
 Existing source publication and partial certification rows remain untouched.
 Normal source updates supersede admitted work. The current worker performs native
