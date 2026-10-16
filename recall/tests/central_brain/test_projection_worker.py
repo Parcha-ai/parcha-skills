@@ -91,7 +91,7 @@ class _Scan:
 
 
 class ProjectionWorkerTest(unittest.TestCase):
-    def test_only_new_worker_cycle_renews_optional_certification_window(self):
+    def test_only_new_worker_cycle_renews_optional_certification_allowance(self):
         from unittest.mock import patch
         from types import SimpleNamespace
 
@@ -102,7 +102,9 @@ class ProjectionWorkerTest(unittest.TestCase):
         class Passages(_Passages):
             def project_pending(self, **kwargs):
                 now[0] += 10  # Source work before optional proof.
-                deadlines.append(kwargs["certification_budget"].deadline())
+                with kwargs["certification_budget"].lease() as deadline:
+                    deadlines.append(deadline)
+                    now[0] += 1  # Charge only actual optional work.
                 return super().project_pending(**kwargs)
 
         class Logical(_Logical):
@@ -119,7 +121,7 @@ class ProjectionWorkerTest(unittest.TestCase):
                 interval_seconds=1, max_cycles=2, skip_embedding=True,
                 sleep=lambda _: None,
             )
-        self.assertEqual(deadlines, [13, 13, 13, 43, 43, 43])
+        self.assertEqual(deadlines, [13, 23, 33, 46, 56, 66])
         self.assertEqual(result["passage_documents"], 6)
 
     def test_logical_admission_deadline_uses_scan_budget_only(self):

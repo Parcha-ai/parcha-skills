@@ -8,6 +8,7 @@ import json
 import math
 import threading
 from collections import Counter
+from contextlib import contextmanager
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, replace
 from datetime import datetime
@@ -44,18 +45,25 @@ from .search_outbox import (
 
 
 class CertificationBudget:
-    """One lazy optional-proof window shared by a worker cycle's publishers."""
+    """At most three seconds of optional proof work per worker cycle."""
 
     def __init__(self):
         self._lock = threading.Lock()
-        self._deadline_at: float | None = None
+        self._remaining = 3.0
 
-    def deadline(self) -> float:
-        # Legacy publication hooks can arrive concurrently after their commits.
-        with self._lock:
-            if self._deadline_at is None:
-                self._deadline_at = time.monotonic() + 3
-            return self._deadline_at
+    @contextmanager
+    def lease(self):
+        # Publication has already committed. A competing optional proof must
+        # defer, never hold up source progress or multiply the shared allowance.
+        if not self._lock.acquire(blocking=False):
+            yield None
+            return
+        started = time.monotonic()
+        try:
+            yield started + self._remaining if self._remaining > 0 else None
+        finally:
+            self._remaining = max(0.0, self._remaining - (time.monotonic() - started))
+            self._lock.release()
 
 
 PROJECTION_PROGRESS_INTERVAL_SECONDS = 5.0
@@ -2126,27 +2134,27 @@ class CanonicalPassageProjector:
                 status['prepare_full_documents'] = int(prepared.previous_checkpoint is None)
                 del prepared
                 if should_certify:
-                    certification_deadline = certification_budget.deadline()
-                    if time.monotonic() >= certification_deadline:
-                        status['membership_deferred'] = 1
-                        return status, preparation_elapsed, commit_elapsed
-                    certification_started = time.monotonic()
-                    try:
-                        certification = parent_membership_enrollment.certify_published_passages(
-                            self.store, tenant_id=candidate.tenant_id, source_id=candidate.source_id,
-                            logical_document_id=candidate.logical_document_id, passage_ids=passage_ids,
-                            settings=self.membership_certification, deadline_at=certification_deadline)
-                        status['membership_certified'] = certification['certified_passages']
-                        status['membership_failed'] = int(certification['status'] == 'failed')
-                        status['membership_deferred'] = int(
-                            certification['status'] not in {'enrolled', 'failed'})
-                    except Exception:
-                        # Publication and its queue ACK have committed. Optional
-                        # proof failure must never replay publication or ingest.
-                        status['membership_failed'] = 1
-                    finally:
-                        status['membership_elapsed_ms'] = max(
-                            0, round((time.monotonic() - certification_started) * 1000))
+                    with certification_budget.lease() as certification_deadline:
+                        if certification_deadline is None:
+                            status['membership_deferred'] = 1
+                            return status, preparation_elapsed, commit_elapsed
+                        certification_started = time.monotonic()
+                        try:
+                            certification = parent_membership_enrollment.certify_published_passages(
+                                self.store, tenant_id=candidate.tenant_id, source_id=candidate.source_id,
+                                logical_document_id=candidate.logical_document_id, passage_ids=passage_ids,
+                                settings=self.membership_certification, deadline_at=certification_deadline)
+                            status['membership_certified'] = certification['certified_passages']
+                            status['membership_failed'] = int(certification['status'] == 'failed')
+                            status['membership_deferred'] = int(
+                                certification['status'] not in {'enrolled', 'failed'})
+                        except Exception:
+                            # Publication and its queue ACK have committed. Optional
+                            # proof failure must never replay publication or ingest.
+                            status['membership_failed'] = 1
+                        finally:
+                            status['membership_elapsed_ms'] = max(
+                                0, round((time.monotonic() - certification_started) * 1000))
                 return status, preparation_elapsed, commit_elapsed
 
             requeued_in_batch = unavailable_in_batch = 0
@@ -2212,26 +2220,27 @@ class CanonicalPassageProjector:
                 # A transient archive failure must never become a destructive
                 # logical-document rebuild.
                 break
-        # Source publication continues even after optional proof exhausts the
-        # shared window. Leave durable work queued for the next worker cycle.
-        certification_started = time.monotonic()
-        certification_deadline = (certification_budget.deadline()
-                                  if self.membership_certification.enabled else 0)
-        if self.membership_certification.enabled and time.monotonic() < certification_deadline:
-            try:
-                certification_rows = membership_remainder.pending(self.store,
-                    tenant_id=tenant_id, limit=batch_size, deadline_at=certification_deadline)
-                for row in certification_rows:
-                    if time.monotonic() >= certification_deadline:
-                        break
-                    outcome = membership_remainder.resume(self.store, row,
-                        settings=self.membership_certification, deadline_at=certification_deadline)
-                    membership_certified += outcome['certified_passages']
-                    membership_failed += int(outcome['status'] == 'failed')
-                    membership_deferred += int(outcome['status'] not in {'enrolled', 'failed'})
-            except Exception:
-                membership_failed += 1
-            membership_elapsed_ms += max(0, round((time.monotonic()-certification_started)*1000))
+        # Only optional proof work spends this cycle's shared allowance.
+        # Committed source work and durable certification queues remain intact.
+        if self.membership_certification.enabled:
+            with certification_budget.lease() as certification_deadline:
+                if certification_deadline is not None:
+                    certification_started = time.monotonic()
+                    try:
+                        certification_rows = membership_remainder.pending(self.store,
+                            tenant_id=tenant_id, limit=batch_size, deadline_at=certification_deadline)
+                        for row in certification_rows:
+                            if time.monotonic() >= certification_deadline:
+                                break
+                            outcome = membership_remainder.resume(self.store, row,
+                                settings=self.membership_certification, deadline_at=certification_deadline)
+                            membership_certified += outcome['certified_passages']
+                            membership_failed += int(outcome['status'] == 'failed')
+                            membership_deferred += int(outcome['status'] not in {'enrolled', 'failed'})
+                    except Exception:
+                        membership_failed += 1
+                    finally:
+                        membership_elapsed_ms += max(0, round((time.monotonic()-certification_started)*1000))
         phase_started = time.monotonic()
         with self.store.connect() as connection:
             pending = connection.execute(
