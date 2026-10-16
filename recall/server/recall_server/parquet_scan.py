@@ -24,6 +24,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from .archive import ArchiveCorruption, ArchiveNotFound
+from .db import SearchDeadlineExceeded
 
 
 PARQUET_MEDIA_TYPE = "application/vnd.apache.parquet"
@@ -2368,6 +2369,13 @@ class CanonicalParquetScanProjector:
                 return False
             try:
                 upload = self._build(candidate, allow_compaction=allow_compaction)
+            except SearchDeadlineExceeded:
+                # _build has already handed staged objects to cleanup. No
+                # publication was attempted; keep the durable queue for retry.
+                # Commit errors below must still propagate as unknown outcomes.
+                totals["failed"] = totals.get("failed", 0) + 1
+                LOG.warning("parquet build deferred type=SearchDeadlineExceeded")
+                return False
             except ParquetScanError as error:
                 if str(error) != "parquet_scan_evidence_requeued":
                     raise
@@ -2425,6 +2433,7 @@ class CanonicalParquetScanProjector:
             "documents_dirty": 0,
             "compacted": 0,
             "requeued": 0,
+            "failed": 0,
         }
         for _ in range(max_batches):
             candidate_limit = min(32, batch_size + 7)
@@ -2442,16 +2451,21 @@ class CanonicalParquetScanProjector:
                 # too; required full builds and corruption recovery still run.
                 if self._process(candidate, totals, allow_compaction=bool(compaction_budget)):
                     batch_completed += 1
-            if len(candidates) < candidate_limit:
+                if totals["failed"]:
+                    break
+            if totals["failed"] or len(candidates) < candidate_limit:
                 break
-        if compaction_budget:
+        if compaction_budget and not totals["failed"]:
             for candidate in self._over_fragmented(
                 tenant_id=tenant_id,
                 limit=compaction_budget,
             ):
                 self._process(candidate, totals)
+                if totals["failed"]:
+                    break
         return {
-            "status": "complete",
+            "status": "pending" if totals["failed"] else "complete",
+            "failed": totals["failed"],
             "shards": totals["committed"],
             "rows": totals["rows"],
             "stale": totals["stale"],

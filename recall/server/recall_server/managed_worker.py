@@ -161,7 +161,7 @@ def _run_projection_cycle(
         max_batches=MANAGED_PROJECTION_MAX_BATCHES,
     )
     result = {
-        "status": "complete",
+        "status": "pending" if scan_result.get("failed", 0) else "complete",
         "logical_documents": int(logical_result["documents"]),
         "logical_records": int(logical_result["records"]),
         "passage_documents": int(passage_result["documents"]),
@@ -174,6 +174,7 @@ def _run_projection_cycle(
         "parquet_shards": int(scan_result["shards"]),
         "parquet_rows": int(scan_result["rows"]),
         "parquet_stale": int(scan_result["stale"]),
+        "parquet_failed": int(scan_result.get("failed", 0)),
         "parquet_fragments_rewritten": int(
             scan_result.get("fragments_rewritten", 0)
         ),
@@ -183,12 +184,13 @@ def _run_projection_cycle(
     LOG.info(
         "managed projection cycle passage_documents=%s "
         "membership_certified_passages=%s membership_failed_documents=%s "
-        "membership_deferred_documents=%s membership_elapsed_ms=%s",
+        "membership_deferred_documents=%s membership_elapsed_ms=%s parquet_failed=%s",
         result["passage_documents"],
         result["membership_certified_passages"],
         result["membership_failed_documents"],
         result["membership_deferred_documents"],
         result["membership_elapsed_ms"],
+        result["parquet_failed"],
     )
     return result
 
