@@ -1315,6 +1315,10 @@ class PassageProjectionTests(unittest.TestCase):
                 "passages": 9,
                 "embedded": 9,
                 "stale": 0,
+                "membership_certified_passages": 0,
+                "membership_failed_documents": 0,
+                "membership_deferred_documents": 0,
+                "membership_elapsed_ms": 0,
             },
         )
         self.assertEqual(
