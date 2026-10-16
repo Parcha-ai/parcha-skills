@@ -118,11 +118,12 @@ def change_cursor(store, row, checkpoint, *, deadline_at, after=None):
     """CAS only the optional phase; newer source publication always wins."""
     with native._connect(store, deadline_at) as connection:
         where = """WHERE tenant_id=%s AND source_id=%s AND logical_document_id=%s
-            AND generation=%s AND reason='certification' AND certification_checkpoint IS NOT DISTINCT FROM %s::jsonb"""
+            AND generation=%s AND reason='certification'
+            AND coalesce(certification_checkpoint,'null'::jsonb)=%s::jsonb"""
         params = (
             *key(row),
             row["generation"],
-            None if checkpoint is None else json.dumps(checkpoint),
+            json.dumps(checkpoint),
         )
         if after is None:
             result = native._query(
@@ -220,8 +221,11 @@ def resume(store, row, *, settings, deadline_at):
                     status="busy" if busy else "changed", certified_passages=certified
                 )
             if not rows:
-                change_cursor(store, row, checkpoint, deadline_at=deadline_at)
-                return dict(status="enrolled", certified_passages=certified)
+                removed = change_cursor(store, row, checkpoint, deadline_at=deadline_at)
+                return dict(
+                    status="enrolled" if removed else "changed",
+                    certified_passages=certified,
+                )
             ids = tuple(value["passage_id"] for value in rows)
             outcome = native.certify_published_passages(
                 store,

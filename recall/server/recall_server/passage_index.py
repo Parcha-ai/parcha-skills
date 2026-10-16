@@ -949,7 +949,7 @@ class CanonicalPassageProjector:
                     """SELECT revision,generation,changed_at
                          FROM canonical_passage_projection_queue
                         WHERE tenant_id=%s AND source_id=%s
-                          AND logical_document_id=%s
+                          AND logical_document_id=%s AND reason<>'certification'
                         FOR UPDATE""",
                     (
                         candidate.tenant_id,

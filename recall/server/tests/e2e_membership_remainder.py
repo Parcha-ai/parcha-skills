@@ -49,6 +49,16 @@ class MembershipRemainderTests(ParentMembershipPublicationTests):
         self.assertEqual(compared["disagreements"], 0)
         self.assertEqual(resumed["pending"], 0)
 
+    def test_second_prepared_publisher_cannot_republish_optional_phase(self):
+        self.queue()
+        publisher = self.publisher()
+        candidate = publisher._pending(tenant_id=self.tenant, limit=1)[0]
+        prepared = publisher._prepare(candidate)
+        self.assertEqual(publisher._commit(prepared)["status"], "committed")
+        # A second worker may already hold the same prepared source generation.
+        self.assertEqual(publisher._commit(prepared)["status"], "stale")
+        self.assertEqual(self.queued()[0]["checkpoint"]["after"], "")
+
     def test_disabled_remainder_does_not_make_published_source_pending(self):
         from recall_server.cli import _storage_authority_audit
         from recall_server.canonical_retrieval import BoundCanonicalRetrieval
@@ -199,6 +209,46 @@ class MembershipRemainderTests(ParentMembershipPublicationTests):
         self.assertEqual(outcome["documents"], 1)
         self.assertGreater(outcome["membership_certified_passages"], 0)
 
+    def test_publication_racing_final_cursor_cleanup_is_reported_changed(self):
+        self.interrupted_publication()
+        row = self.queued()[0]
+        remainder.change_cursor(
+            self.store,
+            row,
+            row["checkpoint"],
+            deadline_at=time.monotonic() + 3,
+            after=max(self.scope["passage_ids"]),
+        )
+        row = self.queued()[0]
+        native = remainder.change_cursor
+
+        def superseded(*args, **kwargs):
+            self.ingest("turn/newer-cleanup", "Synthetic newer publication")
+            self.projector.project_pending(
+                tenant_id=self.tenant,
+                batch_size=10,
+                max_batches=1,
+                upload_concurrency=1,
+            )
+            return native(*args, **kwargs)
+
+        with patch.object(remainder, "change_cursor", side_effect=superseded):
+            outcome = remainder.resume(
+                self.store,
+                row,
+                settings=self.settings(),
+                deadline_at=time.monotonic() + 3,
+            )
+        self.assertEqual(outcome["status"], "changed")
+        with self.store.connect() as c:
+            self.assertEqual(
+                c.execute(
+                    "SELECT reason FROM canonical_passage_projection_queue WHERE tenant_id=%s",
+                    (self.tenant,),
+                ).fetchone()["reason"],
+                "logical-update",
+            )
+
     def test_malformed_checkpoint_is_terminal_metadata_work(self):
         self.interrupted_publication()
         with self.store.connect() as c:
@@ -216,6 +266,17 @@ class MembershipRemainderTests(ParentMembershipPublicationTests):
         self.assertEqual(result["membership_deferred_documents"], 1)
         self.assertEqual(self.queued(), [])
         self.assertEqual(self.compare()["certified_passages"], 0)
+
+    def test_json_null_checkpoint_does_not_repeat_forever(self):
+        self.interrupted_publication()
+        with self.store.connect() as c:
+            c.execute(
+                "UPDATE canonical_passage_projection_queue SET certification_checkpoint='null'::jsonb WHERE tenant_id=%s",
+                (self.tenant,),
+            )
+        self.assertEqual(self.run_cycle()["membership_deferred_documents"], 1)
+        self.assertEqual(self.queued(), [])
+        self.assertEqual(self.run_cycle()["membership_deferred_documents"], 0)
 
     def test_one_cycle_deadline_and_finite_selection_follow_publication(self):
         self.queue()
