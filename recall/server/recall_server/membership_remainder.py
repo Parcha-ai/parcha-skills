@@ -318,7 +318,33 @@ def seed_history(
             if upper is not None:
                 through = [upper["source_id"], upper["logical_document_id"]]
                 result["through"] = through
-        if through is not None:
+    if through is not None:
+        # Commit initialization before touching the publication queue. Canonical
+        # writers acquire queue locks before deferred authority updates.
+        selection = """evidence.tenant_id=%s AND
+            (evidence.source_id,evidence.logical_document_id) IN (
+              SELECT source_id,logical_document_id FROM canonical_passage_documents
+              WHERE tenant_id=%s
+                AND (%s::text IS NULL OR (source_id,logical_document_id)>(%s,%s))
+                AND (source_id,logical_document_id)<=(%s,%s)
+              ORDER BY source_id,logical_document_id LIMIT %s)
+            AND EXISTS(SELECT 1 FROM canonical_sources source
+              JOIN brain_access_grants brain ON brain.tenant_id=source.tenant_id
+                AND brain.principal_id=source.owner_principal_id
+                AND brain.permission IN ('owner','admin','read')
+              JOIN canonical_source_grants grant_row ON grant_row.tenant_id=source.tenant_id
+                AND grant_row.source_id=source.source_id
+                AND grant_row.principal_id=source.owner_principal_id
+                AND grant_row.permission IN ('owner','read')
+              WHERE source.tenant_id=evidence.tenant_id AND source.source_id=evidence.source_id)"""
+        with native._connect(store, deadline_at) as connection:
+            native._query(store, connection,
+                native._INITIALIZE_GENERATION.format(selection=selection, passage_selection=''),
+                (tenant_id,tenant_id,after[0] if after else None,*(after or (None,None)),*through,limit),
+                deadline_at)
+        # A fresh snapshot observes committed initialization or a newer native
+        # generation. Existing queue work still wins ON CONFLICT below.
+        with native._connect(store, deadline_at) as connection:
             scope_sql = _CURRENT.format(
                 tenant="%s",
                 source="selected.source_id",
