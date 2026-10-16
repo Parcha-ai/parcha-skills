@@ -2,7 +2,6 @@
 """Canonical origin annotations preserve publication, history, and native vector cost."""
 import hashlib
 import json
-import time
 import unittest
 from unittest.mock import patch
 from e2e_handback_projection import HandbackPublication
