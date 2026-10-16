@@ -42,6 +42,22 @@ from .search_outbox import (
     write_search_tombstones,
 )
 
+
+class CertificationBudget:
+    """One lazy optional-proof window shared by a worker cycle's publishers."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._deadline_at: float | None = None
+
+    def deadline(self) -> float:
+        # Legacy publication hooks can arrive concurrently after their commits.
+        with self._lock:
+            if self._deadline_at is None:
+                self._deadline_at = time.monotonic() + 3
+            return self._deadline_at
+
+
 PROJECTION_PROGRESS_INTERVAL_SECONDS = 5.0
 MAX_PASSAGE_PROJECTION_BATCH = 1_000
 MAX_PASSAGE_EMBEDDING_BATCH = 5_000
@@ -2034,8 +2050,10 @@ class CanonicalPassageProjector:
         max_batches: int = 10,
         concurrency: int = 2,
         on_progress: Callable[[], None] | None = None,
+        certification_budget: CertificationBudget | None = None,
     ) -> dict[str, int | str]:
         tenant_id = self._tenant(tenant_id)
+        certification_budget = certification_budget or CertificationBudget()
         if (
             isinstance(batch_size, bool)
             or not isinstance(batch_size, int)
@@ -2108,12 +2126,16 @@ class CanonicalPassageProjector:
                 status['prepare_full_documents'] = int(prepared.previous_checkpoint is None)
                 del prepared
                 if should_certify:
+                    certification_deadline = certification_budget.deadline()
+                    if time.monotonic() >= certification_deadline:
+                        status['membership_deferred'] = 1
+                        return status, preparation_elapsed, commit_elapsed
                     certification_started = time.monotonic()
                     try:
                         certification = parent_membership_enrollment.certify_published_passages(
                             self.store, tenant_id=candidate.tenant_id, source_id=candidate.source_id,
                             logical_document_id=candidate.logical_document_id, passage_ids=passage_ids,
-                            settings=self.membership_certification, deadline_at=time.monotonic()+3)
+                            settings=self.membership_certification, deadline_at=certification_deadline)
                         status['membership_certified'] = certification['certified_passages']
                         status['membership_failed'] = int(certification['status'] == 'failed')
                         status['membership_deferred'] = int(
@@ -2190,11 +2212,12 @@ class CanonicalPassageProjector:
                 # A transient archive failure must never become a destructive
                 # logical-document rebuild.
                 break
-        # Source publication finishes first. All durable optional work shares one
-        # cycle budget, including metadata selection, regardless of parent count.
+        # Source publication continues even after optional proof exhausts the
+        # shared window. Leave durable work queued for the next worker cycle.
         certification_started = time.monotonic()
-        certification_deadline = certification_started+3
-        if self.membership_certification.enabled:
+        certification_deadline = (certification_budget.deadline()
+                                  if self.membership_certification.enabled else 0)
+        if self.membership_certification.enabled and time.monotonic() < certification_deadline:
             try:
                 certification_rows = membership_remainder.pending(self.store,
                     tenant_id=tenant_id, limit=batch_size, deadline_at=certification_deadline)

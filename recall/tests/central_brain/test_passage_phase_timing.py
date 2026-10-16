@@ -83,6 +83,46 @@ class PassagePhaseTimingTest(unittest.TestCase):
         with patch("recall_server.passage_index.time", projector.store.clock):
             return projector.project_pending(concurrency=1, **kwargs)
 
+    def test_legacy_hooks_share_lazy_window_across_parents_and_remainder(self):
+        from recall_server import membership_remainder, parent_membership_enrollment
+
+        class Legacy(Projector):
+            def _pending(self, **kwargs):
+                candidates = super()._pending(**kwargs)
+                for candidate in candidates:
+                    candidate.tenant_id = "tenant:test"
+                    candidate.source_id = "source:test"
+                return candidates
+
+            def _commit(self, prepared):
+                return {**super()._commit(prepared), "status": "committed"}
+
+        projector = Legacy(Store(Clock()))
+        projector.membership_certification = parent_membership_enrollment.CertificationSettings(
+            enabled=True, binding_epoch="test-epoch")
+        deadlines = []
+
+        def certify(*args, **kwargs):
+            # Pool warmup and source preparation took ten seconds before the
+            # first optional hook. They must not consume its three seconds.
+            self.assertEqual(projector.store.clock.value, 10)
+            self.assertEqual(kwargs["deadline_at"], 13)
+            deadlines.append(kwargs["deadline_at"])
+            projector.store.clock.advance(2)
+            return dict(status="enrolled", certified_passages=1)
+
+        with (
+            patch.object(parent_membership_enrollment, "certify_published_passages", side_effect=certify),
+            patch.object(membership_remainder, "pending", side_effect=AssertionError("expired optional selection")) as pending,
+        ):
+            result = self.run_projector(projector, batch_size=1, max_batches=2)
+        self.assertEqual(result["documents"], 2)
+        self.assertEqual(deadlines, [13])
+        self.assertEqual(result["membership_certified_passages"], 1)
+        self.assertEqual(result["membership_deferred_documents"], 1)
+        self.assertEqual(result["membership_failed_documents"], 0)
+        pending.assert_not_called()
+
     def test_distinct_phase_delays_accumulate_across_batches(self):
         projector = Projector(Store(Clock()))
         result = self.run_projector(projector, batch_size=1, max_batches=2)
