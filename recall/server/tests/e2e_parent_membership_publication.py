@@ -46,8 +46,8 @@ class ParentMembershipPublicationTests(ParentEnrollmentTests):
                     yield
                 finally:
                     active.pop()
-        def prepare(candidate):
-            prepared=native_prepare(candidate);references.append(weakref.ref(prepared));return prepared
+        def prepare(candidate, **kwargs):
+            prepared=native_prepare(candidate, **kwargs);references.append(weakref.ref(prepared));return prepared
         def certify(*args,**kwargs):
             self.assertEqual(active,[])
             self.assertTrue(references)

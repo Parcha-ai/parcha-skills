@@ -66,7 +66,7 @@ class PassageDispatch(ParentProgress):
         lock = threading.Lock()
         held = set()
         prepare = self.passages._prepare
-        def blocked(candidate):
+        def blocked(candidate, **kwargs):
             if candidate.source_id == self.sources['large']:
                 with lock:
                     held.add(candidate.logical_document_id)
@@ -74,7 +74,7 @@ class PassageDispatch(ParentProgress):
                         both_held.set()
                 if not self.release.wait(15):
                     raise AssertionError('large passage preparation not released')
-            return prepare(candidate)
+            return prepare(candidate, **kwargs)
         with patch.object(self.passages, '_prepare', blocked), ThreadPoolExecutor(max_workers=1) as executor:
             future = executor.submit(self.passages.project_pending, batch_size=3,
                 max_batches=1, concurrency=2, on_progress=self.publish)

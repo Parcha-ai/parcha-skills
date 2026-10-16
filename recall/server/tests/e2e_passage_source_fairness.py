@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 from e2e_passage_set_admission import SetAdmission
 from recall_server.logical_evidence import LogicalEvidenceError
+from recall_server.passage_index import PreparedPassageDocument
 
 
 class PassageSourceFairness(SetAdmission):
@@ -112,10 +113,12 @@ class PassageSourceFairness(SetAdmission):
         self.add('healthy-recent',[200],age=10)
         self.projector.store.pool_max_size=4
         attempted=[]
-        def prepare(candidate):
+        def prepare(candidate, *, incremental=False):
+            self.assertTrue(incremental)
             attempted.append(candidate.logical_document_id)
-            return candidate
-        def commit(candidate):
+            return PreparedPassageDocument(candidate, 0, 0, ())
+        def commit(prepared):
+            candidate = prepared.candidate
             self.ack([candidate])
             return {'status':'complete','inserted':1,'deleted':0,'retained':0}
         with patch.object(self.projector,'_prepare',prepare),patch.object(self.projector,'_commit',commit):
@@ -178,15 +181,17 @@ class PassageSourceFairness(SetAdmission):
                 yield self.connection
         self.projector.store.connect=serialized_connection
         attempted=set()
-        def prepare(candidate):
+        def prepare(candidate, *, incremental=False):
+            self.assertTrue(incremental)
             attempted.add(candidate.source_id)
             ordinal=int(candidate.source_id[2:])
             if ordinal<10 and ordinal%3==0:
                 raise LogicalEvidenceError('logical_evidence_unavailable')
             if ordinal<10 and ordinal%3==1:
                 raise LogicalEvidenceError('logical_evidence_not_found')
-            return candidate
-        def commit(candidate):
+            return PreparedPassageDocument(candidate, 0, 0, ())
+        def commit(prepared):
+            candidate = prepared.candidate
             if int(candidate.source_id[2:])<10:
                 return {'status':'stale'}
             with lock:
