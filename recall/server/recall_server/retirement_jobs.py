@@ -8,6 +8,7 @@ intent unresolved. Reconciliation inspects that exact job; never repeat the POST
 import ast
 import base64
 from datetime import datetime, timezone
+from decimal import Decimal
 import gzip
 import hashlib
 import json
@@ -28,6 +29,18 @@ LOG_MAX_PAGES = 64
 LOG_MAX_ROWS = 60000
 LOG_MAX_BYTES = 64 * 1024**2
 LOG_READ_SECONDS = 90
+
+
+def _log_time(value):
+    # datetime retains only microseconds. Keep the full RFC3339 fraction for
+    # exact provider cursor bounds and timezone-equivalent repeat detection.
+    match = re.fullmatch(
+        r"[0-9]{4}-[0-9]{2}-[0-9]{2}[Tt][0-9]{2}:[0-9]{2}:[0-9]{2}"
+        r"(?:\.([0-9]+))?(?:[Zz]|[+-][0-9]{2}:[0-9]{2})", value,
+    ) if isinstance(value, str) else None
+    _check(match is not None, "logs_window")
+    whole_seconds = datetime.fromisoformat(value.replace("z", "+00:00")).replace(microsecond=0)
+    return whole_seconds, Decimal("0." + (match[1] or "0"))
 
 
 def encode_result(value, pin):
@@ -307,10 +320,9 @@ class RenderJob:
             start, end = logs.get("nextStartTime"), logs.get("nextEndTime")
             try:
                 if bounds is None:
-                    bounds = tuple(datetime.fromisoformat(query[key]) for key in ("startTime", "endTime"))
+                    bounds = tuple(_log_time(query[key]) for key in ("startTime", "endTime"))
                     windows.add(bounds)
-                window = tuple(datetime.fromisoformat(value) for value in (start, end))
-                _check(all(value.tzinfo is not None for value in (*bounds, *window)), "logs_window")
+                window = tuple(_log_time(value) for value in (start, end))
                 _check(bounds[0] <= window[0] <= window[1] <= bounds[1]
                        and window not in windows, "logs_window")
             except (TypeError, ValueError):

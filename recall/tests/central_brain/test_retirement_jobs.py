@@ -541,6 +541,28 @@ class PaginationTests(unittest.TestCase):
         self.assertEqual(self.log_reads, 2)
         self.assertEqual(self.now, 0)
 
+    def test_nanosecond_cursor_progress_is_not_a_repeated_window(self):
+        rows = self.rows()
+        transport = self.transport([
+            dict(hasMore=True, logs=rows[:1], nextStartTime="2026-10-16T00:00:00.000000001Z"),
+            dict(hasMore=True, logs=[], nextStartTime="2026-10-16T00:00:00.000000002Z"),
+            dict(hasMore=False, logs=rows[1:]),
+        ])
+        self.assertEqual(transport.reconcile("job", "pin", "owner", Mock()), {"ok": True})
+        self.assertEqual(self.log_reads, 3)
+
+    def test_nanosecond_upper_bound_escape_refuses(self):
+        from datetime import datetime
+        from recall_server import retirement_jobs as jobs
+        class FixedTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return cls(2026, 10, 16, 0, 0, 2, tzinfo=tz)
+        transport = self.transport([dict(hasMore=True, logs=[], nextEndTime="2026-10-16T00:00:02.000000001Z")])
+        with patch.object(jobs, "datetime", FixedTime), self.assertRaisesRegex(ValueError, "logs_window"):
+            transport.reconcile("job", "pin", "owner", Mock())
+        self.assertEqual(self.log_reads, 1)
+
     def test_narrowed_window_changes_only_provider_time_parameters(self):
         rows = self.rows()
         end = "2026-10-16T00:00:02+00:00"
@@ -559,7 +581,8 @@ class PaginationTests(unittest.TestCase):
 
     def test_repeated_or_escaped_window_refuses(self):
         for window in (
-            dict(nextStartTime=self.start), dict(nextStartTime="2026-10-15T00:00:00Z"),
+            dict(nextStartTime=self.start), dict(nextStartTime="2026-10-16T01:00:00.000000000+01:00"),
+            dict(nextStartTime="2026-10-15T00:00:00Z"),
             dict(nextEndTime="2099-01-01T00:00:00Z"), dict(nextStartTime="bad"),
             dict(nextStartTime="2026-10-16T00:00:01"),
         ):
