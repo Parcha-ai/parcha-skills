@@ -29,6 +29,8 @@ SINGLETON_RECEIPT_PROFILE_VERSION = 80
 FORGOTTEN_EVENT_DIGEST_TYPE_VERSION = 81
 # Optional shadow membership generation; no reader trusts this marker.
 PARENT_AUTHORITY_GENERATION_VERSION = 82
+# Optional nullable proof metadata; marker alone grants no reader trust.
+PARENT_MEMBERSHIP_CERTIFICATE_VERSION = 83
 # Optional until a delayed Slack body needs a terminal-identity ACK.
 SUPPRESSED_ARTIFACT_SCHEMA_VERSION = 77
 MANDATORY_SCHEMA_VERSION = 69

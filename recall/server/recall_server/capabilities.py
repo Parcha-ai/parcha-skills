@@ -21,6 +21,7 @@ from . import (
     SINGLETON_RECEIPT_PROFILE_VERSION,
     FORGOTTEN_EVENT_DIGEST_TYPE_VERSION,
     PARENT_AUTHORITY_GENERATION_VERSION,
+    PARENT_MEMBERSHIP_CERTIFICATE_VERSION,
 )
 
 
@@ -216,7 +217,9 @@ def assess_snapshot(snapshot: dict[str, Any], profile: str = "production") -> di
                       + ([FORGOTTEN_EVENT_DIGEST_TYPE_VERSION]
                          if FORGOTTEN_EVENT_DIGEST_TYPE_VERSION in versions else [])
                       + ([PARENT_AUTHORITY_GENERATION_VERSION]
-                         if PARENT_AUTHORITY_GENERATION_VERSION in versions else []))
+                         if PARENT_AUTHORITY_GENERATION_VERSION in versions else [])
+                      + ([PARENT_MEMBERSHIP_CERTIFICATE_VERSION]
+                         if PARENT_MEMBERSHIP_CERTIFICATE_VERSION in versions else []))
     if (RETIREMENT_POLICY_VERSION in versions
             and RETIREMENT_DETACHMENT_VERSION not in versions):
         raise CapabilityError("schema_drift")
@@ -225,6 +228,9 @@ def assess_snapshot(snapshot: dict[str, Any], profile: str = "production") -> di
         raise CapabilityError("schema_drift")
     if (PARENT_AUTHORITY_GENERATION_VERSION in versions
             and SINGLETON_RECEIPT_PROFILE_VERSION not in versions):
+        raise CapabilityError("schema_drift")
+    if (PARENT_MEMBERSHIP_CERTIFICATE_VERSION in versions
+            and PARENT_AUTHORITY_GENERATION_VERSION not in versions):
         raise CapabilityError("schema_drift")
     if versions != expected:
         raise CapabilityError("schema_drift")
