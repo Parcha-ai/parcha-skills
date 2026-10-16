@@ -347,7 +347,7 @@ class BrainStore:
             else None
         )
 
-    def connect(self):
+    def connect(self, *, timeout=None):
         if self._pool is None:
             with self._pool_lock:
                 if self._pool is None:
@@ -371,7 +371,9 @@ class BrainStore:
                         pool.close()
                         raise
                     self._pool = pool
-        return self._pool.connection()
+        if timeout is None:
+            return self._pool.connection()
+        return self._pool.connection(timeout=timeout)
 
     def read_connection(self):
         """Borrow reserved capacity for an explicit read owner, if enabled."""
