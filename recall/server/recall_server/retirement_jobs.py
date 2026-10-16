@@ -24,6 +24,10 @@ from .retirement_campaign import _check, canonical, digest
 DIAGNOSTIC = "recall_retirement_job_v1"
 TERMINAL = {"succeeded", "failed", "canceled"}
 REQUEST_TIMEOUT_SECONDS = 40
+LOG_MAX_PAGES = 64
+LOG_MAX_ROWS = 60000
+LOG_MAX_BYTES = 64 * 1024**2
+LOG_READ_SECONDS = 90
 
 
 def encode_result(value, pin):
@@ -247,12 +251,7 @@ class RenderJob:
 
     def _read_result(self, job, pin, owner_id, emit, *, deadline=None):
         while True:
-            if deadline is not None:
-                # Reserve the configured HTTP timeout before this GET.
-                # A late response is refused below; the job deadline never resets.
-                _check(self.clock() + REQUEST_TIMEOUT_SECONDS < deadline,
-                       "remote_result_unavailable_before_deadline")
-            rows = self._read_result_rows(job, owner_id)
+            rows = self._read_result_rows(job, owner_id, deadline=deadline)
             if deadline is not None:
                 _check(self.clock() < deadline, "remote_result_unavailable_before_deadline")
             if deadline is None or not _result_is_pending(rows, pin):
@@ -265,28 +264,60 @@ class RenderJob:
         )
         return result
 
-    def _read_result_rows(self, job, owner_id):
-        query = urllib.parse.urlencode(
-            dict(
-                ownerId=owner_id,
-                resource=job["id"],
-                type="app",
-                direction="forward",
-                limit=1000,
-                startTime=job["createdAt"],
-                endTime=datetime.now(timezone.utc).isoformat(),
-            )
+    def _read_result_rows(self, job, owner_id, *, deadline=None):
+        stop = self.clock() + LOG_READ_SECONDS
+        if deadline is not None:
+            stop = min(stop, deadline)
+        query = dict(
+            ownerId=owner_id, resource=job["id"], type="app", direction="forward",
+            limit=1000, startTime=job["createdAt"],
+            endTime=datetime.now(timezone.utc).isoformat(),
         )
-        logs = self.request("GET", "/logs?" + query)
-        _check(logs.get("hasMore") is False, "logs_incomplete")
-        rows = []
-        for row in logs.get("logs", []):
-            message = row.get("message", "")
-            if DIAGNOSTIC in message:
-                event = json.loads(message[message.index("{") :])
-                _check(event["diagnostic"] == DIAGNOSTIC, "log_contract")
-                rows.append(event)
-        return rows
+        rows, identities, windows = [], {}, set()
+        count = size = 0
+        bounds = None
+        for _ in range(LOG_MAX_PAGES):
+            # Every page shares the same deadline and original job scope.
+            _check(self.clock() + REQUEST_TIMEOUT_SECONDS < stop,
+                   "remote_result_unavailable_before_deadline")
+            logs = self.request("GET", "/logs?" + urllib.parse.urlencode(query))
+            _check(self.clock() < stop, "remote_result_unavailable_before_deadline")
+            _check(isinstance(logs, dict) and isinstance(logs.get("logs"), list), "logs_shape")
+            for row in logs["logs"]:
+                _check(isinstance(row, dict) and isinstance(row.get("message"), str), "logs_shape")
+                message = row["message"]
+                raw = message.encode()
+                count += 1
+                size += len(raw)
+                _check(count <= LOG_MAX_ROWS and size <= LOG_MAX_BYTES, "logs_bound")
+                identity = (row.get("id"), row.get("timestamp"))
+                if all(isinstance(value, str) and value for value in identity):
+                    message_hash = hashlib.sha256(raw).digest()
+                    if identity in identities:
+                        _check(identities[identity] == message_hash, "logs_duplicate_conflict")
+                        continue
+                    identities[identity] = message_hash
+                if DIAGNOSTIC in message:
+                    event = json.loads(message[message.index("{"):])
+                    _check(event["diagnostic"] == DIAGNOSTIC, "log_contract")
+                    rows.append(event)
+            if logs.get("hasMore") is False:
+                return rows
+            _check(logs.get("hasMore") is True, "logs_shape")
+            start, end = logs.get("nextStartTime"), logs.get("nextEndTime")
+            try:
+                if bounds is None:
+                    bounds = tuple(datetime.fromisoformat(query[key]) for key in ("startTime", "endTime"))
+                    windows.add(bounds)
+                window = tuple(datetime.fromisoformat(value) for value in (start, end))
+                _check(all(value.tzinfo is not None for value in (*bounds, *window)), "logs_window")
+                _check(bounds[0] <= window[0] <= window[1] <= bounds[1]
+                       and window not in windows, "logs_window")
+            except (TypeError, ValueError):
+                raise ValueError("logs_window") from None
+            windows.add(window)
+            query.update(startTime=start, endTime=end)
+        raise ValueError("logs_bound")
 
 
 def package_body(config, payload):
