@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Shadow parent membership generations; native search authority is unchanged."""
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 import json
 import os
 from pathlib import Path
@@ -28,6 +28,56 @@ class ParentAuthorityGenerationTests(SingletonSearchTests):
             with self.store.connect() as c:
                 row=c.execute(sql,args).fetchone()
         return row['generation'] if row else 0
+
+    def test_runtime_role_grants_and_reused_backend_flush_each_transaction(self):
+        role='runtime_generation_'+self.tenant.rsplit(':',1)[-1]
+        with self.store.connect() as admin:
+            admin.execute(psycopg.sql.SQL('CREATE ROLE {} NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS').format(psycopg.sql.Identifier(role)))
+            admin.execute(psycopg.sql.SQL('GRANT USAGE ON SCHEMA public TO {}').format(psycopg.sql.Identifier(role)))
+            admin.execute(psycopg.sql.SQL('GRANT SELECT,INSERT,UPDATE,DELETE ON ALL TABLES IN SCHEMA public TO {}').format(psycopg.sql.Identifier(role)))
+            admin.execute(psycopg.sql.SQL('REVOKE INSERT,UPDATE,DELETE ON schema_migrations FROM {}').format(psycopg.sql.Identifier(role)))
+            admin.execute(psycopg.sql.SQL('GRANT USAGE,SELECT ON ALL SEQUENCES IN SCHEMA public TO {}').format(psycopg.sql.Identifier(role)))
+            database=admin.execute('SELECT current_database() AS name').fetchone()['name']
+            admin.execute(psycopg.sql.SQL('GRANT TEMP ON DATABASE {} TO {}').format(psycopg.sql.Identifier(database),psycopg.sql.Identifier(role)))
+        try:
+            with psycopg.connect(self.store.dsn,row_factory=psycopg.rows.dict_row) as runtime:
+                @contextmanager
+                def role_connection(*,timeout=None):
+                    with runtime.transaction():
+                        runtime.execute(psycopg.sql.SQL('SET LOCAL ROLE {}').format(psycopg.sql.Identifier(role)))
+                        runtime.execute('SET LOCAL search_path=pg_catalog,public')
+                        yield runtime
+                with patch.object(self.store,'connect',side_effect=role_connection):
+                    self.ingest('turn/search','Synthetic runtime original')
+                    self.assertEqual(self.generation(),1)
+                    with psycopg.connect(self.store.dsn) as admin:
+                        admin.execute(psycopg.sql.SQL('REVOKE UPDATE ON canonical_parent_authority FROM {}').format(psycopg.sql.Identifier(role)))
+                    with self.assertRaises(psycopg.errors.InsufficientPrivilege):
+                        self.edit()
+                    self.assertEqual(self.generation(),1)
+                    with psycopg.connect(self.store.dsn) as admin:
+                        admin.execute(psycopg.sql.SQL('GRANT UPDATE ON canonical_parent_authority TO {}').format(psycopg.sql.Identifier(role)))
+                    self.edit()
+                    self.assertEqual(self.generation(),2)
+                    with self.store.connect() as c:
+                        privileges=c.execute("""SELECT current_user AS role,
+                          has_schema_privilege(current_user,'public','CREATE') AS schema_create,
+                          has_table_privilege(current_user,'schema_migrations','INSERT') AS migration_write,
+                          has_database_privilege(current_database(),'TEMP') AS temp,
+                          (SELECT count(*) FROM pg_temp.recall_parent_authority_pending) AS pending""").fetchone()
+                        self.assertEqual(privileges,dict(role=role,schema_create=False,migration_write=False,temp=True,pending=0))
+                    # Simulate backend temp cleanup between transactions. The
+                    # next writer must recreate its queue, retaining durable G.
+                    with self.store.connect() as c:
+                        c.execute('DROP TABLE pg_temp.recall_parent_authority_pending')
+                    self.edit(batch=True,tombstone=True,native='session')
+                    self.assertEqual(self.generation(),3)
+                    with self.store.connect() as c:
+                        self.assertEqual(c.execute('SELECT count(*) AS n FROM pg_temp.recall_parent_authority_pending').fetchone()['n'],0)
+        finally:
+            with self.store.connect() as admin:
+                admin.execute(psycopg.sql.SQL('DROP OWNED BY {}').format(psycopg.sql.Identifier(role)))
+                admin.execute(psycopg.sql.SQL('DROP ROLE {}').format(psycopg.sql.Identifier(role)))
 
     def test_ingest_replay_edit_and_batch_advance_once(self):
         self.receipt=self.ingest('turn/search','Synthetic original')['receipt']
