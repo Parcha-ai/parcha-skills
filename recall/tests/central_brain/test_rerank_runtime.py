@@ -158,6 +158,21 @@ class RerankRuntimeContractTest(unittest.TestCase):
 
     # -- transport hygiene ---------------------------------------------------
 
+    def test_http_status_is_optional_numeric_metadata_not_exception_text(self):
+        legacy = RerankUnavailable("rerank_http_status")
+        self.assertEqual(str(legacy), "rerank_http_status")
+        self.assertEqual(legacy.args, ("rerank_http_status",))
+        self.assertIsNone(legacy.http_status)
+        for status in (400, 413, 429, 503):
+            error = RerankUnavailable("rerank_http_status", http_status=status)
+            self.assertEqual(error.http_status, status)
+            self.assertEqual(str(error), "rerank_http_status")
+            self.assertEqual(error.args, legacy.args)
+        for invalid in (True, "429 private-body", 429.0, 99, 600, {}, None):
+            error = RerankUnavailable("rerank_http_status", http_status=invalid)
+            self.assertIsNone(error.http_status)
+            self.assertEqual(str(error), "rerank_http_status")
+
     def test_rerank_rejects_redirects_and_oversized_responses(self) -> None:
         transport = UrllibRerankTransport()
 
