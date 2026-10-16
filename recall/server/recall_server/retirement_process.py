@@ -10,38 +10,18 @@ import signal
 import sys
 import time
 
-import psycopg
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 
 from .archive_runtime import build_evidence_archive_store
-from .db import BrainStore, SearchDeadlineExceeded, singleton_receipt_capability
+from .db import BrainStore, singleton_receipt_capability
 from .turbopuffer_plane import search_plane_from_env
 from .retirement_maintenance import RetirementMaintenance
 
 
 class RetirementStore:
     _set_statement_deadline = staticmethod(BrainStore._set_statement_deadline)
-
-    @staticmethod
-    def _execute_bounded(conn, sql, values, deadline_at):
-        if deadline_at is None:
-            return BrainStore._execute_bounded(conn, sql, values, deadline_at)
-        try:
-            # Send the timeout setting and its statement in one exchange. Exit
-            # before returning so cursors are ready and COPY/server cursors in
-            # the archive proof still run outside pipeline mode.
-            with conn.pipeline():
-                cursor = BrainStore._execute_bounded(conn, sql, values, deadline_at)
-            return cursor
-        except psycopg.errors.QueryCanceled as exc:
-            # Cancellation may arrive at pipeline exit, after the shared
-            # executor's handler. Preserve its rollback/deadline contract.
-            try:
-                conn.rollback()
-            except psycopg.ProgrammingError:
-                pass
-            raise SearchDeadlineExceeded("search deadline exceeded") from exc
+    _execute_bounded = staticmethod(BrainStore._execute_bounded_pipeline)
 
     def __init__(self, dsn):
         self.verified_singleton_receipts = singleton_receipt_capability()
