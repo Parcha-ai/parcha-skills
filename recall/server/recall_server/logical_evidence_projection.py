@@ -2649,6 +2649,7 @@ class CanonicalLogicalEvidenceProjector:
         ordinary_sources_served = set()
         round_remaining = None
         notification_round = False
+        oldest_head_pending = False
         stopping = threading.Event()
 
         def parent_key(candidate):
@@ -2719,7 +2720,7 @@ class CanonicalLogicalEvidenceProjector:
             )
 
         def fill_slots(executor, handoff_stop=None):
-            nonlocal batches, admitted, round_remaining, notification_round
+            nonlocal batches, admitted, round_remaining, notification_round, oldest_head_pending
             def available():
                 return (not stopping.is_set() and can_admit()
                         and (handoff_stop is None or not handoff_stop.is_set()))
@@ -2743,6 +2744,7 @@ class CanonicalLogicalEvidenceProjector:
                     :min(batch_size, admission_limit - admitted)
                 ]
                 if round_remaining is None:
+                    oldest_head_pending = not self._prefer_recent_admission
                     # Keep one finite round across free-slot refills. Fresh
                     # arrivals may enter, but cannot enlarge its initial budget.
                     notification_round = self._prefer_recent_admission and any(
@@ -2773,19 +2775,31 @@ class CanonicalLogicalEvidenceProjector:
                 }
                 if ordinary and not ordinary - ordinary_sources_served - active_sources:
                     ordinary_sources_served.clear()
-                # Order the same bounded eligible set before selecting free
-                # slots. Keep source rounds ahead of ordinary cost estimates;
-                # explicit forget and notification FIFO still come first.
+                # Reserve one oldest SQL nominee before cost ordering. Without
+                # this floor, each finite cycle can repeatedly admit only cheap
+                # arrivals and leave an old large parent unstarted. The remaining
+                # slots still favor small work, including beside a large owner.
+                oldest_head = None
+                if oldest_head_pending:
+                    ordinary_candidates = [c for c in candidates if c.admission_priority > 1]
+                    unserved = [c for c in ordinary_candidates if (c.tenant_id, c.source_id)
+                                not in ordinary_sources_served | active_sources]
+                    if unserved or ordinary_candidates:
+                        oldest_head = parent_key((unserved or ordinary_candidates)[0])
+                # Source floors, Forget, and notification FIFO retain precedence.
                 candidates.sort(key=lambda c: (
                     c.admission_priority,
                     c.admission_priority > 1 and (c.tenant_id, c.source_id)
                     in ordinary_sources_served | active_sources,
                     c.notification_queued_at or datetime.max.replace(tzinfo=timezone.utc),
+                    oldest_head is not None and parent_key(c) != oldest_head,
                     c.estimated_bytes,
                 ))
                 candidates = candidates[:min(slots, round_remaining)]
                 if not candidates or not available():
                     break
+                if any(parent_key(c) == oldest_head for c in candidates):
+                    oldest_head_pending = False
                 round_remaining -= len(candidates)
                 if round_remaining == 0:
                     round_remaining = None

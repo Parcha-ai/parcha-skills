@@ -2,6 +2,7 @@
 """Real admission priority and finite-batch execution order with held large owners."""
 from concurrent.futures import ThreadPoolExecutor
 import threading
+import time
 import unittest
 
 from e2e_logical_admission_sharing import AdmissionSharing, insert_record, mark_logical_evidence_dirty
@@ -49,7 +50,7 @@ class SmallWorkOrdering(AdmissionSharing):
         by_name = {c.native_parent_id: c for c in admitted}
         self.assertEqual(by_name['tie-a'].estimated_bytes, by_name['tie-b'].estimated_bytes)
         self.logical.project_pending(batch_size=4, max_batches=1, upload_concurrency=1)
-        self.assertEqual(self.selected, ['forget', 'tie-a', 'tie-b', 'old-large'])
+        self.assertEqual(self.selected, ['forget', 'old-large', 'tie-a', 'tie-b'])
         self.assertEqual(set(self.selected), set(by_name))
         self.assertEqual([c.native_parent_id for c in self.logical._pending(tenant_id=self.tenant, limit=10)], ['outside'])
 
@@ -93,6 +94,33 @@ class SmallWorkOrdering(AdmissionSharing):
                 release.set()
             self.assertEqual(future.result(timeout=5)['documents'], 3)
         self.assertEqual(self.logical._pending(tenant_id=self.tenant, limit=10), [])
+
+    def test_oldest_nominee_is_not_perpetually_cost_deferred(self):
+        self.seed([('old-large', 20000, 1000, 'ingest'), ('small-0', 1, 800, 'ingest')])
+        original_commit = self.logical._commit_upload
+        deadline = [None]
+        def finite_commit(candidate, upload):
+            status = original_commit(candidate, upload)
+            # Model one acknowledged owner using the remaining finite cycle.
+            # No production query or admission policy is replaced.
+            remaining = deadline[0] - time.monotonic()
+            if remaining > 0: time.sleep(remaining + .02)
+            return status
+        self.logical._commit_upload = finite_commit
+        for index in range(4):
+            if index:
+                self.add('small-' + str(index), age=100)
+            nominations = self.logical._pending(tenant_id=self.tenant, limit=2,
+                prefer_recent=self.logical._prefer_recent_admission)
+            self.assertIn('old-large', [c.native_parent_id for c in nominations])
+            deadline[0] = time.monotonic() + 1.0
+            result = self.logical.project_pending(batch_size=2, max_batches=1,
+                upload_concurrency=1, admission_deadline_at=deadline[0])
+            self.assertEqual(result['failed'], 0)
+            self.assertEqual(result['documents'], 1, 'fixture must admit exactly one real owner')
+            if 'old-large' in self.selected: break
+        self.assertIn('old-large', self.selected,
+            'oldest eligible source nominee was repeatedly displaced by cheaper arrivals')
 
 
 if __name__ == '__main__':
