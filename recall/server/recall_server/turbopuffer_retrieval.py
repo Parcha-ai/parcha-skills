@@ -660,11 +660,14 @@ class TurbopufferHintRetrieval(PassageHintRetrieval):
             results, legs, deadline_at=deadline_at, include_arms=include_arms,
             collapse_options=collapse_options,
         )
+        # Exact clipping hydrates straddling ranges through the canonical body
+        # owner. Do not fetch their full, unfiltered vendor bodies a second time.
+        authority.update(self._filter_time_ranges(results, legs) or {})
         wanted: dict[str, list[dict[str, Any]]] = {}
         for row in results:
             for item in row.get("matching_ranges") or ():
                 passage_id = item.get("passage_id")
-                if isinstance(passage_id, str) and not item.get("text"):
+                if isinstance(passage_id, str) and not item.get("text") and not item.get("time_clipped"):
                     wanted.setdefault(passage_id, []).append(item)
         if not wanted:
             return {**authority, "hydrate_status": authority["authority_status"], "hydrated_passages": 0}

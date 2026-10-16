@@ -9,6 +9,7 @@ import time
 import urllib.error
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
+from functools import partial
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -1910,7 +1911,13 @@ class BoundCanonicalRetrieval:
             from .turbopuffer_retrieval import TurbopufferHintRetrieval
 
             retrieval_class = TurbopufferHintRetrieval
-        response = retrieval_class(
+        time_filter = None
+        if since is not None or until is not None:
+            time_filter = partial(
+                self._clip_passage_hints_to_time_window,
+                sources=sources, since=since, until=until, deadline_at=deadline_at,
+            )
+        return retrieval_class(
             self.store,
             tenant_id=self.tenant_id,
             sources=sources,
@@ -1918,21 +1925,13 @@ class BoundCanonicalRetrieval:
             actor_ids=passage_actor_ids,
             actor_relations=(relation,) if relation is not None else None,
             actor_scope=person is not None,
+            time_filter=time_filter,
         ).search(
             query,
             lexical_query=lexical_query,
             since=since,
             until=until,
             limit=limit,
-            deadline_at=deadline_at,
-        )
-        if since is None and until is None:
-            return response
-        return self._clip_passage_hints_to_time_window(
-            response,
-            sources=sources,
-            since=since,
-            until=until,
             deadline_at=deadline_at,
         )
 

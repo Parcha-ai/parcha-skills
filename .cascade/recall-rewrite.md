@@ -4,6 +4,8 @@ _Living plan. Status legend: todo / doing / done / blocked. Evidence = PR + card
 
 ## Status board
 
+- **Explicit date-window ranking (doing, 2026-10-16):** clip the already admitted, authorized pool before reranking and top-K. Reuse canonical grouped archive hydration; leave unfiltered searches, overlap semantics, and native authority unchanged. Synthetic counterexample reproduced September prose displacing August evidence despite an explicit August cutoff. Ten unit controls and five native PostgreSQL controls cover ordering, shared reads, empty text, deadlines and Forget; retained time-clip/Forget suites pass. A real101-event pool preserves formerly working final-five results; located reads with finite deadlines share immutable parts without the transitional100-event ceiling, retaining byte/time/catalog bounds. PR/full CI and independent review pending.
+
 _Date note: the entries below marked "2026-09-13 21-22 UTC" and "2026-09-14 00:xx UTC" happened on 2026-09-14 19:40-21:30 UTC (clock misread); Render deploy timestamps are authoritative._
 
 _2026-09-12 summary: the day-long search regression was IO saturation from the tombstone lineage query (T9), compounded by never-analyzed statistics on the 12M-row tables and a frozen parquet plane (T8). All three fixed and deployed by 21:35 UTC._
