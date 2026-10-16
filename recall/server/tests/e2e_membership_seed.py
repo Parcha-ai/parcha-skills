@@ -449,6 +449,17 @@ class HistoricalMembershipSeedTests(ParentMembershipPublicationTests):
             tenant_id=self.tenant, batch_size=200, max_batches=1, concurrency=4
         )
         self.assertEqual(published["documents"], 127)
+        with self.store.connect() as c:
+            c.execute('DELETE FROM canonical_parent_authority WHERE tenant_id=%s', (self.tenant,))
+            # Observe actual insertion order, which must match the existing
+            # deferred invalidator when several authority rows share a commit.
+            c.execute('CREATE TABLE seed_authority_order(ordinal bigserial,native_parent_id text)')
+            c.execute("""CREATE FUNCTION record_seed_authority_order() RETURNS trigger
+                LANGUAGE plpgsql AS $$ BEGIN
+                INSERT INTO seed_authority_order(native_parent_id) VALUES(NEW.native_parent_id);
+                RETURN NEW; END $$""")
+            c.execute('CREATE TRIGGER record_seed_authority_order AFTER INSERT ON canonical_parent_authority '
+                      'FOR EACH ROW EXECUTE FUNCTION record_seed_authority_order()')
         native = enrollment._query
         calls = []
 
@@ -458,15 +469,27 @@ class HistoricalMembershipSeedTests(ParentMembershipPublicationTests):
             return native(*args)
 
         started = time.monotonic()
-        with patch.object(enrollment, "_query", side_effect=delayed):
-            result = self.seed()
+        try:
+            with patch.object(enrollment, "_query", side_effect=delayed):
+                result = self.seed()
+            elapsed = time.monotonic() - started
+            with self.store.connect() as c:
+                actual = [row['native_parent_id'] for row in c.execute(
+                    'SELECT native_parent_id FROM seed_authority_order ORDER BY ordinal').fetchall()]
+            self.assertEqual(len(actual), 128)
+            self.assertEqual(actual, sorted(actual))
+        finally:
+            with self.store.connect() as c:
+                c.execute('DROP TRIGGER record_seed_authority_order ON canonical_parent_authority')
+                c.execute('DROP FUNCTION record_seed_authority_order()')
+                c.execute('DROP TABLE seed_authority_order')
         print(
             json.dumps(
                 dict(
                     seed_parents=result["queued"],
                     query_calls=len(calls),
                     injected_query_ms=20,
-                    elapsed_ms=round((time.monotonic() - started) * 1000),
+                    elapsed_ms=round(elapsed * 1000),
                 )
             )
         )

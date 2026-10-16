@@ -197,7 +197,7 @@ _INITIALIZE_GENERATION = """INSERT INTO canonical_parent_authority
                    WHERE passage.tenant_id=evidence.tenant_id AND passage.source_id=evidence.source_id
                      AND passage.logical_document_id=evidence.logical_document_id
                      AND passage.membership_generation IS NOT NULL)
-            ON CONFLICT DO NOTHING"""
+            {ordering}ON CONFLICT DO NOTHING"""
 
 
 def _enroll(store, scope, deadline_at):
@@ -208,7 +208,7 @@ def _enroll(store, scope, deadline_at):
         # authority row could otherwise make an older certificate match again.
         _query(store,connection,_INITIALIZE_GENERATION.format(
             selection='evidence.tenant_id=%s AND evidence.source_id=%s AND evidence.native_parent_id=%s',
-            passage_selection='AND passage.passage_id=ANY(%s)'),
+            passage_selection='AND passage.passage_id=ANY(%s)', ordering=''),
             (scope['tenant_id'],scope['source_id'],scope['native_parent_id'],list(scope['passage_ids'])),
             deadline_at)
     captured=_capture(store,scope,deadline_at,prove_ownership=True)

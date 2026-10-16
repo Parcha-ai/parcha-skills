@@ -339,7 +339,9 @@ def seed_history(
               WHERE source.tenant_id=evidence.tenant_id AND source.source_id=evidence.source_id)"""
         with native._connect(store, deadline_at) as connection:
             native._query(store, connection,
-                native._INITIALIZE_GENERATION.format(selection=selection, passage_selection=''),
+                native._INITIALIZE_GENERATION.format(
+                    selection=selection, passage_selection='',
+                    ordering='ORDER BY evidence.tenant_id,evidence.source_id,evidence.native_parent_id\n            '),
                 (tenant_id,tenant_id,after[0] if after else None,*(after or (None,None)),*through,limit),
                 deadline_at)
         # A fresh snapshot observes committed initialization or a newer native
