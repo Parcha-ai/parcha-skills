@@ -285,7 +285,7 @@ are supported: versions through 69 are required except optional migration 67,
 which retires the Postgres vector plane and is applied explicitly from the
 turbopuffer plane. Migration 70 adds only a reconciliation performance index;
 serving accepts both schema 69 and 70 and reports the actual recorded version.
-The latest shipped migration is 85; migration 71 remains optional and reserved
+The latest shipped migration is 86; migration 71 remains optional and reserved
 for native-conversation metadata. Migration 72 adds nullable
 `canonical_evidence_document_queue.notification_queued_at`, with no default,
 index, or historical reclassification. Apply it before deploying the notification
@@ -1822,3 +1822,18 @@ seed call loses its response, repeat the same page: conflict handling preserves
 already committed rows and cursors. A successful page reports admitted work, not
 coverage; native agreement and public search measurements remain the coverage
 and latency checks.
+
+### Optional audit diagnostics maintenance (86)
+
+Deploy compatible images to every reader and writer before applying the additive
+nullable policy checkpoint. `NULL` disables audit work. An explicitly admitted
+fixed cutoff drains only archived ordinary ingest-success diagnostics: at most
+three pages of 5,000 keys under one 15-second slice of the existing retirement
+child. Busy rounds use at most one quarter of their shorter quantum. Source history,
+ACK receipts, Forget and exception audits remain intact.
+
+Pending receipts survive uncertain clears and reconcile before the cursor advances.
+Exhausted ranges stay idle; this phase does not automatically advance retention
+cutoffs. Disable the source policy to pause work while retaining its pending
+checkpoint. Clear the checkpoint only after pending clears have been reconciled.
+Keep immutable journal and archive objects for the native restore operation.

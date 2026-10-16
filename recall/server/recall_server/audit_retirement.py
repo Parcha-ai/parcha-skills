@@ -1,9 +1,11 @@
 """Bounded, recoverable retirement of ordinary diagnostic ingest-success rows.
 
-This owner is operator-only. It never alters canonical identity or ACK authority,
+This owner never alters canonical identity or ACK authority,
 creates permanent tables, runs VACUUM, or removes its immutable recovery objects.
 """
 from contextlib import contextmanager
+import copy
+import time
 import csv
 from dataclasses import asdict
 from datetime import datetime, timezone
@@ -13,7 +15,9 @@ import io
 
 from psycopg import sql
 
-from .archive import ArchiveRequest, ArtifactReference
+from .archive import (ArchiveRequest, ArtifactReference, S3ArchiveStore,
+                      S3_DEADLINE_CONNECT_TIMEOUT)
+from .db import SearchDeadlineExceeded
 from .retirement_campaign import _check, digest
 
 COLUMNS = ('tenant_id', 'source_id', 'audit_id', 'operation', 'status',
@@ -36,11 +40,13 @@ def _hash(data):
     return hashlib.sha256(data).hexdigest()
 
 
-def _copy(connection, query, params=()):
+def _copy(connection, query, params=(), *, check=lambda: None):
+    check()
     output = bytearray()
     command = sql.SQL('COPY ({}) TO STDOUT WITH (FORMAT CSV)').format(query)
     with connection.cursor().copy(command, params) as stream:
         for block in stream:
+            check()
             output.extend(block)
             _check(len(output) <= MAX_BYTES, 'page_byte_budget')
     return bytes(output)
@@ -53,29 +59,78 @@ def _select(tenant, source, keys):
 
 
 class AuditRetirement:
-    def __init__(self, store, archive):
+    def __init__(self, store, archive, *, deadline_at=None, before_clear=None):
         self.store, self.archive = store, archive
+        self.deadline_at, self.before_clear = deadline_at, before_clear
+
+    def _remaining(self):
+        if self.deadline_at is None:
+            return None
+        remaining = self.deadline_at - time.monotonic()
+        if remaining <= 0:
+            raise SearchDeadlineExceeded('audit retirement deadline exceeded')
+        return remaining
+
+    def _execute(self, connection, query, params=()):
+        self._remaining()
+        if self.deadline_at is None:
+            return connection.execute(query, params)
+        return self.store._execute_bounded(connection, query, params,
+                                           min(self.deadline_at, time.monotonic() + 15))
+
+    def _copy(self, connection, query, params=()):
+        if self.deadline_at is not None:
+            self.store._set_statement_deadline(connection, min(self.deadline_at, time.monotonic() + 15))
+        return _copy(connection, query, params, check=self._remaining)
+
+    def put(self, request):
+        archive = self.archive
+        remaining = self._remaining()
+        if remaining is not None and isinstance(archive, S3ArchiveStore):
+            _check(archive.deadline_client is not None, 'archive_deadline_client_required')
+            # The native immutable write can perform HEAD, PUT, then a conflict
+            # HEAD. Reserve all three fixed no-retry request allowances.
+            allowance = S3_DEADLINE_CONNECT_TIMEOUT + archive.deadline_read_timeout_seconds
+            if remaining < 3 * allowance:
+                raise SearchDeadlineExceeded('audit archive admission deadline exceeded')
+            archive = copy.copy(archive)
+            archive.client = archive.deadline_client
+        reference = archive.put(request)
+        self._remaining()
+        return reference
+
+    def read(self, reference, *, tenant_id, source_id):
+        self._remaining()
+        if self.deadline_at is not None and isinstance(self.archive, S3ArchiveStore):
+            result = self.archive.read_raw_bounded(reference.to_contract(
+                tenant_id=tenant_id, source_id=source_id, created_at='1970-01-01T00:00:00+00:00'),
+                deadline_at=self.deadline_at)
+        else:
+            result = self.archive.read(reference, tenant_id=tenant_id, source_id=source_id)
+        self._remaining()
+        return result
 
     @contextmanager
     def _connection(self, *, snapshot=False):
-        with self.store.connect() as connection:
+        with self.store.connect(**({'timeout': self._remaining()} if self.deadline_at is not None else {})) as connection:
             if snapshot:
+                self._remaining()
                 connection.execute('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY')
-            connection.execute("SET LOCAL timezone='UTC'")
-            connection.execute("SET LOCAL datestyle='ISO, YMD'")
-            connection.execute('SET LOCAL extra_float_digits=3')
-            connection.execute("SET LOCAL lock_timeout='1s'")
-            connection.execute("SET LOCAL statement_timeout='15s'")
+            self._execute(connection, "SET LOCAL timezone='UTC'")
+            self._execute(connection, "SET LOCAL datestyle='ISO, YMD'")
+            self._execute(connection, 'SET LOCAL extra_float_digits=3')
+            self._execute(connection, "SET LOCAL lock_timeout='1s'")
+            self._execute(connection, "SET LOCAL statement_timeout='15s'")
             # Hold a relation lock before inspecting the catalog. Concurrent DDL
             # cannot add deletion side effects after this check and before mutation.
-            connection.execute('LOCK TABLE canonical_audit_events IN ' +
+            self._execute(connection, 'LOCK TABLE canonical_audit_events IN ' +
                                ('ACCESS SHARE' if snapshot else 'ROW EXCLUSIVE') + ' MODE')
-            columns = connection.execute("""SELECT attname,format_type(atttypid,atttypmod) AS type
+            columns = self._execute(connection, """SELECT attname,format_type(atttypid,atttypmod) AS type
                 FROM pg_attribute WHERE attrelid='canonical_audit_events'::regclass
                 AND attnum>0 AND NOT attisdropped ORDER BY attnum""").fetchall()
             _check([(r['attname'], r['type']) for r in columns] == list(zip(COLUMNS, COLUMN_TYPES)),
                    'audit_schema_changed')
-            side_effects = connection.execute("""SELECT
+            side_effects = self._execute(connection, """SELECT
                 EXISTS(SELECT 1 FROM pg_constraint WHERE contype='f'
                        AND confrelid='canonical_audit_events'::regclass) OR
                 EXISTS(SELECT 1 FROM pg_trigger WHERE tgrelid='canonical_audit_events'::regclass
@@ -84,6 +139,7 @@ class AuditRetirement:
                 AS present""").fetchone()
             _check(not side_effects['present'], 'audit_delete_side_effects')
             yield connection
+            self._remaining()
 
     def archive_page(self, *, tenant_id, source_id, cutoff, after=None, limit=1000):
         _check(type(limit) is int and 1 <= limit <= MAX_ROWS, 'page_row_budget')
@@ -92,7 +148,7 @@ class AuditRetirement:
             _check(after is None or isinstance(after, str), 'page_cursor')
             predicate = '' if after is None else ' AND audit_id>%s'
             params = (tenant_id, source_id) + (() if after is None else (after,)) + (limit,)
-            rows = connection.execute('SELECT audit_id FROM canonical_audit_events '
+            rows = self._execute(connection, 'SELECT audit_id FROM canonical_audit_events '
                 'WHERE tenant_id=%s AND source_id=%s' + predicate +
                 ' ORDER BY audit_id LIMIT %s', params).fetchall()
             keys = [row['audit_id'] for row in rows]
@@ -102,7 +158,7 @@ class AuditRetirement:
                 WHERE tenant_id=%s AND source_id=%s AND audit_id=ANY(%s)
                 AND operation='ingest.commit' AND status='success' AND created_at<%s
                 ORDER BY audit_id''').format(COLUMN_SQL)
-            raw = _copy(connection, query, (tenant_id, source_id, keys, cutoff))
+            raw = self._copy(connection, query, (tenant_id, source_id, keys, cutoff))
         row_count = sum(1 for _ in csv.reader(io.StringIO(raw.decode('utf-8'), newline='')))
         # No database transaction remains open across object I/O.
         receipt = dict(contract=CONTRACT, tenant_id=tenant_id, source_id=source_id,
@@ -112,8 +168,8 @@ class AuditRetirement:
         if row_count:
             request = ArchiveRequest(tenant_id, source_id, 'ingest-audits:' + _hash(raw),
                                      'application/gzip', gzip.compress(raw, mtime=0))
-            reference = self.archive.put(request)
-            _check(self.archive.read(reference, tenant_id=tenant_id, source_id=source_id)
+            reference = self.put(request)
+            _check(self.read(reference, tenant_id=tenant_id, source_id=source_id)
                    == request.payload, 'archive_readback')
             receipt['artifact'] = asdict(reference)
         return dict(receipt, sha256=digest(receipt))
@@ -129,7 +185,7 @@ class AuditRetirement:
         if receipt['row_count']:
             reference = ArtifactReference(**receipt['artifact'])
             _check(reference.size_bytes <= MAX_BYTES + 65536, 'archive_byte_budget')
-            packed = self.archive.read(reference, tenant_id=receipt['tenant_id'],
+            packed = self.read(reference, tenant_id=receipt['tenant_id'],
                                        source_id=receipt['source_id'])
             with gzip.GzipFile(fileobj=io.BytesIO(packed)) as stream:
                 raw = stream.read(MAX_BYTES + 1)
@@ -152,7 +208,7 @@ class AuditRetirement:
         raw, keys = self._load(receipt)
         with self._connection(snapshot=True) as connection:
             query, params = _select(receipt['tenant_id'], receipt['source_id'], keys)
-            current = _copy(connection, query, params)
+            current = self._copy(connection, query, params)
         count = sum(1 for _ in csv.reader(io.StringIO(current.decode(), newline='')))
         status = 'present' if current == raw else 'absent' if not current else 'changed_or_partial'
         return dict(status=status, rows=count, expected=len(keys))
@@ -160,15 +216,17 @@ class AuditRetirement:
     def clear(self, receipt):
         raw, keys = self._load(receipt)
         with self._connection() as connection:
+            if self.before_clear is not None:
+                self.before_clear(connection, receipt)
             tenant, source = receipt['tenant_id'], receipt['source_id']
-            locked = connection.execute('''SELECT audit_id FROM canonical_audit_events
+            locked = self._execute(connection, '''SELECT audit_id FROM canonical_audit_events
                 WHERE tenant_id=%s AND source_id=%s AND audit_id=ANY(%s)
                 ORDER BY audit_id FOR UPDATE''', (tenant, source, keys)).fetchall()
             if not locked:
                 return dict(status='absent', rows=0)
             query, params = _select(tenant, source, keys)
-            _check(_copy(connection, query, params) == raw, 'audit_rows_changed_or_partial')
-            removed = connection.execute('''DELETE FROM canonical_audit_events
+            _check(self._copy(connection, query, params) == raw, 'audit_rows_changed_or_partial')
+            removed = self._execute(connection, '''DELETE FROM canonical_audit_events
                 WHERE tenant_id=%s AND source_id=%s AND audit_id=ANY(%s)
                 AND operation='ingest.commit' AND status='success' AND created_at<%s
                 RETURNING audit_id''', (tenant, source, keys, receipt['cutoff'])).fetchall()
@@ -178,18 +236,18 @@ class AuditRetirement:
     def restore(self, receipt):
         raw, keys = self._load(receipt)
         with self._connection() as connection:
-            connection.execute('CREATE TEMP TABLE _recall_audit_restore '
+            self._execute(connection, 'CREATE TEMP TABLE _recall_audit_restore '
                                '(LIKE canonical_audit_events INCLUDING CONSTRAINTS) ON COMMIT DROP')
             with connection.cursor().copy(sql.SQL('COPY pg_temp._recall_audit_restore ({}) '
                                                    'FROM STDIN WITH (FORMAT CSV)').format(COLUMN_SQL)) as stream:
                 stream.write(raw)
-            restored = connection.execute(sql.SQL('''INSERT INTO canonical_audit_events ({})
+            restored = self._execute(connection, sql.SQL('''INSERT INTO canonical_audit_events ({})
                 SELECT {} FROM pg_temp._recall_audit_restore ORDER BY audit_id
                 ON CONFLICT (tenant_id,source_id,audit_id) DO NOTHING RETURNING audit_id''').format(
                     COLUMN_SQL, COLUMN_SQL)).fetchall()
-            connection.execute('''SELECT audit_id FROM canonical_audit_events
+            self._execute(connection, '''SELECT audit_id FROM canonical_audit_events
                 WHERE tenant_id=%s AND source_id=%s AND audit_id=ANY(%s)
                 ORDER BY audit_id FOR UPDATE''', (receipt['tenant_id'], receipt['source_id'], keys)).fetchall()
             query, params = _select(receipt['tenant_id'], receipt['source_id'], keys)
-            _check(_copy(connection, query, params) == raw, 'audit_restore_conflict')
+            _check(self._copy(connection, query, params) == raw, 'audit_restore_conflict')
         return dict(status='restored', rows=len(restored))

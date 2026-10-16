@@ -110,7 +110,9 @@ class RetirementSupervisor:
                 "metadata_membership_calls=%s metadata_membership_ms=%s metadata_spool_ms=%s "
                 "maintenance_phase=%s claim_phase=%s sqlstate=%s "
                 "membership_certified_passages=%s membership_failed_parents=%s "
-                "membership_deferred_parents=%s membership_elapsed_ms=%s",
+                "membership_deferred_parents=%s membership_elapsed_ms=%s "
+                "audit_status=%s audit_cleared_rows=%s audit_scanned_rows=%s audit_archived_bytes=%s "
+                "audit_reconciled_rows=%s audit_completed_pages=%s audit_unknown=%s audit_phase=%s audit_error_class=%s",
                 result["status"],
                 result.get("elapsed_ms"),
                 result.get("cpu_seconds"),
@@ -143,6 +145,15 @@ class RetirementSupervisor:
                 result.get("membership_failed_parents"),
                 result.get("membership_deferred_parents"),
                 result.get("membership_elapsed_ms"),
+                result.get("audit_status"),
+                result.get("audit_cleared_rows"),
+                result.get("audit_scanned_rows"),
+                result.get("audit_archived_bytes"),
+                result.get("audit_reconciled_rows"),
+                result.get("audit_completed_pages"),
+                result.get("audit_commit_outcome_unknown"),
+                result.get("audit_phase"),
+                result.get("audit_error_class"),
 
             )
             return result
