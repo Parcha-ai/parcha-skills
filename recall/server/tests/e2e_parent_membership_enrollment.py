@@ -22,7 +22,8 @@ class ParentEnrollmentTests(SingletonSearchTests):
         with self.store.connect() as c:
             self.ids=tuple(row['passage_id'] for row in c.execute('SELECT passage_id FROM canonical_passages WHERE tenant_id=%s ORDER BY passage_id',(self.tenant,)).fetchall())
         self.scope=dict(tenant_id=self.tenant,principal_id=self.principal,source_id=self.source,
-                        native_parent_id='session',passage_ids=self.ids)
+                        native_parent_id='session',passage_ids=self.ids,
+                        limits=dict(passages=32,receipt_references=1000,metadata_bytes=1024*1024))
 
     def enroll(self):
         return enrollment.enroll_parent_passages(self.store,**self.scope,deadline_at=time.monotonic()+3)
@@ -186,6 +187,49 @@ class ParentEnrollmentTests(SingletonSearchTests):
         self.assertEqual(result['certified_passages'],len(self.ids))
         self.assertEqual(native.call_count,1)
         self.assertEqual(set(native.call_args.kwargs['receipts']),{self.receipt,self.physical_receipt})
+
+    def test_explicit_job_budget_refuses_whole_scope_without_partial_certificate(self):
+        for key in ('receipt_references','metadata_bytes'):
+            with self.subTest(budget=key):
+                limits=dict(self.scope['limits']);limits[key]=1
+                with patch.dict(self.scope,limits=limits):
+                    result=self.enroll()
+                    self.assertEqual(result,dict(status='budget-exceeded',enrolled_passages=0))
+                    self.assertEqual(self.compare(),dict(status='budget-exceeded',compared_passages=0))
+                self.assertEqual(self.compare()['certified_passages'],0)
+        with patch.dict(self.scope,passage_ids=self.ids*33):
+            self.assertEqual(self.enroll()['status'],'budget-exceeded')
+
+    def test_actual_source_deletion_recreation_retains_generation_and_loses_certificate(self):
+        from psycopg import sql
+        self.enroll()
+        with self.store.connect() as c:
+            old=c.execute('SELECT generation FROM canonical_parent_authority WHERE tenant_id=%s AND source_id=%s',
+                          (self.tenant,self.source)).fetchone()['generation']
+            # Disposable test database only: exercise real FK ordering and normal
+            # triggers, never disable them or use TRUNCATE to simulate cleanup.
+            for table in ('canonical_evidence_documents','canonical_evidence_objects',
+                          'canonical_chunks','canonical_documents','canonical_events',
+                          'canonical_ingest_jobs','raw_artifacts','canonical_source_grants',
+                          'canonical_audit_events','canonical_evidence_document_queue',
+                          'canonical_evidence_cleanup_queue','canonical_sources'):
+                c.execute(sql.SQL('DELETE FROM {} WHERE tenant_id=%s AND source_id=%s').format(sql.Identifier(table)),
+                          (self.tenant,self.source))
+        with self.store.connect() as c:
+            retained=c.execute('SELECT generation FROM canonical_parent_authority WHERE tenant_id=%s AND source_id=%s',
+                               (self.tenant,self.source)).fetchone()['generation']
+            self.assertGreater(retained,old)
+            c.execute('INSERT INTO canonical_sources(tenant_id,source_id,owner_principal_id) VALUES(%s,%s,%s)',
+                      (self.tenant,self.source,self.principal))
+            c.execute("INSERT INTO canonical_source_grants(tenant_id,source_id,principal_id,permission) VALUES(%s,%s,%s,'owner')",
+                      (self.tenant,self.source,self.principal))
+        self.ingest('turn/search','Synthetic recreated source')
+        with self.store.connect() as c:
+            current=c.execute('SELECT generation FROM canonical_parent_authority WHERE tenant_id=%s AND source_id=%s',
+                              (self.tenant,self.source)).fetchone()['generation']
+        self.assertGreater(current,retained)
+        self.assertEqual(self.compare()['status'],'incomplete')
+        self.assertEqual(self.search()['results'],[])
 
 
 if __name__=='__main__':

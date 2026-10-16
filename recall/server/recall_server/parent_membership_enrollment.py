@@ -69,7 +69,16 @@ _OWNERS = """WITH requested AS MATERIALIZED (
 SELECT receipt,bool_and(owned) AS owned FROM owned GROUP BY receipt"""
 
 
-def _scope(*, tenant_id, principal_id, source_id, native_parent_id, passage_ids, deadline_at):
+class _BudgetExceeded(ValueError):
+    pass
+
+
+def _scope(*, tenant_id, principal_id, source_id, native_parent_id, passage_ids, deadline_at, limits):
+    if (not isinstance(limits,dict) or set(limits)!={'passages','receipt_references','metadata_bytes'}
+            or any(type(value) is not int or value<=0 for value in limits.values())):
+        raise ValueError('parent_membership_budget_invalid')
+    if isinstance(passage_ids,tuple) and len(passage_ids)>limits['passages']:
+        raise _BudgetExceeded()
     if (any(not isinstance(value,str) or not V2_AUTHORITY_RE.fullmatch(value)
             for value in (tenant_id,principal_id,source_id))
             or not isinstance(native_parent_id,str) or not native_parent_id
@@ -78,7 +87,7 @@ def _scope(*, tenant_id, principal_id, source_id, native_parent_id, passage_ids,
             or not isinstance(deadline_at,(int,float)) or not math.isfinite(deadline_at)):
         raise ValueError('parent_membership_scope_invalid')
     return dict(tenant_id=tenant_id,principal_id=principal_id,source_id=source_id,
-                native_parent_id=native_parent_id,passage_ids=tuple(sorted(set(passage_ids))))
+                native_parent_id=native_parent_id,passage_ids=tuple(sorted(set(passage_ids))),limits=dict(limits))
 
 
 def _query(store, connection, statement, parameters, deadline):
@@ -96,8 +105,27 @@ def _authorized(store, connection, scope, deadline):
 
 
 def _rows(store, connection, scope, deadline, *, lock=False):
-    return _query(store,connection,_SELECT+(' FOR UPDATE OF passage' if lock else ''),
-                  (scope['tenant_id'],scope['source_id'],scope['native_parent_id'],list(scope['passage_ids'])),deadline).fetchall()
+    # Measure metadata inside PostgreSQL before transferring it to Python.
+    # An excess returns one empty header, never a truncated set of passages.
+    selection=_SELECT+(' FOR UPDATE OF passage' if lock else '')
+    statement="""WITH selected AS MATERIALIZED ("""+selection+"""), measured AS (
+        SELECT count(*) AS selected_count,
+               coalesce(sum(cardinality(receipts)),0) AS receipt_references,
+               coalesce(sum(octet_length(row_to_json(selected)::text)),0) AS metadata_bytes
+          FROM selected
+    ) SELECT selected.*,measured.selected_count,measured.receipt_references,measured.metadata_bytes
+        FROM measured LEFT JOIN selected ON measured.selected_count<=%s
+         AND measured.receipt_references<=%s AND measured.metadata_bytes<=%s"""
+    limits=scope['limits']
+    rows=_query(store,connection,statement,
+        (scope['tenant_id'],scope['source_id'],scope['native_parent_id'],list(scope['passage_ids']),
+         limits['passages'],limits['receipt_references'],limits['metadata_bytes']),deadline).fetchall()
+    measured=rows[0]
+    if (measured['selected_count']>limits['passages']
+            or measured['receipt_references']>limits['receipt_references']
+            or measured['metadata_bytes']>limits['metadata_bytes']):
+        raise _BudgetExceeded()
+    return rows if measured['selected_count'] else []
 
 
 def _binding(row):
@@ -138,9 +166,7 @@ def _capture(store, scope, deadline, *, prove_ownership):
         return dict(status='captured',rows=rows,members=members,unique_receipts=len(receipts))
 
 
-def enroll_parent_passages(store: Any, *, deadline_at: float, **arguments) -> dict[str, Any]:
-    """Prove a fixed explicit passage set, then publish only its captured generation."""
-    scope=_scope(**arguments,deadline_at=deadline_at)
+def _enroll(store, scope, deadline_at):
     with store.connect() as connection, connection.transaction():
         if not _authorized(store,connection,scope,deadline_at):
             return dict(status='unauthorized')
@@ -197,9 +223,7 @@ def enroll_parent_passages(store: Any, *, deadline_at: float, **arguments) -> di
     return dict(status='enrolled',passages=len(rows),unique_receipts=captured['unique_receipts'])
 
 
-def compare_parent_membership(store: Any, *, deadline_at: float, **arguments) -> dict[str, Any]:
-    """Compare the candidate certificate branch with the unchanged native owner."""
-    scope=_scope(**arguments,deadline_at=deadline_at)
+def _compare(store, scope, deadline_at):
     started=time.monotonic()
     captured=_capture(store,scope,deadline_at,prove_ownership=False)
     if captured['status']!='captured':
@@ -214,3 +238,23 @@ def compare_parent_membership(store: Any, *, deadline_at: float, **arguments) ->
                 certified_passages=len(certified),fallback_passages=len(rows)-len(certified),
                 native_allowed_passages=len(native),disagreements=len(certified-native),
                 elapsed_ms=round((time.monotonic()-started)*1000,3))
+
+
+def enroll_parent_passages(store: Any, *, deadline_at: float, limits: dict[str,int], **arguments) -> dict[str,Any]:
+    """Prove an explicit fixed set within caller-declared job metadata budgets.
+
+    An excess enrolls no part of the scope. It remains on native verification;
+    callers can later select smaller batches without dropping captured history.
+    """
+    try:
+        return _enroll(store,_scope(**arguments,deadline_at=deadline_at,limits=limits),deadline_at)
+    except _BudgetExceeded:
+        return dict(status='budget-exceeded',enrolled_passages=0)
+
+
+def compare_parent_membership(store: Any, *, deadline_at: float, limits: dict[str,int], **arguments) -> dict[str,Any]:
+    """Compare certificates with the complete unchanged native proof, or refuse."""
+    try:
+        return _compare(store,_scope(**arguments,deadline_at=deadline_at,limits=limits),deadline_at)
+    except _BudgetExceeded:
+        return dict(status='budget-exceeded',compared_passages=0)
