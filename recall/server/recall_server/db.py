@@ -442,10 +442,14 @@ class BrainStore:
         try:
             self.audit_batcher.close()
         finally:
-            if self._pool is not None:
-                self._pool.close()
-            if self._read_pool is not None:
-                self._read_pool.close()
+            try:
+                if self._pool is not None:
+                    self._pool.close()
+                if self._read_pool is not None:
+                    self._read_pool.close()
+            finally:
+                if self.rerank_runtime is not None:
+                    self.rerank_runtime.close()
 
     def migrate(self, *, retire_postgres_plane: bool = False) -> dict[str, Any]:
         """Apply the numbered migrations in order; every file is idempotent.

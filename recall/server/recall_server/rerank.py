@@ -15,6 +15,7 @@ does not retry: it sits on the query path under a hard deadline, and a
 from __future__ import annotations
 
 import hashlib
+import http.cookiejar
 import json
 import math
 import os
@@ -143,6 +144,66 @@ class UrllibRerankTransport:
             raise RerankUnavailable("rerank_response_invalid") from None
 
 
+class PooledRerankTransport:
+    """Reuse HTTP connections, never a query, response, or bearer credential."""
+
+    def __init__(self):
+        # httpx already ships with the turbopuffer client. Its standard direct
+        # and proxy transports make zero retries; retain environment proxies
+        # and NO_PROXY instead of supplying a custom transport that bypasses them.
+        import httpx
+
+        self._client = httpx.Client(
+            verify=ssl.create_default_context(),
+            follow_redirects=False,
+            cookies=http.cookiejar.CookieJar(
+                policy=http.cookiejar.DefaultCookiePolicy(allowed_domains=[]),
+            ),
+        )
+
+    def close(self):
+        self._client.close()
+
+    def post(self, *, url, headers, body, timeout):
+        import httpx
+
+        deadline = time.monotonic() + timeout
+        try:
+            with self._client.stream(
+                "POST", url, content=json.dumps(body, separators=(",", ":")).encode(),
+                headers={**headers, "Accept": "application/json",
+                         "Accept-Encoding": "identity", "Content-Type": "application/json",
+                         "User-Agent": "recall-core/rerank-v1"},
+                timeout=timeout,
+            ) as response:
+                if 300 <= response.status_code < 400:
+                    raise RerankUnavailable("rerank_redirect_refused")
+                if response.status_code != 200:
+                    raise RerankUnavailable("rerank_http_status")
+                if time.monotonic() >= deadline:
+                    raise RerankUnavailable("rerank_deadline_exhausted")
+                length = response.headers.get("Content-Length")
+                if length is not None and (
+                    not length.isdigit() or int(length) > MAX_RERANK_RESPONSE_BYTES
+                ):
+                    raise RerankUnavailable("rerank_response_too_large")
+                raw = bytearray()
+                for chunk in response.iter_raw():
+                    if time.monotonic() >= deadline:
+                        raise RerankUnavailable("rerank_deadline_exhausted")
+                    if len(raw) + len(chunk) > MAX_RERANK_RESPONSE_BYTES:
+                        raise RerankUnavailable("rerank_response_too_large")
+                    raw.extend(chunk)
+        except RerankUnavailable:
+            raise
+        except (httpx.HTTPError, OSError):
+            raise RerankUnavailable("rerank_transport_error") from None
+        try:
+            return json.loads(raw)
+        except ValueError:
+            raise RerankUnavailable("rerank_response_invalid") from None
+
+
 def _validate_endpoint(url: str, approved_url: str | None) -> str:
     parsed = urlsplit(url)
     if (
@@ -239,7 +300,12 @@ class RerankRuntime:
         self.timeout_seconds = timeout_seconds
         self.max_candidates = max_candidates
         self.max_doc_chars = max_doc_chars
-        self.transport: RerankTransport = transport or UrllibRerankTransport()
+        self.transport: RerankTransport = transport or PooledRerankTransport()
+
+    def close(self) -> None:
+        close = getattr(self.transport, "close", None)
+        if close is not None:
+            close()
 
     @classmethod
     def from_env(cls, transport: RerankTransport | None = None) -> RerankRuntime | None:
