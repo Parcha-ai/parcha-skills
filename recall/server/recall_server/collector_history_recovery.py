@@ -22,6 +22,7 @@ from .canonical_text import MAX_CANONICAL_CHUNK_BYTES, MAX_CANONICAL_TEXT_BYTES
 from .chunk_retirement import require_retirement_owner
 from .canonical_thinning import _compact_event_expression
 from .control import ControlPlane
+from .db import BrainStore
 from .logical_evidence_projection import _validate_source_body
 from .projectors import canonical_json, item_receipt, validate_envelope
 
@@ -123,7 +124,7 @@ def _read(plane, connection, tenant_id, principal_id, expected, deadline, *, loc
     # always requires the explicit existing company-admin predicate.
     ControlPlane._brain_admin(connection, principal_id=principal_id, tenant_id=tenant_id, lock=lock)
     def query(sql, params=()):
-        return store._execute_bounded(connection, sql, params, deadline)
+        return BrainStore._execute_bounded_pipeline(connection, sql, params, deadline)
     if query('''SELECT 1 FROM forget_tombstones WHERE tenant_id=%s AND source_id=%s
         AND target_identity_sha256=%s''', (*scope, _identity_sha256(*scope, native))).fetchone():
         _refuse('forgotten')

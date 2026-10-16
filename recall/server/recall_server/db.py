@@ -3386,6 +3386,26 @@ class BrainStore:
                 pass
             raise SearchDeadlineExceeded("search deadline exceeded") from exc
 
+    @staticmethod
+    def _execute_bounded_pipeline(conn, sql, values, deadline_at):
+        if deadline_at is None:
+            return BrainStore._execute_bounded(conn, sql, values, deadline_at)
+        try:
+            # Send the timeout setting and its statement in one exchange. Exit
+            # before returning so cursors are ready and COPY/server cursors in
+            # the archive proof still run outside pipeline mode.
+            with conn.pipeline():
+                cursor = BrainStore._execute_bounded(conn, sql, values, deadline_at)
+            return cursor
+        except psycopg.errors.QueryCanceled as exc:
+            # Cancellation may arrive at pipeline exit, after the shared
+            # executor's handler. Preserve its rollback/deadline contract.
+            try:
+                conn.rollback()
+            except psycopg.ProgrammingError:
+                pass
+            raise SearchDeadlineExceeded("search deadline exceeded") from exc
+
     def _entity_leg(self, conn, values: list[str], filters: dict,
                     *, authorized_source: str | None = None, limit: int = 400,
                     routed_source_ids: list[str] | None = None,
