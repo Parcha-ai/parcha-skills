@@ -27,10 +27,10 @@ version is initialized only when no older certificate exists for that publicatio
 
 The writer is disabled by default. `RECALL_PARENT_MEMBERSHIP_CERTIFICATION=1`
 requires a nonempty `RECALL_PARENT_MEMBERSHIP_EPOCH`. Deployment also requires
-schema 082 generation recording and separately installed nullable
+schema 082 generation recording and schema 083 nullable
 `canonical_passages.membership_generation` and `membership_binding_sha256`
-columns. This change does not install those columns in production; tests supply
-them as fixtures. Enabling before that schema exists yields failed proof work and
+columns. Apply schema 083 only after every database client accepts optional 83.
+No image deployment installs these columns in production. Enabling before that schema exists yields failed proof work and
 native fallback, while publication remains committed.
 
 The hook has a three-second budget, including pool checkout and statements. Each
@@ -56,3 +56,32 @@ trust switch, so this reset contract cannot accidentally enable a shortcut.
 content-free certificate eligibility, fallback and disagreement counts. A future
 read path requires separate review, live grant fences, and measured comparison
 before any certificate is trusted.
+
+
+## Reader shadow comparison
+
+`RECALL_PARENT_MEMBERSHIP_SHADOW=1` enables comparison on the singleton authority
+path. It requires the same explicit `RECALL_PARENT_MEMBERSHIP_EPOCH` as enrollment.
+It is off by default. The legacy path reports `requires-singleton` without querying
+certificate metadata.
+
+The original selected-passage SQL and native receipt membership verifier execute
+in full. In that same repeatable-read snapshot, one extra query loads only binding
+and generation metadata for the selected keys. Receipts already fetched by the
+native query are reused. Certificates never change accepted rows, including when
+a deliberately false certificate disagrees with the native decision.
+
+The optional query gets at most `RECALL_PARENT_MEMBERSHIP_SHADOW_BUDGET_MS`
+(default 100ms; maximum 1000ms) and must leave
+`RECALL_PARENT_MEMBERSHIP_SHADOW_RESERVE_MS` (default 1000ms) before the existing
+request deadline. If the reserve is reached, comparison is skipped. A savepoint
+contains SQL failure or timeout so native authorization remains usable. Metadata
+larger than 8MiB is refused as one optional observation; captured history is intact.
+
+`authority_stages.parent_membership_shadow` reports status, elapsed milliseconds,
+selected parents/passages, eligible certificates, fallback, disagreements and
+potentially avoidable unique receipt probes. Unavailable or skipped observations
+do not report zero disagreement. No source identifiers or bodies are emitted.
+Native membership timing remains the completed original proof timing; total
+authority latency includes this added observation. These measurements establish
+agreement and potential work reduction, not a deployed speedup.

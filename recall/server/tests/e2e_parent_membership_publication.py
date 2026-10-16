@@ -61,15 +61,21 @@ class ParentMembershipPublicationTests(ParentEnrollmentTests):
             result=publisher.project_pending(tenant_id=self.tenant,batch_size=10,max_batches=1,concurrency=1)
         self.assertEqual(result['documents'],1)
         self.assertGreater(result['membership_certified_passages'],0)
+        self.assertGreater(result['membership_elapsed_ms'],0)
         self.refresh_scope()
         self.assertEqual(self.compare()['certified_passages'],len(self.scope['passage_ids']))
 
     def test_interrupted_hook_keeps_publication_and_queue_committed(self):
         self.queue();publisher=self.publisher()
-        with patch.object(enrollment,'certify_published_passages',side_effect=OSError('synthetic interruption')):
+        def interrupted(*args, **kwargs):
+            time.sleep(.01)
+            raise OSError('synthetic interruption')
+        with patch.object(enrollment,'certify_published_passages',side_effect=interrupted):
             result=publisher.project_pending(tenant_id=self.tenant,batch_size=10,max_batches=1,concurrency=1)
         self.assertEqual(result['documents'],1)
         self.assertEqual(result['pending'],0)
+        self.assertGreaterEqual(result['membership_elapsed_ms'],10)
+        self.assertEqual(result['membership_failed_documents'],1)
         self.assertEqual(result['membership_certified_passages'],0)
         self.refresh_scope()
         self.assertEqual(self.compare()['certified_passages'],0)
@@ -82,6 +88,9 @@ class ParentMembershipPublicationTests(ParentEnrollmentTests):
             result=publisher.project_pending(tenant_id=self.tenant,batch_size=10,max_batches=1,concurrency=1)
         certify.assert_not_called()
         self.assertEqual(result['documents'],1)
+        self.assertEqual(result['membership_elapsed_ms'],0)
+        self.assertEqual(result['membership_certified_passages'],0)
+        self.assertEqual(result['membership_failed_documents'],0)
 
     def test_edit_after_publication_before_proof_keeps_native_fallback(self):
         self.queue();publisher=self.publisher();native=enrollment.certify_published_passages

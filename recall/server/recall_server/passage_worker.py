@@ -50,15 +50,25 @@ def run_passage_worker(
             "passages": int(projected["passages"]),
             "embedded": int(embedded["processed"]),
             "stale": int(projected["stale"]),
+            "membership_certified_passages": int(projected.get("membership_certified_passages", 0)),
+            "membership_failed_documents": int(projected.get("membership_failed_documents", 0)),
+            "membership_deferred_documents": int(projected.get("membership_deferred_documents", 0)),
+            "membership_elapsed_ms": int(projected.get("membership_elapsed_ms", 0)),
         }
         LOG.info(
             "passage cycle status=%s documents=%s passages=%s "
-            "embedded=%s stale=%s",
+            "embedded=%s stale=%s "
+            "membership_certified_passages=%s membership_failed_documents=%s "
+            "membership_deferred_documents=%s membership_elapsed_ms=%s",
             result["status"],
             result["documents"],
             result["passages"],
             result["embedded"],
             result["stale"],
+            result["membership_certified_passages"],
+            result["membership_failed_documents"],
+            result["membership_deferred_documents"],
+            result["membership_elapsed_ms"],
         )
         if once:
             return result

@@ -18,6 +18,7 @@ import time
 from typing import Any
 
 from .db import SearchDeadlineExceeded, bounded_search_text
+from . import parent_membership_read, parent_membership_shadow
 from .passage_retrieval import (
     DENSE_NEAREST_LIMIT,
     PassageHintRetrieval,
@@ -247,6 +248,8 @@ class TurbopufferHintRetrieval(PassageHintRetrieval):
             raise ValueError("turbopuffer client is required for the turbopuffer plane")
         self.namespace = query_client(self.client).namespace(self.settings.namespace(self.tenant_id))
         self.temporal_window_budget_ms = window_budget_ms_from_env()
+        self.parent_membership_shadow = parent_membership_shadow.ShadowSettings.from_env()
+        self.parent_membership_read = parent_membership_read.ReadSettings.from_env()
 
     # The query is embedded by turbopuffer: no provider round trip here, and
     # the clause / window passes reuse the text.
@@ -410,15 +413,39 @@ class TurbopufferHintRetrieval(PassageHintRetrieval):
             stages['selected_passages'] = len(selected)
             stages['receipt_references'] = sum(len(row['receipts']) for row in selected)
             stages['unique_receipts'] = len(receipts)
+            certified = set()
+            if self.parent_membership_read.enabled and not self.parent_membership_shadow.enabled:
+                certified, stages['parent_membership_read'] = parent_membership_read.partition(
+                    self.store, connection, selected=selected,
+                    settings=self.parent_membership_read, deadline_at=deadline_at)
+            elif self.parent_membership_read.enabled:
+                # Shadow comparison must retain actual native proof, not compare
+                # a certificate with a result derived from that same certificate.
+                stages['parent_membership_read'] = {'status': 'shadow-native', 'elapsed_ms': 0}
+            fallback = [row for row in selected if (row['source_id'], row['passage_id']) not in certified]
+            fallback_receipts = (tuple(dict.fromkeys(receipt for row in fallback for receipt in row['receipts']))
+                                 if certified else receipts)
+            if self.parent_membership_read.enabled:
+                stages['native_receipts'] = len(fallback_receipts)
             stage_started = time.monotonic()
-            members = lookup_current_search_membership(self.store, tenant_id=self.tenant_id,
-                authorized_sources=tuple(self.sources), receipts=receipts,
-                deadline_at=deadline_at, connection=connection)
+            if time.monotonic() >= deadline_at:
+                raise SearchDeadlineExceeded()
+            members = (set() if certified and not fallback_receipts else
+                lookup_current_search_membership(self.store, tenant_id=self.tenant_id,
+                authorized_sources=tuple(self.sources), receipts=fallback_receipts,
+                deadline_at=deadline_at, connection=connection))
             stages['membership_ms'] = round((time.monotonic() - stage_started) * 1000, 3)
-            stages['allowed_receipts'] = len(members)
-            authoritative = [row for row in selected if all(
+            proven_receipts = {(row['source_id'], receipt) for row in selected
+                              if (row['source_id'], row['passage_id']) in certified
+                              for receipt in row['receipts']}
+            stages['allowed_receipts'] = len(members | proven_receipts)
+            authoritative = [row for row in selected if (row['source_id'], row['passage_id']) in certified or all(
                 (row['source_id'], receipt) in members
                 for receipt in row['receipts'])]
+            if self.parent_membership_shadow.enabled:
+                stages['parent_membership_shadow'] = parent_membership_shadow.observe_membership(
+                    self.store, connection, selected=selected, members=members,
+                    settings=self.parent_membership_shadow, deadline_at=deadline_at)
             stage_started = time.monotonic()
         stages['transaction_exit_ms'] = round((time.monotonic() - stage_started) * 1000, 3)
         return authoritative
@@ -478,6 +505,8 @@ class TurbopufferHintRetrieval(PassageHintRetrieval):
                     authoritative = self._authorize_singletons(connection, requested, deadline_at, stages=stages)
                 else:
                     stages['path'] = 'legacy'
+                    if self.parent_membership_shadow.enabled:
+                        stages['parent_membership_shadow'] = {'status': 'requires-singleton', 'elapsed_ms': 0}
                     authoritative = self.store._execute_bounded(
                         connection,
                         """WITH selected AS MATERIALIZED (
