@@ -1451,7 +1451,8 @@ retries on the query path and never logs query text, passage text, or the bearer
 | `RECALL_RERANK_KEY_FILE` | unset | Owner-only (`0600`), non-symlink bearer file. Mutually exclusive with the variable below. |
 | `RECALL_RERANK_KEY_ENV` | unset | Name of the secret-manager variable holding the bearer. |
 | `RECALL_RERANK_TIMEOUT_SECONDS` | `2.5` | Per-request timeout (0.1–30). Search may pass a shorter remaining budget. |
-| `RECALL_RERANK_MAX_CANDIDATES` | `50` | Passages sent per query; extra candidates are dropped, not reranked. |
+| `RECALL_RERANK_MAX_CANDIDATES` | `50` | Document admission width for search. The search call expands scoring capacity to its selected ranges, up to the existing 1,000-passage ceiling; standalone runtime calls retain this passage limit. |
+| `RECALL_SEARCH_BALANCED_PASSAGES` | `1` | With RRF and a reranker, allocate the existing aggregate range slots across admitted documents by passage RRF, keeping each document's strongest passage. `0`, `off`, or `false` restores the legacy per-document selection. |
 | `RECALL_RERANK_MAX_DOC_CHARS` | `2000` | Each passage is truncated to this many characters before sending. |
 | `RECALL_RERANK_MIN_BUDGET_SECONDS` | `1.0` | Search reranks only when at least this much of the search deadline remains after the arms (0.05–30); otherwise it keeps the fused order with `rerank_status=skipped-budget`. |
 
@@ -1463,11 +1464,15 @@ inside the submitted batch. The `fingerprint` (protocol, model, truncation width
 search diagnostics so eval runs can attribute a ranking change to a reranker change. Enabling a
 hosted reranker sends redacted passage text to that provider; make the privacy choice deliberately.
 
-Where it runs: `passage_retrieval.search()` fuses the arms, collapses the pool to documents (widened
-to at least `RECALL_RERANK_MAX_CANDIDATES` documents when a reranker is configured), selects up to
-that many passages round-robin over the fused document order (each document's strongest range
-first), sends the query plus each passage's redacted text once, and re-orders documents by their
-best reranked passage. The time clip runs after this. Diagnostics carry `rerank_status`
+Where it runs: `passage_retrieval.search()` admits documents using the existing fusion and arm
+nominations. With RRF and a reranker, it redistributes the same aggregate passage count: one
+strongest passage per admitted document, then the remaining slots by passage RRF. Authorization
+may remove selections but cannot refill them. Explicit time filters clip authorized evidence before
+scoring. The provider scores selected passage text once, sharing scores for exact text duplicates,
+and documents are ordered by their best passage and the configured blend. All scored ranges remain
+available to the existing MCP response fitter; there is no additional three-range presentation cut.
+Pools whose legacy capacity exceeds 1,000 passages retain legacy selection. The range count does
+not bound token cost: selected passages can differ in length. Diagnostics carry `rerank_status`
 (`ok` | `skipped-budget` | `skipped-disabled` | `unavailable`), `rerank_elapsed_ms` (also under
 `arm_elapsed_ms.rerank` when the provider was called, so `latency.search_stages` reports
 `arm.rerank.p95_ms`), `rerank_candidates`, `rerank_model` (the runtime fingerprint) and, on
