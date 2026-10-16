@@ -111,6 +111,9 @@ class ParentMembershipShadowTests(ParentEnrollmentTests):
         self.assertEqual(stages['parent_membership_shadow']['status'],'serving-reserve')
 
     def test_shadow_and_native_share_snapshot_across_concurrent_edit(self):
+        # This snapshot race includes a synchronous writer transaction. Keep its
+        # finite budget separate from the retained 300ms deadline regressions.
+        self.enterContext(patch.object(self.store, 'search_deadline_ms', 2000))
         self.enroll();self.store.verified_singleton_receipts=True;before=self.search();self.enable()
         native=shadow.observe_membership
         def edited(*args,**kwargs):
