@@ -28,6 +28,10 @@ class ExpectedSchemaVersionsTests(unittest.TestCase):
         self.assertEqual(self.versions(81, False), [*range(1, 71), *range(72, 82)])
         self.assertEqual(self.versions(82, False), [*range(1, 71), *range(72, 83)])
 
+    def test_certificate_schema_is_explicitly_supported(self):
+        self.assertEqual(self.versions(83,False),[*range(1,71),*range(72,84)])
+        self.assertEqual(self.versions(83,True),list(range(1,84)))
+
     def test_known_071_can_ship_without_creating_a_gap(self):
         self.assertEqual(self.versions(71, True), list(range(1, 72)))
         self.assertEqual(self.versions(72, True), list(range(1, 73)))
@@ -50,7 +54,7 @@ class ExpectedSchemaVersionsTests(unittest.TestCase):
                     self.versions(latest, native_file)
 
     def test_unknown_latest_is_not_implicitly_allowed(self):
-        for latest in (69, 83):
+        for latest in (69, 84):
             with self.subTest(latest=latest):
                 with self.assertRaisesRegex(AssertionError, "unreviewed latest"):
                     self.versions(latest, False)
