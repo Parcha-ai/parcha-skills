@@ -452,6 +452,48 @@ class MiddleRewriteTest(unittest.TestCase):
         self.assertEqual(delivered, ['quiet evidence'])
         self.assertIsNone(collector.db.execute('SELECT * FROM files WHERE path=?', (str(active),)).fetchone())
 
+    def test_fresh_snapshot_deadline_preserves_historical_walk(self):
+        self._assert_fresh_snapshot_failure_preserves_historical_walk('source_snapshot_deadline')
+
+    def test_fresh_snapshot_change_preserves_historical_walk(self):
+        self._assert_fresh_snapshot_failure_preserves_historical_walk('source_snapshot_changed')
+
+    def _assert_fresh_snapshot_failure_preserves_historical_walk(self, error_code):
+        from unittest.mock import patch
+        from collector import collector as module
+        quiet = self.root / 'b.jsonl'
+        active = self.root / 'y.jsonl'
+        tail = self.root / 'z.jsonl'
+        quiet.write_text(claude_line('quiet evidence'))
+        tail.write_text(''.join(claude_line(f'tail {i}') for i in range(4)))
+        active.write_text(claude_line('hot evidence'))
+        # The freshness lane sees the hot file first; the fair lane should
+        # resume before the quiet file, not jump to the hot file's successor.
+        os.utime(active, ns=(active.stat().st_atime_ns, tail.stat().st_mtime_ns + 1_000_000))
+        collector = self.collector()
+        self.addCleanup(collector.close)
+        collector.max_scan_records = 1
+        original = module.snapshot_hashes
+        collector._set_meta('scan_next_lane', 'fresh')
+        collector._set_meta('scan_resume_after_path', str(self.root / 'a.jsonl'))
+        collector.db.commit()
+        def budgeted(path, *args):
+            if path == active:
+                raise module.CollectorRuntimeError(error_code)
+            return original(path, *args)
+        with patch.object(module, 'snapshot_hashes', side_effect=budgeted):
+            with self.assertRaisesRegex(module.CollectorRuntimeError, error_code):
+                collector.scan()
+            self.assertEqual(collector.db.execute(
+                "SELECT value FROM meta WHERE key='scan_resume_after_path'"
+            ).fetchone()[0], str(self.root / 'a.jsonl'))
+            collector.scan()
+            collector.flush()
+        row = collector.db.execute('SELECT * FROM files WHERE path=?', (str(quiet),)).fetchone()
+        self.assertEqual(row['committed_offset'], quiet.stat().st_size)
+        delivered = [e['content']['message']['content'] for batch in AckServer.received for e in batch['events']]
+        self.assertEqual(delivered.count('quiet evidence'), 1)
+
     def test_growth_confirmation_refuses_changed_observed_prefix(self):
         from unittest.mock import patch, MagicMock
         from collector import collector as module
