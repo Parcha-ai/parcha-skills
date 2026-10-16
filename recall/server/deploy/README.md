@@ -1792,3 +1792,30 @@ Rollback disables `RECALL_PARENT_MEMBERSHIP_CERTIFICATION` on a schema-85-compat
 image. Optional rows remain idle, while source publication continues normally.
 Re-enabling the same epoch resumes them. Do not roll back to an image that treats
 all passage queue rows as unfinished source publication.
+
+### Historical certificate admission
+
+After schema 85 and the compatible worker are live, `membership-certification-seed`
+adds one bounded metadata page to the existing certification phase. It does not
+read archives, rebuild passages, embed text, or certify authority itself. Enable
+`RECALL_PARENT_MEMBERSHIP_CERTIFICATION=1` and use the worker's exact
+`RECALL_PARENT_MEMBERSHIP_EPOCH` when invoking it:
+
+```sh
+python -m recall_server.cli membership-certification-seed --tenant "$tenant" --limit 128
+```
+
+Reuse the first response's `through` JSON pair and each completed response's
+`after` JSON pair with `--through` and `--after`. Each call examines at most 1,000
+parents within a five-second database budget; the default is 128. Selection uses
+the existing parent primary key, independent of search queries. Busy or changed
+parents appear in `deferred` with their exact keys and reasons. Preserve that list
+for a later finite pass after their publication or retirement work completes.
+
+Existing source publication and partial certification rows remain untouched.
+Normal source updates supersede admitted work. The current worker performs native
+proof and resumes its cursor within the existing aggregate cycle budget. If a
+seed call loses its response, repeat the same page: conflict handling preserves
+already committed rows and cursors. A successful page reports admitted work, not
+coverage; native agreement and public search measurements remain the coverage
+and latency checks.

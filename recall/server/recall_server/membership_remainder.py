@@ -253,3 +253,136 @@ def resume(store, row, *, settings, deadline_at):
         # Earlier commits remain acknowledged work; the uncertain batch's cursor
         # stays unchanged and a later ordinary slice can safely reprove it.
         return dict(status="failed", certified_passages=certified)
+
+
+def seed_history(
+    store, *, tenant_id, settings, deadline_at, after=None, through=None, limit=128
+):
+    """Queue one finite metadata page; existing work and proof cursors always win.
+
+    A response is returned only after the page transaction commits. Repeating a
+    page after an uncertain response is safe: conflicts never reset queued work.
+    The worker, not admission, proves authority and measures certificate coverage.
+    """
+    if not settings.enabled:
+        raise ValueError("membership_certification_disabled")
+    if not isinstance(tenant_id, str) or not 1 <= len(tenant_id) <= 512:
+        raise ValueError("tenant_invalid")
+    if type(limit) is not int or not 1 <= limit <= 1000:
+        raise ValueError("seed_limit_invalid")
+    for cursor in (after, through):
+        if cursor is not None and (
+            not isinstance(cursor, (tuple, list))
+            or len(cursor) != 2
+            or any(
+                not isinstance(value, str) or not 1 <= len(value) <= 512
+                for value in cursor
+            )
+        ):
+            raise ValueError("seed_cursor_invalid")
+    if after is not None and through is not None and tuple(after) > tuple(through):
+        raise ValueError("seed_cursor_outside_range")
+    result = dict(
+        status="completed",
+        after=after,
+        through=through,
+        scanned=0,
+        queued=0,
+        deferred=[],
+        coverage_measured=False,
+    )
+    with native._connect(store, deadline_at) as connection:
+        available = native._query(
+            store,
+            connection,
+            """SELECT EXISTS(SELECT 1 FROM pg_attribute
+            WHERE attrelid=to_regclass('canonical_passage_projection_queue')
+              AND attname='certification_checkpoint' AND atttypid='jsonb'::regtype
+              AND NOT attisdropped) AS available""",
+            (),
+            deadline_at,
+        ).fetchone()["available"]
+        if not available:
+            raise ValueError("membership_remainder_schema_required")
+        if through is None:
+            upper = native._query(
+                store,
+                connection,
+                """SELECT source_id,logical_document_id
+                FROM canonical_passage_documents WHERE tenant_id=%s
+                ORDER BY source_id DESC,logical_document_id DESC LIMIT 1""",
+                (tenant_id,),
+                deadline_at,
+            ).fetchone()
+            if upper is not None:
+                through = [upper["source_id"], upper["logical_document_id"]]
+                result["through"] = through
+        if through is not None:
+            rows = native._query(
+                store,
+                connection,
+                """SELECT source_id,logical_document_id
+                FROM canonical_passage_documents WHERE tenant_id=%s
+                  AND (%s::text IS NULL OR (source_id,logical_document_id)>(%s,%s))
+                  AND (source_id,logical_document_id)<=(%s,%s)
+                ORDER BY source_id,logical_document_id LIMIT %s""",
+                (
+                    tenant_id,
+                    after[0] if after else None,
+                    *(after or (None, None)),
+                    *through,
+                    limit + 1,
+                ),
+                deadline_at,
+            ).fetchall()
+            result["status"] = "bounded" if len(rows) > limit else "completed"
+            for row in rows[:limit]:
+                identity = [row["source_id"], row["logical_document_id"]]
+                scope = native._query(
+                    store, connection, CURRENT, (tenant_id, *identity), deadline_at
+                ).fetchone()
+                reasons = (
+                    ["publication_changed"]
+                    if scope is None
+                    else [
+                        name
+                        for name in (
+                            "logical_pending",
+                            "retirement_pending",
+                            "retirement_intent",
+                        )
+                        if scope[name]
+                    ]
+                )
+                if scope is not None and scope["authority_generation"] is None:
+                    reasons.append("authority_generation_missing")
+                if not reasons:
+                    checkpoint = dict(
+                        version=1,
+                        epoch=settings.binding_epoch,
+                        after="",
+                        **{name: scope[name] for name in FIELDS},
+                    )
+                    inserted = native._query(
+                        store,
+                        connection,
+                        """INSERT INTO canonical_passage_projection_queue
+                        (tenant_id,source_id,logical_document_id,revision,reason,certification_checkpoint)
+                        VALUES(%s,%s,%s,%s,'certification',%s::jsonb)
+                        ON CONFLICT(tenant_id,source_id,logical_document_id) DO NOTHING""",
+                        (
+                            tenant_id,
+                            *identity,
+                            scope["revision"],
+                            json.dumps(checkpoint),
+                        ),
+                        deadline_at,
+                    )
+                    result["queued"] += inserted.rowcount
+                    if not inserted.rowcount:
+                        reasons.append("already_queued")
+                if reasons:
+                    result["deferred"].append(dict(key=identity, reasons=reasons))
+                result["scanned"] += 1
+                result["after"] = identity
+    return result
