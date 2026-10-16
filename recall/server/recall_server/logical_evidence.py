@@ -4,10 +4,11 @@ import hashlib
 import hmac
 import json
 import re
-from collections import deque
+from collections import OrderedDict, deque
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime
+from threading import Lock
 from typing import Any, Callable, Iterable, Protocol
 from urllib.parse import urlsplit
 
@@ -34,6 +35,7 @@ MAX_DOCUMENT_RECORDS = 5_000_000
 MAX_DOCUMENT_RECEIPTS = 5_000_000
 MAX_RECORD_RECEIPTS = 512
 MIN_PART_BYTES = 1_024
+DIGEST_CONTINUATION_ENTRIES = 64
 RETENTION_PROFILES = {"lossless-v1", "conversation-useful-v1"}
 
 
@@ -426,6 +428,8 @@ class LogicalEvidenceUpload:
     manifest_reference: dict[str, Any]
     part_references: tuple[dict[str, Any], ...]
     created_part_references: tuple[dict[str, Any], ...]
+    # Process-local only. Never serialize a hash state or admit an uncommitted one.
+    _digest_continuation: tuple[int, Any] | None = field(default=None, repr=False, compare=False)
 
     @property
     def all_references(self) -> tuple[dict[str, Any], ...]:
@@ -588,6 +592,51 @@ class LogicalEvidenceProjectionStore:
             raise LogicalEvidenceError("logical_evidence_budget_invalid")
         self.archive = archive
         self.part_upload_concurrency = part_upload_concurrency
+        self._digest_states: OrderedDict[str, Any] = OrderedDict()
+        self._digest_lock = Lock()
+
+    @staticmethod
+    def _digest_key(upload: LogicalEvidenceUpload, part_bytes: int) -> str:
+        reference_fields = (
+            "tenant_id", "source_id", "artifact_id", "storage_backend", "object_key",
+            "content_sha256", "size_bytes", "media_type", "encryption", "version_id",
+        )
+        value = (
+            upload.prepared.tenant_id, upload.prepared.source_id,
+            upload.prepared.native_parent_id, part_bytes, upload.manifest.encode().hex(),
+            [[reference.get(key) for key in reference_fields]
+             for reference in upload.all_references],
+            [(part.ordinal, part.first_record_ordinal, part.last_record_ordinal,
+              part.first_occurred_at, part.last_occurred_at, part.receipt_count,
+              part.content_sha256) for part in upload.prepared.parts],
+        )
+        return hashlib.sha256(json.dumps(value, separators=(",", ":")).encode()).hexdigest()
+
+    def remember_committed(self, upload: LogicalEvidenceUpload) -> None:
+        continuation = upload._digest_continuation
+        if continuation is None:
+            return
+        part_bytes, state = continuation
+        if state.hexdigest() != upload.prepared.document_content_sha256:
+            return
+        key = self._digest_key(upload, part_bytes)
+        with self._digest_lock:
+            self._digest_states[key] = state.copy()
+            self._digest_states.move_to_end(key)
+            while len(self._digest_states) > DIGEST_CONTINUATION_ENTRIES:
+                self._digest_states.popitem(last=False)
+
+    def _prefix_digest(self, prefix: LogicalEvidenceUpload, part_bytes: int):
+        key = self._digest_key(prefix, part_bytes)
+        with self._digest_lock:
+            state = self._digest_states.get(key)
+            if state is None:
+                return None
+            if state.hexdigest() != prefix.prepared.document_content_sha256:
+                del self._digest_states[key]
+                return None
+            self._digest_states.move_to_end(key)
+            return state.copy()
 
     def put(
         self,
@@ -888,12 +937,25 @@ class LogicalEvidenceProjectionStore:
                     tenant_id=tenant_id, source_id=source_id)
                 if archived_manifest != json.loads(prefix.manifest.encode()):
                     raise LogicalEvidenceError("logical_evidence_prefix_invalid")
+                continued_digest = self._prefix_digest(prefix, part_bytes)
+                if continued_digest is not None:
+                    document_digest = continued_digest
                 if not existing_part_references:
                     existing_part_references = prefix.part_references
                 prior_size = None
                 for index, (part, reference) in enumerate(zip(previous.parts, prefix.part_references, strict=True)):
                     if prefix_checkpoint is not None:
                         prefix_checkpoint()
+                    if continued_digest is not None and index < len(previous.parts) - 1:
+                        # Exact manifest/reference/geometry was verified before the
+                        # acknowledged publication. Reads still verify old objects;
+                        # warm append does not re-audit untouched interior bytes.
+                        accepted_parts[index] = (part, prefix.manifest.parts[index], reference)
+                        next_part_ordinal += 1
+                        record_count += part.last_record_ordinal - part.first_record_ordinal + 1
+                        receipt_count += part.receipt_count
+                        prior_size = reference["size_bytes"]
+                        continue
                     payload = self.read_part(reference, tenant_id=tenant_id, source_id=source_id)
                     count = part.last_record_ordinal - part.first_record_ordinal + 1
                     if (part.ordinal != index or part.first_record_ordinal != record_count
@@ -908,7 +970,8 @@ class LogicalEvidenceProjectionStore:
                         reference=reference, tenant_id=tenant_id, source_id=source_id)
                     if manifest_part != prefix.manifest.parts[index]:
                         raise LogicalEvidenceError("logical_evidence_prefix_invalid")
-                    document_digest.update(payload)
+                    if continued_digest is None:
+                        document_digest.update(payload)
                     record_count += count
                     receipt_count += part.receipt_count
                     prior_size = len(payload)
@@ -1060,6 +1123,7 @@ class LogicalEvidenceProjectionStore:
             manifest_reference=manifest_reference,
             part_references=part_references,
             created_part_references=tuple(created_part_references),
+            _digest_continuation=(part_bytes, document_digest.copy()),
         )
 
     def read_manifest(
