@@ -27,10 +27,10 @@ version is initialized only when no older certificate exists for that publicatio
 
 The writer is disabled by default. `RECALL_PARENT_MEMBERSHIP_CERTIFICATION=1`
 requires a nonempty `RECALL_PARENT_MEMBERSHIP_EPOCH`. Deployment also requires
-schema 082 generation recording and separately installed nullable
+schema 082 generation recording and schema 083 nullable
 `canonical_passages.membership_generation` and `membership_binding_sha256`
-columns. This change does not install those columns in production; tests supply
-them as fixtures. Enabling before that schema exists yields failed proof work and
+columns. Apply schema 083 only after every database client accepts optional 83.
+No image deployment installs these columns in production. Enabling before that schema exists yields failed proof work and
 native fallback, while publication remains committed.
 
 The hook has a three-second budget, including pool checkout and statements. Each

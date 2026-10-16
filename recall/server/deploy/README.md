@@ -285,7 +285,7 @@ are supported: versions through 69 are required except optional migration 67,
 which retires the Postgres vector plane and is applied explicitly from the
 turbopuffer plane. Migration 70 adds only a reconciliation performance index;
 serving accepts both schema 69 and 70 and reports the actual recorded version.
-The latest shipped migration is 82; migration 71 remains optional and reserved
+The latest shipped migration is 83; migration 71 remains optional and reserved
 for native-conversation metadata. Migration 72 adds nullable
 `canonical_evidence_document_queue.notification_queued_at`, with no default,
 index, or historical reclassification. Apply it before deploying the notification
@@ -1728,3 +1728,13 @@ singleton receipt profile are prerequisites. Refresh runtime grants after applyi
 shadow metadata: search and publication do not trust it. Do not remove or disable
 its triggers after certificates are introduced without the later certificate
 invalidation/reset procedure. Image deployment does not apply this migration.
+
+
+Migration 83 adds nullable passage membership generation and binding columns,
+without defaults, indexes, backfill or reader trust. Deploy optional-83
+compatibility to every database client before applying it; migrations 80 and 82
+are prerequisites. The writer remains off until explicitly enabled with a fresh
+binding epoch. Existing publications remain on native membership verification.
+Image deployment does not apply this migration. See
+[the certification boundary](../../docs/architecture/2026-10-16-parent-membership-certification.md)
+for enrollment budgets and the invalidation-interruption reset procedure.
