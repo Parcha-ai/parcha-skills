@@ -1,0 +1,538 @@
+#!/usr/bin/env python3
+"""A committed publication retains optional native certification work across restart."""
+
+import time
+from pathlib import Path
+import unittest
+from unittest.mock import patch
+from e2e_parent_membership_publication import ParentMembershipPublicationTests
+from recall_server import parent_membership_enrollment as enrollment
+from recall_server import membership_remainder as remainder
+from e2e_passage_receipt_repair import Repair
+
+
+class MembershipRemainderTests(ParentMembershipPublicationTests):
+    def test_restart_certifies_committed_publication_without_archive_republication(
+        self,
+    ):
+        self.queue()
+        with patch.object(
+            enrollment,
+            "enroll_parent_passages",
+            side_effect=OSError("synthetic interruption after publication"),
+        ):
+            published = self.publisher().project_pending(
+                tenant_id=self.tenant, batch_size=10, max_batches=1, concurrency=1
+            )
+        self.assertEqual(published["documents"], 1)
+        self.assertEqual(published["membership_failed_documents"], 1)
+        self.refresh_scope()
+        self.assertEqual(self.compare()["certified_passages"], 0)
+        restarted = self.publisher()
+        with patch.object(
+            restarted.logical_projection,
+            "read_part",
+            side_effect=AssertionError("certification must not reread archives"),
+        ):
+            resumed = restarted.project_pending(
+                tenant_id=self.tenant, batch_size=10, max_batches=1, concurrency=1
+            )
+        self.assertEqual(resumed["documents"], 0)
+        self.assertEqual(
+            resumed["membership_certified_passages"], len(self.scope["passage_ids"])
+        )
+        compared = self.compare()
+        self.assertEqual(compared["certified_passages"], len(self.scope["passage_ids"]))
+        self.assertEqual(
+            compared["native_allowed_passages"], len(self.scope["passage_ids"])
+        )
+        self.assertEqual(compared["disagreements"], 0)
+        self.assertEqual(resumed["pending"], 0)
+
+    def test_second_prepared_publisher_cannot_republish_optional_phase(self):
+        self.queue()
+        publisher = self.publisher()
+        candidate = publisher._pending(tenant_id=self.tenant, limit=1)[0]
+        prepared = publisher._prepare(candidate)
+        self.assertEqual(publisher._commit(prepared)["status"], "committed")
+        # A second worker may already hold the same prepared source generation.
+        self.assertEqual(publisher._commit(prepared)["status"], "stale")
+        self.assertEqual(self.queued()[0]["checkpoint"]["after"], "")
+
+    def test_disabled_remainder_does_not_make_published_source_pending(self):
+        from recall_server.cli import _storage_authority_audit
+        from recall_server.canonical_retrieval import BoundCanonicalRetrieval
+
+        self.queue()
+        with patch.object(
+            enrollment, "enroll_parent_passages", side_effect=OSError("interrupted")
+        ):
+            self.publisher().project_pending(
+                tenant_id=self.tenant, batch_size=10, max_batches=1
+            )
+        disabled = self.publisher(self.settings(enabled=False))
+        with patch.object(
+            disabled.logical_projection,
+            "read_part",
+            side_effect=AssertionError("archive replay"),
+        ):
+            outcome = disabled.project_pending(
+                tenant_id=self.tenant, batch_size=10, max_batches=1
+            )
+        self.assertEqual(outcome["documents"], 0)
+        self.assertEqual(outcome["pending"], 0)
+        source = self.plane.source_status(
+            tenant_id=self.tenant, principal_id=self.principal, source_id=self.source
+        )
+        self.assertEqual(source["passage_queue"], 0)
+        self.assertEqual(
+            _storage_authority_audit(self.store, self.tenant)["queues"]["passage"], 0
+        )
+        reader = BoundCanonicalRetrieval(
+            self.store,
+            tenant_id=self.tenant,
+            principal_id=self.principal,
+            authorized_sources=(self.source,),
+        )
+        with self.store.connect() as connection:
+            connection.execute(
+                "DELETE FROM canonical_parquet_scan_queue WHERE tenant_id=%s",
+                (self.tenant,),
+            )
+        self.assertEqual(
+            reader._parquet_shards([self.source], since=None, until=None)[1], 0
+        )
+        self.refresh_scope()
+        self.assertEqual(self.compare()["certified_passages"], 0)
+        # Re-enabling the same durable owner still has the retained work.
+        resumed = self.publisher().project_pending(
+            tenant_id=self.tenant, batch_size=10, max_batches=1
+        )
+        self.assertEqual(
+            resumed["membership_certified_passages"], len(self.scope["passage_ids"])
+        )
+
+    def run_cycle(self):
+        return self.publisher().project_pending(
+            tenant_id=self.tenant, batch_size=10, max_batches=1
+        )
+
+    def interrupted_publication(self):
+        self.queue()
+        with patch.object(
+            enrollment, "enroll_parent_passages", side_effect=OSError("interrupt")
+        ):
+            self.run_cycle()
+        self.refresh_scope()
+
+    def queued(self):
+        return remainder.pending(
+            self.store,
+            tenant_id=self.tenant,
+            limit=10,
+            deadline_at=time.monotonic() + 3,
+        )
+
+    def test_native_commit_lost_response_reproves_without_publication(self):
+        self.interrupted_publication()
+        native = enrollment.enroll_parent_passages
+
+        def lost_response(*args, **kwargs):
+            native(*args, **kwargs)
+            raise OSError("lost response after committed native proof")
+
+        before = self.queued()
+        with patch.object(
+            enrollment, "enroll_parent_passages", side_effect=lost_response
+        ):
+            first = self.run_cycle()
+        self.assertEqual(first["membership_failed_documents"], 1)
+        self.assertEqual(self.queued(), before)
+        self.assertEqual(
+            self.compare()["certified_passages"], len(self.scope["passage_ids"])
+        )
+        with patch.object(enrollment, "enroll_parent_passages", wraps=native) as prove:
+            second = self.run_cycle()
+        self.assertGreater(prove.call_count, 0)
+        self.assertEqual(second["documents"], 0)
+        self.assertEqual(
+            second["membership_certified_passages"], len(self.scope["passage_ids"])
+        )
+        self.assertEqual(self.queued(), [])
+
+    def test_committed_cursor_lost_response_resumes_after_acknowledged_ids(self):
+        self.interrupted_publication()
+        native = remainder.change_cursor
+
+        def lost_response(*args, **kwargs):
+            result = native(*args, **kwargs)
+            if kwargs.get("after") is not None:
+                raise OSError("lost response after cursor commit")
+            return result
+
+        with patch.object(remainder, "change_cursor", side_effect=lost_response):
+            first = self.run_cycle()
+        self.assertEqual(first["membership_failed_documents"], 1)
+        self.assertEqual(
+            self.queued()[0]["checkpoint"]["after"], max(self.scope["passage_ids"])
+        )
+        with patch.object(
+            enrollment,
+            "enroll_parent_passages",
+            side_effect=AssertionError("already committed prefix"),
+        ):
+            second = self.run_cycle()
+        self.assertEqual(second["membership_failed_documents"], 0)
+        self.assertEqual(self.queued(), [])
+        self.assertEqual(self.compare()["disagreements"], 0)
+
+    def test_new_publication_overrides_old_cursor_cas(self):
+        self.interrupted_publication()
+        old = self.queued()[0]
+        self.ingest("turn/newer", "Synthetic subsequent content")
+        self.projector.project_pending(
+            tenant_id=self.tenant, batch_size=10, max_batches=1, upload_concurrency=1
+        )
+        self.assertFalse(
+            remainder.change_cursor(
+                self.store, old, old["checkpoint"], deadline_at=time.monotonic() + 3
+            )
+        )
+        with self.store.connect() as c:
+            row = c.execute(
+                "SELECT reason,generation FROM canonical_passage_projection_queue WHERE tenant_id=%s",
+                (self.tenant,),
+            ).fetchone()
+        self.assertEqual(row["reason"], "logical-update")
+        self.assertGreater(row["generation"], old["generation"])
+        outcome = self.run_cycle()
+        self.assertEqual(outcome["documents"], 1)
+        self.assertGreater(outcome["membership_certified_passages"], 0)
+
+    def test_publication_racing_final_cursor_cleanup_is_reported_changed(self):
+        self.interrupted_publication()
+        row = self.queued()[0]
+        remainder.change_cursor(
+            self.store,
+            row,
+            row["checkpoint"],
+            deadline_at=time.monotonic() + 3,
+            after=max(self.scope["passage_ids"]),
+        )
+        row = self.queued()[0]
+        native = remainder.change_cursor
+
+        def superseded(*args, **kwargs):
+            self.ingest("turn/newer-cleanup", "Synthetic newer publication")
+            self.projector.project_pending(
+                tenant_id=self.tenant,
+                batch_size=10,
+                max_batches=1,
+                upload_concurrency=1,
+            )
+            return native(*args, **kwargs)
+
+        with patch.object(remainder, "change_cursor", side_effect=superseded):
+            outcome = remainder.resume(
+                self.store,
+                row,
+                settings=self.settings(),
+                deadline_at=time.monotonic() + 3,
+            )
+        self.assertEqual(outcome["status"], "changed")
+        with self.store.connect() as c:
+            self.assertEqual(
+                c.execute(
+                    "SELECT reason FROM canonical_passage_projection_queue WHERE tenant_id=%s",
+                    (self.tenant,),
+                ).fetchone()["reason"],
+                "logical-update",
+            )
+
+    def test_malformed_checkpoint_is_terminal_metadata_work(self):
+        self.interrupted_publication()
+        with self.store.connect() as c:
+            c.execute(
+                "UPDATE canonical_passage_projection_queue SET certification_checkpoint='[]'::jsonb WHERE tenant_id=%s",
+                (self.tenant,),
+            )
+        with patch.object(
+            enrollment,
+            "enroll_parent_passages",
+            side_effect=AssertionError("malformed scope"),
+        ):
+            result = self.run_cycle()
+        self.assertEqual(result["membership_failed_documents"], 0)
+        self.assertEqual(result["membership_deferred_documents"], 1)
+        self.assertEqual(self.queued(), [])
+        self.assertEqual(self.compare()["certified_passages"], 0)
+
+    def test_json_null_checkpoint_does_not_repeat_forever(self):
+        self.interrupted_publication()
+        with self.store.connect() as c:
+            c.execute(
+                "UPDATE canonical_passage_projection_queue SET certification_checkpoint='null'::jsonb WHERE tenant_id=%s",
+                (self.tenant,),
+            )
+        self.assertEqual(self.run_cycle()["membership_deferred_documents"], 1)
+        self.assertEqual(self.queued(), [])
+        self.assertEqual(self.run_cycle()["membership_deferred_documents"], 0)
+
+    def test_one_cycle_deadline_and_finite_selection_follow_publication(self):
+        self.queue()
+        native_pending = remainder.pending
+        observed = []
+
+        def pending(*args, **kwargs):
+            rows = native_pending(*args, **kwargs)
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(kwargs["limit"], 10)
+            observed.append(kwargs["deadline_at"])
+            return rows * 3
+
+        def resume(*args, **kwargs):
+            self.assertEqual(kwargs["deadline_at"], observed[0])
+            observed.append(kwargs["deadline_at"])
+            return dict(status="deadline", certified_passages=0)
+
+        with (
+            patch.object(remainder, "pending", side_effect=pending),
+            patch.object(remainder, "resume", side_effect=resume),
+        ):
+            outcome = self.run_cycle()
+        self.assertEqual(outcome["documents"], 1)
+        self.assertEqual(len(observed), 4)
+        self.assertEqual(len(set(observed)), 1)
+
+    def test_active_retirement_defers_once_without_archive_or_reproof(self):
+        self.interrupted_publication()
+        with self.store.connect() as c:
+            c.execute(
+                """INSERT INTO canonical_chunk_retirement_progress(
+                tenant_id,source_id,native_parent_id,logical_document_id,enabled,status)
+                SELECT tenant_id,source_id,native_parent_id,logical_document_id,true,'pending'
+                FROM canonical_evidence_documents WHERE tenant_id=%s
+                ON CONFLICT(tenant_id,source_id,native_parent_id)
+                DO UPDATE SET enabled=true,status='pending'""",
+                (self.tenant,),
+            )
+        with patch.object(
+            enrollment,
+            "enroll_parent_passages",
+            side_effect=AssertionError("busy parent"),
+        ):
+            outcome = self.run_cycle()
+        self.assertEqual(outcome["membership_deferred_documents"], 1)
+        self.assertEqual(self.queued(), [])
+        self.assertEqual(self.run_cycle()["membership_deferred_documents"], 0)
+
+    def test_partial_batch_restart_preserves_committed_prefix(self):
+        self.ingest("turn/long-publication", "Synthetic evidence paragraph. " * 3000)
+        self.projector.project_pending(
+            tenant_id=self.tenant, batch_size=10, max_batches=1, upload_concurrency=1
+        )
+        native = enrollment.enroll_parent_passages
+        calls = []
+
+        def interrupted(*args, **kwargs):
+            calls.append(tuple(kwargs["passage_ids"]))
+            if len(calls) == 2:
+                raise OSError("second batch interrupted")
+            return native(*args, **kwargs)
+
+        with (
+            patch.dict(enrollment._CERTIFICATION_LIMITS, passages=1),
+            patch.object(enrollment, "enroll_parent_passages", side_effect=interrupted),
+        ):
+            first = self.run_cycle()
+        self.assertEqual(first["membership_certified_passages"], 1)
+        self.assertEqual(self.queued()[0]["checkpoint"]["after"], calls[0][0])
+        subsequent = []
+
+        def recorded(*args, **kwargs):
+            subsequent.extend(kwargs["passage_ids"])
+            return native(*args, **kwargs)
+
+        with patch.object(enrollment, "enroll_parent_passages", side_effect=recorded):
+            second = self.run_cycle()
+        self.assertNotIn(calls[0][0], subsequent)
+        self.assertIn(calls[1][0], subsequent)
+        self.assertEqual(second["documents"], 0)
+        self.assertEqual(self.queued(), [])
+
+    def test_old_schema_keeps_original_optional_hook(self):
+        def restore_schema():
+            with self.store.connect() as c:
+                c.execute(
+                    (
+                        Path(__file__).resolve().parents[1]
+                        / "schema/085_membership_remainder.sql"
+                    ).read_text()
+                )
+
+        self.addCleanup(restore_schema)
+        with self.store.connect() as c:
+            c.execute(
+                "ALTER TABLE canonical_passage_projection_queue DROP COLUMN certification_checkpoint"
+            )
+            c.execute("DELETE FROM schema_migrations WHERE version=85")
+        self.queue()
+        result = self.run_cycle()
+        self.assertEqual(result["documents"], 1)
+        self.assertGreater(result["membership_certified_passages"], 0)
+        self.assertEqual(self.queued(), [])
+
+    def test_repeated_failure_rotates_queue_without_advancing_cursor(self):
+        self.interrupted_publication()
+        before = self.queued()
+        with self.store.connect() as c:
+            old = c.execute(
+                "SELECT changed_at FROM canonical_passage_projection_queue WHERE tenant_id=%s",
+                (self.tenant,),
+            ).fetchone()["changed_at"]
+        with patch.object(
+            enrollment,
+            "enroll_parent_passages",
+            side_effect=OSError("repeatable proof failure"),
+        ):
+            self.run_cycle()
+        with self.store.connect() as c:
+            new = c.execute(
+                "SELECT changed_at FROM canonical_passage_projection_queue WHERE tenant_id=%s",
+                (self.tenant,),
+            ).fetchone()["changed_at"]
+        self.assertGreater(new, old)
+        self.assertEqual(self.queued(), before)
+
+    def test_live_source_grant_revocation_rejects_remainder(self):
+        self.interrupted_publication()
+        with self.store.connect() as c:
+            c.execute(
+                "DELETE FROM canonical_source_grants WHERE tenant_id=%s AND principal_id=%s",
+                (self.tenant, self.principal),
+            )
+        result = self.run_cycle()
+        self.assertEqual(result["membership_certified_passages"], 0)
+        self.assertEqual(self.queued(), [])
+        self.assertEqual(self.compare()["status"], "unauthorized")
+
+    def test_forget_remains_effective_before_archive_cleanup(self):
+        from recall_server.canonical import CanonicalLifecycleError
+
+        self.interrupted_publication()
+        request = dict(
+            contract="recall.forget-request.v1",
+            schema_version=1,
+            tenant_id=self.tenant,
+            principal_id=self.principal,
+            source_id=self.source,
+            target_receipt=self.receipt,
+            mode="explicit_forget",
+            reason="owner_requested",
+            requested_at="2026-10-14T00:01:00Z",
+            idempotency_key="remainder-forget",
+        )
+        with patch.object(
+            self.archive,
+            "delete_internal_raw_bounded",
+            side_effect=OSError("archive unavailable"),
+        ):
+            with self.assertRaisesRegex(
+                CanonicalLifecycleError, "archive_delete_failed"
+            ):
+                self.plane.forget(request)
+        result = self.run_cycle()
+        self.assertEqual(result["membership_certified_passages"], 0)
+        self.assertEqual(self.compare()["certified_passages"], 0)
+        self.assertEqual(self.compare()["disagreements"], 0)
+
+
+class RepairWithRemainder(Repair):
+    def test_native_receipt_repair_supersedes_only_optional_phase(self):
+        self.passages.membership_certification = enrollment.CertificationSettings(
+            enabled=True, binding_epoch="synthetic-epoch-a"
+        )
+        with patch.object(
+            enrollment, "enroll_parent_passages", side_effect=OSError("interruption")
+        ):
+            plan = self.company_admin_plan()
+        with self.store.connect() as c:
+            row = c.execute(
+                "SELECT reason,generation FROM canonical_passage_projection_queue WHERE tenant_id=%s",
+                (self.tenant,),
+            ).fetchone()
+        self.assertEqual(row["reason"], "certification")
+        self.assertEqual(
+            self.passages.requeue_receipt_repair(plan=plan, principal_id=self.admin)[
+                "status"
+            ],
+            "queued",
+        )
+        with self.store.connect() as c:
+            changed = c.execute(
+                "SELECT reason,generation FROM canonical_passage_projection_queue WHERE tenant_id=%s",
+                (self.tenant,),
+            ).fetchone()
+        self.assertEqual(changed["reason"], "backfill")
+        self.assertGreater(changed["generation"], row["generation"])
+        self.passages.project_pending(
+            tenant_id=self.tenant, batch_size=10, max_batches=1
+        )
+        self.assertEqual(self.rows()[0]["receipts"], self.correct[0]["receipts"])
+
+    def test_empty_repair_and_backfill_override_optional_phase(self):
+        self.passages.membership_certification = enrollment.CertificationSettings(
+            enabled=True, binding_epoch="synthetic-epoch-a"
+        )
+        with patch.object(
+            enrollment, "enroll_parent_passages", side_effect=OSError("interruption")
+        ):
+            self.company_admin_plan()
+        with self.store.connect() as c:
+            c.execute(
+                "DELETE FROM canonical_passages WHERE tenant_id=%s", (self.tenant,)
+            )
+            c.execute(
+                "UPDATE canonical_passage_documents SET passage_count=0 WHERE tenant_id=%s",
+                (self.tenant,),
+            )
+        result = self.passages.repair_empty(
+            tenant_id=self.tenant, source_id=self.source, limit=10, apply=True
+        )
+        self.assertEqual(result["queued"], 1)
+        self.passages.project_pending(
+            tenant_id=self.tenant, batch_size=10, max_batches=1
+        )
+        self.assertEqual(self.rows()[0]["receipts"], self.correct[0]["receipts"])
+        # A changed extraction policy similarly supersedes optional old work.
+        with self.store.connect() as c:
+            c.execute(
+                "INSERT INTO canonical_passage_projection_queue(tenant_id,source_id,logical_document_id,revision,reason) SELECT tenant_id,source_id,logical_document_id,revision,'certification' FROM canonical_passage_documents WHERE tenant_id=%s ON CONFLICT(tenant_id,source_id,logical_document_id) DO UPDATE SET reason='certification'",
+                (self.tenant,),
+            )
+            c.execute(
+                "UPDATE canonical_passage_documents SET policy_fingerprint=%s WHERE tenant_id=%s",
+                ("f" * 64, self.tenant),
+            )
+        self.assertEqual(self.passages.seed_backfill(tenant_id=self.tenant), 1)
+        self.assertEqual(self.passages.seed_backfill(tenant_id=self.tenant), 0)
+        with self.store.connect() as c:
+            self.assertEqual(
+                c.execute(
+                    "SELECT reason FROM canonical_passage_projection_queue WHERE tenant_id=%s",
+                    (self.tenant,),
+                ).fetchone()["reason"],
+                "backfill",
+            )
+
+
+if __name__ == "__main__":
+    suite = unittest.TestSuite(
+        cls(name)
+        for cls in (MembershipRemainderTests, RepairWithRemainder)
+        for name in cls.__dict__
+        if name.startswith("test_")
+    )
+    raise SystemExit(
+        not unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful()
+    )

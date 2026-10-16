@@ -23,6 +23,7 @@ from . import (
     PARENT_AUTHORITY_GENERATION_VERSION,
     PARENT_MEMBERSHIP_CERTIFICATE_VERSION,
     PASSAGE_APPEND_CHECKPOINT_VERSION,
+    MEMBERSHIP_REMAINDER_VERSION,
 )
 
 
@@ -222,7 +223,9 @@ def assess_snapshot(snapshot: dict[str, Any], profile: str = "production") -> di
                       + ([PARENT_MEMBERSHIP_CERTIFICATE_VERSION]
                          if PARENT_MEMBERSHIP_CERTIFICATE_VERSION in versions else [])
                       + ([PASSAGE_APPEND_CHECKPOINT_VERSION]
-                         if PASSAGE_APPEND_CHECKPOINT_VERSION in versions else []))
+                         if PASSAGE_APPEND_CHECKPOINT_VERSION in versions else [])
+                      + ([MEMBERSHIP_REMAINDER_VERSION]
+                         if MEMBERSHIP_REMAINDER_VERSION in versions else []))
     if (RETIREMENT_POLICY_VERSION in versions
             and RETIREMENT_DETACHMENT_VERSION not in versions):
         raise CapabilityError("schema_drift")
@@ -234,6 +237,9 @@ def assess_snapshot(snapshot: dict[str, Any], profile: str = "production") -> di
         raise CapabilityError("schema_drift")
     if (PARENT_MEMBERSHIP_CERTIFICATE_VERSION in versions
             and PARENT_AUTHORITY_GENERATION_VERSION not in versions):
+        raise CapabilityError("schema_drift")
+    if (MEMBERSHIP_REMAINDER_VERSION in versions
+            and PARENT_MEMBERSHIP_CERTIFICATE_VERSION not in versions):
         raise CapabilityError("schema_drift")
     if versions != expected:
         raise CapabilityError("schema_drift")

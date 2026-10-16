@@ -285,7 +285,7 @@ are supported: versions through 69 are required except optional migration 67,
 which retires the Postgres vector plane and is applied explicitly from the
 turbopuffer plane. Migration 70 adds only a reconciliation performance index;
 serving accepts both schema 69 and 70 and reports the actual recorded version.
-The latest shipped migration is 84; migration 71 remains optional and reserved
+The latest shipped migration is 85; migration 71 remains optional and reserved
 for native-conversation metadata. Migration 72 adds nullable
 `canonical_evidence_document_queue.notification_queued_at`, with no default,
 index, or historical reclassification. Apply it before deploying the notification
@@ -1762,3 +1762,63 @@ corpus to disable reuse. The existing projection cycle log reports
 `passage_prepare_full_documents`, and `passage_prepare_reused_documents`.
 These count completed preparation work, including abandoned prefix reads
 before a full fallback; they exclude logical-document SHA preparation.
+
+
+### Optional certification remainder (85)
+
+Migration 85 adds a nullable `certification_checkpoint` to the existing passage
+publication queue and permits its `certification` reason. Deploy compatible
+images to every reader and worker before applying it. Schema 83 is required;
+the mandatory schema floor remains 69. No existing parent is backfilled.
+
+With `RECALL_PARENT_MEMBERSHIP_CERTIFICATION=1`, publication commits its output
+and retains optional certification work in the same transaction. Source
+publication runs first. One subsequent metadata-only slice has a total
+three-second budget and visits at most the configured passage batch size in
+parents. Native proof retains its passage, receipt, and metadata budgets. The
+cursor advances only after an acknowledged certificate batch. Interrupted proof
+can safely run again against current generation, bindings, live grants, and Forget.
+No archive hydration, embedding, or source publication repeats for this phase.
+
+New source publication and admitted repairs supersede an optional cursor.
+Source status, scan freshness, and publication pending counts exclude this
+phase. A changed epoch or binding, revoked authority, malformed checkpoint, or
+active retirement ends the optional attempt; these outcomes retain native read
+fallback. Repeated transient failures keep the same cursor and move to the end
+of existing queue order. The retirement completion hook remains a separate
+bounded best-effort proof and does not gain a durable remainder here.
+
+Rollback disables `RECALL_PARENT_MEMBERSHIP_CERTIFICATION` on a schema-85-compatible
+image. Optional rows remain idle, while source publication continues normally.
+Re-enabling the same epoch resumes them. Do not roll back to an image that treats
+all passage queue rows as unfinished source publication.
+
+### Historical certificate admission
+
+After schema 85 and the compatible worker are live, `membership-certification-seed`
+adds one bounded metadata page to the existing certification phase. It does not
+read archives, rebuild passages, embed text, or certify authority itself. Enable
+`RECALL_PARENT_MEMBERSHIP_CERTIFICATION=1` and use the worker's exact
+`RECALL_PARENT_MEMBERSHIP_EPOCH` when invoking it:
+
+```sh
+python -m recall_server.cli membership-certification-seed --tenant "$tenant" --limit 128
+```
+
+Reuse the first response's `through` JSON pair and each completed response's
+`after` JSON pair with `--through` and `--after`. Each call examines at most 1,000
+parents within a five-second database budget; the default is 128. One set-based
+statement checks and admits the page, avoiding a database round trip per parent. Selection uses
+the existing parent primary key, independent of search queries. Busy or changed
+parents appear in `deferred` with their exact keys and reasons. Preserve that list
+for a later finite pass after their publication or retirement work completes.
+The upper bound fixes the key range. New parents created behind the cursor need
+ordinary writer handling or a later finite pass.
+
+Existing source publication and partial certification rows remain untouched.
+Normal source updates supersede admitted work. The current worker performs native
+proof and resumes its cursor within the existing aggregate cycle budget. If a
+seed call loses its response, repeat the same page: conflict handling preserves
+already committed rows and cursors. A successful page reports admitted work, not
+coverage; native agreement and public search measurements remain the coverage
+and latency checks.

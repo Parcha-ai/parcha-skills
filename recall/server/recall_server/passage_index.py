@@ -16,7 +16,7 @@ from typing import Any, Callable, Iterable, Iterator
 
 import psycopg
 
-from . import parent_membership_enrollment, passage_append
+from . import parent_membership_enrollment, passage_append, membership_remainder
 from .logical_evidence import (
     LogicalEvidenceError,
     LogicalEvidenceProjectionStore,
@@ -575,7 +575,10 @@ class CanonicalPassageProjector:
                    WHERE (%s::text IS NULL OR evidence.tenant_id=%s)
                       AND projected.logical_document_id IS NULL
                    ON CONFLICT(tenant_id,source_id,logical_document_id)
-                   DO NOTHING""",
+                   DO UPDATE SET revision=excluded.revision,
+                       generation=canonical_passage_projection_queue.generation+1,
+                       reason='backfill',changed_at=clock_timestamp()
+                   WHERE canonical_passage_projection_queue.reason='certification'""",
                 (self.policy.fingerprint, tenant_id, tenant_id),
             )
         return max(0, result.rowcount)
@@ -599,6 +602,7 @@ class CanonicalPassageProjector:
                                         (%s::text,%s::text) THEN 0 ELSE 1 END AS source_wrap
                          FROM canonical_passage_projection_queue candidate_queue
                         WHERE (%s::text IS NULL OR tenant_id=%s)
+                          AND reason<>'certification'
                    ), ranked AS (
                        SELECT eligible.*,
                               row_number() OVER (
@@ -945,7 +949,7 @@ class CanonicalPassageProjector:
                     """SELECT revision,generation,changed_at
                          FROM canonical_passage_projection_queue
                         WHERE tenant_id=%s AND source_id=%s
-                          AND logical_document_id=%s
+                          AND logical_document_id=%s AND reason<>'certification'
                         FOR UPDATE""",
                     (
                         candidate.tenant_id,
@@ -1302,19 +1306,22 @@ class CanonicalPassageProjector:
                             [passage.passage_id for passage in diff.to_insert],
                         ),
                     )
-                deleted = connection.execute(
-                    """DELETE FROM canonical_passage_projection_queue
-                        WHERE tenant_id=%s AND source_id=%s
-                          AND logical_document_id=%s AND generation=%s""",
-                    (
-                        candidate.tenant_id,
-                        candidate.source_id,
-                        candidate.logical_document_id,
-                        candidate.generation,
-                    ),
-                )
-                if deleted.rowcount != 1:
-                    raise LogicalEvidenceError("passage_queue_conflict")
+                durable_certification = membership_remainder.retain(
+                    connection, candidate, self.membership_certification)
+                if not durable_certification:
+                    deleted = connection.execute(
+                        """DELETE FROM canonical_passage_projection_queue
+                            WHERE tenant_id=%s AND source_id=%s
+                              AND logical_document_id=%s AND generation=%s""",
+                        (
+                            candidate.tenant_id,
+                            candidate.source_id,
+                            candidate.logical_document_id,
+                            candidate.generation,
+                        ),
+                    )
+                    if deleted.rowcount != 1:
+                        raise LogicalEvidenceError("passage_queue_conflict")
                 connection.execute(
                     """INSERT INTO canonical_parquet_scan_queue(
                            tenant_id,source_id,bucket_start,
@@ -1371,7 +1378,10 @@ class CanonicalPassageProjector:
                     ),
                     reason="logical-update",
                 )
-        return {"status": "committed", **diff.counters}
+        result = {"status": "committed", **diff.counters}
+        if durable_certification:
+            result["membership_durable"] = True
+        return result
 
     @staticmethod
     def _write_headers(
@@ -1605,6 +1615,7 @@ class CanonicalPassageProjector:
                                        WHERE queued.tenant_id=sampled.tenant_id
                                          AND queued.source_id=sampled.source_id
                                          AND queued.logical_document_id=sampled.logical_document_id
+                                         AND queued.reason<>'certification'
                                   )
                               ))
                               AND (%s::text IS NULL OR sampled.logical_document_id>%s)
@@ -1867,7 +1878,7 @@ class CanonicalPassageProjector:
             pending = query(
                 """SELECT
                 EXISTS(SELECT 1 FROM canonical_evidence_document_queue WHERE tenant_id=%s AND source_id=%s AND native_parent_id=%s) OR
-                EXISTS(SELECT 1 FROM canonical_passage_projection_queue WHERE tenant_id=%s AND source_id=%s AND logical_document_id=%s) AS pending""",
+                EXISTS(SELECT 1 FROM canonical_passage_projection_queue WHERE tenant_id=%s AND source_id=%s AND logical_document_id=%s AND reason<>'certification') AS pending""",
                 (
                     tenant,
                     target["source_id"],
@@ -1904,7 +1915,11 @@ class CanonicalPassageProjector:
                 """INSERT INTO canonical_passage_projection_queue(
                 tenant_id,source_id,logical_document_id,revision,generation,reason,changed_at)
                 VALUES(%s,%s,%s,%s,1,'backfill',clock_timestamp())
-                ON CONFLICT(tenant_id,source_id,logical_document_id) DO NOTHING""",
+                ON CONFLICT(tenant_id,source_id,logical_document_id) DO UPDATE SET
+                    revision=excluded.revision,
+                    generation=canonical_passage_projection_queue.generation+1,
+                    reason='backfill',changed_at=clock_timestamp()
+                WHERE canonical_passage_projection_queue.reason='certification'""",
                 (
                     tenant,
                     target["source_id"],
@@ -1984,7 +1999,10 @@ class CanonicalPassageProjector:
                               AND projected.policy_fingerprint=selected.policy_fingerprint
                               AND projected.passage_count=0
                            ON CONFLICT(tenant_id,source_id,logical_document_id)
-                           DO NOTHING""",
+                           DO UPDATE SET revision=excluded.revision,
+                               generation=canonical_passage_projection_queue.generation+1,
+                               reason='backfill',changed_at=clock_timestamp()
+                           WHERE canonical_passage_projection_queue.reason='certification'""",
                         (json.dumps(eligible), tenant_id, source_id),
                     )
                     queued = max(0, result.rowcount)
@@ -2079,7 +2097,8 @@ class CanonicalPassageProjector:
                         status = {"status": "stale"}
                 commit_elapsed = time.monotonic() - commit_started
                 should_certify = (status['status'] == 'committed'
-                                  and self.membership_certification.enabled)
+                                  and self.membership_certification.enabled
+                                  and not status.get('membership_durable'))
                 passage_ids = (tuple(passage.passage_id for passage in prepared.passages)
                                if should_certify else ())
                 status['archive_bytes_read'] = prepared.archive_bytes_read
@@ -2170,12 +2189,31 @@ class CanonicalPassageProjector:
                 # A transient archive failure must never become a destructive
                 # logical-document rebuild.
                 break
+        # Source publication finishes first. All durable optional work shares one
+        # cycle budget, including metadata selection, regardless of parent count.
+        certification_started = time.monotonic()
+        certification_deadline = certification_started+3
+        if self.membership_certification.enabled:
+            try:
+                certification_rows = membership_remainder.pending(self.store,
+                    tenant_id=tenant_id, limit=batch_size, deadline_at=certification_deadline)
+                for row in certification_rows:
+                    if time.monotonic() >= certification_deadline:
+                        break
+                    outcome = membership_remainder.resume(self.store, row,
+                        settings=self.membership_certification, deadline_at=certification_deadline)
+                    membership_certified += outcome['certified_passages']
+                    membership_failed += int(outcome['status'] == 'failed')
+                    membership_deferred += int(outcome['status'] not in {'enrolled', 'failed'})
+            except Exception:
+                membership_failed += 1
+            membership_elapsed_ms += max(0, round((time.monotonic()-certification_started)*1000))
         phase_started = time.monotonic()
         with self.store.connect() as connection:
             pending = connection.execute(
                 """SELECT count(*) AS count
                      FROM canonical_passage_projection_queue
-                    WHERE (%s::text IS NULL OR tenant_id=%s)""",
+                    WHERE (%s::text IS NULL OR tenant_id=%s) AND reason<>'certification'""",
                 (tenant_id, tenant_id),
             ).fetchone()["count"]
         count_seconds = time.monotonic() - phase_started

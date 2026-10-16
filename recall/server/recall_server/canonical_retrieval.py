@@ -1524,6 +1524,7 @@ class BoundCanonicalRetrieval:
                       AND document.source_id=queue.source_id
                       AND document.logical_document_id=queue.logical_document_id
                     WHERE queue.tenant_id=%s AND queue.source_id=ANY(%s)
+                      AND queue.reason<>'certification'
                       AND (
                           %s::timestamptz IS NULL OR document.last_occurred_at >=
                           date_trunc('month',%s::timestamptz)
