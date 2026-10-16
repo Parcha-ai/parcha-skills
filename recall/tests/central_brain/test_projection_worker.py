@@ -91,6 +91,37 @@ class _Scan:
 
 
 class ProjectionWorkerTest(unittest.TestCase):
+    def test_only_new_worker_cycle_renews_optional_certification_window(self):
+        from unittest.mock import patch
+        from types import SimpleNamespace
+
+        now = [0.0]
+        deadlines = []
+        calls = []
+
+        class Passages(_Passages):
+            def project_pending(self, **kwargs):
+                now[0] += 10  # Source work before optional proof.
+                deadlines.append(kwargs["certification_budget"].deadline())
+                return super().project_pending(**kwargs)
+
+        class Logical(_Logical):
+            def project_pending(self, **kwargs):
+                kwargs["on_progress"]()
+                kwargs["on_progress"]()
+                return super().project_pending(**kwargs)
+
+        with patch("recall_server.passage_index.time", SimpleNamespace(monotonic=lambda: now[0])):
+            result = run_projection_worker(
+                Logical(calls), Passages(calls), tenant_id="tenant:test",
+                logical_batch_size=2, passage_batch_size=1, embedding_batch_size=1,
+                max_batches_per_cycle=1, upload_concurrency=1, passage_concurrency=1,
+                interval_seconds=1, max_cycles=2, skip_embedding=True,
+                sleep=lambda _: None,
+            )
+        self.assertEqual(deadlines, [13, 13, 13, 43, 43, 43])
+        self.assertEqual(result["passage_documents"], 6)
+
     def test_logical_admission_deadline_uses_scan_budget_only(self):
         import time
         for with_scan in (False, True):

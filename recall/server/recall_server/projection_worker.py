@@ -19,7 +19,7 @@ from .embedding_ledger import (
 )
 from .logical_evidence_projection import CanonicalLogicalEvidenceProjector
 from .search_outbox import search_outbox_pending
-from .passage_index import CanonicalPassageProjector
+from .passage_index import CanonicalPassageProjector, CertificationBudget
 from .parquet_scan import CanonicalParquetScanProjector
 
 
@@ -269,6 +269,7 @@ def run_projection_worker(
     cycles = 0
     while True:
         cycles += 1
+        certification_budget = CertificationBudget()
         cycle_started = phase_started = clock()
         active_phase = "setup"
         phase_elapsed = {key: 0 for key in PHASE_ELAPSED_KEYS}
@@ -409,6 +410,7 @@ def run_projection_worker(
                     max_batches=1,
                     concurrency=passage_concurrency,
                     on_progress=publish_search if search_plane is not None else None,
+                    certification_budget=certification_budget,
                 )
                 passage_elapsed_ms += elapsed_ms(phase_started)
                 phase_elapsed["passage_elapsed_ms"] = passage_elapsed_ms

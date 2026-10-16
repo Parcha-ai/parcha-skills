@@ -12,6 +12,47 @@ from e2e_passage_receipt_repair import Repair
 
 
 class MembershipRemainderTests(ParentMembershipPublicationTests):
+    def test_worker_callbacks_share_certification_window_and_keep_source_progress(self):
+        from recall_server.projection_worker import run_projection_worker
+
+        self.queue()
+        publisher = self.publisher()
+        deadlines = []
+        test = self
+
+        class Logical:
+            def project_pending(self, **kwargs):
+                for index in range(2):
+                    test.ingest(f"turn/callback-{index}", f"Published callback {index}")
+                    test.projector.project_pending(tenant_id=test.tenant, batch_size=10,
+                                                   max_batches=1, upload_concurrency=1)
+                    kwargs["on_progress"]()
+                return dict(status="complete", documents=2, records=2, batches=1, pending=0, pruned=0, cleanup_failures=0)
+
+        def exhaust_window(*args, **kwargs):
+            deadlines.append(kwargs["deadline_at"])
+            if len(deadlines) == 1:
+                time.sleep(max(0, kwargs["deadline_at"] - time.monotonic()) + .02)
+            return dict(status="deadline", certified_passages=0)
+
+        with patch.object(remainder, "resume", side_effect=exhaust_window):
+            outcome = run_projection_worker(
+                Logical(), publisher, tenant_id=self.tenant,
+                logical_batch_size=2, passage_batch_size=1, embedding_batch_size=1,
+                max_batches_per_cycle=1, upload_concurrency=1, passage_concurrency=1,
+                interval_seconds=1, once=True, skip_embedding=True,
+            )
+        self.assertEqual(outcome["passage_documents"], 3)
+        self.assertEqual(len(deadlines), 1, "later callbacks renewed the exhausted budget")
+        self.assertEqual(len(self.queued()), 1)
+        self.assertEqual(self.queued()[0]["checkpoint"]["after"], "")
+        # A new cycle can finish native proof without republishing source bytes.
+        resumed = self.run_cycle()
+        self.assertEqual(resumed["documents"], 0)
+        self.assertGreater(resumed["membership_certified_passages"], 0)
+        self.refresh_scope()
+        self.assertEqual(self.compare()["certified_passages"], len(self.scope["passage_ids"]))
+
     def test_restart_certifies_committed_publication_without_archive_republication(
         self,
     ):
