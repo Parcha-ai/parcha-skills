@@ -55,6 +55,27 @@ class OriginFolding(unittest.TestCase):
         self.assertEqual(diagnostics['copied_ranges_folded'],2)
         self.assertFalse(any(k.startswith('_origin')for r in result for x in r['matching_ranges']for k in x))
 
+    def test_blending_uses_the_surviving_continuation_score(self):
+        from recall_server.passage_retrieval import fold_copied_evidence
+        p=passages((record(),))[0]
+        def copied(parent,score):
+            return dict(passage_id=parent,text=p.text,receipts=[parent],rerank_score=score,
+                _origin_spans=json.loads(canonical_spans_json(p.spans)),_origin_text_sha256=p.text_sha256)
+        rows=[dict(source_id='codex:test',logical_document_id='primary',rank=.1,
+                   matching_ranges=[copied('primary',.9)]),
+              dict(source_id='codex:test',logical_document_id='fork',rank=1,
+                   matching_ranges=[copied('fork',.8),dict(passage_id='unique',rerank_score=.3)]),
+              dict(source_id='codex:test',logical_document_id='other',rank=.5,
+                   matching_ranges=[dict(passage_id='other',rerank_score=.6)])]
+        for blend,expected in ((0,['fork','other','primary']),(.6,['primary','other','fork'])):
+            with self.subTest(blend=blend):
+                out,_=fold_copied_evidence(rows,blend=blend)
+                self.assertEqual([r['logical_document_id']for r in out],expected)
+                fork=next(r for r in out if r['logical_document_id']=='fork')
+                self.assertEqual(fork['rerank_score'],.3)
+                self.assertEqual([r['passage_id']for r in fork['matching_ranges']],['unique'])
+        self.assertEqual(len(rows[1]['matching_ranges']),2)
+
 class OriginCompatibility(unittest.TestCase):
     def test_same_identity_and_text_with_different_roles_stay_distinct(self):
         from recall_server.passage_retrieval import fold_copied_evidence
