@@ -1505,7 +1505,7 @@ def _storage_authority_audit(
                    (SELECT count(*) FROM canonical_evidence_document_queue
                      WHERE tenant_id=%s)::bigint AS logical,
                    (SELECT count(*) FROM canonical_passage_projection_queue
-                     WHERE tenant_id=%s)::bigint AS passage,
+                     WHERE tenant_id=%s AND reason<>'certification')::bigint AS passage,
                    (SELECT count(*) FROM canonical_evidence_cleanup_queue
                      WHERE tenant_id=%s)::bigint AS cleanup""",
             (tenant_id, tenant_id, tenant_id),

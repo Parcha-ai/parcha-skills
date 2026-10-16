@@ -1,6 +1,6 @@
 """Recall central BrainStore service."""
 
-SCHEMA_VERSION = 84
+SCHEMA_VERSION = 85
 # H3-e': migration 067 drops the Postgres vector/tsvector plane (passage
 # embeddings, the embedding ledger, canonical_passages.search_vector). It is
 # destructive, so ``migrate`` applies it only when asked to retire the plane
@@ -33,6 +33,8 @@ PARENT_AUTHORITY_GENERATION_VERSION = 82
 PARENT_MEMBERSHIP_CERTIFICATE_VERSION = 83
 # Optional preparation checkpoint; missing state uses full native projection.
 PASSAGE_APPEND_CHECKPOINT_VERSION = 84
+# Optional derived certification continuation in the existing publication queue.
+MEMBERSHIP_REMAINDER_VERSION = 85
 # Optional until a delayed Slack body needs a terminal-identity ACK.
 SUPPRESSED_ARTIFACT_SCHEMA_VERSION = 77
 MANDATORY_SCHEMA_VERSION = 69
