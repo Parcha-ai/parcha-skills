@@ -3,9 +3,10 @@
 import os
 import time
 import unittest
+from contextlib import contextmanager
 from unittest.mock import patch
 
-from psycopg import sql
+from psycopg import ServerCursor, sql
 
 from e2e_parent_membership_enrollment import ParentEnrollmentTests
 from recall_server import parent_membership_read as reader
@@ -183,6 +184,53 @@ class ParquetCertificateTests(ParentEnrollmentTests):
         # The100ms optional phase shares the original6s deadline; it cannot renew it.
         self.assertGreater(native_deadlines[0] - metadata_calls[0], 5.8)
         self.assertLessEqual(native_deadlines[0] - metadata_calls[0], 5.91)
+
+    def test_successful_certificate_restores_timeout_before_next_native_fetch(self):
+        self.clone_passages(1, self.physical_receipt)
+        with self.store.connect() as c:
+            self.scope['passage_ids'] = tuple(row['passage_id'] for row in c.execute(
+                'SELECT passage_id FROM canonical_passages WHERE tenant_id=%s', (self.tenant,)).fetchall())
+        self.enroll()
+        connect = self.store.connect
+        timeouts = []
+        class SlowSecondFetch(ServerCursor):
+            def execute(self, statement, parameters=None, **kwargs):
+                statement = ('WITH native_rows AS MATERIALIZED (' + statement + ') '
+                             'SELECT native_rows.*,pg_sleep(CASE WHEN row_number() OVER ()=2 '
+                             'THEN 0.15 ELSE 0 END) AS test_delay FROM native_rows')
+                return super().execute(statement, parameters, **kwargs)
+
+            def fetchmany(self, size=0):
+                timeouts.append(self.connection.execute('SHOW statement_timeout').fetchone()['statement_timeout'])
+                print({'fetch': len(timeouts), 'statement_timeout': timeouts[-1]}, flush=True)
+                # Real PostgreSQL FETCH boundaries, using two small native batches.
+                return super().fetchmany(1)
+
+        class Connection:
+            def __init__(self, connection):
+                self.connection = connection
+
+            def __getattr__(self, name):
+                return getattr(self.connection, name)
+
+            def cursor(self, name):
+                return SlowSecondFetch(self.connection, name, row_factory=self.connection.row_factory)
+
+        @contextmanager
+        def delayed():
+            with connect() as connection:
+                yield Connection(connection)
+
+        with patch.object(self.store, 'connect', side_effect=delayed):
+            with patch('recall_server.receipt_membership.lookup_current_search_membership',
+                       wraps=lookup_current_search_membership) as native:
+                rows = self.stream()
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(len(timeouts), 3)
+        self.assertTrue(timeouts[1].endswith('ms'))
+        self.assertGreater(int(timeouts[1][:-2]), 1000)
+        self.assertLessEqual(int(timeouts[1][:-2]), 6000)
+        native.assert_not_called()
 
     def test_concurrent_edit_keeps_snapshot_then_next_stream_rejects(self):
         self.enroll()
