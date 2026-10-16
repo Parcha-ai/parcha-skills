@@ -49,6 +49,7 @@ MAX_SPARSE_TOKENS = 8
 _SELECTED_AUTHORITY_SQL = """
                             SELECT passage.tenant_id,passage.source_id,passage.passage_id,
                                    passage.logical_document_id,passage.text_sha256,passage.receipts,
+                                   passage.spans AS origin_spans,
                                    evidence.revision,evidence.manifest_object_key,
                                    evidence.manifest_content_sha256,
                                    CASE WHEN jsonb_array_length(passage.spans)=1
@@ -512,6 +513,7 @@ class TurbopufferHintRetrieval(PassageHintRetrieval):
                         """WITH selected AS MATERIALIZED (
                             SELECT passage.tenant_id,passage.source_id,passage.passage_id,
                                    passage.logical_document_id,passage.text_sha256,passage.receipts,
+                                   passage.spans AS origin_spans,
                                    evidence.revision,evidence.manifest_object_key,
                                    evidence.manifest_content_sha256,
                                    CASE WHEN jsonb_array_length(passage.spans)=1
@@ -551,7 +553,7 @@ class TurbopufferHintRetrieval(PassageHintRetrieval):
                         SELECT selected.tenant_id,selected.source_id,selected.passage_id,
                                selected.logical_document_id,selected.text_sha256,selected.receipts,
                                selected.revision,selected.manifest_object_key,
-                               selected.manifest_content_sha256,selected.source_unit
+                               selected.manifest_content_sha256,selected.source_unit,selected.origin_spans
                           FROM selected
                           CROSS JOIN LATERAL unnest(selected.receipts) AS receipt(value)
                           LEFT JOIN live_receipts live
@@ -560,7 +562,7 @@ class TurbopufferHintRetrieval(PassageHintRetrieval):
                          GROUP BY selected.tenant_id,selected.source_id,selected.passage_id,
                                   selected.logical_document_id,selected.text_sha256,selected.receipts,
                                   selected.revision,selected.manifest_object_key,
-                                  selected.manifest_content_sha256,selected.source_unit
+                                  selected.manifest_content_sha256,selected.source_unit,selected.origin_spans
                         HAVING bool_and(live.value IS NOT NULL)""",
                         (self.tenant_id, self.sources, self.policy_fingerprint,
                          [source for source, _passage in requested],
@@ -627,6 +629,8 @@ class TurbopufferHintRetrieval(PassageHintRetrieval):
             for item in row["matching_ranges"]:
                 canonical = live[(row["source_id"], row["logical_document_id"], item["passage_id"])]
                 item["receipts"] = list(canonical["receipts"])
+                item["_origin_spans"] = canonical.get("origin_spans")
+                item["_origin_text_sha256"] = canonical["text_sha256"]
                 row.update({field: canonical[field] for field in locator_fields})
         return {"authority_status": status,
                 "authority_stages": stages,

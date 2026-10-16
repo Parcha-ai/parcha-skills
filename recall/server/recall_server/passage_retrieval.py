@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import os
 import re
@@ -770,6 +771,93 @@ def similar_document_record(row: dict[str, Any], similarity: float) -> dict[str,
         "similarity": round(similarity, 4),
         "receipts": list((ranges[0].get("receipts") or ())[:4]) if ranges else [],
     }
+
+
+def _copied_range_key(source_id: str, item: dict[str, Any]) -> tuple | None:
+    """Only canonical origin metadata and authenticated complete bytes identify a copy."""
+    spans = item.get("_origin_spans")
+    text = item.get("text")
+    if (not isinstance(source_id, str) or not source_id.strip()
+            or not isinstance(spans, list) or not spans or not isinstance(text, str)
+            or hashlib.sha256(text.encode()).hexdigest() != item.get("_origin_text_sha256")):
+        return None
+    identities = []
+    for span in spans:
+        if not isinstance(span, dict) or not isinstance(span.get("origin"), dict):
+            return None
+        origin = span["origin"]
+        if not isinstance(origin.get("role"), str) or origin["role"] not in {"user", "assistant"}:
+            return None
+        fields = tuple(origin.get(key) for key in ("message_id", "turn_id", "text_sha256"))
+        if (not all(isinstance(value, str) and value.strip() for value in fields)
+                or len(fields[2]) != 64 or set(fields[2]) - set("0123456789abcdef")):
+            return None
+        window = tuple(span.get(key) for key in ("source_byte_start", "source_byte_end",
+                                                "passage_byte_start", "passage_byte_end"))
+        if (not all(type(value) is int and value >= 0 for value in window)
+                or window[1] <= window[0] or window[3] <= window[2]
+                or window[1] - window[0] != window[3] - window[2]):
+            return None
+        identities.append((*fields, origin["role"], *window))
+    return source_id, item["_origin_text_sha256"], tuple(identities)
+
+
+def fold_copied_evidence(
+    results: list[dict[str, Any]], *, blend: float = 1.0,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Spend one ranking slot on an exact copied range, keeping its source pointers.
+
+    Each input range has already passed its own current authority check. A fork's
+    other ranges remain candidates, with their own scores and receipts.
+    """
+    groups: dict[tuple, list[tuple[int, int]]] = {}
+    rows = [{**row, "matching_ranges": [dict(item) for item in row.get("matching_ranges", ())]}
+            for row in results]
+    for index, row in enumerate(rows):
+        for range_index, item in enumerate(row["matching_ranges"]):
+            key = _copied_range_key(row.get("source_id"), item)
+            if key is not None:
+                groups.setdefault(key, []).append((index, range_index))
+    removed: set[tuple[int, int]] = set()
+    folded_groups = 0
+    for members in groups.values():
+        if len(members) < 2:
+            continue
+        # Keep the strongest already-computed passage score. Existing order
+        # breaks ties and also governs searches without a reranker.
+        winner = max(members, key=lambda pair: (
+            rows[pair[0]]["matching_ranges"][pair[1]].get("rerank_score", float("-inf")),
+            -pair[0], -pair[1]))
+        primary = rows[winner[0]]["matching_ranges"][winner[1]]
+        copies = []
+        for pair in members:
+            if pair == winner:
+                continue
+            row = rows[pair[0]]
+            item = row["matching_ranges"][pair[1]]
+            copies.append({**{key: row.get(key) for key in (
+                "source_id", "logical_document_id", "native_parent_id", "revision",
+                "manifest_object_key", "manifest_content_sha256")},
+                "passage_id": item.get("passage_id"), "receipts": list(item.get("receipts", ()))})
+            removed.add(pair)
+        primary["copied_evidence"] = copies
+        folded_groups += 1
+    kept = []
+    for index, row in enumerate(rows):
+        row["matching_ranges"] = [
+            {key: value for key, value in item.items() if not key.startswith("_origin_")}
+            for range_index, item in enumerate(row["matching_ranges"])
+            if (index, range_index) not in removed]
+        if row["matching_ranges"]:
+            kept.append(row)
+    if removed:
+        scores = {item["passage_id"]: item["rerank_score"] for row in kept
+                  for item in row["matching_ranges"] if "rerank_score" in item}
+        # Recompute a fork's score from the ranges it still contributes.
+        kept = [{key: value for key, value in row.items()
+                 if key not in {"rerank_score", "blended_score"}} for row in kept]
+        kept = apply_rerank_scores(kept, scores, blend=blend)
+    return kept, {"copied_ranges_folded": len(removed), "copied_evidence_groups": folded_groups}
 
 
 def group_near_duplicates(
@@ -2496,10 +2584,15 @@ class PassageHintRetrieval:
                 lexical_query=lexical_query,
             )
         near_duplicate_diagnostics: dict[str, Any] = {}
+        results, copied_diagnostics = fold_copied_evidence(
+            results, blend=float(getattr(self.store, "rerank_blend", DEFAULT_RERANK_BLEND)),
+        )
+        near_duplicate_diagnostics.update(copied_diagnostics)
         if near_duplicates_enabled():
-            results, near_duplicate_diagnostics = group_near_duplicates(
+            results, similar_diagnostics = group_near_duplicates(
                 results, threshold=near_duplicate_threshold(),
             )
+            near_duplicate_diagnostics.update(similar_diagnostics)
         results = [
             {key: value for key, value in row.items() if key != "nominated"}
             for row in results[:limit]
