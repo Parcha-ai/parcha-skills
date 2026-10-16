@@ -1,0 +1,259 @@
+#!/usr/bin/env python3
+"""Certified authority skips only the unchanged native receipt proof."""
+import hashlib
+from pathlib import Path
+import time
+import unittest
+from unittest.mock import patch
+
+from e2e_parent_membership_enrollment import ParentEnrollmentTests
+from recall_server import parent_membership_read as reader
+from recall_server import parent_membership_shadow as shadow
+from recall_server.db import SearchDeadlineExceeded
+from recall_server.receipt_membership import lookup_current_search_membership
+
+
+class ParentMembershipFastReadTests(ParentEnrollmentTests):
+    def setUp(self):
+        super().setUp()
+        self.store.verified_singleton_receipts = True
+
+    def enable(self, epoch='synthetic-epoch-a'):
+        self.retrieval.parent_membership_read = reader.ReadSettings(enabled=True, binding_epoch=epoch)
+
+    def search(self):
+        # An explicit caller budget exercises the 1s fallback reserve. Both
+        # variants receive the same budget; retained short-deadline tests remain
+        # unchanged and the separate reserve test verifies native-only behavior.
+        return self.retrieval.search('exact deployment phrase', lexical_query='deployment phrase',
+            since=None, until=None, limit=10, include_arms=True,
+            deadline_at=time.monotonic() + 3)
+
+    def authorize(self, deadline=None):
+        stages = {}
+        with self.store.connect() as connection:
+            rows = self.retrieval._authorize_singletons(connection,
+                [(self.source, value) for value in self.ids],
+                time.monotonic() + 3 if deadline is None else deadline, stages=stages)
+        return rows, stages
+
+    def test_default_off_preserves_native_inputs_and_does_not_read_certificates(self):
+        self.enroll()
+        with patch.object(reader, 'partition', side_effect=AssertionError('disabled')) as certificate:
+            with patch('recall_server.receipt_membership.lookup_current_search_membership', wraps=lookup_current_search_membership) as native:
+                result = self.search()
+        self.assertTrue(result['results'])
+        certificate.assert_not_called()
+        self.assertEqual(native.call_count, 1)
+        self.assertEqual(set(native.call_args.kwargs['receipts']), {self.receipt, self.physical_receipt})
+
+    def test_certified_search_matches_native_with_zero_native_receipt_calls(self):
+        self.enroll(); before = self.search(); self.enable()
+        with patch('recall_server.receipt_membership.lookup_current_search_membership', wraps=lookup_current_search_membership) as native:
+            after = self.search()
+        self.assertEqual(after['results'], before['results'])
+        self.assertEqual(after['arms'], before['arms'])
+        native.assert_not_called()
+        stages = after['diagnostics']['authority_stages']
+        self.assertEqual(stages['native_receipts'], 0)
+        self.assertEqual(stages['parent_membership_read']['certified_passages'], len(self.ids))
+
+    def test_missing_or_wrong_epoch_certificates_use_original_receipts_once(self):
+        for epoch in ('synthetic-epoch-a', 'other-epoch'):
+            self.enable(epoch)
+            with patch('recall_server.receipt_membership.lookup_current_search_membership', wraps=lookup_current_search_membership) as native:
+                rows, stages = self.authorize()
+            self.assertEqual(len(rows), len(self.ids))
+            self.assertEqual(native.call_count, 1)
+            self.assertEqual(set(native.call_args.kwargs['receipts']), {self.receipt, self.physical_receipt})
+            self.assertEqual(stages['parent_membership_read']['certified_passages'], 0)
+            self.enroll()
+
+    def test_mixed_certificates_send_only_deduplicated_fallback_union(self):
+        # Two distinct real catalog passages with disjoint receipt sets; clone a
+        # second fallback range to prove shared receipts are looked up only once.
+        clones = tuple('psg_' + hashlib.sha256((self.ids[0] + suffix).encode()).hexdigest()[:32] for suffix in ('a', 'b'))
+        with self.store.connect() as c:
+            c.execute('UPDATE canonical_passages SET receipts=ARRAY[%s] WHERE tenant_id=%s', (self.receipt, self.tenant))
+            for index, passage_id in enumerate(clones, 1):
+                c.execute("""INSERT INTO canonical_passages(
+                    tenant_id,source_id,logical_document_id,revision,passage_id,ordinal,
+                    policy_fingerprint,target_tokens,overlap_tokens,token_count,
+                    first_occurred_at,last_occurred_at,roles,receipts,spans,text_redacted,text_sha256)
+                    SELECT tenant_id,source_id,logical_document_id,revision,%s,ordinal+%s,
+                           policy_fingerprint,target_tokens,overlap_tokens,token_count,
+                           first_occurred_at,last_occurred_at,roles,ARRAY[%s],spans,text_redacted,text_sha256
+                    FROM canonical_passages WHERE tenant_id=%s AND passage_id=%s""",
+                    (passage_id, index * 100, self.physical_receipt, self.tenant, self.ids[0]))
+        self.enroll()
+        self.ids = (*self.ids, *clones)
+        native_rows, _ = self.authorize(); self.enable()
+        with patch('recall_server.receipt_membership.lookup_current_search_membership', wraps=lookup_current_search_membership) as native:
+            fast_rows, stages = self.authorize()
+        self.assertEqual(fast_rows, native_rows)
+        self.assertEqual(native.call_count, 1)
+        self.assertEqual(native.call_args.kwargs['receipts'], (self.physical_receipt,))
+        self.assertEqual(stages['native_receipts'], 1)
+        self.assertEqual(stages['unique_receipts'], 2)
+
+    def test_edit_invalidates_certificate_and_stale_vendor_results(self):
+        self.enroll(); self.enable(); self.edit()
+        with patch('recall_server.receipt_membership.lookup_current_search_membership', wraps=lookup_current_search_membership) as native:
+            result = self.search()
+        self.assertEqual(result['results'], [])
+        self.assertEqual(native.call_count, 1)
+
+    def test_forget_invalidates_before_archive_cleanup_failure(self):
+        self.enable()
+        super().test_forget_revocation_precedes_archive_cleanup_failure()
+        self.assertEqual(self.search()['results'], [])
+
+    def test_source_recreation_does_not_reuse_old_certificates(self):
+        self.enable()
+        super().test_actual_source_deletion_recreation_retains_generation_and_loses_certificate()
+
+    def test_live_source_grant_revocation_keeps_stale_vendor_out_of_scope(self):
+        self.enroll(); self.enable()
+        self.assertEqual(self.store.authorized_canonical_source_ids(self.tenant, self.principal), [self.source])
+        with self.store.connect() as c:
+            c.execute('DELETE FROM canonical_source_grants WHERE tenant_id=%s AND principal_id=%s', (self.tenant, self.principal))
+        # The MCP authority owner resolves these grants for each request. The
+        # retrieval owner receives that scope, never a certificate-derived one.
+        self.retrieval.sources = self.store.authorized_canonical_source_ids(self.tenant, self.principal)
+        self.assertEqual(self.retrieval.sources, [])
+        self.assertEqual(self.search()['results'], [])
+
+    def test_live_brain_grant_revocation_also_removes_scope(self):
+        self.enroll(); self.enable()
+        with self.store.connect() as c:
+            c.execute('DELETE FROM brain_access_grants WHERE tenant_id=%s AND principal_id=%s', (self.tenant, self.principal))
+        self.retrieval.sources = self.store.authorized_canonical_source_ids(self.tenant, self.principal)
+        self.assertEqual(self.retrieval.sources, [])
+        self.assertEqual(self.search()['results'], [])
+
+    def test_metadata_failure_rolls_back_savepoint_and_runs_native_once(self):
+        self.enroll(); before = self.search(); self.enable()
+        execute = self.store._execute_bounded
+        def failed(c, sql, values, deadline):
+            if sql == reader._METADATA_SQL:
+                return c.execute('SELECT * FROM deliberately_missing_fast_reader_table')
+            return execute(c, sql, values, deadline)
+        with patch.object(self.store, '_execute_bounded', side_effect=failed):
+            with patch('recall_server.receipt_membership.lookup_current_search_membership', wraps=lookup_current_search_membership) as native:
+                after = self.search()
+        self.assertEqual(after['results'], before['results'])
+        self.assertEqual(native.call_count, 1)
+        self.assertEqual(after['diagnostics']['authority_stages']['parent_membership_read']['status'], 'unavailable')
+
+    def test_expired_deadline_never_runs_certificate_or_membership(self):
+        self.enroll(); self.enable()
+        with patch.object(reader, 'partition', side_effect=AssertionError('expired')) as certificate:
+            with self.assertRaises(SearchDeadlineExceeded):
+                self.authorize(time.monotonic() - 1)
+        certificate.assert_not_called()
+
+    def test_metadata_timeout_retains_native_fallback_with_original_deadline(self):
+        self.enroll(); self.enable(); execute = self.store._execute_bounded
+        def delayed(c, sql, values, deadline):
+            if sql == reader._METADATA_SQL:
+                return execute(c, 'SELECT pg_sleep(0.2)', (), deadline)
+            return execute(c, sql, values, deadline)
+        with patch.object(self.store, '_execute_bounded', side_effect=delayed):
+            with patch('recall_server.receipt_membership.lookup_current_search_membership', wraps=lookup_current_search_membership) as native:
+                deadline = time.monotonic() + 3
+                rows, stages = self.authorize(deadline)
+                self.assertEqual(len(rows), len(self.ids))
+                self.assertEqual(stages['parent_membership_read']['status'], 'deadline')
+                self.assertEqual(native.call_count, 1)
+                self.assertEqual(native.call_args.kwargs['deadline_at'], deadline)
+        # The failed read did not poison the pool or alter any certificate.
+        rows, stages = self.authorize()
+        self.assertEqual(len(rows), len(self.ids)); self.assertEqual(stages['native_receipts'], 0)
+
+    def test_short_remaining_budget_skips_metadata_and_preserves_native_proof(self):
+        self.enroll(); self.enable(); execute = self.store._execute_bounded
+        def guarded(c, sql, values, deadline):
+            self.assertNotEqual(sql, reader._METADATA_SQL)
+            return execute(c, sql, values, deadline)
+        with patch.object(self.store, '_execute_bounded', side_effect=guarded):
+            rows, stages = self.authorize(time.monotonic() + .5)
+        self.assertEqual(len(rows), len(self.ids))
+        self.assertEqual(stages['parent_membership_read']['status'], 'serving-reserve')
+        self.assertGreater(stages['native_receipts'], 0)
+
+    def test_changed_actual_owner_invalidates_certificate_and_uses_native(self):
+        self.enroll(); self.enable()
+        with self.store.connect() as c:
+            c.execute("UPDATE canonical_events SET native_parent_id='other-parent' WHERE tenant_id=%s", (self.tenant,))
+        with patch('recall_server.receipt_membership.lookup_current_search_membership', wraps=lookup_current_search_membership) as native:
+            rows, stages = self.authorize()
+        self.assertEqual(native.call_count, 1)
+        self.assertEqual(stages['parent_membership_read']['certified_passages'], 0)
+        self.assertEqual(len(rows), len(self.ids))
+
+    def test_unknown_chunk_profile_stays_on_native_fail_closed_path(self):
+        for receipt in (self.receipt, self.physical_receipt):
+            self.admit_fixture(self.baseline(receipt)['document_id'])
+        self.enroll(); self.enable()
+        with self.store.connect() as c:
+            c.execute('UPDATE canonical_documents SET chunk_receipt_profile=2 WHERE tenant_id=%s', (self.tenant,))
+        with patch('recall_server.receipt_membership.lookup_current_search_membership', wraps=lookup_current_search_membership) as native:
+            result = self.search()
+        self.assertEqual(native.call_count, 1)
+        self.assertEqual(result['results'], [])
+        self.assertEqual(result['diagnostics']['authority_status'], 'unavailable')
+
+    def test_missing_generation_and_mutated_bindings_fall_back(self):
+        self.enroll(); self.enable()
+        with self.store.connect() as c:
+            c.execute('DELETE FROM canonical_parent_authority WHERE tenant_id=%s', (self.tenant,))
+        rows, stages = self.authorize()
+        self.assertEqual(len(rows), len(self.ids)); self.assertGreater(stages['native_receipts'], 0)
+
+    def test_read_setting_requires_explicit_epoch(self):
+        self.assertFalse(reader.ReadSettings().enabled)
+        with self.assertRaises(ValueError):
+            reader.ReadSettings(enabled=True)
+
+    def test_concurrent_edit_keeps_one_snapshot_and_next_request_rejects(self):
+        self.enroll(); before = self.search(); self.enable()
+        original = reader.partition
+        def edited(*args, **kwargs):
+            self.edit()
+            return original(*args, **kwargs)
+        with patch.object(reader, 'partition', side_effect=edited):
+            after = self.search()
+        self.assertEqual(after['results'], before['results'])
+        self.assertEqual(self.search()['results'], [])
+
+    def test_concurrent_manifest_publication_uses_snapshot_then_falls_back(self):
+        self.enroll(); self.enable(); original = reader.partition
+        def published(*args, **kwargs):
+            with self.store.connect() as c:
+                c.execute('UPDATE canonical_evidence_documents SET manifest_content_sha256=%s WHERE tenant_id=%s', ('a' * 64, self.tenant))
+            return original(*args, **kwargs)
+        with patch.object(reader, 'partition', side_effect=published):
+            rows, stages = self.authorize()
+        self.assertEqual(len(rows), len(self.ids)); self.assertEqual(stages['native_receipts'], 0)
+        rows, stages = self.authorize()
+        self.assertEqual(len(rows), len(self.ids)); self.assertGreater(stages['native_receipts'], 0)
+
+    def test_shadow_still_observes_real_native_proof_when_both_flags_enabled(self):
+        self.enroll(); self.enable()
+        self.retrieval.parent_membership_shadow = shadow.ShadowSettings(enabled=True, binding_epoch='synthetic-epoch-a', serving_reserve_ms=100)
+        with patch('recall_server.receipt_membership.lookup_current_search_membership', wraps=lookup_current_search_membership) as native:
+            result = self.search()
+        self.assertEqual(native.call_count, 1)
+        self.assertEqual(result['diagnostics']['authority_stages']['parent_membership_shadow']['disagreements'], 0)
+
+    def test_original_verifier_and_catalog_sql_are_unchanged(self):
+        from recall_server import receipt_membership, turbopuffer_retrieval
+        self.assertEqual(hashlib.sha256(Path(receipt_membership.__file__).read_bytes()).hexdigest(),
+            'e413d0faac8b9ff686f8e4399502b431a7807058f8ce0ff64f3ef73e704a2aa9')
+        self.assertEqual(hashlib.sha256(turbopuffer_retrieval._SELECTED_AUTHORITY_SQL.encode()).hexdigest(),
+            '33cbb2194d20a5a75b67879de1d707910844d41be8c118e90e5de9712de6dac4')
+
+
+if __name__ == '__main__':
+    suite = unittest.TestSuite(ParentMembershipFastReadTests(name) for name in ParentMembershipFastReadTests.__dict__ if name.startswith('test_'))
+    raise SystemExit(not unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful())
