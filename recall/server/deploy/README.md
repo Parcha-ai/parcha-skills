@@ -1724,7 +1724,10 @@ deployment does not run it. The marker is optional for capability admission.
 Migration 82 records parent membership generations through deferred invalidation
 triggers. Deploy optional-82 compatibility first; migration 80 and its nullable
 singleton receipt profile are prerequisites. Refresh runtime grants after applying
-82 so canonical writers can update `canonical_parent_authority`. The table is
+82 so canonical writers can update `canonical_parent_authority`. Runtime roles
+also need database `TEMP` permission: the deferred collector uses a transaction-
+cleared temporary queue and recreates it after backend session cleanup. Missing
+authority-table write grants abort the entire canonical transaction. The table is
 shadow metadata: search and publication do not trust it. Do not remove or disable
 its triggers after certificates are introduced without the later certificate
 invalidation/reset procedure. Image deployment does not apply this migration.
