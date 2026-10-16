@@ -1623,9 +1623,11 @@ class Collector:
         except CollectorRuntimeError as error:
             if (error.error_code in {"source_snapshot_changed", "source_snapshot_deadline"}
                     and last_visited_path is not None):
-                # A hot or oversized snapshot must not repeatedly prevent the
-                # next file from being visited. Keep this scan visibly failed.
-                self._set_meta("scan_resume_after_path", last_visited_path)
+                # Only the fair lane owns the historical walk's cursor.
+                # A fresh-file failure must not reset that walk on every cycle.
+                # Fair-lane failures still advance past a hot or oversized file.
+                if fair_slice:
+                    self._set_meta("scan_resume_after_path", last_visited_path)
                 self._set_meta("scan_next_lane", "fair")
                 self.db.commit()
             raise
