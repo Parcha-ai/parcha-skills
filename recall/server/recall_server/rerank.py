@@ -64,9 +64,12 @@ _MODEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}")
 class RerankUnavailable(RuntimeError):
     """The reranker could not produce a ranking; callers keep fused results."""
 
-    def __init__(self, code: str):
+    def __init__(self, code: str, *, http_status: int | None = None):
         super().__init__(code)
         self.code = code
+        self.http_status = (
+            http_status if type(http_status) is int and 100 <= http_status <= 599 else None
+        )
 
 
 class RerankTransport(Protocol):
@@ -118,7 +121,7 @@ class UrllibRerankTransport:
         try:
             with opener.open(request, timeout=timeout) as response:
                 if response.status != 200:
-                    raise RerankUnavailable("rerank_http_status")
+                    raise RerankUnavailable("rerank_http_status", http_status=response.status)
                 length = response.headers.get("Content-Length")
                 if length is not None and (
                     not length.isdigit() or int(length) > MAX_RERANK_RESPONSE_BYTES
@@ -133,7 +136,7 @@ class UrllibRerankTransport:
             try:
                 error.close()
             finally:
-                raise RerankUnavailable(code) from None
+                raise RerankUnavailable(code, http_status=error.code) from None
         except (RemoteDisconnected, TimeoutError, urllib.error.URLError, OSError):
             raise RerankUnavailable("rerank_transport_error") from None
         if len(raw) > MAX_RERANK_RESPONSE_BYTES:
@@ -177,9 +180,9 @@ class PooledRerankTransport:
                 timeout=timeout,
             ) as response:
                 if 300 <= response.status_code < 400:
-                    raise RerankUnavailable("rerank_redirect_refused")
+                    raise RerankUnavailable("rerank_redirect_refused", http_status=response.status_code)
                 if response.status_code != 200:
-                    raise RerankUnavailable("rerank_http_status")
+                    raise RerankUnavailable("rerank_http_status", http_status=response.status_code)
                 if time.monotonic() >= deadline:
                     raise RerankUnavailable("rerank_deadline_exhausted")
                 length = response.headers.get("Content-Length")
