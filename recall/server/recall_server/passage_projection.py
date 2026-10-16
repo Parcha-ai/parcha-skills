@@ -214,6 +214,7 @@ class PassageMessage:
     record_count: int = 1
     actor_links: tuple[ActorLink, ...] = ()
     source_unit: str | None = None
+    origin: dict[str, str] | None = None
 
     def validate(self) -> None:
         if (
@@ -264,6 +265,7 @@ class PassageSpan:
     passage_byte_start: int
     passage_byte_end: int
     source_unit: str | None = None
+    origin: dict[str, str] | None = None
 
 
 @dataclass(frozen=True)
@@ -378,6 +380,7 @@ def _spans(tokens: list[_Token], messages: tuple[PassageMessage, ...]) -> tuple[
                 source_byte_end=source_end,
                 passage_byte_start=passage_offset,
                 passage_byte_end=passage_offset + span_size,
+                origin=messages[message_index].origin,
             )
         )
         passage_offset += span_size
@@ -516,12 +519,13 @@ def passage_embed_sha256(header: str, text: str) -> str:
     ).hexdigest()
 
 
-def canonical_spans_json(spans: tuple[PassageSpan, ...]) -> str:
+def canonical_spans_json(spans: tuple[PassageSpan, ...], *, include_origin: bool = True) -> str:
     """Canonical JSON for a passage's record windows (sorted keys, no spaces)."""
 
     return json.dumps(
         [{key: value for key, value in asdict(span).items()
-          if key != "source_unit" or value is not None} for span in spans],
+          if (key not in {"source_unit", "origin"} or value is not None)
+          and (include_origin or key != "origin")} for span in spans],
         sort_keys=True,
         separators=(",", ":"),
     )
@@ -553,7 +557,9 @@ def passage_identity(
             logical_document_id,
             policy_fingerprint,
             text_sha256,
-            canonical_spans_json(spans),
+            # Origin is an authenticated catalog annotation, not window
+            # geometry. Enriching it must not re-key or re-embed old passages.
+            canonical_spans_json(spans, include_origin=False),
         )
     )
     return "psg_" + hashlib.sha256(identity.encode()).hexdigest()[:32]
@@ -801,6 +807,32 @@ def _typed_communication_message(event_kind: str, text: str) -> bool:
     )
 
 
+def _message_origin(source_text: str, visible_text: str) -> dict[str, str] | None:
+    """Keep explicit Codex message identity; ordinary pasted text has no origin."""
+    try:
+        value = orjson.loads(source_text)
+    except orjson.JSONDecodeError:
+        return None
+    if not isinstance(value, dict) or value.get("type") != "response_item":
+        return None
+    payload = value.get("payload")
+    if (not isinstance(payload, dict) or payload.get("type") != "message"
+            or not isinstance(payload.get("role"), str)
+            or payload["role"] not in VISIBLE_DENSE_ROLES):
+        return None
+    metadata = payload.get("internal_chat_message_metadata_passthrough")
+    if not isinstance(metadata, dict):
+        return None
+    message_id, turn_id = payload.get("id"), metadata.get("turn_id")
+    if not all(isinstance(item, str) and item.strip() for item in (message_id, turn_id)):
+        return None
+    payload_text = "\n".join(dict.fromkeys(_text_blocks(payload.get("content"), include_tool_results=False)))
+    if payload_text != visible_text:
+        return None
+    return {"message_id": message_id, "turn_id": turn_id, "role": payload["role"],
+            "text_sha256": hashlib.sha256(visible_text.encode()).hexdigest()}
+
+
 def visible_messages(
     records: Iterable[LogicalEvidenceRecord], *, first_record_ordinal: int = 0,
 ) -> tuple[PassageMessage, ...]:
@@ -869,6 +901,7 @@ def visible_messages(
             text=text,
             actor_links=first.actor_links,
             source_unit=source_unit,
+            origin=_message_origin(source_text, text),
         )
         message.validate()
         messages.append(message)

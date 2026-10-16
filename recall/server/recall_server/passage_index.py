@@ -1169,26 +1169,31 @@ class CanonicalPassageProjector:
                             candidate.source_id,
                         ),
                     )
-                # Stable passage IDs cover text and spans, not receipts. A
-                # canonical metadata revision can replace a receipt without
-                # changing the visible body or its embedding input.
+                # Stable IDs cover text and window geometry, not receipts or
+                # optional origin annotations. Refresh full prepared metadata;
+                # immutable append-prefix records carry no replacement spans.
                 retained_receipts = [
                     {"passage_id": passage.passage_id,
-                     "receipts": list(passage.receipts)}
+                     "receipts": list(passage.receipts),
+                     "spans": (json.loads(canonical_spans_json(passage.spans))
+                               if isinstance(passage, LosslessPassage) else None)}
                     for passage in prepared.passages
                     if passage.passage_id in retained_ids
                 ]
                 if retained_receipts:
                     connection.execute(
                         """UPDATE canonical_passages passage
-                              SET revision=%s,receipts=current.receipts
+                              SET revision=%s,receipts=current.receipts,
+                                  spans=coalesce(current.spans,passage.spans)
                              FROM jsonb_to_recordset(%s::jsonb)
-                                  AS current(passage_id text,receipts text[])
+                                  AS current(passage_id text,receipts text[],spans jsonb)
                             WHERE passage.tenant_id=%s AND passage.source_id=%s
                               AND passage.logical_document_id=%s
                               AND passage.passage_id=current.passage_id
                               AND (passage.revision IS DISTINCT FROM %s
-                                   OR passage.receipts IS DISTINCT FROM current.receipts)""",
+                                   OR passage.receipts IS DISTINCT FROM current.receipts
+                                   OR (current.spans IS NOT NULL
+                                       AND passage.spans IS DISTINCT FROM current.spans))""",
                         (candidate.revision,json.dumps(retained_receipts), candidate.tenant_id,
                          candidate.source_id, candidate.logical_document_id,candidate.revision),
                     )
