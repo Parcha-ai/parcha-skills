@@ -221,7 +221,7 @@ class DatabaseCapabilityContractTest(unittest.TestCase):
                     snapshot["postgres_vector_plane_present"] = not retired
                     result = assess_snapshot(snapshot)
                     self.assertEqual(result["schema_version"], 79 if marker else 69)
-                    snapshot["migration_versions"].append(SCHEMA_VERSION + 1)
+                    snapshot["migration_versions"].append(83)
                     with self.assertRaisesRegex(CapabilityError, "schema_drift"):
                         assess_snapshot(snapshot)
 
@@ -241,18 +241,41 @@ class DatabaseCapabilityContractTest(unittest.TestCase):
             snapshot["migration_versions"] = list(range(1, 70)) + ([81] if marker else [])
             snapshot["postgres_vector_plane_present"] = False
             self.assertEqual(assess_snapshot(snapshot)["schema_version"], 81 if marker else 69)
-            for versions in (snapshot["migration_versions"] + [SCHEMA_VERSION + 1],
+            for versions in (snapshot["migration_versions"] + [83],
                              snapshot["migration_versions"] + [81, 81],
                              [v for v in snapshot["migration_versions"] if v != 69]):
                 snapshot["migration_versions"] = versions
                 with self.assertRaisesRegex(CapabilityError, "schema_drift"):
                     assess_snapshot(snapshot)
 
+    def test_parent_authority_shadow_marker_is_optional_without_granting_reader_trust(self) -> None:
+        for retired in (False, True):
+            for marker in (False, True):
+                snapshot = healthy_snapshot()
+                snapshot["migration_versions"] = [v for v in snapshot["migration_versions"] if v != 82]
+                baseline_version = max(snapshot["migration_versions"])
+                if not retired:
+                    snapshot["migration_versions"].remove(67)
+                if marker:
+                    snapshot["migration_versions"].append(82)
+                snapshot["postgres_vector_plane_present"] = not retired
+                result = assess_snapshot(snapshot)
+                self.assertEqual(result["schema_version"], 82 if marker else baseline_version)
+                baseline = list(snapshot["migration_versions"])
+                invalid_versions = [baseline + [83], baseline + [82, 82],
+                                    [v for v in baseline if v != 69]]
+                if marker:
+                    invalid_versions.append([v for v in baseline if v != 80])
+                for invalid in invalid_versions:
+                    snapshot["migration_versions"] = invalid
+                    with self.assertRaisesRegex(CapabilityError, "schema_drift"):
+                        assess_snapshot(snapshot)
+
     def test_native_conversation_marker_cannot_hide_gaps_or_unknown_versions(self) -> None:
         complete = list(range(1, 72))
         for versions in ([n for n in complete if n != 69],
                          [n for n in complete if n != 68],
-                         complete + [SCHEMA_VERSION + 1], complete + [71],
+                         complete + [83], complete + [71],
                          complete[:-2] + [71, 70]):
             with self.subTest(versions=versions):
                 snapshot = healthy_snapshot()
@@ -265,7 +288,7 @@ class DatabaseCapabilityContractTest(unittest.TestCase):
         complete = list(range(1, 71))
         for versions in ([n for n in complete if n != 68],
                          [n for n in complete if n != 69],
-                         complete + [SCHEMA_VERSION + 1], complete + [70],
+                         complete + [83], complete + [70],
                          complete[:-2] + [70, 69]):
             with self.subTest(versions=versions):
                 snapshot = healthy_snapshot()
