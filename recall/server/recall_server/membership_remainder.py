@@ -165,8 +165,14 @@ def resume(store, row, *, settings, deadline_at):
                     and checkpoint.get("version") == 1
                     and checkpoint.get("epoch") == settings.binding_epoch
                     and isinstance(checkpoint.get("after"), str)
+                    and type(checkpoint.get("authority_generation")) is int
+                    and checkpoint["authority_generation"] > 0
                     and scope is not None
-                    and all(checkpoint.get(name) == scope[name] for name in FIELDS)
+                    and scope["authority_generation"] is not None
+                    and all(
+                        checkpoint.get(name) == scope[name]
+                        for name in FIELDS if name != "authority_generation"
+                    )
                 )
                 busy = scope is not None and any(
                     scope[name]
@@ -176,22 +182,35 @@ def resume(store, row, *, settings, deadline_at):
                         "retirement_intent",
                     )
                 )
-                if valid and not busy and first_slice:
+                generation_changed = valid and (
+                    checkpoint["authority_generation"] != scope["authority_generation"]
+                )
+                if valid and (first_slice or generation_changed):
                     # Fair retries use the existing work-order timestamp, never
                     # a reservation. Release this short queue lock before proof.
+                    updated = checkpoint
+                    if generation_changed and not busy:
+                        # A membership change invalidates the acknowledged prefix.
+                        # Keep the publication binding and reprove from the start.
+                        updated = dict(
+                            checkpoint, after="",
+                            authority_generation=scope["authority_generation"],
+                        )
                     scheduled = native._query(
                         store,
                         connection,
                         """UPDATE canonical_passage_projection_queue
-                        SET changed_at=clock_timestamp()
+                        SET changed_at=clock_timestamp(),certification_checkpoint=%s::jsonb
                         WHERE tenant_id=%s AND source_id=%s AND logical_document_id=%s
                           AND generation=%s AND reason='certification'
                           AND certification_checkpoint=%s::jsonb""",
-                        (*key(row), row["generation"], json.dumps(checkpoint)),
+                        (json.dumps(updated), *key(row), row["generation"],
+                         json.dumps(checkpoint)),
                         deadline_at,
                     )
                     if scheduled.rowcount != 1:
                         return dict(status="changed", certified_passages=certified)
+                    checkpoint = updated
                     first_slice = False
                 rows = (
                     native._query(
@@ -216,11 +235,11 @@ def resume(store, row, *, settings, deadline_at):
                     if valid and not busy
                     else []
                 )
-            if not valid or busy:
+            if not valid:
                 change_cursor(store, row, checkpoint, deadline_at=deadline_at)
-                return dict(
-                    status="busy" if busy else "changed", certified_passages=certified
-                )
+                return dict(status="changed", certified_passages=certified)
+            if busy:
+                return dict(status="busy", certified_passages=certified)
             if not rows:
                 removed = change_cursor(store, row, checkpoint, deadline_at=deadline_at)
                 return dict(
@@ -239,7 +258,7 @@ def resume(store, row, *, settings, deadline_at):
             )
             certified += outcome["certified_passages"]
             if outcome["status"] != "enrolled":
-                if outcome["status"] not in ("failed", "deadline"):
+                if outcome["status"] not in ("failed", "deadline", "busy", "changed"):
                     change_cursor(store, row, checkpoint, deadline_at=deadline_at)
                 return dict(status=outcome["status"], certified_passages=certified)
             if outcome["certified_passages"] != len(ids):

@@ -2,6 +2,7 @@
 """A committed publication retains optional native certification work across restart."""
 
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import unittest
 from unittest.mock import patch
@@ -397,7 +398,7 @@ class MembershipRemainderTests(ParentMembershipPublicationTests):
         self.assertEqual(len(observed), 4)
         self.assertEqual(len(set(observed)), 1)
 
-    def test_active_retirement_defers_once_without_archive_or_reproof(self):
+    def test_active_retirement_rotates_without_archive_or_reproof(self):
         self.interrupted_publication()
         with self.store.connect() as c:
             c.execute(
@@ -409,15 +410,119 @@ class MembershipRemainderTests(ParentMembershipPublicationTests):
                 DO UPDATE SET enabled=true,status='pending'""",
                 (self.tenant,),
             )
+        before = self.queued()
+        with self.store.connect() as c:
+            changed_at = c.execute(
+                "SELECT changed_at FROM canonical_passage_projection_queue WHERE tenant_id=%s",
+                (self.tenant,),
+            ).fetchone()["changed_at"]
         with patch.object(
             enrollment,
             "enroll_parent_passages",
             side_effect=AssertionError("busy parent"),
         ):
             outcome = self.run_cycle()
+            second = self.run_cycle()
         self.assertEqual(outcome["membership_deferred_documents"], 1)
+        self.assertEqual(second["membership_deferred_documents"], 1)
+        self.assertEqual(self.queued(), before)
+        with self.store.connect() as c:
+            self.assertGreater(c.execute(
+                "SELECT changed_at FROM canonical_passage_projection_queue WHERE tenant_id=%s",
+                (self.tenant,),
+            ).fetchone()["changed_at"], changed_at)
+
+    def test_busy_parent_rotates_behind_independent_ready_parent(self):
+        self.interrupted_publication()
+        busy = self.queued()[0]
+        with self.store.connect() as c:
+            c.execute("""INSERT INTO canonical_chunk_retirement_progress(
+                tenant_id,source_id,native_parent_id,logical_document_id,enabled,status)
+                SELECT tenant_id,source_id,native_parent_id,logical_document_id,true,'pending'
+                FROM canonical_evidence_documents WHERE tenant_id=%s""", (self.tenant,))
+        ingest = self.plane.ingest_document
+
+        def independent(**kwargs):
+            kwargs["envelope"]["native_parent_id"] = "independent-parent"
+            return ingest(**kwargs)
+
+        with patch.object(self.plane, "ingest_document", side_effect=independent):
+            self.ingest("turn/independent", "Synthetic independent parent")
+        self.projector.project_pending(
+            tenant_id=self.tenant, batch_size=10, max_batches=1, upload_concurrency=1,
+        )
+        with patch.object(enrollment, "enroll_parent_passages", side_effect=TimeoutError("hold ready proof")):
+            self.run_cycle()
+        with self.store.connect() as c:
+            c.execute("""UPDATE canonical_passage_projection_queue
+                SET changed_at=now()-interval '1 minute'
+                WHERE tenant_id=%s AND logical_document_id=%s""",
+                (self.tenant, busy["logical_document_id"]))
+        oldest = remainder.pending(self.store, tenant_id=self.tenant,
+            limit=1, deadline_at=time.monotonic()+3)[0]
+        self.assertEqual(oldest["logical_document_id"], busy["logical_document_id"])
+        self.assertEqual(remainder.resume(self.store, oldest, settings=self.settings(),
+            deadline_at=time.monotonic()+3)["status"], "busy")
+        ready = remainder.pending(self.store, tenant_id=self.tenant,
+            limit=1, deadline_at=time.monotonic()+3)[0]
+        self.assertNotEqual(ready["logical_document_id"], busy["logical_document_id"])
+        result = remainder.resume(self.store, ready, settings=self.settings(),
+            deadline_at=time.monotonic()+3)
+        self.assertEqual(result["status"], "enrolled")
+        self.assertGreater(result["certified_passages"], 0)
+        self.assertEqual(self.queued(), [busy])
+
+    def test_concurrent_publication_wins_rotation_cas(self):
+        self.interrupted_publication()
+        original = self.queued()[0]
+        query = enrollment._query
+        interleaved = []
+
+        def publish_newer():
+            self.ingest("turn/rotation-race", "Synthetic newer publication")
+            self.projector.project_pending(tenant_id=self.tenant,
+                batch_size=10, max_batches=1, upload_concurrency=1)
+
+        def before_rotation(store, connection, statement, parameters, deadline):
+            if "SET changed_at=clock_timestamp(),certification_checkpoint=" in statement and not interleaved:
+                interleaved.append(True)
+                with ThreadPoolExecutor(max_workers=1) as executor:
+                    executor.submit(publish_newer).result(timeout=10)
+            return query(store, connection, statement, parameters, deadline)
+
+        with patch.object(enrollment, "_query", side_effect=before_rotation):
+            outcome = remainder.resume(self.store, original, settings=self.settings(),
+                deadline_at=time.monotonic()+15)
+        self.assertEqual(interleaved, [True])
+        self.assertEqual(outcome["status"], "changed")
+        self.assertEqual(outcome["certified_passages"], 0)
+        with self.store.connect() as c:
+            current = c.execute("""SELECT reason,generation,certification_checkpoint
+                FROM canonical_passage_projection_queue WHERE tenant_id=%s""",
+                (self.tenant,)).fetchone()
+        self.assertEqual(current["reason"], "logical-update")
+        self.assertGreater(current["generation"], original["generation"])
+        self.assertEqual(self.run_cycle()["documents"], 1)
+
+    def test_busy_proof_outcome_keeps_acknowledged_cursor(self):
+        self.interrupted_publication()
+        before = self.queued()
+        with patch.object(enrollment, "certify_published_passages",
+                          return_value=dict(status="busy", certified_passages=0)):
+            outcome = self.run_cycle()
+        self.assertEqual(outcome["membership_deferred_documents"], 1)
+        self.assertEqual(self.queued(), before)
+        self.assertGreater(self.run_cycle()["membership_certified_passages"], 0)
         self.assertEqual(self.queued(), [])
-        self.assertEqual(self.run_cycle()["membership_deferred_documents"], 0)
+
+    def test_epoch_mismatch_is_not_rebased(self):
+        self.interrupted_publication()
+        with patch.object(enrollment, "enroll_parent_passages",
+                          side_effect=AssertionError("foreign epoch")):
+            outcome = remainder.resume(self.store, self.queued()[0],
+                settings=self.settings(epoch="synthetic-epoch-b"), deadline_at=time.monotonic()+3)
+        self.assertEqual(outcome["status"], "changed")
+        self.assertEqual(self.queued(), [])
 
     def test_partial_batch_restart_preserves_committed_prefix(self):
         self.ingest("turn/long-publication", "Synthetic evidence paragraph. " * 3000)
