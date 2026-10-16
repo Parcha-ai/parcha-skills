@@ -13,10 +13,15 @@ import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "server"))
-from recall_server.rerank import MAX_RERANK_RESPONSE_BYTES, PooledRerankTransport, RerankRuntime, RerankUnavailable
+from recall_server.rerank import (
+    MAX_RERANK_RESPONSE_BYTES, PooledRerankTransport, RerankRuntime,
+    RerankUnavailable, UrllibRerankTransport,
+)
+from recall_server.passage_retrieval import PassageHintRetrieval
 
 
 class Server(ThreadingHTTPServer):
@@ -68,7 +73,10 @@ class Handler(BaseHTTPRequestHandler):
             payload = b"x" * (MAX_RERANK_RESPONSE_BYTES + 1)
         if self.path == "/compressed":
             payload = gzip.compress(b"x" * (MAX_RERANK_RESPONSE_BYTES * 10))
-        status = 302 if self.path == "/redirect" else 429 if self.path == "/rate-limit" else 503 if self.path == "/unavailable" else 200
+        status = {"/redirect": 302, "/bad-request": 400, "/too-large": 413,
+                  "/rate-limit": 429, "/unavailable": 503}.get(self.path, 200)
+        if status != 200:
+            payload = b"private-provider-body"
         self.send_response(status)
         if self.path == "/cookie":
             self.send_header("Set-Cookie", "session=synthetic; Path=/")
@@ -145,6 +153,41 @@ class KeepaliveTest(unittest.TestCase):
                 self.assertEqual(caught.exception.code, code)
                 self.assertEqual(str(caught.exception), code)
                 self.assertEqual(len(self.server.requests), before + 1)
+        self.assertNotIn("/target", [row[0] for row in self.server.requests])
+
+    def test_http_status_reaches_diagnostics_without_changing_fallback_or_retrying(self):
+        retrieval = object.__new__(PassageHintRetrieval)
+        retrieval.store = SimpleNamespace(rerank_blend=.6, rerank_min_budget_seconds=.05)
+        pool = [{"source_id": "source", "logical_document_id": "doc", "rank": 1.,
+                 "matching_ranges": [{"passage_id": "passage"}]}]
+        legs = (("dense", 1., [{"passage_id": "passage", "text_redacted": "private-passage"}]),)
+        for transport_type in (PooledRerankTransport, UrllibRerankTransport):
+            for path, status in (("/bad-request", 400), ("/too-large", 413),
+                                 ("/rate-limit", 429), ("/unavailable", 503), ("/redirect", 302)):
+                with self.subTest(transport=transport_type.__name__, status=status):
+                    transport = transport_type()
+                    if hasattr(transport, "close"):
+                        self.addCleanup(transport.close)
+                    runtime = RerankRuntime(
+                        protocol="voyage", key_env="KEEPALIVE_TEST_KEY", transport=transport,
+                        url=f"http://127.0.0.1:{self.server.server_port}{path}",
+                    )
+                    before = len(self.server.requests)
+                    output, diagnostics = retrieval._rerank_fused(
+                        "private-query", pool, legs, runtime=runtime,
+                        deadline_at=time.monotonic() + 5, arm_elapsed_ms={},
+                    )
+                    self.assertIs(output, pool)
+                    self.assertEqual(len(self.server.requests), before + 1)
+                    self.assertEqual(diagnostics["rerank_status"], "unavailable")
+                    self.assertEqual(diagnostics["rerank_error"],
+                                     "rerank_redirect_refused" if status == 302 else "rerank_http_status")
+                    self.assertEqual(diagnostics["rerank_http_status"], status)
+                    self.assertIs(type(diagnostics["rerank_http_status"]), int)
+                    serialized = json.dumps(diagnostics)
+                    for private in ("private-provider-body", "private-passage", "private-query",
+                                    "synthetic-first", "Authorization", "Retry-After", "Location"):
+                        self.assertNotIn(private, serialized)
         self.assertNotIn("/target", [row[0] for row in self.server.requests])
 
     def test_header_and_body_stalls_obey_per_call_timeout_without_retry(self):
