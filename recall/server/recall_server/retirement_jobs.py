@@ -186,22 +186,14 @@ class RenderJob:
         )
         service = read(self.base)
         _check(service.get("autoDeploy") == "no", "auto_deploy_enabled")
-        cursor, seen = None, set()
-        while True:
-            query = {"limit": 100}
-            if cursor:
-                query["cursor"] = cursor
+        # Render filters jobs by status. Any returned row blocks, including
+        # terminal rows from an ignored filter; no later page could admit us.
+        for status in ("pending", "running"):
+            query = {"limit": 100, "status": status}
             jobs = read(self.base + "/jobs?" + urllib.parse.urlencode(query))
-            _check(
-                all(row.get("job", row).get("status") in TERMINAL for row in jobs),
-                "active_job",
-            )
-            if len(jobs) < 100:
-                break
-            cursor = jobs[-1].get("cursor")
-            _check(cursor and cursor not in seen, "job_cursor")
-            seen.add(cursor)
-        checkpoint = self.guard()  # No stale health after paginating the job inventory.
+            _check(isinstance(jobs, list), "job_inventory_shape")
+            _check(not jobs, "active_job")
+        checkpoint = self.guard()  # No stale health after checking the job inventory.
         deployment = read(self.base + "/deploys?limit=1")[0]["deploy"]
         _check(
             deployment["status"] == "live"

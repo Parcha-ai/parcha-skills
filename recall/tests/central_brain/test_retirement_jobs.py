@@ -208,7 +208,7 @@ class JobTests(unittest.TestCase):
                 raise AssertionError("expired preflight launched a job")
             if path.endswith("deploys?limit=1"):
                 return [{"deploy": {"status": "live", "commit": {"id": "commit"}}}]
-            if path.endswith("jobs?limit=100"):
+            if path.startswith("/services/service/jobs?"):
                 return []
             return {"autoDeploy": "no", "ownerId": "owner"}
 
@@ -240,7 +240,7 @@ class JobTests(unittest.TestCase):
                 raise TimeoutError()
             if path.endswith("deploys?limit=1"):
                 return [{"deploy": {"status": "live", "commit": {"id": "commit"}}}]
-            if path.endswith("jobs?limit=100"):
+            if path.startswith("/services/service/jobs?"):
                 return []
             return {"autoDeploy": "no", "ownerId": "owner"}
 
@@ -267,7 +267,7 @@ class JobTests(unittest.TestCase):
                 return dict(id="job", createdAt="now", status="pending")
             if path.endswith("deploys?limit=1"):
                 return [{"deploy": {"status": "live", "commit": {"id": "commit"}}}]
-            if path.endswith("jobs?limit=100"):
+            if path.startswith("/services/service/jobs?"):
                 return []
             if path.endswith("jobs/job"):
                 terminal = True
@@ -289,6 +289,81 @@ class JobTests(unittest.TestCase):
         self.assertEqual(sum(method == "POST" for method, _ in calls), 1)
 
 
+class ActiveInventoryTests(unittest.TestCase):
+    def transport(self, inventories):
+        self.calls, self.events = [], []
+        self.guard = Mock(return_value={})
+
+        def request(method, path, body=None):
+            self.calls.append((method, path))
+            if method == "POST":
+                self.assertEqual(self.events[-1][0], "launch_intent")
+                return dict(id="job", createdAt="start", status="pending")
+            if path.endswith("deploys?limit=1"):
+                return [{"deploy": {"status": "live", "commit": {"id": "commit"}}}]
+            if path.startswith("/services/service/jobs?"):
+                query = urllib.parse.parse_qs(urllib.parse.urlsplit(path).query)
+                self.assertEqual(set(query), {"limit", "status"})
+                self.assertEqual(query["limit"], ["100"])
+                self.assertIn(query["status"], [["pending"], ["running"]])
+                return inventories[query["status"][0]]
+            if path.endswith("jobs/job"):
+                return dict(id="job", status="succeeded")
+            if path.startswith("/logs?"):
+                return dict(hasMore=False, logs=[
+                    dict(message=json.dumps(row)) for row in encode_result({"ok": True}, "pin")
+                ])
+            return dict(autoDeploy="no", ownerId="owner")
+
+        return RenderJob(dict(service_id="service", commit="commit"),
+                         request=request, guard=self.guard)
+
+    def test_empty_active_queries_admit_without_reading_terminal_history(self):
+        transport = self.transport(dict(
+            pending=[], running=[],
+            succeeded=[dict(job=dict(id=f"done-{i}", status="succeeded")) for i in range(300)],
+            failed=[dict(job=dict(id=f"failed-{i}", status="failed")) for i in range(300)],
+        ))
+        self.assertEqual(transport.run("pass", "pin", lambda *e: self.events.append(e)), {"ok": True})
+        inventory = [path for method, path in self.calls if "jobs?" in path]
+        self.assertEqual(len(inventory), 2)
+        self.assertEqual([urllib.parse.parse_qs(urllib.parse.urlsplit(path).query)["status"]
+                          for path in inventory], [["pending"], ["running"]])
+        self.assertEqual(sum(method == "POST" for method, _ in self.calls), 1)
+        self.assertEqual(self.guard.call_count, 2)
+        self.assertEqual(sum(path.endswith("deploys?limit=1") for _, path in self.calls), 2)
+
+    def test_pending_or_running_row_with_cursor_blocks_before_intent(self):
+        for status in ("pending", "running"):
+            with self.subTest(status=status):
+                values = dict(pending=[], running=[])
+                values[status] = [dict(job=dict(id="busy", status=status), cursor="more")]
+                transport = self.transport(values)
+                with self.assertRaisesRegex(ValueError, "active_job"):
+                    transport.run("pass", "pin", lambda *e: self.events.append(e))
+                self.assertFalse(self.events)
+                self.assertFalse(any(method == "POST" for method, _ in self.calls))
+                self.assertFalse(any("cursor=" in path for _, path in self.calls))
+
+    def test_ignored_filter_returning_terminal_history_fails_closed(self):
+        for status in ("succeeded", "failed", "canceled"):
+            with self.subTest(status=status):
+                transport = self.transport(dict(pending=[dict(job=dict(id="old", status=status))], running=[]))
+                with self.assertRaises(ValueError):
+                    transport.run("pass", "pin", lambda *e: self.events.append(e))
+                self.assertFalse(self.events)
+                self.assertFalse(any(method == "POST" for method, _ in self.calls))
+
+    def test_malformed_inventory_fails_closed(self):
+        for invalid in ({}, {"jobs": []}, None, "", False, [None], [{}]):
+            with self.subTest(invalid=invalid):
+                transport = self.transport(dict(pending=invalid, running=[]))
+                with self.assertRaises(ValueError):
+                    transport.run("pass", "pin", lambda *e: self.events.append(e))
+                self.assertFalse(self.events)
+                self.assertFalse(any(method == "POST" for method, _ in self.calls))
+
+
 
 class AvailabilityTests(unittest.TestCase):
     def transport(self, snapshots, *, status_seconds=0, log_seconds=0):
@@ -299,7 +374,7 @@ class AvailabilityTests(unittest.TestCase):
                 return dict(id="job", createdAt="start", status="pending")
             if path.endswith("deploys?limit=1"):
                 return [{"deploy": {"status": "live", "commit": {"id": "commit"}}}]
-            if path.endswith("jobs?limit=100"):
+            if path.startswith("/services/service/jobs?"):
                 return []
             if path.endswith("jobs/job"):
                 self.now += status_seconds
