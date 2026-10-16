@@ -70,8 +70,8 @@ class RetirementStore:
         # No caller can obtain the pool until optional-schema validation passes.
         self.pool = pool
 
-    def connect(self):
-        return self.pool.connection()
+    def connect(self, *, timeout=None):
+        return self.pool.connection(timeout=timeout)
 
     def close(self):
         self.pool.close(timeout=2)

@@ -507,8 +507,10 @@ def run_retirement(
     parent_limits_for=None,
     metadata_mode="keep",
     failure_diagnostic=None,
+    membership_certification=None,
 ):
     """Sequential enabled-only maintenance; bounded selected proofs within each claim."""
+    from .parent_membership_enrollment import CertificationSettings
     limits = RunnerLimits() if limits is None else limits
     parent_limits = ParentRetirementLimits() if parent_limits is None else parent_limits
     if (
@@ -523,6 +525,8 @@ def run_retirement(
         and not callable(before_parent)
         or parent_limits_for is not None
         and not callable(parent_limits_for)
+        or membership_certification is not None
+        and not isinstance(membership_certification, CertificationSettings)
     ):
         _invalid()
     deadline_at = _parent_deadline(deadline_at)
@@ -551,6 +555,10 @@ def run_retirement(
         metadata_capture_ms=0.0,
         **{field: 0 for field in CAPTURE_DETAIL_FIELDS},
         commit_outcome_unknown=False,
+        membership_certified_passages=0,
+        membership_failed_parents=0,
+        membership_deferred_parents=0,
+        membership_elapsed_ms=0,
     )
     errors, excluded, attempted = Counter(), Counter(), []
     for _ in range(limits.max_parents):
@@ -632,6 +640,31 @@ def run_retirement(
             report["partial_parents"] += int(not result["complete"])
             report["eligible_documents"] += result.get("eligible_documents", 0)
             excluded.update(result.get("excluded", {}))
+            if (result["complete"] and metadata_mode == "singleton"
+                    and membership_certification is not None
+                    and membership_certification.enabled):
+                # The native owner has committed and released all retirement
+                # locks. Final no-op tails also need to repair certificates
+                # invalidated by earlier windows. Never certify every window.
+                from .parent_membership_enrollment import certify_retired_parent
+                certification_started = time.monotonic()
+                try:
+                    certified = certify_retired_parent(store,
+                        tenant_id=key[0], source_id=key[1], native_parent_id=key[2],
+                        logical_document_id=candidate["manifest"]["logical_document_id"],
+                        principal_id=scope.principal_id, settings=membership_certification,
+                        deadline_at=min(deadline_at, certification_started + 3),
+                        should_stop=should_stop)
+                    report["membership_certified_passages"] += certified["certified_passages"]
+                    if certified["status"] == "failed":
+                        report["membership_failed_parents"] += 1
+                    elif certified["status"] != "enrolled":
+                        report["membership_deferred_parents"] += 1
+                except Exception:
+                    report["membership_failed_parents"] += 1
+                finally:
+                    report["membership_elapsed_ms"] += round(
+                        (time.monotonic() - certification_started) * 1000)
         except ChunkRetirementError as error:
             report["failed_parents"] += 1
             errors[error.error_code] += 1
