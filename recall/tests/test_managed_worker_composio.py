@@ -75,6 +75,7 @@ class ManagedWorkerComposioTests(unittest.TestCase):
                 "parquet_shards": 1,
                 "parquet_rows": 13,
                 "parquet_stale": 0,
+                "parquet_failed": 0,
                 "parquet_fragments_rewritten": 0,
                 "parquet_fragments_total": 0,
                 "parquet_documents_dirty": 0,
@@ -96,6 +97,18 @@ class ManagedWorkerComposioTests(unittest.TestCase):
         self.assertEqual(passages.project_calls[0]["concurrency"], 4)
         self.assertEqual(passages.embed_calls[0]["batch_size"], 100)
         self.assertEqual(scan.calls[0]["tenant_id"], None)
+
+    def test_managed_scan_failure_preserves_known_work_and_reports_pending(self):
+        scan = FakeScanProjector()
+        with patch.object(scan, "project_pending", return_value={
+            "status": "pending", "failed": 1, "shards": 1, "rows": 13, "stale": 0,
+        }):
+            result = _run_projection_cycle(FakeLogicalProjector(), FakePassageProjector(), scan)
+        self.assertEqual(result["status"], "pending")
+        self.assertEqual(result["parquet_failed"], 1)
+        self.assertEqual(result["parquet_shards"], 1)
+        self.assertEqual(result["parquet_rows"], 13)
+        self.assertEqual(result["logical_documents"], 2)
 
     def test_private_root_normalizes_provider_mount_mode_without_following_links(
         self,

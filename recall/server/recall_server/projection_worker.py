@@ -33,6 +33,7 @@ PROJECTION_TOTALS: dict[str, int] = {
     "documents_projected": 0,
     "passages_embedded": 0,
     "parquet_rows_written": 0,
+    "parquet_failed": 0,
     "search_plane_rows_written": 0,
     "bodies_thinned": 0,
     "retirement_cleared_documents": 0,
@@ -55,6 +56,7 @@ _CYCLE_TO_TOTAL = {
     "passage_documents": "documents_projected",
     "embedded": "passages_embedded",
     "parquet_rows": "parquet_rows_written",
+    "parquet_failed": "parquet_failed",
     "search_plane_rows": "search_plane_rows_written",
     "canonical_bodies_thinned": "bodies_thinned",
     "retirement_cleared_documents": "retirement_cleared_documents",
@@ -617,6 +619,7 @@ def run_projection_worker(
                 "parquet_stale": int(scanned["stale"]),
                 "parquet_contended": int(scanned["contended"]),
                 "parquet_requeued": int(scanned.get("requeued", 0)),
+                "parquet_failed": int(scanned.get("failed", 0)),
                 "parquet_fragments_rewritten": int(scanned.get("fragments_rewritten", 0)),
                 "parquet_fragments_total": int(scanned.get("fragments_total", 0)),
                 "parquet_documents_dirty": int(scanned.get("documents_dirty", 0)),
@@ -689,7 +692,7 @@ def run_projection_worker(
                 "embedding_error=%s "
                 "parquet_shards=%s "
                 "parquet_rows=%s parquet_stale=%s parquet_contended=%s "
-                "parquet_requeued=%s "
+                "parquet_requeued=%s parquet_failed=%s "
                 "parquet_fragments_rewritten=%s parquet_fragments_total=%s "
                 "parquet_documents_dirty=%s "
                 "search_plane_months=%s search_plane_rows=%s "
@@ -742,6 +745,7 @@ def run_projection_worker(
                         "parquet_stale",
                         "parquet_contended",
                         "parquet_requeued",
+                        "parquet_failed",
                         "parquet_fragments_rewritten",
                         "parquet_fragments_total",
                         "parquet_documents_dirty",
