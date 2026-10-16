@@ -491,5 +491,165 @@ class AvailabilityTests(unittest.TestCase):
         self.assertEqual(self.now, 0)
 
 
+class PaginationTests(unittest.TestCase):
+    start = "2026-10-16T00:00:00+00:00"
+    middle = "2026-10-16T00:00:01+00:00"
+
+    def transport(self, pages, **kwargs):
+        transport = AvailabilityTests.transport(self, pages, **kwargs)
+        request = transport.request
+        self.queries = []
+
+        def page_request(method, path, body=None):
+            value = request(method, path, body)
+            if isinstance(value, dict) and "createdAt" in value:
+                value = dict(value, createdAt=self.start)
+            if path.startswith("/logs?"):
+                query = dict(urllib.parse.parse_qsl(path.split("?", 1)[1]))
+                self.queries.append(query)
+                if isinstance(value, dict) and value.get("hasMore") is True:
+                    value = dict(value)
+                    value.setdefault("nextStartTime", self.middle)
+                    value.setdefault("nextEndTime", query["endTime"])
+            return value
+
+        transport.request = page_request
+        return transport
+
+    def rows(self, pin="pin"):
+        return [dict(id=str(n), timestamp=self.middle, message=json.dumps(frame))
+                for n, frame in enumerate(encode_result({"ok": True}, pin))]
+
+    def test_overlapping_pages_keep_original_job_and_single_post(self):
+        rows = self.rows()
+        transport = self.transport([dict(hasMore=True, logs=rows[:1]), dict(hasMore=False, logs=rows)])
+        self.assertEqual(transport.run("pass", "pin", Mock()), {"ok": True})
+        self.assertEqual(self.log_reads, 2)
+        self.assertEqual(sum(method == "POST" for method, _ in self.calls), 1)
+        self.assertEqual(self.queries[0]["startTime"], self.start)
+        self.assertEqual(self.queries[1]["startTime"], self.middle)
+        self.assertEqual(self.queries[0]["endTime"], self.queries[1]["endTime"])
+        for query in self.queries:
+            self.assertEqual({k: v for k, v in query.items() if k not in ("startTime", "endTime")},
+                             dict(ownerId="owner", resource="job", type="app", direction="forward", limit="1000"))
+
+    def test_reconcile_paginates_without_launch_or_poll(self):
+        rows = self.rows()
+        transport = self.transport([dict(hasMore=True, logs=rows[:1]), dict(hasMore=False, logs=rows[1:])])
+        self.assertEqual(transport.reconcile("job", "pin", "owner", Mock()), {"ok": True})
+        self.assertTrue(all(method == "GET" for method, _ in self.calls))
+        self.assertEqual(self.log_reads, 2)
+        self.assertEqual(self.now, 0)
+
+    def test_nanosecond_cursor_progress_is_not_a_repeated_window(self):
+        rows = self.rows()
+        transport = self.transport([
+            dict(hasMore=True, logs=rows[:1], nextStartTime="2026-10-16T00:00:00.000000001Z"),
+            dict(hasMore=True, logs=[], nextStartTime="2026-10-16T00:00:00.000000002Z"),
+            dict(hasMore=False, logs=rows[1:]),
+        ])
+        self.assertEqual(transport.reconcile("job", "pin", "owner", Mock()), {"ok": True})
+        self.assertEqual(self.log_reads, 3)
+
+    def test_nanosecond_upper_bound_escape_refuses(self):
+        from datetime import datetime
+        from recall_server import retirement_jobs as jobs
+        class FixedTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return cls(2026, 10, 16, 0, 0, 2, tzinfo=tz)
+        transport = self.transport([dict(hasMore=True, logs=[], nextEndTime="2026-10-16T00:00:02.000000001Z")])
+        with patch.object(jobs, "datetime", FixedTime), self.assertRaisesRegex(ValueError, "logs_window"):
+            transport.reconcile("job", "pin", "owner", Mock())
+        self.assertEqual(self.log_reads, 1)
+
+    def test_narrowed_window_changes_only_provider_time_parameters(self):
+        rows = self.rows()
+        end = "2026-10-16T00:00:02+00:00"
+        transport = self.transport([dict(hasMore=True, logs=rows[:1], nextEndTime=end),
+                                    dict(hasMore=False, logs=rows[1:])])
+        self.assertEqual(transport.reconcile("job", "pin", "owner", Mock()), {"ok": True})
+        self.assertEqual(self.queries[1], dict(self.queries[0], startTime=self.middle, endTime=end))
+
+    def test_conflicting_duplicate_identity_refuses(self):
+        rows = self.rows()
+        changed = dict(rows[0], message=rows[0]["message"] + " ")
+        transport = self.transport([dict(hasMore=True, logs=rows[:1]), dict(hasMore=False, logs=[changed, rows[-1]])])
+        with self.assertRaisesRegex(ValueError, "logs_duplicate_conflict"):
+            transport.run("pass", "pin", lambda *event: self.events.append(event))
+        self.assertFalse(any(name == "verified_job_result" for name, _ in self.events))
+
+    def test_repeated_or_escaped_window_refuses(self):
+        for window in (
+            dict(nextStartTime=self.start), dict(nextStartTime="2026-10-16T01:00:00.000000000+01:00"),
+            dict(nextStartTime="2026-10-15T00:00:00Z"),
+            dict(nextEndTime="2099-01-01T00:00:00Z"), dict(nextStartTime="bad"),
+            dict(nextStartTime="2026-10-16T00:00:01"),
+        ):
+            with self.subTest(window=window):
+                transport = self.transport([dict(hasMore=True, logs=[], **window)])
+                with self.assertRaisesRegex(ValueError, "logs_window"):
+                    transport.reconcile("job", "pin", "owner", Mock())
+                self.assertEqual(self.log_reads, 1)
+        transport = self.transport([dict(hasMore=True, logs=[])])
+        with self.assertRaisesRegex(ValueError, "logs_window"):
+            transport.reconcile("job", "pin", "owner", Mock())
+        self.assertEqual(self.log_reads, 2)
+
+    def test_paginated_partial_snapshot_is_not_merged_with_later_snapshot(self):
+        rows = self.rows()
+        transport = self.transport([dict(hasMore=True, logs=rows[:1]), dict(hasMore=False, logs=[]),
+                                    dict(hasMore=False, logs=rows[1:])])
+        with self.assertRaisesRegex(ValueError, "remote_result_unavailable_before_deadline"):
+            transport.run("pass", "pin", Mock())
+        self.assertEqual(sum(method == "POST" for method, _ in self.calls), 1)
+        self.assertGreater(self.log_reads, 2)
+
+    def test_each_page_reserves_deadline_and_refuses_late_response(self):
+        for status_seconds, log_seconds, reads in ((290, 31, 1), (270, 45, 2)):
+            with self.subTest(status_seconds=status_seconds):
+                rows = self.rows()
+                transport = self.transport([dict(hasMore=True, logs=rows[:1]), dict(hasMore=False, logs=rows[1:])],
+                                           status_seconds=status_seconds, log_seconds=log_seconds)
+                with self.assertRaisesRegex(ValueError, "remote_result_unavailable_before_deadline"):
+                    transport.run("pass", "pin", Mock())
+                self.assertEqual(self.log_reads, reads)
+        transport = self.transport([dict(hasMore=True, logs=[])], log_seconds=51)
+        with self.assertRaisesRegex(ValueError, "remote_result_unavailable_before_deadline"):
+            transport.reconcile("job", "pin", "owner", Mock())
+        self.assertEqual(self.log_reads, 1)
+
+    def test_missing_identity_does_not_hide_duplicate_frame(self):
+        rows = [dict(message=row["message"]) for row in self.rows()]
+        transport = self.transport([dict(hasMore=True, logs=rows[:1]), dict(hasMore=False, logs=rows)])
+        with self.assertRaisesRegex(ValueError, "remote_result_parts"):
+            transport.reconcile("job", "pin", "owner", Mock())
+
+    def test_wrong_pin_after_pagination_stays_refused(self):
+        rows = self.rows(pin="wrong")
+        transport = self.transport([dict(hasMore=True, logs=rows[:1]), dict(hasMore=False, logs=rows[1:])])
+        with self.assertRaisesRegex(ValueError, "wrong_pin"):
+            transport.reconcile("job", "pin", "owner", Mock())
+
+    def test_bounds_and_malformed_pages_refuse(self):
+        from recall_server import retirement_jobs as jobs
+        for field, bound, pages in (
+            ("LOG_MAX_ROWS", 1, [dict(hasMore=False, logs=self.rows())]),
+            ("LOG_MAX_BYTES", 1, [dict(hasMore=False, logs=[dict(message="ordinary log")])]),
+            ("LOG_MAX_PAGES", 1, [dict(hasMore=True, logs=[])]),
+        ):
+            with self.subTest(field=field), patch.object(jobs, field, bound):
+                transport = self.transport(pages)
+                with self.assertRaisesRegex(ValueError, "logs_bound"):
+                    transport.reconcile("job", "pin", "owner", Mock())
+                self.assertEqual(self.log_reads, 1)
+        for page in (dict(hasMore=False), dict(hasMore=False, logs=None), dict(hasMore=False, logs=[None]),
+                     dict(hasMore=False, logs=[dict(message=42)]), dict(hasMore=0, logs=[])):
+            with self.subTest(page=page):
+                transport = self.transport([page])
+                with self.assertRaisesRegex(ValueError, "logs_shape"):
+                    transport.reconcile("job", "pin", "owner", Mock())
+
+
 if __name__ == "__main__":
     unittest.main()
