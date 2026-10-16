@@ -83,7 +83,7 @@ class PassagePhaseTimingTest(unittest.TestCase):
         with patch("recall_server.passage_index.time", projector.store.clock):
             return projector.project_pending(concurrency=1, **kwargs)
 
-    def test_legacy_hooks_share_lazy_window_across_parents_and_remainder(self):
+    def test_legacy_hooks_share_active_allowance_across_parents_and_remainder(self):
         from recall_server import membership_remainder, parent_membership_enrollment
 
         class Legacy(Projector):
@@ -105,10 +105,10 @@ class PassagePhaseTimingTest(unittest.TestCase):
         def certify(*args, **kwargs):
             # Pool warmup and source preparation took ten seconds before the
             # first optional hook. They must not consume its three seconds.
-            self.assertEqual(projector.store.clock.value, 10)
-            self.assertEqual(kwargs["deadline_at"], 13)
+            self.assertEqual(projector.store.clock.value, 10 if not deadlines else 21)
+            self.assertEqual(kwargs["deadline_at"], 13 if not deadlines else 22)
             deadlines.append(kwargs["deadline_at"])
-            projector.store.clock.advance(2)
+            projector.store.clock.advance(2 if len(deadlines) == 1 else 1)
             return dict(status="enrolled", certified_passages=1)
 
         with (
@@ -117,9 +117,9 @@ class PassagePhaseTimingTest(unittest.TestCase):
         ):
             result = self.run_projector(projector, batch_size=1, max_batches=2)
         self.assertEqual(result["documents"], 2)
-        self.assertEqual(deadlines, [13])
-        self.assertEqual(result["membership_certified_passages"], 1)
-        self.assertEqual(result["membership_deferred_documents"], 1)
+        self.assertEqual(deadlines, [13, 22])
+        self.assertEqual(result["membership_certified_passages"], 2)
+        self.assertEqual(result["membership_deferred_documents"], 0)
         self.assertEqual(result["membership_failed_documents"], 0)
         pending.assert_not_called()
 

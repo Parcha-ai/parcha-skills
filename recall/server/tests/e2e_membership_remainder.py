@@ -12,6 +12,58 @@ from e2e_passage_receipt_repair import Repair
 
 
 class MembershipRemainderTests(ParentMembershipPublicationTests):
+    def test_empty_early_queue_does_not_spend_proof_budget_during_source_work(self):
+        from recall_server.projection_worker import run_projection_worker
+
+        publisher = self.publisher()
+        self.assertEqual(self.queued(), [])
+        test = self
+
+        class Logical:
+            def project_pending(self, **kwargs):
+                # The initial publication callback found no optional work.
+                # Real source work can take longer than the proof allowance.
+                time.sleep(10)
+                test.queue()
+                kwargs["on_progress"]()
+                return dict(status="complete", documents=1, records=1,
+                            batches=1, pending=0, pruned=0, cleanup_failures=0)
+
+        outcome = run_projection_worker(
+            Logical(), publisher, tenant_id=self.tenant,
+            logical_batch_size=1, passage_batch_size=1, embedding_batch_size=1,
+            max_batches_per_cycle=1, upload_concurrency=1, passage_concurrency=1,
+            interval_seconds=1, once=True, skip_embedding=True,
+        )
+        self.assertEqual(outcome["passage_documents"], 1)
+        self.assertGreater(outcome["membership_certified_passages"], 0)
+        self.assertEqual(self.queued(), [])
+        self.refresh_scope()
+        self.assertEqual(self.compare()["certified_passages"], len(self.scope["passage_ids"]))
+
+    def test_busy_optional_lease_never_blocks_committed_source_publication(self):
+        from recall_server.passage_index import CertificationBudget
+
+        self.queue()
+        budget = CertificationBudget()
+        with budget.lease() as deadline:
+            self.assertIsNotNone(deadline)
+            outcome = self.publisher().project_pending(
+                tenant_id=self.tenant, batch_size=1, max_batches=1,
+                concurrency=1, certification_budget=budget)
+            self.assertEqual(outcome["documents"], 1)
+            self.assertEqual(outcome["membership_certified_passages"], 0)
+            self.assertEqual(outcome["membership_failed_documents"], 0)
+            self.assertEqual(len(self.queued()), 1)
+            self.refresh_scope()
+            current = self.compare()
+            self.assertEqual(current["certified_passages"], 0)
+            self.assertEqual(current["native_allowed_passages"], len(self.scope["passage_ids"]))
+        resumed = self.run_cycle()
+        self.assertEqual(resumed["documents"], 0)
+        self.assertGreater(resumed["membership_certified_passages"], 0)
+        self.assertEqual(self.queued(), [])
+
     def test_worker_callbacks_share_certification_window_and_keep_source_progress(self):
         from recall_server.projection_worker import run_projection_worker
 
