@@ -385,6 +385,10 @@ def collapse_document_candidates(
                 value["_temporal_boost"] = factor
     if source_boost is not None:
         prefixes, factor = source_boost
+        # Managed Slack installations use the connector ID namespace; legacy
+        # collectors use slack:. Keep both under the same source hint.
+        if "slack:" in prefixes:
+            prefixes = (*prefixes, "source:slack.messages:")
         # Same floor as the window boost: a document only one arm saw sits
         # at 0.0 and a multiply alone could not move it.
         positive = [value["_score"] for value in documents.values() if value["_score"] > 0.0]

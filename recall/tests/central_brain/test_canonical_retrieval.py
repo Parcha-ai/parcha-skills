@@ -2843,6 +2843,60 @@ class RankAlignedUnionTests(unittest.TestCase):
 
 
 class SourceHintTests(unittest.TestCase):
+    def test_slack_hint_matches_managed_and_legacy_ids_without_cross_source_boosts(self):
+        from recall_server.passage_retrieval import collapse_document_candidates, parse_source_hint
+        from tests.central_brain.test_passage_fusion import candidate
+        source_ids = (
+            "source:slack.messages:synthetic-workspace", "slack:synthetic-workspace",
+            "source:google.gmail:synthetic-mail", "source:portable.slack:synthetic",
+            "source:slack.messages-extra:synthetic", "source:slack.messages",
+            "codex:linux:synthetic", "claude:linux:synthetic", "cowork:mac:synthetic",
+        )
+        rows = [candidate(str(index), "dense", 1.0 - index / 20)
+                for index in range(len(source_ids))]
+        for row, source_id in zip(rows, source_ids, strict=True):
+            row["source_id"] = source_id
+        legs = (("dense", 1.0, rows),)
+        for query, expected in (
+            ("in Slack what did we decide", set(source_ids[:2])),
+            ("in Codex what did we decide", {source_ids[6]}),
+            ("in Claude Code what did we decide", {source_ids[7]}),
+            ("in Cowork what did we decide", {source_ids[8]}),
+            ("across Slack and Codex sessions", {*source_ids[:2], source_ids[6]}),
+        ):
+            with self.subTest(query=query):
+                result = collapse_document_candidates(
+                    legs, limit=20, source_boost=(parse_source_hint(query), 1.5),
+                )
+                self.assertEqual({row["source_id"] for row in result}, set(source_ids))
+                self.assertEqual({row["source_id"] for row in result if "source_boost" in row}, expected)
+
+    def test_search_boosts_managed_slack_and_off_restores_original_order(self):
+        from tests.central_brain.test_passage_fusion import candidate
+        store = RerankWiringTests._Store()
+        store.source_hints = True
+        store.query_clauses = False
+        source_ids = ["source:google.gmail:synthetic", "source:slack.messages:synthetic"]
+        retrieval = PassageHintRetrieval(
+            store, tenant_id="tenant:test", sources=source_ids, policy_fingerprint="fp-policy",
+        )
+        dense = [candidate("a", "dense", .9), candidate("b", "dense", .8)]
+        for row, source_id in zip(dense, source_ids, strict=True):
+            row["source_id"] = source_id
+        retrieval._dense_candidates = lambda query, vector=None, **kwargs: (dense, "ok", "prose-pool", 10)
+        retrieval._embed_query = lambda text: [0.0]
+        retrieval._lexical_candidates = lambda query, **kwargs: ([], "ok")
+        retrieval._sparse_candidates = lambda query, original_query=None, **kwargs: ([], "skipped-prose-query")
+        kwargs = dict(lexical_query="retry decision", since=None, until=None, limit=10)
+        response = retrieval.search("What did we decide in Slack about retries?", **kwargs)
+        self.assertEqual(response["diagnostics"]["source_hint"], {"families": ["slack"], "boost": 1.5})
+        self.assertEqual(response["diagnostics"]["source_boosted"], 1)
+        self.assertEqual(response["results"][0]["source_id"], source_ids[1])
+        store.source_hints = False
+        response = retrieval.search("What did we decide in Slack about retries?", **kwargs)
+        self.assertNotIn("source_hint", response["diagnostics"])
+        self.assertEqual(response["results"][0]["source_id"], source_ids[0])
+
     def test_parser_names_the_harness_family(self) -> None:
         from recall_server.passage_retrieval import parse_source_hint
         self.assertEqual(parse_source_hint("In the Codex work, what was the root cause?"), ("codex:",))
