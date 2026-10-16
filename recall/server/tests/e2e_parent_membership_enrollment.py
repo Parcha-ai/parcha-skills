@@ -22,7 +22,7 @@ class ParentEnrollmentTests(SingletonSearchTests):
         with self.store.connect() as c:
             self.ids=tuple(row['passage_id'] for row in c.execute('SELECT passage_id FROM canonical_passages WHERE tenant_id=%s ORDER BY passage_id',(self.tenant,)).fetchall())
         self.scope=dict(tenant_id=self.tenant,principal_id=self.principal,source_id=self.source,
-                        native_parent_id='session',passage_ids=self.ids,
+                        native_parent_id='session',passage_ids=self.ids,binding_epoch='synthetic-epoch-a',
                         limits=dict(passages=32,receipt_references=1000,metadata_bytes=1024*1024))
 
     def enroll(self):

@@ -16,6 +16,7 @@ from typing import Any, Callable, Iterable, Iterator
 
 import psycopg
 
+from . import parent_membership_enrollment
 from .logical_evidence import (
     LogicalEvidenceError,
     LogicalEvidenceProjectionStore,
@@ -442,6 +443,7 @@ class CanonicalPassageProjector:
         *,
         policy: PassagePolicy,
         bound_tenant_id: str | None = None,
+        membership_certification: parent_membership_enrollment.CertificationSettings | None = None,
     ) -> None:
         if bound_tenant_id is not None and (
             not isinstance(bound_tenant_id, str)
@@ -455,6 +457,9 @@ class CanonicalPassageProjector:
         self.logical_projection = logical_projection
         self.policy = policy
         self.bound_tenant_id = bound_tenant_id
+        self.membership_certification = (membership_certification
+            if membership_certification is not None
+            else parent_membership_enrollment.CertificationSettings.from_env())
         self._prefer_notification_admission = False
         # Separate history/recent turns; fixed-size process-local state. Advance
         # on admission, so an unavailable source cannot retain the first turn.
@@ -1910,6 +1915,7 @@ class CanonicalPassageProjector:
         started = time.monotonic()
         documents = passages = stale = requeued = unavailable = batches = 0
         deleted = retained = 0
+        membership_certified = membership_failed = membership_deferred = 0
         while batches < max_batches:
             phase_started = time.monotonic()
             candidates = self._pending(
@@ -1946,7 +1952,27 @@ class CanonicalPassageProjector:
                         # _commit has rolled back and released its locks. Keep
                         # the unchanged queue for retry without aborting siblings.
                         status = {"status": "stale"}
-                return status, preparation_elapsed, time.monotonic() - commit_started
+                commit_elapsed = time.monotonic() - commit_started
+                should_certify = (status['status'] == 'committed'
+                                  and self.membership_certification.enabled)
+                passage_ids = (tuple(passage.passage_id for passage in prepared.passages)
+                               if should_certify else ())
+                del prepared
+                if should_certify:
+                    try:
+                        certification = parent_membership_enrollment.certify_published_passages(
+                            self.store, tenant_id=candidate.tenant_id, source_id=candidate.source_id,
+                            logical_document_id=candidate.logical_document_id, passage_ids=passage_ids,
+                            settings=self.membership_certification, deadline_at=time.monotonic()+3)
+                        status['membership_certified'] = certification['certified_passages']
+                        status['membership_failed'] = int(certification['status'] == 'failed')
+                        status['membership_deferred'] = int(
+                            certification['status'] not in {'enrolled', 'failed'})
+                    except Exception:
+                        # Publication and its queue ACK have committed. Optional
+                        # proof failure must never replay publication or ingest.
+                        status['membership_failed'] = 1
+                return status, preparation_elapsed, commit_elapsed
 
             requeued_in_batch = unavailable_in_batch = 0
             with ThreadPoolExecutor(
@@ -1980,6 +2006,9 @@ class CanonicalPassageProjector:
                             if status["status"] == "stale":
                                 stale += 1
                                 continue
+                            membership_certified += int(status.get('membership_certified', 0))
+                            membership_failed += int(status.get('membership_failed', 0))
+                            membership_deferred += int(status.get('membership_deferred', 0))
                             documents += 1
                             passages += int(status["inserted"])
                             deleted += int(status["deleted"])
@@ -2017,6 +2046,9 @@ class CanonicalPassageProjector:
         return {
             "status": "complete" if int(pending) == 0 else "pending",
             "documents": documents,
+            "membership_certified_passages": membership_certified,
+            "membership_failed_documents": membership_failed,
+            "membership_deferred_documents": membership_deferred,
             "passages": passages,
             "inserted": passages,
             "deleted": deleted,
