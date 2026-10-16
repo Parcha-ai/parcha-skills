@@ -96,6 +96,7 @@ print(json.dumps({'status':'complete','cleared_documents':3,'cleared_utf8_bytes'
         result = dict(status='commit_outcome_unknown', cleared_documents=1,
             cleared_utf8_bytes=99, commit_outcome_unknown=True,
             committed_sql_ms=15., committed_hash_ms=3., archive_read_ms=8.,
+            archive_reused_gets=2, archive_reused_bytes=1234,
             claim_wall_ms=2., parent_wall_ms=31., metadata_capture_ms=5., error_class="LogicalEvidenceError",
             cause_error_code="logical_evidence_record_invalid", phase="maintenance",
             metadata_rows=3, metadata_fetches=2, metadata_fetch_ms=2.,
@@ -106,6 +107,7 @@ print(json.dumps({'status':'complete','cleared_documents':3,'cleared_utf8_bytes'
             observed = self.worker.cycle()
         self.assertTrue(observed['commit_outcome_unknown'])
         for field in ('committed_sql_ms','committed_hash_ms','archive_read_ms',
+                      'archive_reused_gets','archive_reused_bytes',
                       'claim_wall_ms','parent_wall_ms','metadata_capture_ms','cause_error_code',
                       'metadata_rows','metadata_fetches','metadata_fetch_ms',
                       'metadata_membership_calls','metadata_membership_ms','metadata_spool_ms'):
