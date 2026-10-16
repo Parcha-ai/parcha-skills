@@ -262,8 +262,11 @@ class DatabaseCapabilityContractTest(unittest.TestCase):
                 result = assess_snapshot(snapshot)
                 self.assertEqual(result["schema_version"], 82 if marker else baseline_version)
                 baseline = list(snapshot["migration_versions"])
-                for invalid in (baseline + [83], baseline + [82, 82],
-                                [v for v in baseline if v != 69]):
+                invalid_versions = [baseline + [83], baseline + [82, 82],
+                                    [v for v in baseline if v != 69]]
+                if marker:
+                    invalid_versions.append([v for v in baseline if v != 80])
+                for invalid in invalid_versions:
                     snapshot["migration_versions"] = invalid
                     with self.assertRaisesRegex(CapabilityError, "schema_drift"):
                         assess_snapshot(snapshot)

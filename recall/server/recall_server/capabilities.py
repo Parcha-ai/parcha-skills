@@ -223,6 +223,9 @@ def assess_snapshot(snapshot: dict[str, Any], profile: str = "production") -> di
     if (RETIREMENT_MAINTENANCE_VERSION in versions
             and RETIREMENT_POLICY_VERSION not in versions):
         raise CapabilityError("schema_drift")
+    if (PARENT_AUTHORITY_GENERATION_VERSION in versions
+            and SINGLETON_RECEIPT_PROFILE_VERSION not in versions):
+        raise CapabilityError("schema_drift")
     if versions != expected:
         raise CapabilityError("schema_drift")
     vector_plane_present = snapshot.get("postgres_vector_plane_present")
