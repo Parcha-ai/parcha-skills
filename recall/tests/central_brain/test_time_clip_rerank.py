@@ -1,10 +1,14 @@
 """Explicit event windows constrain the evidence scored, before top-K."""
 
 import copy
+import sys
 import time
 import unittest
 from functools import partial
+from pathlib import Path
 from unittest import mock
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "server"))
 
 from recall_server.canonical_retrieval import BoundCanonicalRetrieval
 from recall_server.passage_retrieval import PassageHintRetrieval

@@ -1,9 +1,13 @@
 """Located event pools share part reads under the original byte/time bounds."""
 
 import copy
+import sys
 import time
 import unittest
+from pathlib import Path
 from unittest.mock import patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "server"))
 
 from recall_server.chunk_bodies import ChunkBodyError
 from recall_server.db import SearchDeadlineExceeded
