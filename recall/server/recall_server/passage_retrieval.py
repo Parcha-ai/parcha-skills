@@ -2630,6 +2630,8 @@ class PassageHintRetrieval:
                 "rerank_elapsed_ms": elapsed,
                 "rerank_error": error.code,
             })
+            if error.http_status is not None:
+                diagnostics["rerank_http_status"] = error.http_status
             return results, diagnostics
         elapsed = round((time.monotonic() - started) * 1000, 3)
         arm_elapsed_ms["rerank"] = elapsed

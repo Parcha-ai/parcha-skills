@@ -1471,8 +1471,9 @@ best reranked passage. The time clip runs after this. Diagnostics carry `rerank_
 (`ok` | `skipped-budget` | `skipped-disabled` | `unavailable`), `rerank_elapsed_ms` (also under
 `arm_elapsed_ms.rerank` when the provider was called, so `latency.search_stages` reports
 `arm.rerank.p95_ms`), `rerank_candidates`, `rerank_model` (the runtime fingerprint) and, on
-`unavailable`, the content-free `rerank_error` code. Each reranked result row and matching range
-carries `rerank_score`; the fused `rank` is left as-is. With `RECALL_RERANK_PROTOCOL=off` the only
+`unavailable`, the content-free `rerank_error` code. HTTP failures also carry the numeric
+`rerank_http_status`; response bodies and headers are never included. Each reranked result row and
+matching range carries `rerank_score`; the fused `rank` is left as-is. With `RECALL_RERANK_PROTOCOL=off` the only
 trace is `rerank_status=skipped-disabled`; results are byte-identical to a build without the stage.
 
 The optional packaged self-hosted unit pins TEI 1.9 and Qwen3-Embedding-0.6B, binds only
