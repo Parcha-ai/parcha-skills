@@ -1166,7 +1166,7 @@ class HttpBoundaryContractTest(unittest.TestCase):
             self.assertEqual(
                 projection_worker.projection_totals(),
                 {
-                    "passages_written": 42, "documents_projected": 3, "passages_embedded": 8, "parquet_rows_written": 100, "search_plane_rows_written": 7, "bodies_thinned": 1,
+                    "passages_written": 42, "documents_projected": 3, "passages_embedded": 8, "parquet_rows_written": 100, "parquet_failed": 0, "search_plane_rows_written": 7, "bodies_thinned": 1,
                     "cycle_elapsed_ms": 2000, "embed_elapsed_ms": 300, "passage_elapsed_ms": 0, "logical_elapsed_ms": 1000, "parquet_elapsed_ms": 0, "search_plane_elapsed_ms": 30, "thin_elapsed_ms": 50,
                     "retirement_cleared_documents": 3, "retirement_cleared_utf8_bytes": 300, "retirement_elapsed_ms": 30,
                 },
