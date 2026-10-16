@@ -1373,7 +1373,10 @@ class CanonicalPassageProjector:
                     ),
                     reason="logical-update",
                 )
-        return {"status": "committed", "membership_durable": durable_certification, **diff.counters}
+        result = {"status": "committed", **diff.counters}
+        if durable_certification:
+            result["membership_durable"] = True
+        return result
 
     @staticmethod
     def _write_headers(

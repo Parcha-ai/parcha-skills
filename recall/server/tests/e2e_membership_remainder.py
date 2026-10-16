@@ -515,6 +515,7 @@ class RepairWithRemainder(Repair):
                 ("f" * 64, self.tenant),
             )
         self.assertEqual(self.passages.seed_backfill(tenant_id=self.tenant), 1)
+        self.assertEqual(self.passages.seed_backfill(tenant_id=self.tenant), 0)
         with self.store.connect() as c:
             self.assertEqual(
                 c.execute(

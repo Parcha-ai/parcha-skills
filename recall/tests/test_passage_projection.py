@@ -1333,8 +1333,8 @@ class PassageProjectionTests(unittest.TestCase):
         pending = inspect.getsource(CanonicalPassageProjector._pending)
 
         self.assertIn("ON CONFLICT(tenant_id,source_id,logical_document_id)", seed)
-        self.assertIn("DO NOTHING", seed)
-        self.assertNotIn("generation+1", seed)
+        self.assertIn("WHERE canonical_passage_projection_queue.reason='certification'", seed)
+        self.assertIn("generation=canonical_passage_projection_queue.generation+1", seed)
         self.assertIn("sum(part.size_bytes)", pending)
         self.assertLess(pending.index("LIMIT %s"), pending.index("LEFT JOIN canonical_evidence_document_parts"))
         self.assertIn("interval '5 minutes'", pending)
