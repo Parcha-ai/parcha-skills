@@ -40,7 +40,11 @@ def _failure_details(error, phase, claim):
 class RetirementMaintenance:
     def __init__(self, store, archive, *, tenant_id=None, enabled=False, seconds=10,
                  reconcile_parents=25, max_parents=10, max_clear_bytes=64*1024**2,
-                 max_archive_bytes=256*1024**2, catalog_archive_budget=False, metadata_mode="keep"):
+                 max_archive_bytes=256*1024**2, catalog_archive_budget=False, metadata_mode="keep",
+                 membership_certification=None):
+        from .parent_membership_enrollment import CertificationSettings
+        self.membership_certification = (CertificationSettings.from_env()
+            if membership_certification is None else membership_certification)
         if metadata_mode not in ('keep', 'singleton'):
             raise ValueError('invalid retirement metadata mode')
         self.metadata_mode = metadata_mode
@@ -195,7 +199,9 @@ class RetirementMaintenance:
                 before_parent=lambda candidate: self._record_intent(source, candidate),
                 parent_limits_for=(lambda candidate: self._parent_limits(source, candidate))
                     if self.catalog_archive_budget else None,
-                **({"metadata_mode": self.metadata_mode} if self.metadata_mode != "keep" else {}))
+                **({"metadata_mode": self.metadata_mode} if self.metadata_mode != "keep" else {}),
+                **({"membership_certification": self.membership_certification}
+                   if self.membership_certification.enabled else {}))
             report.update(result)
             if not result['commit_outcome_unknown']:
                 phase = 'intent_finalize'

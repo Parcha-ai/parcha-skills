@@ -330,3 +330,51 @@ def certify_published_passages(store, *, tenant_id, source_id, logical_document_
         else:
             return dict(status=outcome['status'],certified_passages=certified)
     return dict(status='enrolled',certified_passages=certified)
+
+
+def certify_retired_parent(store, *, tenant_id, source_id, native_parent_id,
+                           logical_document_id, principal_id, settings, deadline_at,
+                           should_stop=None):
+    """Certify committed passages after retirement, within the caller's budget.
+
+    Keyset pages bound metadata transfer without a parent-size ceiling. Each
+    page uses the original native proof and captured generation; a later edit
+    invalidates earlier pages normally. Counts describe acknowledged writes.
+    """
+    if not settings.enabled:
+        return dict(status='disabled', certified_passages=0)
+    certified, after = 0, ''
+    limits = dict(_CERTIFICATION_LIMITS)
+    try:
+        while True:
+            if time.monotonic() >= deadline_at:
+                return dict(status='deadline', certified_passages=certified)
+            if should_stop is not None and should_stop():
+                return dict(status='stopped', certified_passages=certified)
+            with _connect(store, deadline_at) as connection:
+                rows = _query(store, connection, """SELECT passage.passage_id
+                    FROM canonical_passages passage
+                    JOIN canonical_evidence_documents evidence
+                      USING(tenant_id,source_id,logical_document_id)
+                   WHERE passage.tenant_id=%s AND passage.source_id=%s
+                     AND passage.logical_document_id=%s AND evidence.native_parent_id=%s
+                     AND passage.passage_id>%s
+                   ORDER BY passage.passage_id LIMIT %s""",
+                    (tenant_id, source_id, logical_document_id, native_parent_id,
+                     after, limits['passages']), deadline_at).fetchall()
+            if not rows:
+                return dict(status='enrolled' if certified else 'empty',
+                            certified_passages=certified)
+            ids = tuple(row['passage_id'] for row in rows)
+            outcome = enroll_parent_passages(store, tenant_id=tenant_id,
+                source_id=source_id, native_parent_id=native_parent_id,
+                principal_id=principal_id, passage_ids=ids, limits=limits,
+                binding_epoch=settings.binding_epoch, deadline_at=deadline_at)
+            if outcome['status'] != 'enrolled':
+                return dict(status=outcome['status'], certified_passages=certified)
+            certified += outcome['passages']
+            after = ids[-1]
+    except Exception:
+        # Earlier pages may have committed. Stop without replaying the unknown
+        # page, and never relabel already committed retirement as a failure.
+        return dict(status='failed', certified_passages=certified)

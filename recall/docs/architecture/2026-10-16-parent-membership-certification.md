@@ -85,3 +85,27 @@ do not report zero disagreement. No source identifiers or bodies are emitted.
 Native membership timing remains the completed original proof timing; total
 authority latency includes this added observation. These measurements establish
 agreement and potential work reduction, not a deployed speedup.
+
+## Certification after retirement
+
+Singleton metadata retirement changes the parent generation after removing physical
+chunk rows. A certificate written by the passage publisher can therefore become
+stale without another publication being queued. The retirement runner also invokes
+the same native enroller after a completed parent's transaction and archive context
+have closed. This includes a no-op final tail whose earlier windows did the physical
+work. Partial and unknown retirement outcomes retain native fallback.
+
+The existing certification flag and epoch control both invocation sites. Retirement
+certification receives at most three seconds within the original owner deadline;
+it cannot consume the maintenance intent-finalization reserve. Passage IDs stream
+in bounded keyset pages. Missing grants, changed publication, concurrent Forget or
+an exhausted metadata budget preserve the original authority checks. Optional
+failure never changes the retirement acknowledgment or retries its SQL. The child
+log exposes acknowledged certificate writes, failed/deferred parents and elapsed
+milliseconds; these counters do not establish current certificate coverage.
+
+There is one certification owner and two commit boundaries, without a refresh
+queue. Keep the publisher invocation for parents that have not retired or cannot
+retire; removing it would discard their coverage. Reconsider that invocation only
+if measured lifecycle coverage makes it redundant. Neither invocation authorizes
+removing the native receipt/revision catalogs used by the fallback verifier.

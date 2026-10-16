@@ -176,10 +176,17 @@ class ClaimDiagnosticTests(unittest.TestCase):
                 "archive_bytes",
                 "body_eligibility",
                 "physical_reclaimed_bytes",
+                "membership_certified_passages",
+                "membership_failed_parents",
+                "membership_deferred_parents",
+                "membership_elapsed_ms",
             },
         )
         self.assertEqual(result["status"], "claim_refused")
         self.assertEqual(result["retired_metadata_chunks"], 0)
+        for field in ("membership_certified_passages", "membership_failed_parents",
+                      "membership_deferred_parents", "membership_elapsed_ms"):
+            self.assertEqual(result[field], 0)
         self.assertEqual(
             (
                 result["attempted_parents"],
