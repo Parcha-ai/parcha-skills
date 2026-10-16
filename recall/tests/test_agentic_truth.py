@@ -224,6 +224,38 @@ class AgenticTruthSetTest(unittest.TestCase):
             with self.assertRaisesRegex(EvaluationInputError, "gold receipt"):
                 validate_truth_set(truth)
 
+    def test_accepts_long_questions_through_the_mcp_search_limit(self) -> None:
+        # Real authored requests can include context and several related needs.
+        # Keep their full wording; examples and labels remain outside Git.
+        for length in (895, 1253, 8192):
+            with self.subTest(length=length), tempfile.TemporaryDirectory() as temporary:
+                rows = truth_cases()
+                rows[0]["question"] = (
+                    "Find our prior work and explain the decisions and outcomes. "
+                    * ((length // 59) + 1)
+                )[:length - 1] + "?"
+                self.assertEqual(len(rows[0]["question"]), length)
+                directory = private_directory(Path(temporary))
+                truth = directory / "truth.jsonl"
+                private_write(truth, rows)
+
+                receipt = validate_truth_set(truth)
+
+                self.assertEqual(receipt["case_count"], 60)
+                self.assertEqual(receipt["owner_approved_cases"], 60)
+
+    def test_rejects_questions_beyond_mcp_limit_and_invalid_text(self) -> None:
+        for question in ("x" * 8193, "", " ", None, 8192, " padded", "line\nbreak"):
+            with self.subTest(question_type=type(question).__name__), tempfile.TemporaryDirectory() as temporary:
+                rows = truth_cases()
+                rows[0]["question"] = question
+                directory = private_directory(Path(temporary))
+                truth = directory / "truth.jsonl"
+                private_write(truth, rows)
+
+                with self.assertRaisesRegex(EvaluationInputError, "question is invalid"):
+                    validate_truth_set(truth)
+
     def test_rejects_unbalanced_employee_intents(self) -> None:
         rows = truth_cases()
         rows[0]["intent"] = rows[1]["intent"]
