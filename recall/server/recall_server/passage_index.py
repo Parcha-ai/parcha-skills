@@ -941,6 +941,12 @@ class CanonicalPassageProjector:
         candidate = prepared.candidate
         with self.store.connect() as connection:
             with connection.transaction():
+                # Logical publication takes the parent catalog before this
+                # queue. Serialize commit before taking the opposite FK order.
+                connection.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended(%s,0))",
+                    ("logical-evidence\x1f" + candidate.logical_document_id,),
+                )
                 connection.execute(
                     "SELECT pg_advisory_xact_lock(hashtextextended(%s,0))",
                     ("lossless-passages\x1f" + candidate.logical_document_id,),
