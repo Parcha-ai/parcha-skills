@@ -12,6 +12,7 @@ import os
 import re
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 from . import SCHEMA_VERSION
@@ -1782,6 +1783,14 @@ def main() -> None:
         default=5,
     )
     passage_worker.add_argument("--once", action="store_true")
+    membership_seed = sub.add_parser(
+        "membership-certification-seed",
+        help="queue a finite historical metadata page for native certification; no archive or embedding work",
+    )
+    membership_seed.add_argument("--tenant", required=True)
+    membership_seed.add_argument("--after", type=json.loads, help="exclusive [source_id, logical_document_id] cursor")
+    membership_seed.add_argument("--through", type=json.loads, help="reuse the first response's inclusive upper bound")
+    membership_seed.add_argument("--limit", type=int, default=128)
     parquet_backfill = sub.add_parser("backfill-parquet-scan")
     parquet_backfill.add_argument("--tenant", required=True)
     parquet_backfill.add_argument("--source")
@@ -2496,6 +2505,14 @@ def main() -> None:
                 interval_seconds=args.interval_seconds,
                 once=args.once,
             )
+        print(json.dumps(result, sort_keys=True))
+    elif args.command == "membership-certification-seed":
+        from . import membership_remainder, parent_membership_enrollment
+        result = membership_remainder.seed_history(
+            store, tenant_id=args.tenant,
+            settings=parent_membership_enrollment.CertificationSettings.from_env(),
+            deadline_at=time.monotonic()+5, after=args.after, through=args.through, limit=args.limit,
+        )
         print(json.dumps(result, sort_keys=True))
     elif args.command == "backfill-parquet-scan":
         projector = CanonicalParquetScanProjector(
