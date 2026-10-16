@@ -18,6 +18,7 @@ import time
 from typing import Any
 
 from .db import SearchDeadlineExceeded, bounded_search_text
+from . import parent_membership_shadow
 from .passage_retrieval import (
     DENSE_NEAREST_LIMIT,
     PassageHintRetrieval,
@@ -247,6 +248,7 @@ class TurbopufferHintRetrieval(PassageHintRetrieval):
             raise ValueError("turbopuffer client is required for the turbopuffer plane")
         self.namespace = query_client(self.client).namespace(self.settings.namespace(self.tenant_id))
         self.temporal_window_budget_ms = window_budget_ms_from_env()
+        self.parent_membership_shadow = parent_membership_shadow.ShadowSettings.from_env()
 
     # The query is embedded by turbopuffer: no provider round trip here, and
     # the clause / window passes reuse the text.
@@ -419,6 +421,10 @@ class TurbopufferHintRetrieval(PassageHintRetrieval):
             authoritative = [row for row in selected if all(
                 (row['source_id'], receipt) in members
                 for receipt in row['receipts'])]
+            if self.parent_membership_shadow.enabled:
+                stages['parent_membership_shadow'] = parent_membership_shadow.observe_membership(
+                    self.store, connection, selected=selected, members=members,
+                    settings=self.parent_membership_shadow, deadline_at=deadline_at)
             stage_started = time.monotonic()
         stages['transaction_exit_ms'] = round((time.monotonic() - stage_started) * 1000, 3)
         return authoritative
@@ -478,6 +484,8 @@ class TurbopufferHintRetrieval(PassageHintRetrieval):
                     authoritative = self._authorize_singletons(connection, requested, deadline_at, stages=stages)
                 else:
                     stages['path'] = 'legacy'
+                    if self.parent_membership_shadow.enabled:
+                        stages['parent_membership_shadow'] = {'status': 'requires-singleton', 'elapsed_ms': 0}
                     authoritative = self.store._execute_bounded(
                         connection,
                         """WITH selected AS MATERIALIZED (

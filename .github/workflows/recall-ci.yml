@@ -135,6 +135,7 @@ jobs:
             e2e_parent_membership_enrollment.py \
             e2e_parent_membership_publication.py \
             e2e_parent_certificate_schema.py \
+            e2e_parent_membership_shadow.py \
             e2e_handback_projection.py \
             e2e_report_unit_authority.py \
             e2e_assistant_final_units.py \
