@@ -247,6 +247,8 @@ def read_archived_chunks(
     Interactive callers set located_only=True: NULL positions are omitted for
     verified PostgreSQL fallback without scanning their parents. Recovery and
     migration callers retain the default bounded transitional full scan.
+    Located reads with a deadline are bounded by part/result bytes and time,
+    rather than event count: many small events can share one immutable part.
 
     Existing logical objects serve multiple events and are read once per group.
     Located events fetch only intersecting immutable parts, independently of
@@ -275,7 +277,8 @@ def read_archived_chunks(
         or not isinstance(tenant_id, str) or not tenant_id
         or not isinstance(source_ids, tuple)
         or any(not isinstance(s, str) or not s for s in source_ids)
-        or not isinstance(document_ids, tuple) or len(document_ids) > MAX_DOCUMENTS
+        or not isinstance(document_ids, tuple)
+        or (len(document_ids) > MAX_DOCUMENTS and not (located_only and deadline_at is not None))
         or any(not isinstance(d, str) or not DOCUMENT_ID_RE.fullmatch(d) for d in document_ids)
         or (deadline_at is not None and (
             isinstance(deadline_at, bool) or not isinstance(deadline_at, (int, float))
