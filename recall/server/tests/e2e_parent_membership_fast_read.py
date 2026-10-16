@@ -250,8 +250,31 @@ class ParentMembershipFastReadTests(ParentEnrollmentTests):
         from recall_server import receipt_membership, turbopuffer_retrieval
         self.assertEqual(hashlib.sha256(Path(receipt_membership.__file__).read_bytes()).hexdigest(),
             'e413d0faac8b9ff686f8e4399502b431a7807058f8ce0ff64f3ef73e704a2aa9')
-        self.assertEqual(hashlib.sha256(turbopuffer_retrieval._SELECTED_AUTHORITY_SQL.encode()).hexdigest(),
-            '33cbb2194d20a5a75b67879de1d707910844d41be8c118e90e5de9712de6dac4')
+        original_sha = '33cbb2194d20a5a75b67879de1d707910844d41be8c118e90e5de9712de6dac4'
+        origin_sha = '7c2ef4b4d8629c8abb042b5de7940b271b133a5f8c7a743e188c816b9e530636'
+        projection = '                                   passage.spans AS origin_spans,\n'
+
+        def check_catalog(statement):
+            self.assertIn(hashlib.sha256(statement.encode()).hexdigest(), (original_sha, origin_sha))
+            # The only accepted extension returns authenticated canonical metadata.
+            # Removing that exact projection must restore every original SQL byte,
+            # including joins, authority predicates and parameter placeholders.
+            self.assertLessEqual(statement.count(projection), 1)
+            original = statement.replace(projection, '')
+            self.assertEqual(hashlib.sha256(original.encode()).hexdigest(), original_sha)
+            return original
+
+        original = check_catalog(turbopuffer_retrieval._SELECTED_AUTHORITY_SQL)
+        anchor = '                                   evidence.revision,evidence.manifest_object_key,\n'
+        self.assertEqual(original.count(anchor), 1)
+        check_catalog(original.replace(anchor, projection + anchor))
+        for changed in (original.replace('WHERE', 'WHERE true OR', 1),
+                        original.replace('%s', 'NULL', 1),
+                        original.replace(anchor, projection + projection + anchor),
+                        original.replace(anchor, '                                   passage.text_redacted,\n' + anchor)):
+            with self.subTest(statement_sha256=hashlib.sha256(changed.encode()).hexdigest()):
+                with self.assertRaises(AssertionError):
+                    check_catalog(changed)
 
 
 if __name__ == '__main__':
