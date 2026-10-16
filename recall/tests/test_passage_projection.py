@@ -1244,11 +1244,11 @@ class PassageProjectionTests(unittest.TestCase):
         self.assertIn("deadline_at", source)
 
     def test_slow_dense_arm_cannot_erase_fast_lexical_evidence(self) -> None:
-        retrieval = object.__new__(PassageHintRetrieval)
-        retrieval.store = SimpleNamespace(search_deadline_ms=500)
-        retrieval.actor_ids = None
-        retrieval.actor_relations = None
-        retrieval.policy_fingerprint = "a" * 64
+        retrieval = PassageHintRetrieval(
+            SimpleNamespace(search_deadline_ms=500),
+            tenant_id="tenant:test", sources=["source:test"],
+            policy_fingerprint="a" * 64,
+        )
         barrier = threading.Barrier(3)
         candidate = {
             "source_id": "source:test",

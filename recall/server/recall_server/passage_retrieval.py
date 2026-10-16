@@ -12,7 +12,7 @@ import urllib.error
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from itertools import combinations
-from typing import Any
+from typing import Any, Callable
 
 from psycopg import sql
 from psycopg_pool import PoolTimeout
@@ -1073,6 +1073,39 @@ class PassageHintRetrieval:
     temporal_window_budget_ms: int | None = None
     window_pass_concurrent = False
 
+    def _filter_time_ranges(
+        self,
+        results: list[dict[str, Any]],
+        legs: tuple[tuple[str, float, list[dict[str, Any]]], ...],
+    ) -> dict[str, Any] | None:
+        """Clip authorized evidence before hydration and ranking, once per pool."""
+        if self.time_filter is None:
+            return None
+        filtered = self.time_filter({"results": results, "diagnostics": {}})
+        results[:] = filtered["results"]
+        ranges = {
+            (document["source_id"], document["logical_document_id"], _range_key(item)): item
+            for document in results for item in document.get("matching_ranges", ())
+        }
+        # Reranking reads the leg rows, not the presentation snippets. Keep
+        # both views on the same eligible receipts, including on clip failure.
+        for _name, _weight, rows in legs:
+            kept = []
+            for row in rows:
+                item = ranges.get((row["source_id"], row["logical_document_id"],
+                                   row.get("passage_id") or row.get("receipt")))
+                if item is None:
+                    continue
+                if item.get("time_clipped"):
+                    row.update(
+                        text_redacted=item["text"], receipts=item["receipts"], spans=[],
+                        # A source-unit header can describe an excluded event.
+                        header_redacted=f"source: {row['source_id']}", source_unit=None,
+                    )
+                kept.append(row)
+            rows[:] = kept
+        return filtered["diagnostics"]
+
     def _hydrate_ranges(
         self,
         results: list[dict[str, Any]],
@@ -1084,9 +1117,10 @@ class PassageHintRetrieval:
     ) -> dict[str, Any] | None:
         """Fill the bodies of the collapsed ranges when the arms returned
         catalog rows (a plane whose rows are wide fetches bodies once, for
-        the head). The Postgres arms return complete rows: nothing to do."""
+        the head). Postgres rows already have bodies; explicit event windows
+        still constrain those bodies before reranking."""
 
-        return None
+        return self._filter_time_ranges(results, legs)
 
     def __init__(
         self,
@@ -1098,6 +1132,7 @@ class PassageHintRetrieval:
         actor_ids: tuple[str, ...] | None = None,
         actor_relations: tuple[str, ...] | None = None,
         actor_scope: bool = False,
+        time_filter: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
     ) -> None:
         if actor_ids is not None and (
             not isinstance(actor_ids, tuple)
@@ -1122,6 +1157,7 @@ class PassageHintRetrieval:
         self.actor_ids = actor_ids
         self.actor_relations = actor_relations
         self.actor_scope = actor_scope or actor_ids is not None
+        self.time_filter = time_filter
 
     def _lexical_candidates(
         self,
