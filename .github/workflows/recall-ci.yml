@@ -66,6 +66,7 @@ jobs:
             e2e_collector_history_recovery.py \
             e2e_collector_history_lock_outcome.py \
             e2e_collector_history_compacted.py \
+            e2e_collector_history_full_provenance.py \
             e2e_collector_history_multichunk.py \
             e2e_collector_history_size.py \
             e2e_compact_ingest_metadata.py \

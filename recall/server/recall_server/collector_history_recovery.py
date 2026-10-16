@@ -10,6 +10,7 @@ import json
 import math
 import time
 import uuid
+from datetime import datetime
 
 from psycopg.errors import LockNotAvailable
 from psycopg.pq import PipelineStatus, TransactionStatus
@@ -67,6 +68,50 @@ def _rollback_acknowledged(connection, deadline):
 
 def _refuse(code):
     raise CollectorHistoryRecoveryError('collector_history_' + code)
+
+
+def _validate_full_provenance(provenance, content, expected, artifact):
+    """Bind the exact #424 bulk collector metadata to the proved original body."""
+    keys = {'harness', 'connector_id', 'connector_schema_version', 'collector_version',
+            'privacy_policy_version', 'original_path', 'byte_start', 'byte_end',
+            'artifact_ref', 'artifact_member'}
+    if (set(provenance) != keys
+            or not isinstance(provenance['original_path'], str)
+            or not provenance['original_path']
+            or content.get('contract') == 'recall.oversized-projection.v1'):
+        _refuse('lineage_changed')
+    member = provenance['artifact_member']
+    if (not isinstance(member, dict) or set(member) != {
+            'contract', 'schema_version', 'ordinal', 'native_id', 'content_sha256',
+            'byte_start', 'byte_end', 'manifest_sha256'}
+            or member['contract'] != 'recall.artifact-member.v1'
+            or type(member['schema_version']) is not int or member['schema_version'] != 1
+            or any(type(member[k]) is not int or member[k] < 0
+                   for k in ('ordinal', 'byte_start', 'byte_end'))
+            or any(type(provenance[k]) is not int or provenance[k] != member[k]
+                   for k in ('byte_start', 'byte_end'))
+            or member['byte_end'] < member['byte_start']
+            or member['native_id'] != expected['native_id']
+            or member['manifest_sha256'] != artifact['content_sha256']
+            or artifact['media_type'] != 'application/vnd.recall.bulk-manifest+json'):
+        _refuse('lineage_changed')
+    # The manifest precedes _versioned_record_content, which always adds this
+    # field, even at generation0. Canonical bytes have already passed full proof.
+    generation = content.get('_recall_collector_generation')
+    base = {key: value for key, value in content.items() if key != '_recall_collector_generation'}
+    if (type(generation) is not int or generation < 0
+            or member['content_sha256'] != hashlib.sha256(canonical_json(base)).hexdigest()):
+        _refuse('lineage_changed')
+    try:
+        reference = validate_contract(provenance['artifact_ref'], expected='recall.artifact-ref.v1')
+    except ValueError:
+        _refuse('lineage_changed')
+    # An equivalent timestamp spelling must not change immutable object identity.
+    if (set(reference) != set(artifact)
+            or any(reference[key] != value for key, value in artifact.items() if key != 'created_at')
+            or datetime.fromisoformat(reference['created_at'].replace('Z', '+00:00'))
+            != datetime.fromisoformat(artifact['created_at'].replace('Z', '+00:00'))):
+        _refuse('lineage_changed')
 
 
 def _read(plane, connection, tenant_id, principal_id, expected, deadline, *, lock):
@@ -172,9 +217,10 @@ def _read(plane, connection, tenant_id, principal_id, expected, deadline, *, loc
             or metadata.get('provenance', {}).get('connector_id') != 'claude.jsonl'):
         _refuse('lineage_changed')
     publication_metadata = metadata
+    full_provenance = False
     if metadata.get('principal_id') != source_row['owner_principal_id']:
         # Before #792 the body thinner discarded these three envelope fields.
-        # Accept only that exact old shape, never a present mismatching owner.
+        # Accept exact historical shapes, never a present mismatching owner.
         if any(key in metadata for key in ('principal_id', 'visibility', 'content_type')):
             _refuse('lineage_changed')
         provenance = metadata.get('provenance', {})
@@ -186,13 +232,20 @@ def _read(plane, connection, tenant_id, principal_id, expected, deadline, *, loc
             _refuse('lineage_changed')
         legacy = (f"({_compact_event_expression('event')} - 'principal_id' - 'visibility' - 'content_type')"
                   " #- '{provenance,uri}' #- '{provenance,original_path}'")
-        accepted = query(f'''SELECT event.canonical_redacted={legacy} AS compact
+        # #424 kept the full provenance object. All other normal-record fields
+        # use the same compactor; oversized pointer compatibility is excluded.
+        historical = f"jsonb_set({legacy}, '{{provenance}}', event.canonical_redacted->'provenance')"
+        accepted = query(f'''SELECT event.canonical_redacted={legacy} AS compact,
+            event.canonical_redacted={historical} AS full_provenance
             FROM canonical_events event JOIN canonical_ingest_jobs job USING(tenant_id,source_id,job_id)
             WHERE event.tenant_id=%s AND event.source_id=%s AND event.event_id=%s
               AND event.body_location='raw' AND job.connector_id='claude.jsonl'
             ''',
             (*scope, expected['original_event_id'])).fetchone()
-        if accepted is None or accepted['compact'] is not True:
+        if accepted is None:
+            _refuse('lineage_changed')
+        full_provenance = accepted['compact'] is not True
+        if full_provenance and accepted['full_provenance'] is not True:
             _refuse('lineage_changed')
         # Accepted canonical writes required the immutable registered source
         # owner. Private is the NEW publication policy, not recovered visibility.
@@ -207,6 +260,8 @@ def _read(plane, connection, tenant_id, principal_id, expected, deadline, *, loc
     artifact['created_at'] = artifact['created_at'].isoformat()
     artifact.update(contract='recall.artifact-ref.v1', schema_version=1)
     validate_contract(artifact, expected='recall.artifact-ref.v1')
+    if full_provenance:
+        _validate_full_provenance(metadata['provenance'], content, expected, artifact)
     return dict(original=original, marker=marker, document=documents[0], chunks=chunks,
                 artifact=artifact, content=content, publication_metadata=publication_metadata)
 
