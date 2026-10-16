@@ -104,6 +104,7 @@ class RetirementSupervisor:
                 "retirement_child status=%s elapsed_ms=%s cpu_seconds=%s peak_rss_kib=%s "
                 "archive_bytes=%s cleared_utf8_bytes=%s unknown=%s error_class=%s phase=%s cause_error_code=%s "
                 "committed_sql_ms=%s committed_hash_ms=%s archive_read_ms=%s "
+                "archive_reused_gets=%s archive_reused_bytes=%s "
                 "claim_wall_ms=%s parent_wall_ms=%s metadata_capture_ms=%s retired_metadata_chunks=%s "
                 "metadata_rows=%s metadata_fetches=%s metadata_fetch_ms=%s "
                 "metadata_membership_calls=%s metadata_membership_ms=%s metadata_spool_ms=%s "
@@ -121,6 +122,8 @@ class RetirementSupervisor:
                 result.get("committed_sql_ms"),
                 result.get("committed_hash_ms"),
                 result.get("archive_read_ms"),
+                result.get("archive_reused_gets"),
+                result.get("archive_reused_bytes"),
                 result.get("claim_wall_ms"),
                 result.get("parent_wall_ms"),
                 result.get("metadata_capture_ms"),

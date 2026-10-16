@@ -6,7 +6,7 @@ enroll or rebind replacements; rebind requires a fresh explicit owner review.
 """
 
 from collections import Counter
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, dataclass, replace
 import hashlib
 import time
@@ -20,7 +20,7 @@ from .chunk_retirement import (
     require_retirement_owner,
 )
 from .parent_chunk_window import retire_parent_windows
-from .logical_evidence import IDENTITY_RE
+from .logical_evidence import IDENTITY_RE, MAX_PART_BYTES, PART_MEDIA_TYPE
 from .parent_chunk_proof import (
     CAPTURE_DETAIL_FIELDS,
     manifest_identity,
@@ -422,41 +422,73 @@ def _claim(store, *, scope, limits, deadline_at, attempted, diagnostic=None):
 
 
 class RunArchive:
-    """Charge attempted catalog bytes across successful AND failed parent proofs."""
+    """Charge attempted catalog bytes, including failed and reused reads.
+
+    Reuse counters distinguish avoided transport reads from this conservative
+    budget. Only the outer runner enables retention, for one claimed parent.
+    """
 
     def __init__(self, delegate, *, max_bytes):
         self.delegate, self.max_bytes = delegate, max_bytes
         self.gets = self.bytes = 0
+        self.reused_gets = self.reused_bytes = 0
         self.read_ms = 0.0
+        self._reuse = False
+        self._part = None
+
+    @contextmanager
+    def reuse_part(self):
+        """Retain at most one immutable part; never retain authority or proof."""
+        self._reuse = True
+        self._part = None
+        try:
+            yield
+        finally:
+            self._part = None
+            self._reuse = False
 
     def read_raw(self, reference):
-        size = reference["size_bytes"]
-        if type(size) is not int or size < 0 or self.bytes + size > self.max_bytes:
-            raise ChunkRetirementError("retirement_runner_archive_budget")
-        self.gets += 1
-        self.bytes += size
-        started = time.monotonic()
-        try:
-            return self.delegate.read_raw(reference)
-        finally:
-            self.read_ms += (time.monotonic() - started) * 1000
+        return self._read(reference, deadline_at=None)
 
     def read_raw_bounded(self, reference, *, deadline_at):
-        # _VerifiedArchive calls this surface when available. Preserve transport
-        # cancellation while sharing the exact same invocation-wide accounting.
+        return self._read(reference, deadline_at=deadline_at)
+
+    def _read(self, reference, *, deadline_at):
+        from .archive import _remaining
+
         size = reference["size_bytes"]
         if type(size) is not int or size < 0 or self.bytes + size > self.max_bytes:
             raise ChunkRetirementError("retirement_runner_archive_budget")
         self.gets += 1
         self.bytes += size
-        bounded = getattr(self.delegate, "read_raw_bounded", None)
         started = time.monotonic()
         try:
-            return (
+            if deadline_at is not None:
+                _remaining(deadline_at)
+            key = None
+            if self._reuse and reference.get("media_type") == PART_MEDIA_TYPE and 0 < size <= MAX_PART_BYTES:
+                # Full identity includes scope, locator/version, size and hash.
+                key = orjson.dumps(reference, option=orjson.OPT_SORT_KEYS)
+            if key is not None and self._part is not None and self._part[0] == key:
+                self.reused_gets += 1
+                self.reused_bytes += size
+                return self._part[1]
+            # Evict before fetching so two retained parts cannot accumulate,
+            # including when a new read fails or is not a logical part.
+            self._part = None
+            bounded = getattr(self.delegate, "read_raw_bounded", None)
+            payload = (
                 bounded(reference, deadline_at=deadline_at)
-                if callable(bounded)
+                if deadline_at is not None and callable(bounded)
                 else self.delegate.read_raw(reference)
             )
+            retain = (key is not None and type(payload) is bytes and len(payload) == size
+                      and hashlib.sha256(payload).hexdigest() == reference.get("content_sha256"))
+            if deadline_at is not None:
+                _remaining(deadline_at)
+            if retain:
+                self._part = key, payload
+            return payload
         finally:
             self.read_ms += (time.monotonic() - started) * 1000
 
@@ -572,27 +604,28 @@ def run_retirement(
             selected_limits = parent_limits if parent_limits_for is None else parent_limits_for(candidate)
             if not isinstance(selected_limits, ParentRetirementLimits):
                 raise ChunkRetirementError("parent_retirement_limits_invalid")
-            result = retire_parent_windows(
-                store,
-                meter,
-                tenant_id=key[0],
-                source_id=key[1],
-                native_parent_id=key[2],
-                apply=True,
-                reviewed_plan=parent_retirement_plan(key, candidate["manifest"]),
-                limits=replace(
-                    selected_limits,
-                    max_clear_bytes=min(selected_limits.max_clear_bytes, remaining_bytes),
-                    max_archive_bytes=min(
-                        selected_limits.max_archive_bytes, remaining_archive
+            with meter.reuse_part():
+                result = retire_parent_windows(
+                    store,
+                    meter,
+                    tenant_id=key[0],
+                    source_id=key[1],
+                    native_parent_id=key[2],
+                    apply=True,
+                    reviewed_plan=parent_retirement_plan(key, candidate["manifest"]),
+                    limits=replace(
+                        selected_limits,
+                        max_clear_bytes=min(selected_limits.max_clear_bytes, remaining_bytes),
+                        max_archive_bytes=min(
+                            selected_limits.max_archive_bytes, remaining_archive
+                        ),
                     ),
-                ),
-                deadline_at=deadline_at,
-                required_scope_epoch=candidate["scope_epoch"],
-                owner_principal_id=scope.principal_id,
-                should_stop=should_stop,
-                metadata_mode=metadata_mode,
-            )
+                    deadline_at=deadline_at,
+                    required_scope_epoch=candidate["scope_epoch"],
+                    owner_principal_id=scope.principal_id,
+                    should_stop=should_stop,
+                    metadata_mode=metadata_mode,
+                )
             for field in ("metadata_capture_ms", *CAPTURE_DETAIL_FIELDS):
                 report[field] += result.get(field, 0)
             report["completed_parent_proofs"] += int(result["complete"])
@@ -646,6 +679,8 @@ def run_retirement(
         errors=dict(errors),
         excluded=dict(excluded),
         archive_gets=meter.gets,
+        archive_reused_gets=meter.reused_gets,
+        archive_reused_bytes=meter.reused_bytes,
         archive_bytes=meter.bytes,
         archive_read_ms=meter.read_ms,
         body_eligibility="proved_targets_only",
