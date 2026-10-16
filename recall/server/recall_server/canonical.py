@@ -1244,7 +1244,7 @@ class CanonicalPlane:
                          AND passage_document.logical_document_id IS NULL)
                        AS missing_passage_documents,
                      (SELECT count(*) FROM canonical_passage_projection_queue
-                       WHERE tenant_id=%s AND source_id=%s)
+                       WHERE tenant_id=%s AND source_id=%s AND reason<>'certification')
                        AS passage_queue,
                      (SELECT count(*) FROM canonical_passages
                        WHERE tenant_id=%s AND source_id=%s) AS passages,

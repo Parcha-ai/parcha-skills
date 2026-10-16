@@ -73,8 +73,8 @@ class EmptyPassageRepairTest(unittest.TestCase):
         self.assertEqual(result["embedding_cost_usd_estimate"], 0.00015)
         sql, args = con.execute.call_args.args
         self.assertIn("ON CONFLICT", sql)
-        self.assertIn("DO NOTHING", sql)
-        self.assertNotIn("DO UPDATE", sql)
+        self.assertIn("WHERE canonical_passage_projection_queue.reason='certification'", sql)
+        self.assertIn("generation=canonical_passage_projection_queue.generation+1", sql)
         self.assertIn("projected.passage_count=0", sql)
         self.assertIn(
             "evidence.document_content_sha256=selected.source_document_sha256", sql

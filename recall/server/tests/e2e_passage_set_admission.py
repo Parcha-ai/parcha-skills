@@ -32,6 +32,7 @@ class SetAdmission(unittest.TestCase):
         self.connection.execute('''CREATE TEMP TABLE canonical_passage_projection_queue (
             tenant_id text,source_id text,logical_document_id text,revision integer,
             generation bigint,changed_at timestamptz,notification_queued_at timestamptz,
+            reason text NOT NULL DEFAULT 'logical-update',
             PRIMARY KEY(tenant_id,source_id,logical_document_id))''')
         self.connection.execute('''CREATE INDEX ON canonical_passage_projection_queue
             (tenant_id,changed_at,source_id,logical_document_id)''')
