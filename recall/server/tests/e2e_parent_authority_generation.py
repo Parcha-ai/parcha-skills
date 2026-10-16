@@ -29,6 +29,53 @@ class ParentAuthorityGenerationTests(SingletonSearchTests):
                 row=c.execute(sql,args).fetchone()
         return row['generation'] if row else 0
 
+    def test_multichunk_batch_does_not_cross_join_every_source_event(self):
+        events = []
+        def capture(**kwargs):
+            events.append(kwargs['envelope'])
+        with patch.object(self.plane, 'ingest_document', capture):
+            for index in range(64):
+                self.ingest(f'batch/{index}',
+                            'Synthetic business decision and supporting evidence. ' * 1500)
+                events[-1]['native_parent_id'] = f'parent/{index // 4}'
+        # EXPLAIN the actual dynamic statement inside its native transition
+        # trigger. The outer INSERT plan excludes AFTER-statement trigger I/O.
+        with self.store.connect() as connection:
+            original = connection.execute("SELECT pg_get_functiondef('recall_collect_parent_authority()'::regprocedure) AS body").fetchone()['body']
+            instrumented = original.replace('DECLARE fields text; changed text; parents text;',
+                                            'DECLARE fields text; changed text; parents text; measured json;')
+            instrumented = instrumented.replace("EXECUTE 'WITH changed AS ('",
+                                                "EXECUTE 'EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) WITH changed AS ('")
+            instrumented = instrumented.replace("|| parents || ' ON CONFLICT DO NOTHING';",
+                "|| parents || ' ON CONFLICT DO NOTHING' INTO measured; "
+                "INSERT INTO public.parent_authority_test_plans VALUES(TG_TABLE_NAME,TG_OP,measured);")
+            self.assertNotEqual(instrumented, original)
+            connection.execute('CREATE TABLE parent_authority_test_plans(relation text,operation text,plan jsonb)')
+            connection.execute(instrumented)
+        try:
+            result = self.plane.ingest_batch(tenant_id=self.tenant,
+                                            principal_id=self.principal, events=events)
+            with self.store.connect() as connection:
+                plans = [row['plan'][0] for row in connection.execute(
+                    "SELECT plan FROM parent_authority_test_plans WHERE relation='canonical_chunks' AND operation='INSERT'")]
+        finally:
+            with self.store.connect() as connection:
+                connection.execute(original)
+                connection.execute('DROP TABLE parent_authority_test_plans')
+        self.assertEqual(result['inserted'], 64)
+        self.assertEqual(len(plans), 1)
+        with self.store.connect() as connection:
+            chunks = connection.execute('SELECT count(*) AS n FROM canonical_chunks WHERE tenant_id=%s',
+                                        (self.tenant,)).fetchone()['n']
+        self.assertEqual(chunks, 256)
+        for parent in range(16):
+            self.assertEqual(self.generation(f'parent/{parent}'), 1)
+        # The original join performs 16,384 document probes for256 chunks,
+        # exceeding300k shared-buffer hits. Bound work rather than wall time.
+        blocks = plans[0]['Plan']['Shared Hit Blocks'] + plans[0]['Plan']['Shared Read Blocks']
+        self.assertLess(blocks, 50_000, 'chunk parent collection repeated source-wide document probes')
+        print(json.dumps(dict(test=self._testMethodName,shared_blocks=blocks,parents=16,documents=64,chunks=chunks)),flush=True)
+
     def test_runtime_role_grants_and_reused_backend_flush_each_transaction(self):
         role='runtime_generation_'+self.tenant.rsplit(':',1)[-1]
         with self.store.connect() as admin:
