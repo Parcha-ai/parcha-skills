@@ -2556,6 +2556,8 @@ class CanonicalLogicalEvidenceProjector:
             _close_body_locators(upload)
         if status == "stale":
             self._schedule_cleanup(upload.cleanup_references)
+        if status == "committed" and getattr(upload, "_digest_continuation", None) is not None:
+            self.projection.remember_committed(upload)
         return status
 
     def project_pending(
