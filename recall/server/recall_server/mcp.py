@@ -1250,6 +1250,14 @@ def fit_search_result(value: Any) -> Any:
                 if isinstance(receipts, list) and len(receipts) > MAX_FITTED_RECEIPTS:
                     item["receipts"] = receipts[:MAX_FITTED_RECEIPTS]
                     item["receipts_truncated"] = len(receipts) - MAX_FITTED_RECEIPTS
+                if isinstance(item.get("copied_evidence"), list):
+                    copies = [dict(pointer) for pointer in item["copied_evidence"]]
+                    for pointer in copies:
+                        receipts = pointer.get("receipts")
+                        if isinstance(receipts, list) and len(receipts) > MAX_FITTED_RECEIPTS:
+                            pointer["receipts"] = receipts[:MAX_FITTED_RECEIPTS]
+                            pointer["receipts_truncated"] = len(receipts) - MAX_FITTED_RECEIPTS
+                    item["copied_evidence"] = copies
                 if item.get("spans"):
                     item["spans"] = []
                     item["spans_omitted"] = True

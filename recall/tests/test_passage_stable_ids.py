@@ -497,7 +497,12 @@ class DifferentialCommitTests(unittest.TestCase):
         source = inspect.getsource(CanonicalPassageProjector._commit)
         for statement in re.findall(r'UPDATE canonical_passages.*?"""', source, flags=re.S):
             self.assertNotIn("text_redacted", statement)
-            self.assertNotIn("spans", statement)
+            # Optional origin annotations may enrich the canonical span JSON.
+            # The native origin publication test proves its geometry, text and
+            # identity stay unchanged, including the next incremental append.
+            if "spans" in statement:
+                self.assertIn("spans=coalesce(current.spans,passage.spans)", statement)
+                self.assertIn("passage.passage_id=current.passage_id", statement)
         self.assertIn("FOR UPDATE", source)
 
 
