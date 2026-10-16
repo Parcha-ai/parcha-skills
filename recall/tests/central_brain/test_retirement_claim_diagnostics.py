@@ -159,6 +159,8 @@ class ClaimDiagnosticTests(unittest.TestCase):
                 "errors",
                 "excluded",
                 "archive_gets",
+                "archive_reused_gets",
+                "archive_reused_bytes",
                 "committed_sql_ms",
                 "committed_hash_ms",
                 "archive_read_ms",

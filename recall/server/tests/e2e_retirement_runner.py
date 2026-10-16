@@ -44,8 +44,10 @@ def assert_archive_cost(store, archive, tenant, source, report):
             "SELECT artifact_id,size_bytes FROM canonical_evidence_document_parts WHERE tenant_id=%s AND source_id=%s",
             (tenant, source),
         ).fetchall()}
-    assert report["archive_gets"] == sum(archive.reads.values())
-    assert report["archive_bytes"] == sum(sizes[key] * count for key, count in archive.reads.items())
+    # Conservative charges include reads served by the attempt-local part.
+    assert report["archive_reused_gets"] >= 0 and report["archive_reused_bytes"] >= 0
+    assert report["archive_gets"] == sum(archive.reads.values()) + report["archive_reused_gets"]
+    assert report["archive_bytes"] == sum(sizes[key] * count for key, count in archive.reads.items()) + report["archive_reused_bytes"]
     assert report["archive_bytes"] <= runner.RunnerLimits().max_archive_bytes
 
 
