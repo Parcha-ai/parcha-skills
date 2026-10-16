@@ -27,6 +27,8 @@ LOGICAL_APPEND_CAPABILITY_VERSION = 79
 SINGLETON_RECEIPT_PROFILE_VERSION = 80
 # Optional type correction for the existing forgotten-identity trigger.
 FORGOTTEN_EVENT_DIGEST_TYPE_VERSION = 81
+# Optional shadow membership generation; no reader trusts this marker.
+PARENT_AUTHORITY_GENERATION_VERSION = 82
 # Optional until a delayed Slack body needs a terminal-identity ACK.
 SUPPRESSED_ARTIFACT_SCHEMA_VERSION = 77
 MANDATORY_SCHEMA_VERSION = 69
