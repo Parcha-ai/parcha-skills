@@ -17,6 +17,12 @@ OLD and NEW parent keys. A transaction-local table deduplicates them. Its deferr
 trigger advances generations in sorted order at commit. The trigger does not lock
 the published parent or acquire the logical publisher's advisory lock.
 
+Chunk collection first deduplicates document keys and materializes their event
+ownership before joining events. This boundary prevents the planner from joining
+changed chunks to every event in the source before checking document identity.
+The retained native batch test checks buffer work for 256 chunks across 64 documents
+and 16 parents; it also proves every parent advances exactly once.
+
 | Table | Fields that invalidate the generation |
 | --- | --- |
 | `canonical_events` | tenant, source, event ID, native ID, native parent ID |
