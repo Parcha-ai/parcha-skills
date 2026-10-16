@@ -66,8 +66,8 @@ class TrackedStore(BrainStore):
         return getattr(self.local, "active", 0)
 
     @contextmanager
-    def connect(self):
-        with super().connect() as connection:
+    def connect(self, *, timeout=None):
+        with super().connect(timeout=timeout) as connection:
             self.local.active = self.active_connections + 1
             try:
                 yield connection

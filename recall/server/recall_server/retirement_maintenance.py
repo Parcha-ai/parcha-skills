@@ -189,6 +189,12 @@ class RetirementMaintenance:
                 _authorize(self.store, c, scope, self.deadline)
             phase = 'intent_reconcile'
             report.update(self._reconcile_intent(source))
+            if source.get('audit_checkpoint') is not None:
+                from .audit_maintenance import retire_audit_pages
+                # Optional audit work gets one small slice. Body retirement keeps
+                # the remaining existing quantum and its commit reserves.
+                report.update(retire_audit_pages(self.store, self.archive, source,
+                    deadline_at=min(stop_admitting_at, time.monotonic() + min(15, budget / 4))))
             phase = 'publication_enroll'
             report['enrolled_parents'] = self._reconcile_publications(source)
             phase = 'parent_claim'
