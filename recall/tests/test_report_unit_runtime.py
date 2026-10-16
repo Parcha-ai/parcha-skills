@@ -95,8 +95,10 @@ class ReportUnits(unittest.TestCase):
         for p in passages:
             encoded = json.loads(canonical_spans_json(p.spans))
             self.assertTrue(all("source_unit" not in s for s in encoded))
+            self.assertTrue(all(s.origin is None for s in p.spans))
+            self.assertTrue(all("origin" not in s for s in encoded))
             expected = [
-                {k: v for k, v in dataclasses.asdict(s).items() if k != "source_unit"}
+                {k: v for k, v in dataclasses.asdict(s).items() if k not in {"source_unit", "origin"}}
                 for s in p.spans
             ]
             self.assertEqual(encoded, expected)
