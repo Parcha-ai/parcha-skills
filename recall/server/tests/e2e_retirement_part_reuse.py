@@ -40,7 +40,8 @@ class RunnerPartReuse(unittest.TestCase):
         return runner.run_retirement(self.store, self.archive,
             scope=runner.RetirementScope(self.tenant,self.principal,(self.source,)), apply=True,
             limits=runner.RunnerLimits(max_parents=1), parent_limits=replace(self.limits,batch_documents=64,max_batches=3),
-            deadline_at=time.monotonic()+20, metadata_mode=metadata_mode)
+            # This 256-document fixture checks proof and reuse, not host speed.
+            deadline_at=time.monotonic()+60, metadata_mode=metadata_mode)
 
     def test_three_windows_use_one_fetch_and_preserve_nonselected_rows(self):
         part_bytes = self.one_part_parent()
