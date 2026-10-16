@@ -13,7 +13,7 @@ import urllib.error
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from itertools import combinations
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 
 from psycopg import sql
 from psycopg_pool import PoolTimeout
@@ -259,6 +259,7 @@ def collapse_document_candidates(
     nominate_per_arm: int = 0,
     window_boost: tuple[str, str, float] | None = None,
     source_boost: tuple[tuple[str, ...], float] | None = None,
+    passage_budget: int | Literal["admitted"] | None = None,
 ) -> list[dict[str, Any]]:
     """Fuse mechanical hints while keeping their strongest exact ranges.
 
@@ -278,11 +279,23 @@ def collapse_document_candidates(
     smallest positive fused score) before ranking and the fused cut, so a
     document the arms placed past ``limit`` can still enter the head; those
     rows carry ``temporal_boost``. Nominations follow the boosted head.
+    ``passage_budget="admitted"`` reallocates the legacy range count by passage
+    RRF while preserving every admitted parent; an integer freezes that capacity
+    for an authority rebuild. ``None`` retains the legacy per-parent selector.
     """
 
     documents: dict[str, dict[str, Any]] = {}
     nominated_documents: set[tuple[str, str]] = set()
+    passage_scores: dict[tuple[str, str, str], float] = {}
+    if passage_budget is not None and (
+        fusion != "rrf" or (passage_budget != "admitted" and (
+            type(passage_budget) is not int
+            or not 1 <= passage_budget <= MAX_CANDIDATES_CEILING
+        ))
+    ):
+        raise ValueError("passage budget requires RRF and admitted or bounded integer capacity")
     for leg_name, weight, rows in legs:
+        seen_passages: set[tuple[str, str, str]] = set()
         leg_scores, normalized = leg_document_scores(rows, mode=fusion)
         leg_weight = (
             float(alphas.get(leg_name, weight))
@@ -335,6 +348,11 @@ def collapse_document_candidates(
                 or row.get("receipt")
                 or f"{leg_name}:{rank}"
             )
+            if passage_budget:
+                identity = (row["source_id"], document_id, range_key)
+                if identity not in seen_passages:
+                    passage_scores[identity] = passage_scores.get(identity, 0.0) + weight / (60 + rank)
+                    seen_passages.add(identity)
             prior = value["_ranges"].get(range_key)
             arm_top = value["_arm_tops"].get(leg_name)
             replace_range = prior is None or float(row["score"]) > float(prior["score"])
@@ -419,49 +437,77 @@ def collapse_document_candidates(
             if (value["source_id"], value["logical_document_id"]) in nominated_documents
         )
     results = []
+    selected_passages: set[tuple[str, str, str]] = set()
+    if passage_budget == "admitted":
+        # The legacy selector spends at most three distinct ranges per parent.
+        # Compute that exact capacity during this collapse, without rerunning it.
+        passage_budget = sum(min(3, len(value["_ranges"])) for value in ranked)
+        if passage_budget > MAX_CANDIDATES_CEILING:
+            # Preserve legacy behavior for pools beyond the native scoring cap.
+            passage_budget = None
+    if passage_budget:
+        # Spend the same range slots across admitted parents. Authorization can
+        # subsequently remove selections, but never refill from rejected IDs.
+        admitted = {(value["source_id"], value["logical_document_id"]) for value in ranked}
+        # The caller freezes capacity from the original selection once. Keep
+        # it through authority rebuilds, which receive only surviving IDs.
+        budget = passage_budget
+        available = [key for key in passage_scores if key[:2] in admitted]
+        ordered_passages = sorted(available, key=lambda key: (-passage_scores[key], key))
+        represented: set[tuple[str, str]] = set()
+        for key in ordered_passages:
+            if key[:2] not in represented:
+                selected_passages.add(key)
+                represented.add(key[:2])
+        if len(selected_passages) > budget:
+            raise ValueError("admitted parents exceed native passage capacity")
+        for key in ordered_passages:
+            if len(selected_passages) >= budget:
+                break
+            selected_passages.add(key)
     for value in ranked:
-        ordered_ranges = sorted(
-            value.pop("_ranges").items(),
-            key=lambda pair: (pair[1]["score"], pair[1]["kind"]),
-            reverse=True,
-        )
-        selected_range_keys: set[str] = set()
-        ranges = []
+        all_ranges = value.pop("_ranges")
         arm_tops = value.pop("_arm_tops")
-        # A passage can lead one arm while carrying a larger raw score in
-        # another. Preserve the actual per-arm winners before deduplicating
-        # their identities; raw scores from different arms are not comparable.
-        for kind in ("dense", "passage-lexical", "sparse-exact"):
-            selected = arm_tops.get(kind)
-            if selected is not None:
-                _score, key, item = selected
+        arm_scores = value.pop("_arm_scores")
+        if passage_budget:
+            prefix = (value["source_id"], value["logical_document_id"])
+            ranges = [item for key, item in sorted(
+                all_ranges.items(), key=lambda pair: (-passage_scores[(*prefix, pair[0])], pair[0])
+            ) if (*prefix, key) in selected_passages]
+            if not ranges:
+                continue
+        else:
+            ordered_ranges = sorted(
+                all_ranges.items(),
+                key=lambda pair: (pair[1]["score"], pair[1]["kind"]),
+                reverse=True,
+            )
+            selected_range_keys: set[str] = set()
+            ranges = []
+            # A passage can lead one arm while carrying a larger raw score in
+            # another. Preserve the actual per-arm winners before deduplicating
+            # their identities; raw scores from different arms are not comparable.
+            for kind in ("dense", "passage-lexical", "sparse-exact"):
+                selected = arm_tops.get(kind)
+                if selected is not None:
+                    _score, key, item = selected
+                    if key not in selected_range_keys:
+                        selected_range_keys.add(key)
+                        ranges.append(item)
+            for key, item in ordered_ranges:
+                if len(ranges) >= 3:
+                    break
                 if key not in selected_range_keys:
                     selected_range_keys.add(key)
                     ranges.append(item)
-        for key, item in ordered_ranges:
-            if len(ranges) >= 3:
-                break
-            if key not in selected_range_keys:
-                selected_range_keys.add(key)
-                ranges.append(item)
-        arm_scores = value.pop("_arm_scores")
-        # The strongest evidence leads: the range from the arm where this
-        # document scored best (its normalized leg score), not a fixed arm
-        # order. The reranker judges most documents by their first range
-        # (50 passages over ~80 documents), so a weak dense window hit must
-        # not displace the lexical or exact passage that carried the
-        # document (live: a P2 review answer fell from rank 1 to 11 when a
-        # dense rank-338 passage took the lead). Stable: ties keep the arm
-        # order dense, lexical, exact. An exact-identifier range never leads
-        # while a prose arm has one: it is usually tool output the
-        # cross-encoder scores low (live: 0.24 for the identifier passage,
-        # 0.44 for the same document's dense passage).
-        ranges.sort(
-            key=lambda item: (
-                item["kind"] == "sparse-exact",
-                -float((arm_scores.get(item["kind"]) or {}).get("normalized", 0.0)),
-            ),
-        )
+            # Legacy fallback order favors the strongest prose arm; ties retain
+            # dense, lexical, exact order. The reranker scores every selected range.
+            ranges.sort(
+                key=lambda item: (
+                    item["kind"] == "sparse-exact",
+                    -float((arm_scores.get(item["kind"]) or {}).get("normalized", 0.0)),
+                ),
+            )
         reasons = sorted(value.pop("_reasons"))
         score = value.pop("_score")
         temporal_boost = value.pop("_temporal_boost", None)
@@ -2543,7 +2589,21 @@ class PassageHintRetrieval:
             window_boost=window_boost,
             source_boost=source_boost,
         )
+        balanced_passages = (
+            rerank_runtime is not None and fusion_mode == "rrf"
+            and os.environ.get("RECALL_SEARCH_BALANCED_PASSAGES", "1").strip().lower()
+            not in {"0", "off", "false"}
+        )
+        if balanced_passages:
+            collapse_options["passage_budget"] = "admitted"
         results = collapse_document_candidates(legs, **collapse_options)
+        if balanced_passages:
+            # Freeze the request's capacity for the authority rebuild. Its input
+            # is restricted to selected surviving IDs, so it cannot refill.
+            capacity = sum(len(row["matching_ranges"]) for row in results)
+            collapse_options["passage_budget"] = (
+                capacity if 0 < capacity <= MAX_CANDIDATES_CEILING else None
+            )
         hydrate_started = time.monotonic()
         hydrate_diagnostics = self._hydrate_ranges(
             results, legs, deadline_at=deadline_at, include_arms=include_arms,
