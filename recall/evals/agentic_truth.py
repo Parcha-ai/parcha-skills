@@ -88,7 +88,8 @@ CASE_ID_RE = re.compile(r"^case_[0-9a-f]{32}$")
 FACT_ID_RE = re.compile(r"^fact_[0-9a-f]{32}$")
 DOCUMENT_ID_RE = re.compile(r"^ldoc_[0-9a-f]{32}$")
 ABSOLUTE_PATH_RE = re.compile(r"(?:^|\s)(?:/(?:home|tmp|Users|var|opt|etc)/|[A-Za-z]:\\)")
-QUESTION_MAX_CHARS = 240
+# Preserve full user questions accepted by the recall_search MCP contract.
+QUESTION_MAX_CHARS = 8192
 FACT_MAX_CHARS = 600
 MAX_FACTS_PER_CASE = 5
 
