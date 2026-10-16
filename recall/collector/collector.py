@@ -1688,6 +1688,8 @@ class Collector:
                 with path.open("rb") as source:
                     source.seek(row["start_offset"])
                     raw = source.read(row["end_offset"] - row["start_offset"])
+                provenance = retained_envelope.get("provenance", {}) if isinstance(retained_envelope, dict) else {}
+                self._check_recovered_suffix_bytes(provenance, raw, row["start_offset"], row["end_offset"])
                 if not raw.endswith(b"\n"):
                     raise ValueError("source byte window is no longer a complete record")
                 content = json.loads(raw)
@@ -1711,6 +1713,8 @@ class Collector:
                     start=row["start_offset"],
                     end=row["end_offset"],
                 )
+                if isinstance(provenance, dict) and "recovered_suffix" in provenance:
+                    envelope["provenance"]["recovered_suffix"] = provenance["recovered_suffix"]
                 self.db.execute(
                     "UPDATE outbox SET state='pending',content_sha256=?,envelope_json=?,queued_at=?,acked_at=NULL,receipt=NULL WHERE id=?",
                     (envelope["content_sha256"], canonical_json(envelope).decode(), time.time(), row["id"]),
@@ -1746,6 +1750,17 @@ class Collector:
         self.db.commit()
         return result
 
+    @staticmethod
+    def _check_recovered_suffix_bytes(provenance: dict, raw: bytes, start: int, end: int) -> None:
+        recovery = provenance.get("recovered_suffix") if isinstance(provenance, dict) else None
+        if recovery is not None and (
+            not isinstance(recovery, dict)
+            or recovery.get("suffix_start") != start
+            or recovery.get("original_line_end") != end
+            or recovery.get("suffix_sha256") != hashlib.sha256(raw).hexdigest()
+        ):
+            raise ValueError("recovered source byte window changed")
+
     def _repair_pending_envelope(
         self,
         row: sqlite3.Row,
@@ -1770,6 +1785,7 @@ class Collector:
                     with path.open("rb") as source:
                         source.seek(row["start_offset"])
                         raw = source.read(row["end_offset"] - row["start_offset"])
+                    self._check_recovered_suffix_bytes(envelope.get("provenance", {}), raw, row["start_offset"], row["end_offset"])
                     if not raw.endswith(b"\n"):
                         raise ValueError("source byte window is incomplete")
                     original = json.loads(raw)
@@ -1796,6 +1812,7 @@ class Collector:
                     payload=raw,
                     occurred_at=envelope["occurred_at"],
                 )
+                recovered_suffix = envelope["provenance"].get("recovered_suffix")
                 envelope = self._envelope(
                     Path(row["path"]),
                     row["native_id"],
@@ -1806,6 +1823,8 @@ class Collector:
                     row["end_offset"],
                     artifact_ref,
                 )
+                if recovered_suffix is not None:
+                    envelope["provenance"]["recovered_suffix"] = recovered_suffix
                 rendered = canonical_json(envelope).decode()
                 self.db.execute(
                     "UPDATE outbox SET envelope_json=?,queued_at=? WHERE id=?",

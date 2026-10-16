@@ -8,6 +8,7 @@ from pathlib import Path
 
 from .collector import Collector, CollectorRuntimeError
 from .health import build_health_report
+from .suffix_recovery import inspect_suffix, recover_suffix
 from client.mac import (
     CanonicalArchiveClient,
     CanonicalBrainWriter,
@@ -119,12 +120,26 @@ def main() -> None:
     parser.add_argument("--shard-count", type=int, default=1)
     parser.add_argument("--shard-index", type=int, default=0)
     parser.add_argument("--receipt")
+    parser.add_argument("--verified-suffix-manifest", help="Reviewed hash-pinned Claude recovery windows; recover only")
     parser.add_argument("--privacy-mode", choices=("off", "scrub", "drop"), default=os.environ.get("RECALL_PRIVACY_MODE", "off"))
     parser.add_argument("--privacy-judge-base-url", default=os.environ.get("RECALL_PRIVACY_JUDGE_BASE_URL"))
     parser.add_argument("--privacy-judge-key-file", default=os.environ.get("RECALL_PRIVACY_JUDGE_KEY_FILE"))
     parser.add_argument("--privacy-judge-model", default=os.environ.get("RECALL_PRIVACY_JUDGE_MODEL"))
     parser.add_argument("--privacy-judge-failure", choices=("drop", "ignore"), default="drop")
     args = parser.parse_args()
+    verified_suffixes = None
+    if args.verified_suffix_manifest:
+        if args.command != "recover" or args.harness != "claude":
+            parser.error("verified suffix recovery requires recover --harness claude")
+        try:
+            manifest = json.loads(Path(args.verified_suffix_manifest).read_text())
+            verified_suffixes = manifest["items"]
+            if not isinstance(verified_suffixes, list) or not verified_suffixes:
+                raise ValueError("empty recovery manifest")
+            for spec in verified_suffixes:
+                inspect_suffix(Path(args.root), spec)
+        except (OSError, ValueError, KeyError, TypeError):
+            parser.error("verified suffix manifest failed validation")
     if args.command in {"flush", "run", "watch", "status"} and (
         not args.endpoint or not args.token_file
     ):
@@ -205,7 +220,10 @@ def main() -> None:
                 parser.error("status requires canonical collector configuration")
             print(json.dumps(canonical[0].status(), sort_keys=True))
         elif args.command == "recover":
-            print(json.dumps(collector.recover_dead_payloads(), sort_keys=True))
+            if verified_suffixes is None:
+                print(json.dumps(collector.recover_dead_payloads(), sort_keys=True))
+            else:
+                print(json.dumps({"suffix_recovery": [recover_suffix(collector, spec) for spec in verified_suffixes]}, sort_keys=True))
         elif args.command == "locate":
             if not args.receipt:
                 parser.error("--receipt is required for locate")
