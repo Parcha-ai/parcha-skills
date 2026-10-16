@@ -313,6 +313,7 @@ def collapse_document_candidates(
                     "_score": 0.0,
                     "_reasons": set(),
                     "_ranges": {},
+                    "_arm_tops": {},
                     "_arm_scores": {},
                 },
             )
@@ -334,7 +335,10 @@ def collapse_document_candidates(
                 or f"{leg_name}:{rank}"
             )
             prior = value["_ranges"].get(range_key)
-            if prior is None or float(row["score"]) > float(prior["score"]):
+            arm_top = value["_arm_tops"].get(leg_name)
+            replace_range = prior is None or float(row["score"]) > float(prior["score"])
+            replace_arm_top = arm_top is None or float(row["score"]) > arm_top[0]
+            if replace_range or replace_arm_top:
                 text, clipped = bounded_search_text(row["text_redacted"])
                 hint = {
                     "kind": leg_name,
@@ -360,7 +364,10 @@ def collapse_document_candidates(
                         str(row["passage_first_occurred_at"]),
                         str(row["passage_last_occurred_at"]),
                     ]
-                value["_ranges"][range_key] = hint
+                if replace_range:
+                    value["_ranges"][range_key] = hint
+                if replace_arm_top:
+                    value["_arm_tops"][leg_name] = (float(row["score"]), range_key, hint)
     if window_boost is not None:
         since, until, factor = window_boost
         # Convex min-max gives an arm's weakest document 0.0, and a document
@@ -415,19 +422,17 @@ def collapse_document_candidates(
         )
         selected_range_keys: set[str] = set()
         ranges = []
+        arm_tops = value.pop("_arm_tops")
+        # A passage can lead one arm while carrying a larger raw score in
+        # another. Preserve the actual per-arm winners before deduplicating
+        # their identities; raw scores from different arms are not comparable.
         for kind in ("dense", "passage-lexical", "sparse-exact"):
-            selected = next(
-                (
-                    (key, item)
-                    for key, item in ordered_ranges
-                    if item["kind"] == kind
-                ),
-                None,
-            )
+            selected = arm_tops.get(kind)
             if selected is not None:
-                key, item = selected
-                selected_range_keys.add(key)
-                ranges.append(item)
+                _score, key, item = selected
+                if key not in selected_range_keys:
+                    selected_range_keys.add(key)
+                    ranges.append(item)
         for key, item in ordered_ranges:
             if len(ranges) >= 3:
                 break
