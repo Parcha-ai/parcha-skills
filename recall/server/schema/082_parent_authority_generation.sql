@@ -65,9 +65,16 @@ BEGIN
           FROM changed JOIN public.canonical_events event USING(tenant_id,source_id,event_id)';
       WHEN 'canonical_chunks' THEN
         fields := 'tenant_id,source_id,chunk_id,document_id,ordinal,receipt,deleted_at';
-        parents := 'SELECT changed.tenant_id,changed.source_id,coalesce(event.native_parent_id,event.native_id) AS native_parent_id
-          FROM changed JOIN public.canonical_documents document USING(tenant_id,source_id,document_id)
-          JOIN public.canonical_events event USING(tenant_id,source_id,event_id)';
+        -- Resolve each affected document before joining its event. Reordering
+        -- the three-way join can multiply chunks by every event in a source.
+        parents := 'WITH affected_documents AS MATERIALIZED (
+          SELECT document.tenant_id,document.source_id,document.event_id
+          FROM (SELECT DISTINCT tenant_id,source_id,document_id FROM changed) keys
+          JOIN public.canonical_documents document USING(tenant_id,source_id,document_id)
+        )
+        SELECT DISTINCT affected_documents.tenant_id,affected_documents.source_id,
+          coalesce(event.native_parent_id,event.native_id) AS native_parent_id
+        FROM affected_documents JOIN public.canonical_events event USING(tenant_id,source_id,event_id)';
       ELSE
         RAISE EXCEPTION 'unexpected parent authority table';
     END CASE;
