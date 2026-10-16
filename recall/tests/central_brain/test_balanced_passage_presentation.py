@@ -1,8 +1,7 @@
 """Keep paid-for evidence available under the native MCP serialization bound."""
 import copy
 import unittest
-from unittest import mock
-from recall_server import mcp, passage_retrieval as passage
+from recall_server import mcp
 from tests.central_brain.test_rerank_matched_ranges import MatchedRangeRerankTests,RecordingProvider
 
 class DescendingProvider(RecordingProvider):
