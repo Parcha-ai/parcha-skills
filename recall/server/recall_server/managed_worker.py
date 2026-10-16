@@ -160,12 +160,16 @@ def _run_projection_cycle(
         batch_size=4,
         max_batches=MANAGED_PROJECTION_MAX_BATCHES,
     )
-    return {
+    result = {
         "status": "complete",
         "logical_documents": int(logical_result["documents"]),
         "logical_records": int(logical_result["records"]),
         "passage_documents": int(passage_result["documents"]),
         "passages": int(passage_result["passages"]),
+        "membership_certified_passages": int(passage_result.get("membership_certified_passages", 0)),
+        "membership_failed_documents": int(passage_result.get("membership_failed_documents", 0)),
+        "membership_deferred_documents": int(passage_result.get("membership_deferred_documents", 0)),
+        "membership_elapsed_ms": int(passage_result.get("membership_elapsed_ms", 0)),
         "passage_embeddings": int(embedding_result["processed"]),
         "parquet_shards": int(scan_result["shards"]),
         "parquet_rows": int(scan_result["rows"]),
@@ -176,6 +180,17 @@ def _run_projection_cycle(
         "parquet_fragments_total": int(scan_result.get("fragments_total", 0)),
         "parquet_documents_dirty": int(scan_result.get("documents_dirty", 0)),
     }
+    LOG.info(
+        "managed projection cycle passage_documents=%s "
+        "membership_certified_passages=%s membership_failed_documents=%s "
+        "membership_deferred_documents=%s membership_elapsed_ms=%s",
+        result["passage_documents"],
+        result["membership_certified_passages"],
+        result["membership_failed_documents"],
+        result["membership_deferred_documents"],
+        result["membership_elapsed_ms"],
+    )
+    return result
 
 
 def _selector_defaults(connector_id: str) -> dict[str, Any]:

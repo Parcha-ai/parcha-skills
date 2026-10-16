@@ -1916,6 +1916,7 @@ class CanonicalPassageProjector:
         documents = passages = stale = requeued = unavailable = batches = 0
         deleted = retained = 0
         membership_certified = membership_failed = membership_deferred = 0
+        membership_elapsed_ms = 0
         while batches < max_batches:
             phase_started = time.monotonic()
             candidates = self._pending(
@@ -1959,6 +1960,7 @@ class CanonicalPassageProjector:
                                if should_certify else ())
                 del prepared
                 if should_certify:
+                    certification_started = time.monotonic()
                     try:
                         certification = parent_membership_enrollment.certify_published_passages(
                             self.store, tenant_id=candidate.tenant_id, source_id=candidate.source_id,
@@ -1972,6 +1974,9 @@ class CanonicalPassageProjector:
                         # Publication and its queue ACK have committed. Optional
                         # proof failure must never replay publication or ingest.
                         status['membership_failed'] = 1
+                    finally:
+                        status['membership_elapsed_ms'] = max(
+                            0, round((time.monotonic() - certification_started) * 1000))
                 return status, preparation_elapsed, commit_elapsed
 
             requeued_in_batch = unavailable_in_batch = 0
@@ -2009,6 +2014,7 @@ class CanonicalPassageProjector:
                             membership_certified += int(status.get('membership_certified', 0))
                             membership_failed += int(status.get('membership_failed', 0))
                             membership_deferred += int(status.get('membership_deferred', 0))
+                            membership_elapsed_ms += int(status.get('membership_elapsed_ms', 0))
                             documents += 1
                             passages += int(status["inserted"])
                             deleted += int(status["deleted"])
@@ -2049,6 +2055,8 @@ class CanonicalPassageProjector:
             "membership_certified_passages": membership_certified,
             "membership_failed_documents": membership_failed,
             "membership_deferred_documents": membership_deferred,
+            # Sum of optional owner durations; concurrent hooks may overlap.
+            "membership_elapsed_ms": membership_elapsed_ms,
             "passages": passages,
             "inserted": passages,
             "deleted": deleted,

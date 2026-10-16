@@ -655,6 +655,10 @@ def run_projection_worker(
                 "passage_prepare_ms": int(projected.get("prepare_ms", 0)),
                 "passage_commit_ms": int(projected.get("commit_ms", 0)),
                 "passage_count_ms": int(projected.get("count_ms", 0)),
+                "membership_certified_passages": int(projected.get("membership_certified_passages", 0)),
+                "membership_failed_documents": int(projected.get("membership_failed_documents", 0)),
+                "membership_deferred_documents": int(projected.get("membership_deferred_documents", 0)),
+                "membership_elapsed_ms": int(projected.get("membership_elapsed_ms", 0)),
                 "logical_elapsed_ms": logical_elapsed_ms,
                 "parquet_elapsed_ms": parquet_elapsed_ms,
                 "search_plane_elapsed_ms": search_plane_elapsed_ms,
@@ -701,7 +705,9 @@ def run_projection_worker(
                 "retirement_cleared_utf8_bytes=%s retirement_archive_bytes=%s "
                 "retirement_enrolled_parents=%s retirement_reconciled_intents=%s retirement_unknown=%s "
                 "passage_warmup_ms=%s passage_pending_ms=%s passage_prepare_ms=%s "
-                "passage_commit_ms=%s passage_count_ms=%s",
+                "passage_commit_ms=%s passage_count_ms=%s "
+                "membership_certified_passages=%s membership_failed_documents=%s "
+                "membership_deferred_documents=%s membership_elapsed_ms=%s",
                 *(
                     result[key]
                     for key in (
@@ -762,6 +768,10 @@ def run_projection_worker(
                         "passage_prepare_ms",
                         "passage_commit_ms",
                         "passage_count_ms",
+                        "membership_certified_passages",
+                        "membership_failed_documents",
+                        "membership_deferred_documents",
+                        "membership_elapsed_ms",
                     )
                 ),
             )
