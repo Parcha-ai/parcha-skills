@@ -339,14 +339,17 @@ class Collector:
             "AND outbox.start_offset=dead_letters.byte_offset "
             "AND outbox.state='acked')"
         )
-        last_ack = self.db.execute(
-            "SELECT max(acked_at) FROM outbox WHERE state='acked' AND acked_at IS NOT NULL"
-        ).fetchone()[0]
-        if last_ack is not None:
-            self.db.execute(
-                "INSERT OR IGNORE INTO meta(key,value) VALUES ('last_success_epoch',?)",
-                (str(int(last_ack)),),
-            )
+        if self.db.execute(
+            "SELECT 1 FROM meta WHERE key='last_success_epoch'"
+        ).fetchone() is None:
+            last_ack = self.db.execute(
+                "SELECT max(acked_at) FROM outbox WHERE state='acked' AND acked_at IS NOT NULL"
+            ).fetchone()[0]
+            if last_ack is not None:
+                self.db.execute(
+                    "INSERT OR IGNORE INTO meta(key,value) VALUES ('last_success_epoch',?)",
+                    (str(int(last_ack)),),
+                )
         self.db.execute("INSERT OR REPLACE INTO meta(key,value) VALUES ('collector_version',?)", (str(COLLECTOR_VERSION),))
         self.db.commit()
 

@@ -562,6 +562,31 @@ class CollectorTest(unittest.TestCase):
         self.assertEqual(codes, ["JSONDecodeError"])
         migrated.close()
 
+    def test_startup_keeps_existing_success_without_scanning_acked_outbox(self) -> None:
+        from unittest.mock import patch
+        from collector import collector as module
+        (self.root / "session.jsonl").write_text(claude_line("acknowledged history"))
+        collector = self.collector()
+        collector.scan()
+        collector.flush()
+        collector.db.execute("UPDATE meta SET value='0' WHERE key='last_success_epoch'")
+        collector.db.commit()
+        collector.close()
+
+        statements = []
+        original_connect = module.sqlite3.connect
+        def traced_connect(*args, **kwargs):
+            connection = original_connect(*args, **kwargs)
+            connection.set_trace_callback(statements.append)
+            return connection
+        with patch.object(module.sqlite3, "connect", side_effect=traced_connect):
+            migrated = self.collector()
+        self.addCleanup(migrated.close)
+        self.assertEqual(migrated.db.execute(
+            "SELECT value FROM meta WHERE key='last_success_epoch'"
+        ).fetchone()[0], "0")
+        self.assertFalse(any("max(acked_at)" in sql.lower() for sql in statements))
+
     def test_startup_backfills_legacy_last_success_from_acked_outbox(self) -> None:
         (self.root / "session.jsonl").write_text(claude_line("legacy acknowledgement"))
         collector = self.collector()
