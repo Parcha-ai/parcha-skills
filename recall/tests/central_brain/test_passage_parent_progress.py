@@ -8,7 +8,7 @@ import weakref
 from unittest.mock import patch
 
 from recall_server.logical_evidence import LogicalEvidenceError
-from recall_server.passage_index import CanonicalPassageProjector
+from recall_server.passage_index import CanonicalPassageProjector, PreparedPassageDocument
 from recall_server.passage_projection import PassagePolicy
 
 
@@ -22,9 +22,9 @@ class Store:
         return SimpleNamespace(fetchone=lambda: {'count': 0})
 
 
-class Prepared:
+class Prepared(PreparedPassageDocument):
     def __init__(self, candidate):
-        self.candidate = candidate
+        super().__init__(candidate, 0, 0, ())
 
 
 class PassageOwnerTests(unittest.TestCase):
@@ -38,7 +38,8 @@ class PassageOwnerTests(unittest.TestCase):
         class Projector(CanonicalPassageProjector):
             def _pending(self, **kwargs):
                 return [SimpleNamespace(name=n) for n in range(64)]
-            def _prepare(self, candidate):
+            def _prepare(self, candidate, *, incremental=False):
+                assert incremental is True
                 value = Prepared(candidate)
                 weakref.finalize(value, freed)
                 with lock:
@@ -78,7 +79,8 @@ class PassageOwnerTests(unittest.TestCase):
             def _pending(self, **kwargs):
                 calls.append('pending')
                 return [SimpleNamespace(name=name) for name in ('missing', 'unavailable', 'ready')]
-            def _prepare(self, candidate):
+            def _prepare(self, candidate, *, incremental=False):
+                assert incremental is True
                 if candidate.name != 'ready':
                     raise LogicalEvidenceError('logical_evidence_' +
                         ('not_found' if candidate.name == 'missing' else 'unavailable'))
@@ -106,7 +108,8 @@ class PassageOwnerTests(unittest.TestCase):
                     def _pending(self, **kwargs):
                         return [SimpleNamespace(name=name) for name in
                             ('large', 'small', *[f'tiny{n}' for n in range(8)])]
-                    def _prepare(self, candidate):
+                    def _prepare(self, candidate, *, incremental=False):
+                        assert incremental is True
                         started.append(candidate.name)
                         if candidate.name in {'large', 'tiny0'}:
                             if candidate.name == 'large':

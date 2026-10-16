@@ -285,7 +285,7 @@ are supported: versions through 69 are required except optional migration 67,
 which retires the Postgres vector plane and is applied explicitly from the
 turbopuffer plane. Migration 70 adds only a reconciliation performance index;
 serving accepts both schema 69 and 70 and reports the actual recorded version.
-The latest shipped migration is 83; migration 71 remains optional and reserved
+The latest shipped migration is 84; migration 71 remains optional and reserved
 for native-conversation metadata. Migration 72 adds nullable
 `canonical_evidence_document_queue.notification_queued_at`, with no default,
 index, or historical reclassification. Apply it before deploying the notification
@@ -1742,3 +1742,23 @@ binding epoch. Existing publications remain on native membership verification.
 Image deployment does not apply this migration. See
 [the certification boundary](../../docs/architecture/2026-10-16-parent-membership-certification.md)
 for enrollment budgets and the invalidation-interruption reset procedure.
+
+### Optional passage append checkpoint (84)
+
+Migration 84 adds one nullable `append_checkpoint` column to
+`canonical_passage_documents`, without a backfill or index. Deploy compatible
+images to MCP, managed ingestion, and the projection worker before applying it.
+On schema 83 or missing checkpoint state, preparation uses the existing full
+path. Exact immutable prefixes allow the publisher to rebuild only the
+overlapping tail; edits, Forget, changed policies, or invalid checkpoints use
+full preparation. Preview and verification callers still use full preparation.
+
+`RECALL_PASSAGE_APPEND_REUSE` accepts only `0` or `1` and defaults to `1`.
+Set it to `0` to restore full publisher preparation while continuing to refresh
+checkpoints. After migration 84, keep a compatible image for rollback; older
+images reject the marker. Do not remove migration markers or re-embed the
+corpus to disable reuse. The existing projection cycle log reports
+`passage_archive_bytes_read`, `passage_archive_parts_read`,
+`passage_prepare_full_documents`, and `passage_prepare_reused_documents`.
+These count completed preparation work, including abandoned prefix reads
+before a full fallback; they exclude logical-document SHA preparation.

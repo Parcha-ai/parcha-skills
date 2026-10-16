@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from recall_server.passage_index import CanonicalPassageProjector
+from recall_server.passage_index import CanonicalPassageProjector, PreparedPassageDocument
 from recall_server.passage_projection import PassagePolicy
 
 
@@ -65,10 +65,11 @@ class Projector(CanonicalPassageProjector):
         self.store.clock.advance(2)
         return () if self.empty else (SimpleNamespace(logical_document_id="PRIVATE"),)
 
-    def _prepare(self, candidate):
+    def _prepare(self, candidate, *, incremental=False):
+        assert incremental is True
         self.calls.append("prepare")
         self.store.clock.advance(3)
-        return SimpleNamespace(candidate=candidate)
+        return PreparedPassageDocument(candidate, 0, 0, ())
 
     def _commit(self, prepared):
         self.calls.append("commit")
