@@ -9,14 +9,14 @@ import math
 import threading
 from collections import Counter
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from io import BytesIO
 from typing import Any, Callable, Iterable, Iterator
 
 import psycopg
 
-from . import parent_membership_enrollment
+from . import parent_membership_enrollment, passage_append
 from .logical_evidence import (
     LogicalEvidenceError,
     LogicalEvidenceProjectionStore,
@@ -75,7 +75,12 @@ class PreparedPassageDocument:
     candidate: PassageCandidate
     dense_message_count: int
     dense_message_bytes: int
-    passages: tuple[LosslessPassage, ...]
+    passages: tuple[LosslessPassage | passage_append.RetainedPassage, ...]
+    append_checkpoint: dict[str, Any] | None = None
+    previous_checkpoint: dict[str, Any] | None = None
+    append_checkpoint_available: bool = False
+    archive_bytes_read: int = 0
+    archive_parts_read: int = 0
 
 
 @dataclass(frozen=True)
@@ -107,7 +112,7 @@ class PassageDiff:
 
 def classify_passages(
     existing: Iterable[dict[str, Any]],
-    passages: tuple[LosslessPassage, ...],
+    passages: tuple[LosslessPassage | passage_append.RetainedPassage, ...],
     *,
     revision: int,
 ) -> PassageDiff:
@@ -129,8 +134,12 @@ def classify_passages(
     new_ids = {passage.passage_id for passage in passages}
     if len(new_ids) != len(passages):
         raise LogicalEvidenceError("passage_identity_collision")
+    if any(isinstance(passage, passage_append.RetainedPassage)
+           and passage.passage_id not in stored for passage in passages):
+        raise LogicalEvidenceError("passage_retained_prefix_missing")
     to_insert = tuple(
-        passage for passage in passages if passage.passage_id not in stored
+        passage for passage in passages
+        if isinstance(passage, LosslessPassage) and passage.passage_id not in stored
     )
     retained = tuple(
         passage.passage_id for passage in passages if passage.passage_id in stored
@@ -457,6 +466,7 @@ class CanonicalPassageProjector:
         self.logical_projection = logical_projection
         self.policy = policy
         self.bound_tenant_id = bound_tenant_id
+        self.append_reuse_enabled = passage_append.reuse_enabled()
         self.membership_certification = (membership_certification
             if membership_certification is not None
             else parent_membership_enrollment.CertificationSettings.from_env())
@@ -749,11 +759,44 @@ class CanonicalPassageProjector:
             )
         return max(0, result.rowcount)
 
+    def _append_state(self, candidate):
+        # to_jsonb keeps schema083 readers/writers compatible during rollout.
+        # Capability is read per attempt, never cached across migrations.
+        try:
+            with self.store.connect() as connection:
+                return connection.execute("""SELECT EXISTS(
+                    SELECT 1 FROM pg_attribute
+                    WHERE attrelid=to_regclass('canonical_passage_documents')
+                      AND attname='append_checkpoint' AND NOT attisdropped
+                      AND atttypid='jsonb'::regtype) AS available,
+                    (SELECT to_jsonb(projected) FROM canonical_passage_documents projected
+                     WHERE tenant_id=%s AND source_id=%s AND logical_document_id=%s) AS projected""",
+                    (candidate.tenant_id, candidate.source_id, candidate.logical_document_id)).fetchone()
+        except psycopg.Error:
+            return None
+
+    def _append_prefix(self, candidate, checkpoint, connection=None):
+        if connection is None:
+            with self.store.connect() as current:
+                return self._append_prefix(candidate, checkpoint, current)
+        rows = connection.execute("""SELECT passage_id,ordinal,receipts
+            FROM canonical_passages WHERE tenant_id=%s AND source_id=%s
+              AND logical_document_id=%s AND ordinal<%s ORDER BY ordinal""",
+            (candidate.tenant_id, candidate.source_id, candidate.logical_document_id,
+             checkpoint['passage_ordinal'])).fetchall()
+        prefix = tuple(passage_append.RetainedPassage(row['passage_id'], row['ordinal'],
+                                                     tuple(row['receipts'])) for row in rows)
+        if (len(prefix) != checkpoint['passage_ordinal']
+            or passage_append.prefix_digest(prefix) != checkpoint['retained_prefix_sha256']):
+            return None
+        return prefix
+
     def _prepare(
         self,
         candidate: PassageCandidate,
         *,
         policy: PassagePolicy | None = None,
+        incremental: bool = False,
     ) -> PreparedPassageDocument:
         policy = self.policy if policy is None else policy
         manifest = self.logical_projection.read_manifest(
@@ -771,6 +814,43 @@ class CanonicalPassageProjector:
             != len(candidate.part_references)
         ):
             raise LogicalEvidenceError("passage_manifest_catalog_mismatch")
+        state = self._append_state(candidate) if policy == self.policy else None
+        checkpoint = (state.get('projected') or {}).get('append_checkpoint') if state else None
+        bodies = {}
+        archive_bytes_read = archive_parts_read = 0
+
+        def full_fallback():
+            full = self._prepare(candidate, policy=policy, incremental=False)
+            return replace(full, archive_bytes_read=full.archive_bytes_read + archive_bytes_read,
+                           archive_parts_read=full.archive_parts_read + archive_parts_read)
+
+        def read_part(ordinal, *, remember=False):
+            nonlocal archive_bytes_read, archive_parts_read
+            if ordinal in bodies:
+                return bodies.pop(ordinal)
+            body = self.logical_projection.read_part(
+                candidate.part_references[ordinal], tenant_id=candidate.tenant_id,
+                source_id=candidate.source_id)
+            archive_bytes_read += len(body)
+            archive_parts_read += 1
+            if remember:
+                bodies[ordinal] = body
+            return body
+
+        resume = None
+        prefix = ()
+        if incremental and self.append_reuse_enabled and state and isinstance(checkpoint, dict) and checkpoint.get('policy_fingerprint') == policy.fingerprint:
+            try:
+                if passage_append.proves_append(checkpoint, state['projected'], candidate, manifest, lambda ordinal: read_part(ordinal, remember=True)):
+                    prefix = self._append_prefix(candidate, checkpoint)
+                    if prefix is not None:
+                        resume = checkpoint
+            except (LogicalEvidenceError, KeyError, TypeError, ValueError, psycopg.Error):
+                # Optional prefix proof cannot make an otherwise valid current
+                # full publication unavailable. Current reads still verify hashes.
+                bodies.clear()
+        first_record = resume['record_ordinal'] if resume else 0
+
         def records() -> Iterator[Any]:
             for ordinal, reference in enumerate(candidate.part_references):
                 manifest_part = manifest["parts"][ordinal]
@@ -791,16 +871,16 @@ class CanonicalPassageProjector:
                     raise LogicalEvidenceError(
                         "passage_manifest_part_mismatch"
                     )
-                payload = self.logical_projection.read_part(
-                    reference,
-                    tenant_id=candidate.tenant_id,
-                    source_id=candidate.source_id,
-                )
+                if manifest_part['last_record_ordinal'] < first_record:
+                    continue
+                payload = read_part(ordinal)
                 if not payload.endswith(b"\n"):
                     raise LogicalEvidenceError(
                         "passage_logical_part_invalid"
                     )
-                for line in BytesIO(payload):
+                for record_ordinal, line in enumerate(BytesIO(payload), manifest_part['first_record_ordinal']):
+                    if record_ordinal < first_record:
+                        continue
                     # read_part verifies the immutable object hash. Validate
                     # each record contract without serializing trusted bytes
                     # back into canonical JSON a second time.
@@ -810,7 +890,12 @@ class CanonicalPassageProjector:
                         verify_canonical=False,
                     )
 
-        messages = visible_messages(records())
+        try:
+            messages = visible_messages(records(), first_record_ordinal=first_record)
+        except LogicalEvidenceError:
+            if resume:
+                return full_fallback()
+            raise
         passages = (
             build_passages(
                 tenant_id=candidate.tenant_id,
@@ -820,14 +905,32 @@ class CanonicalPassageProjector:
                 messages=messages,
                 policy=policy,
             )
-            if messages
+            if messages and not resume
             else ()
         )
+        if resume:
+            if not messages or messages[0].record_ordinal != resume['record_ordinal']:
+                return full_fallback()
+            arguments = dict(tenant_id=candidate.tenant_id, source_id=candidate.source_id,
+                logical_document_id=candidate.logical_document_id, revision=candidate.revision, policy=policy)
+            try:
+                if resume['source_byte_start'] >= len(messages[0].text.encode()):
+                    raise ValueError("invalid passage restart offset")
+                passages = prefix + passage_append.resume_passages(messages, resume, arguments)
+            except (ValueError, IndexError, UnicodeDecodeError):
+                return full_fallback()
+        checkpoint = (passage_append.make_checkpoint(candidate, manifest, messages, passages,
+            policy, previous=resume) if state and state['available'] else None)
         return PreparedPassageDocument(
             candidate=candidate,
-            dense_message_count=len(messages),
-            dense_message_bytes=sum(len(message.text.encode()) for message in messages),
+            dense_message_count=len(messages) + (resume["message_index"] if resume else 0),
+            dense_message_bytes=sum(len(message.text.encode()) for message in messages) + (resume["prefix_message_bytes"] if resume else 0),
             passages=passages,
+            append_checkpoint=checkpoint,
+            previous_checkpoint=resume,
+            append_checkpoint_available=bool(state and state["available"]),
+            archive_bytes_read=archive_bytes_read,
+            archive_parts_read=archive_parts_read,
         )
 
     def _commit(self, prepared: PreparedPassageDocument) -> dict[str, Any]:
@@ -886,6 +989,14 @@ class CanonicalPassageProjector:
                         candidate.logical_document_id,
                     ),
                 ).fetchall()
+                if prepared.previous_checkpoint is not None:
+                    prior = connection.execute("""SELECT append_checkpoint
+                        FROM canonical_passage_documents WHERE tenant_id=%s AND source_id=%s
+                          AND logical_document_id=%s FOR UPDATE""",
+                        (candidate.tenant_id,candidate.source_id,candidate.logical_document_id)).fetchone()
+                    if (prior is None or prior['append_checkpoint'] != prepared.previous_checkpoint
+                        or self._append_prefix(candidate, prepared.previous_checkpoint, connection) is None):
+                        return {"status": "stale"}
                 diff = classify_passages(
                     existing,
                     prepared.passages,
@@ -1021,6 +1132,13 @@ class CanonicalPassageProjector:
                         len(prepared.passages),
                     ),
                 )
+                if prepared.append_checkpoint_available:
+                    connection.execute("""UPDATE canonical_passage_documents SET append_checkpoint=%s::jsonb
+                        WHERE tenant_id=%s AND source_id=%s AND logical_document_id=%s""",
+                        (json.dumps(prepared.append_checkpoint) if prepared.append_checkpoint is not None else None,candidate.tenant_id,
+                         candidate.source_id,candidate.logical_document_id))
+                elif prepared.previous_checkpoint is not None:
+                    raise LogicalEvidenceError("passage_append_checkpoint_missing")
                 if diff.moved:
                     moved_ids = [passage_id for passage_id, _ in diff.moved]
                     connection.execute(
@@ -1917,6 +2035,7 @@ class CanonicalPassageProjector:
         deleted = retained = 0
         membership_certified = membership_failed = membership_deferred = 0
         membership_elapsed_ms = 0
+        preparation_counts = Counter()
         while batches < max_batches:
             phase_started = time.monotonic()
             candidates = self._pending(
@@ -1937,7 +2056,7 @@ class CanonicalPassageProjector:
                 # futures retain scalar results, never a batch of passage text.
                 preparation_started = time.monotonic()
                 try:
-                    prepared = self._prepare(candidate)
+                    prepared = self._prepare(candidate, incremental=True)
                 except LogicalEvidenceError as error:
                     if str(error) not in {"logical_evidence_not_found", "logical_evidence_unavailable"}:
                         raise
@@ -1958,6 +2077,10 @@ class CanonicalPassageProjector:
                                   and self.membership_certification.enabled)
                 passage_ids = (tuple(passage.passage_id for passage in prepared.passages)
                                if should_certify else ())
+                status['archive_bytes_read'] = prepared.archive_bytes_read
+                status['archive_parts_read'] = prepared.archive_parts_read
+                status['prepare_reused_documents'] = int(prepared.previous_checkpoint is not None)
+                status['prepare_full_documents'] = int(prepared.previous_checkpoint is None)
                 del prepared
                 if should_certify:
                     certification_started = time.monotonic()
@@ -1998,6 +2121,9 @@ class CanonicalPassageProjector:
                         for future in completed:
                             candidate = futures.pop(future)
                             status, preparation_elapsed, commit_elapsed = future.result()
+                            for key in ('archive_bytes_read', 'archive_parts_read',
+                                        'prepare_reused_documents', 'prepare_full_documents'):
+                                preparation_counts[key] += int(status.get(key, 0))
                             prepare_seconds += preparation_elapsed
                             commit_seconds += commit_elapsed
                             if status["status"] == "logical_evidence_not_found":
@@ -2072,6 +2198,12 @@ class CanonicalPassageProjector:
             "warmup_ms": max(0, round(warmup_seconds * 1000)),
             "pending_ms": max(0, round(pending_seconds * 1000)),
             "prepare_ms": max(0, round(prepare_seconds * 1000)),
+            # Successful archive reads, including an abandoned prefix attempt
+            # before a full fallback. These measure work, not total history size.
+            "archive_bytes_read": preparation_counts['archive_bytes_read'],
+            "archive_parts_read": preparation_counts['archive_parts_read'],
+            "prepare_reused_documents": preparation_counts['prepare_reused_documents'],
+            "prepare_full_documents": preparation_counts['prepare_full_documents'],
             "commit_ms": max(0, round(commit_seconds * 1000)),
             "count_ms": max(0, round(count_seconds * 1000)),
             "elapsed_seconds": round(elapsed_seconds, 3),

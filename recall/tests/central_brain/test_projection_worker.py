@@ -149,7 +149,9 @@ class ProjectionWorkerTest(unittest.TestCase):
             def project_pending(self, **kwargs):
                 return {**super().project_pending(**kwargs),
                         "warmup_ms": 11, "pending_ms": 22, "prepare_ms": 33,
-                        "commit_ms": 44, "count_ms": 55, "private": "SECRET_PAYLOAD"}
+                        "commit_ms": 44, "count_ms": 55, "private": "SECRET_PAYLOAD",
+                        "archive_bytes_read": 7823, "archive_parts_read": 3,
+                        "prepare_full_documents": 1, "prepare_reused_documents": 2}
 
         with self.assertLogs("recall_server.projection_worker", level="INFO") as logs:
             result = run_projection_worker(
@@ -165,6 +167,10 @@ class ProjectionWorkerTest(unittest.TestCase):
             key = f"passage_{phase}_ms"
             self.assertEqual(result[key], expected)
             self.assertIn(f"{key}={expected}", "\n".join(logs.output))
+        for key, expected in (("archive_bytes_read", 7823), ("archive_parts_read", 3),
+                              ("prepare_full_documents", 1), ("prepare_reused_documents", 2)):
+            self.assertEqual(result[f"passage_{key}"], expected)
+            self.assertIn(f"passage_{key}={expected}", "\n".join(logs.output))
         self.assertNotIn("SECRET_PAYLOAD", str(result) + str(logs.output))
 
     def test_embedding_disconnect_does_not_terminate_the_projection_worker(self):

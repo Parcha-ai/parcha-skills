@@ -653,6 +653,10 @@ def run_projection_worker(
                 "passage_warmup_ms": int(projected.get("warmup_ms", 0)),
                 "passage_pending_ms": int(projected.get("pending_ms", 0)),
                 "passage_prepare_ms": int(projected.get("prepare_ms", 0)),
+                "passage_archive_bytes_read": int(projected.get("archive_bytes_read", 0)),
+                "passage_archive_parts_read": int(projected.get("archive_parts_read", 0)),
+                "passage_prepare_reused_documents": int(projected.get("prepare_reused_documents", 0)),
+                "passage_prepare_full_documents": int(projected.get("prepare_full_documents", 0)),
                 "passage_commit_ms": int(projected.get("commit_ms", 0)),
                 "passage_count_ms": int(projected.get("count_ms", 0)),
                 "membership_certified_passages": int(projected.get("membership_certified_passages", 0)),
@@ -706,6 +710,10 @@ def run_projection_worker(
                 "retirement_enrolled_parents=%s retirement_reconciled_intents=%s retirement_unknown=%s "
                 "passage_warmup_ms=%s passage_pending_ms=%s passage_prepare_ms=%s "
                 "passage_commit_ms=%s passage_count_ms=%s "
+                "passage_archive_bytes_read=%s "
+                "passage_archive_parts_read=%s "
+                "passage_prepare_reused_documents=%s "
+                "passage_prepare_full_documents=%s "
                 "membership_certified_passages=%s membership_failed_documents=%s "
                 "membership_deferred_documents=%s membership_elapsed_ms=%s",
                 *(
@@ -768,6 +776,10 @@ def run_projection_worker(
                         "passage_prepare_ms",
                         "passage_commit_ms",
                         "passage_count_ms",
+                        "passage_archive_bytes_read",
+                        "passage_archive_parts_read",
+                        "passage_prepare_reused_documents",
+                        "passage_prepare_full_documents",
                         "membership_certified_passages",
                         "membership_failed_documents",
                         "membership_deferred_documents",

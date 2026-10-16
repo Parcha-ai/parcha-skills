@@ -757,6 +757,8 @@ class PassageProjectionTests(unittest.TestCase):
                     "parts": [
                         {
                             "ordinal": 0,
+                            "first_record_ordinal": 0,
+                            "last_record_ordinal": len(records) - 1,
                             **{
                                 field: part[field]
                                 for field in (
@@ -778,8 +780,12 @@ class PassageProjectionTests(unittest.TestCase):
                 self.assertEqual(source_id, "source:test")
                 return StreamingPayload(payload)
 
+        store = mock.MagicMock()
+        store.connect.return_value.__enter__.return_value.execute.return_value.fetchone.return_value = {
+            "available": False, "projected": None,
+        }
         projector = CanonicalPassageProjector(
-            object(),
+            store,
             Projection(),  # type: ignore[arg-type]
             policy=PassagePolicy(target_tokens=8, overlap_tokens=2),
         )
