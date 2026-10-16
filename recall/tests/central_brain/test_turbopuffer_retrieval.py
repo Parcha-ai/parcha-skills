@@ -226,6 +226,52 @@ class ArmTests(unittest.TestCase):
         self.assertTrue(hint["text"])
         self.assertEqual(response["diagnostics"]["hydrate_status"], "ok")
 
+    def test_legacy_tool_passage_remains_readable_until_reprojected(self) -> None:
+        import json
+        from recall_server.logical_evidence import LogicalEvidenceRecord
+        from recall_server.passage_projection import (
+            PassagePolicy, build_passages, visible_message_text, visible_messages,
+        )
+
+        envelope = json.dumps({"type": "user", "message": {
+            "role": "user", "content": [
+                {"type": "text", "text": "deployment question"},
+                {"type": "tool_result", "content": "deployment tool output"},
+            ],
+        }})
+        legacy_text = visible_message_text(envelope)
+        self.assertEqual(legacy_text, "deployment question\ndeployment tool output")
+        record = LogicalEvidenceRecord(
+            ordinal=0, event_native_id="native:legacy", event_kind="user",
+            occurred_at="2026-05-03T10:00:00Z", roles=("user",),
+            receipts=("recall://codex:linux:test/x-1?rev=1#item=0",),
+            segment_ordinal=0, segment_count=1, text=envelope,
+        )
+        replacement = build_passages(
+            tenant_id=TENANT, source_id="codex:linux:test", logical_document_id=LDOC,
+            revision=2, messages=visible_messages((record,)),
+            policy=PassagePolicy(target_tokens=1024, overlap_tokens=128),
+        )
+        self.assertEqual(len(replacement), 1)
+        self.assertEqual(replacement[0].text, "deployment question")
+
+        client = FakeTurbopuffer()
+        ns = client.namespace(SETTINGS.namespace(TENANT))
+        ns.write(upsert_rows=[passage_row(catalog_passage(1, legacy_text))])
+        retrieval, store = self._retrieval(client)
+        store.query_clauses = False
+        old = retrieval.search("deployment", lexical_query="deployment", since=None, until=None, limit=5)
+        self.assertEqual(old["diagnostics"]["hydrate_status"], "ok")
+        self.assertEqual(old["results"][0]["matching_ranges"][0]["text"], legacy_text)
+
+        # Model an acknowledged replacement publication. Native hydration reads
+        # its stored bytes/hash, never re-extracting old bodies with new offsets.
+        ns.write(upsert_rows=[passage_row(catalog_passage(1, replacement[0].text))])
+        new = retrieval.search("deployment", lexical_query="deployment", since=None, until=None, limit=5)
+        self.assertEqual(new["diagnostics"]["hydrate_status"], "ok")
+        self.assertEqual(new["results"][0]["matching_ranges"][0]["text"], "deployment question")
+        self.assertEqual(record.text, envelope)
+
     def test_search_runs_fusion_rerank_and_hints_on_the_plane(self) -> None:
         client = FakeTurbopuffer()
         ns = self._seed(client)

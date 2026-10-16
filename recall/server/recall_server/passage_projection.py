@@ -62,8 +62,10 @@ RECEIPT_RE = re.compile(r"recall://[^\s]{1,2040}\Z")
 TOKEN_RE = re.compile(r"\S+")
 
 
-def _text_blocks(value: object) -> tuple[str, ...]:
-    """Extract only explicitly visible text blocks from a message value."""
+def _text_blocks(
+    value: object, *, include_tool_results: bool = True,
+) -> tuple[str, ...]:
+    """Extract message text, optionally omitting typed tool-result blocks."""
 
     if isinstance(value, str):
         return (value,) if value.strip() else ()
@@ -71,18 +73,25 @@ def _text_blocks(value: object) -> tuple[str, ...]:
         return tuple(
             text
             for item in value
-            for text in _text_blocks(item)
+            for text in _text_blocks(item, include_tool_results=include_tool_results)
         )
     if not isinstance(value, dict):
+        return ()
+    if not include_tool_results and value.get("type") == "tool_result":
         return ()
     text = value.get("text")
     if isinstance(text, str) and text.strip():
         return (text,)
     content = value.get("content")
-    return _text_blocks(content) if content is not None else ()
+    return (
+        _text_blocks(content, include_tool_results=include_tool_results)
+        if content is not None else ()
+    )
 
 
-def _visible_message(text: str) -> tuple[str | None, str | None]:
+def _visible_message(
+    text: str, *, include_tool_results: bool = False,
+) -> tuple[str | None, str | None]:
     """Project harness envelopes to their exact human-visible message text."""
 
     try:
@@ -108,7 +117,7 @@ def _visible_message(text: str) -> tuple[str | None, str | None]:
         block
         for candidate in candidates
         if candidate is not None
-        for block in _text_blocks(candidate)
+        for block in _text_blocks(candidate, include_tool_results=include_tool_results)
     ))
     if blocks:
         # Provider-declared final text, not an inferred summary or a vendor hint.
@@ -156,7 +165,8 @@ def _visible_message(text: str) -> tuple[str | None, str | None]:
 
 
 def visible_message_text(text: str) -> str | None:
-    return _visible_message(text)[0]
+    """Keep historical extraction semantics for previously published spans."""
+    return _visible_message(text, include_tool_results=True)[0]
 
 
 @dataclass(frozen=True)
@@ -841,6 +851,8 @@ def visible_messages(
             or not set(dense_roles) <= VISIBLE_DENSE_ROLES
         ):
             continue
+        # Claude wraps tool results in user-role envelopes. Keep those bytes
+        # in captured evidence, but do not project them as conversational text.
         text, source_unit = _visible_message(source_text)
         if source_unit == COMPLETE_ASSISTANT_FINAL_UNIT and first.roles != ("assistant",):
             source_unit = None

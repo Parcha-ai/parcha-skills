@@ -38,6 +38,7 @@ from recall_server.passage_projection import (
     build_passages,
     decode_logical_record,
     reconstruct_passage,
+    visible_message_text,
     visible_messages,
 )
 from recall_server.passage_retrieval import (
@@ -573,6 +574,73 @@ class PassageProjectionTests(unittest.TestCase):
         self.assertNotIn("noise", "\n".join(
             message.text for message in messages
         ))
+
+    def test_claude_user_wrapped_tool_result_is_not_visible_prose(self):
+        # Claude records shell output as a user message. This shape produced
+        # a Recall skill passage in an otherwise relevant sprint session.
+        envelope = {
+            "type": "user",
+            "userType": "external",
+            "message": {
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_read_skill",
+                    "content": "Recall skill: search prior sessions before continuing.",
+                    "is_error": False,
+                }],
+            },
+            "toolUseResult": {"stdout": "same captured output", "stderr": ""},
+        }
+        record = LogicalEvidenceRecord(
+            ordinal=0,
+            event_native_id="native:claude-tool-result",
+            event_kind="user",
+            occurred_at="2026-10-08T21:10:39Z",
+            roles=("user",),
+            receipts=("recall://source:test/claude-tool-result?rev=1#item=0",),
+            segment_ordinal=0,
+            segment_count=1,
+            text=orjson.dumps(envelope).decode(),
+        )
+        captured = record.encode(source_id="source:test")
+
+        self.assertEqual(visible_messages((record,)), ())
+        self.assertEqual(record.encode(source_id="source:test"), captured)
+
+    def test_mixed_tool_result_keeps_exact_visible_text_code_and_receipts(self):
+        user = 'Explain this code: ```python\nprint("tool_result")\n```'
+        answer = "The output is tool_result. Keep AGENTS.md as documentation."
+        records = []
+        for ordinal, (role, content) in enumerate((
+            ("user", [
+                {"type": "text", "text": user},
+                {"type": "tool_result", "content": [{"type": "text", "text": "hidden tool bytes"}]},
+            ]),
+            ("assistant", [{"type": "text", "text": answer}]),
+        )):
+            records.append(LogicalEvidenceRecord(
+                ordinal=ordinal, event_native_id=f"native:{ordinal}",
+                event_kind=role, occurred_at="2026-10-08T21:10:39Z",
+                roles=(role,), receipts=(f"recall://source:test/{ordinal}?rev=1#item=0",),
+                segment_ordinal=0, segment_count=1,
+                text=orjson.dumps({"type": role, "message": {"role": role, "content": content}}).decode(),
+            ))
+        captured = tuple(record.encode(source_id="source:test") for record in records)
+        messages = visible_messages(records)
+        self.assertEqual([message.text for message in messages], [user, answer])
+        self.assertEqual([message.receipts for message in messages], [record.receipts for record in records])
+        passages = build_passages(
+            tenant_id="tenant:company:test", source_id="source:test",
+            logical_document_id="ldoc_0123456789abcdef0123456789abcdef", revision=1,
+            messages=messages, policy=PassagePolicy(target_tokens=8, overlap_tokens=2),
+        )
+        for passage in passages:
+            self.assertEqual(reconstruct_passage(passage, messages), passage.text)
+            self.assertNotIn("hidden tool bytes", passage.text)
+        self.assertEqual(tuple(record.encode(source_id="source:test") for record in records), captured)
+        # Historical extraction remains available to callers decoding old spans.
+        self.assertEqual(visible_message_text(records[0].text), user + "\nhidden tool bytes")
 
     def test_trusted_archive_decode_validates_without_reserializing(self) -> None:
         record = LogicalEvidenceRecord(
