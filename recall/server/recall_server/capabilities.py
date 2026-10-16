@@ -22,6 +22,7 @@ from . import (
     FORGOTTEN_EVENT_DIGEST_TYPE_VERSION,
     PARENT_AUTHORITY_GENERATION_VERSION,
     PARENT_MEMBERSHIP_CERTIFICATE_VERSION,
+    PASSAGE_APPEND_CHECKPOINT_VERSION,
 )
 
 
@@ -219,7 +220,9 @@ def assess_snapshot(snapshot: dict[str, Any], profile: str = "production") -> di
                       + ([PARENT_AUTHORITY_GENERATION_VERSION]
                          if PARENT_AUTHORITY_GENERATION_VERSION in versions else [])
                       + ([PARENT_MEMBERSHIP_CERTIFICATE_VERSION]
-                         if PARENT_MEMBERSHIP_CERTIFICATE_VERSION in versions else []))
+                         if PARENT_MEMBERSHIP_CERTIFICATE_VERSION in versions else [])
+                      + ([PASSAGE_APPEND_CHECKPOINT_VERSION]
+                         if PASSAGE_APPEND_CHECKPOINT_VERSION in versions else []))
     if (RETIREMENT_POLICY_VERSION in versions
             and RETIREMENT_DETACHMENT_VERSION not in versions):
         raise CapabilityError("schema_drift")
