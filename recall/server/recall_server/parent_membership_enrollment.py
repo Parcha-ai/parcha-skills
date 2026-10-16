@@ -178,30 +178,39 @@ def _capture(store, scope, deadline, *, prove_ownership):
         return dict(status='captured',rows=rows,members=members,unique_receipts=len(receipts))
 
 
-def _enroll(store, scope, deadline_at):
-    with _connect(store,deadline_at) as connection, connection.transaction():
-        if not _authorized(store,connection,scope,deadline_at):
-            return dict(status='unauthorized')
-        # Initialize only a real, never-certified publication. Recreating a lost
-        # authority row could otherwise make an older certificate match again.
-        _query(store,connection,"""INSERT INTO canonical_parent_authority
+# Both explicit enrollment and historical admission initialize only a real
+# publication that has never carried a certificate. Missing authority beside
+# an old certificate must remain unknown, never reset to generation one.
+_INITIALIZE_GENERATION = """INSERT INTO canonical_parent_authority
             (tenant_id,source_id,native_parent_id,generation)
             SELECT evidence.tenant_id,evidence.source_id,evidence.native_parent_id,1
               FROM canonical_evidence_documents evidence
-             WHERE evidence.tenant_id=%s AND evidence.source_id=%s AND evidence.native_parent_id=%s
+             WHERE {selection}
                AND NOT EXISTS(SELECT 1 FROM canonical_parent_authority authority
                    WHERE authority.tenant_id=evidence.tenant_id AND authority.source_id=evidence.source_id
                      AND authority.native_parent_id=evidence.native_parent_id)
                AND EXISTS(SELECT 1 FROM canonical_passages passage
                    WHERE passage.tenant_id=evidence.tenant_id AND passage.source_id=evidence.source_id
                      AND passage.logical_document_id=evidence.logical_document_id
-                     AND passage.passage_id=ANY(%s))
+                     {passage_selection})
                AND NOT EXISTS(SELECT 1 FROM canonical_passages passage
                    WHERE passage.tenant_id=evidence.tenant_id AND passage.source_id=evidence.source_id
                      AND passage.logical_document_id=evidence.logical_document_id
                      AND passage.membership_generation IS NOT NULL)
-            ON CONFLICT DO NOTHING""",(scope['tenant_id'],scope['source_id'],scope['native_parent_id'],
-                                      list(scope['passage_ids'])),deadline_at)
+            {ordering}ON CONFLICT DO NOTHING"""
+
+
+def _enroll(store, scope, deadline_at):
+    with _connect(store,deadline_at) as connection, connection.transaction():
+        if not _authorized(store,connection,scope,deadline_at):
+            return dict(status='unauthorized')
+        # Initialize only a real, never-certified publication. Recreating a lost
+        # authority row could otherwise make an older certificate match again.
+        _query(store,connection,_INITIALIZE_GENERATION.format(
+            selection='evidence.tenant_id=%s AND evidence.source_id=%s AND evidence.native_parent_id=%s',
+            passage_selection='AND passage.passage_id=ANY(%s)', ordering=''),
+            (scope['tenant_id'],scope['source_id'],scope['native_parent_id'],list(scope['passage_ids'])),
+            deadline_at)
     captured=_capture(store,scope,deadline_at,prove_ownership=True)
     if captured['status']!='captured':
         return captured

@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Historical admission uses the existing metadata phase and native proof."""
 
+from concurrent.futures import ThreadPoolExecutor
+import threading
 import time
 import io
 import json
@@ -42,6 +44,139 @@ class HistoricalMembershipSeedTests(ParentMembershipPublicationTests):
         self.assertEqual(compared["certified_passages"], len(self.ids))
         self.assertEqual(compared["native_allowed_passages"], len(self.ids))
         self.assertEqual(compared["disagreements"], 0)
+
+    def test_historical_missing_generation_seed_reaches_native_proof(self):
+        with self.store.connect() as c:
+            c.execute('DELETE FROM canonical_parent_authority WHERE tenant_id=%s', (self.tenant,))
+        self.assertEqual(self.compare()['certified_passages'], 0)
+        seeded = self.seed(limit=10)
+        self.assertEqual(seeded['queued'], 1)
+        publisher = self.publisher()
+        with patch.object(publisher, '_prepare', side_effect=AssertionError('no archive preparation')):
+            result = publisher.project_pending(tenant_id=self.tenant, batch_size=10, max_batches=1)
+        self.assertEqual(result['documents'], 0)
+        self.assertEqual(result['membership_certified_passages'], len(self.ids))
+        compared = self.compare()
+        self.assertEqual(compared['certified_passages'], len(self.ids))
+        self.assertEqual(compared['native_allowed_passages'], len(self.ids))
+        self.assertEqual(compared['disagreements'], 0)
+
+    def test_lost_authority_with_old_certificate_is_not_reinitialized(self):
+        self.assertEqual(self.enroll()['status'], 'enrolled')
+        with self.store.connect() as c:
+            c.execute('DELETE FROM canonical_parent_authority WHERE tenant_id=%s', (self.tenant,))
+        result = self.seed()
+        self.assertEqual(result['queued'], 0)
+        self.assertIn('authority_generation_missing', result['deferred'][0]['reasons'])
+        self.assertEqual(self.compare()['certified_passages'], 0)
+        self.assertEqual(self.queued(), [])
+        with self.store.connect() as c:
+            self.assertIsNone(c.execute('SELECT generation FROM canonical_parent_authority WHERE tenant_id=%s',
+                                       (self.tenant,)).fetchone())
+
+    def test_initializer_lost_commit_response_does_not_admit_or_reset_generation(self):
+        with self.store.connect() as c:
+            c.execute('DELETE FROM canonical_parent_authority WHERE tenant_id=%s', (self.tenant,))
+        connect = enrollment._connect
+        query = enrollment._query
+        initialized = []
+        def track(*args):
+            result = query(*args)
+            if 'INSERT INTO canonical_parent_authority' in args[2]:
+                initialized.append(True)
+            return result
+        @contextmanager
+        def lose_response(*args):
+            with connect(*args) as connection:
+                yield connection
+            if initialized:
+                raise OSError('synthetic lost initializer COMMIT response')
+        with patch.object(enrollment, '_query', side_effect=track), \
+                patch.object(enrollment, '_connect', side_effect=lose_response), self.assertRaises(OSError):
+            self.seed()
+        self.assertEqual(self.queued(), [])
+        with self.store.connect() as c:
+            generation = c.execute('SELECT generation FROM canonical_parent_authority WHERE tenant_id=%s',
+                                   (self.tenant,)).fetchone()['generation']
+        self.assertEqual(generation, 1)
+        self.assertEqual(self.seed()['queued'], 1)
+        with self.store.connect() as c:
+            self.assertEqual(c.execute('SELECT generation FROM canonical_parent_authority WHERE tenant_id=%s',
+                                      (self.tenant,)).fetchone()['generation'], generation)
+
+    def test_initializer_releases_authority_before_queue_admission(self):
+        self.queue()
+        with self.store.connect() as c:
+            c.execute('DELETE FROM canonical_parent_authority WHERE tenant_id=%s', (self.tenant,))
+        queue_locked = threading.Event()
+        blocked_pid = []
+        original = enrollment._query
+        futures = []
+        def canonical_writer():
+            with self.store.connect() as c:
+                c.execute("SET LOCAL lock_timeout='2s'")
+                c.execute('SELECT generation FROM canonical_passage_projection_queue WHERE tenant_id=%s FOR UPDATE',
+                          (self.tenant,)).fetchall()
+                blocked_pid.append(c.info.backend_pid)
+                queue_locked.set()
+                c.execute('INSERT INTO canonical_parent_authority(tenant_id,source_id,native_parent_id,generation) '
+                          'VALUES(%s,%s,%s,1) ON CONFLICT(tenant_id,source_id,native_parent_id) '
+                          'DO UPDATE SET generation=canonical_parent_authority.generation+1',
+                          (self.tenant,self.source,'session'))
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            def after_initialize(*args):
+                result = original(*args)
+                if 'INSERT INTO canonical_parent_authority' in args[2] and not futures:
+                    futures.append(pool.submit(canonical_writer))
+                    self.assertTrue(queue_locked.wait(1), 'concurrent writer must own queue first')
+                    waiting = False
+                    until = time.monotonic() + 1
+                    while time.monotonic() < until:
+                        with self.store.connect() as c:
+                            waiting = c.execute("SELECT wait_event_type='Lock' AS waiting FROM pg_stat_activity "
+                                                "WHERE pid=%s", (blocked_pid[0],)).fetchone()['waiting']
+                        if waiting:
+                            break
+                        time.sleep(.01)
+                    self.assertTrue(waiting, 'native invalidation must wait on the uncommitted initializer')
+                return result
+            with patch.object(enrollment, '_query', side_effect=after_initialize):
+                result = self.seed()
+            futures[0].result(timeout=3)
+        self.assertEqual(result['queued'], 0)
+        with self.store.connect() as c:
+            self.assertEqual(c.execute('SELECT generation FROM canonical_parent_authority WHERE tenant_id=%s',
+                                      (self.tenant,)).fetchone()['generation'], 2)
+            self.assertEqual(c.execute('SELECT reason FROM canonical_passage_projection_queue WHERE tenant_id=%s',
+                                      (self.tenant,)).fetchone()['reason'], 'logical-update')
+
+    def test_concurrent_generation_creation_wins_without_reset(self):
+        with self.store.connect() as c:
+            c.execute('DELETE FROM canonical_parent_authority WHERE tenant_id=%s', (self.tenant,))
+        original = enrollment._query
+        created = []
+        def create_first(*args):
+            if 'INSERT INTO canonical_parent_authority' in args[2] and not created:
+                created.append(True)
+                with self.store.connect() as c:
+                    c.execute('INSERT INTO canonical_parent_authority(tenant_id,source_id,native_parent_id,generation) '
+                              'VALUES(%s,%s,%s,7)', (self.tenant,self.source,'session'))
+            return original(*args)
+        with patch.object(enrollment, '_query', side_effect=create_first):
+            self.assertEqual(self.seed()['queued'], 1)
+        self.assertEqual(self.queued()[0]['checkpoint']['authority_generation'], 7)
+        with self.store.connect() as c:
+            self.assertEqual(c.execute('SELECT generation FROM canonical_parent_authority WHERE tenant_id=%s',
+                                      (self.tenant,)).fetchone()['generation'], 7)
+
+    def test_missing_generation_with_revoked_owner_is_not_initialized(self):
+        with self.store.connect() as c:
+            c.execute('DELETE FROM canonical_parent_authority WHERE tenant_id=%s', (self.tenant,))
+            c.execute('DELETE FROM canonical_source_grants WHERE tenant_id=%s', (self.tenant,))
+        self.assertEqual(self.seed()['queued'], 0)
+        with self.store.connect() as c:
+            self.assertIsNone(c.execute('SELECT generation FROM canonical_parent_authority WHERE tenant_id=%s',
+                                       (self.tenant,)).fetchone())
 
     def queued(self):
         return remainder.pending(
@@ -115,15 +250,24 @@ class HistoricalMembershipSeedTests(ParentMembershipPublicationTests):
 
     def test_commit_lost_response_repeat_does_not_reset_work(self):
         original = enrollment._connect
+        query = enrollment._query
+        admitted = []
+        def track(*args):
+            result = query(*args)
+            if 'INSERT INTO canonical_passage_projection_queue' in args[2]:
+                admitted.append(True)
+            return result
 
         @contextmanager
         def lost_response(*args):
             with original(*args) as connection:
                 yield connection
-            raise OSError("synthetic lost response after actual commit")
+            if admitted:
+                raise OSError("synthetic lost response after actual queue commit")
 
         with (
             patch.object(enrollment, "_connect", side_effect=lost_response),
+            patch.object(enrollment, "_query", side_effect=track),
             self.assertRaises(OSError),
         ):
             self.seed()
@@ -305,6 +449,17 @@ class HistoricalMembershipSeedTests(ParentMembershipPublicationTests):
             tenant_id=self.tenant, batch_size=200, max_batches=1, concurrency=4
         )
         self.assertEqual(published["documents"], 127)
+        with self.store.connect() as c:
+            c.execute('DELETE FROM canonical_parent_authority WHERE tenant_id=%s', (self.tenant,))
+            # Observe actual insertion order, which must match the existing
+            # deferred invalidator when several authority rows share a commit.
+            c.execute('CREATE TABLE seed_authority_order(ordinal bigserial,native_parent_id text)')
+            c.execute("""CREATE FUNCTION record_seed_authority_order() RETURNS trigger
+                LANGUAGE plpgsql AS $$ BEGIN
+                INSERT INTO seed_authority_order(native_parent_id) VALUES(NEW.native_parent_id);
+                RETURN NEW; END $$""")
+            c.execute('CREATE TRIGGER record_seed_authority_order AFTER INSERT ON canonical_parent_authority '
+                      'FOR EACH ROW EXECUTE FUNCTION record_seed_authority_order()')
         native = enrollment._query
         calls = []
 
@@ -314,15 +469,27 @@ class HistoricalMembershipSeedTests(ParentMembershipPublicationTests):
             return native(*args)
 
         started = time.monotonic()
-        with patch.object(enrollment, "_query", side_effect=delayed):
-            result = self.seed()
+        try:
+            with patch.object(enrollment, "_query", side_effect=delayed):
+                result = self.seed()
+            elapsed = time.monotonic() - started
+            with self.store.connect() as c:
+                actual = [row['native_parent_id'] for row in c.execute(
+                    'SELECT native_parent_id FROM seed_authority_order ORDER BY ordinal').fetchall()]
+            self.assertEqual(len(actual), 128)
+            self.assertEqual(actual, sorted(actual))
+        finally:
+            with self.store.connect() as c:
+                c.execute('DROP TRIGGER record_seed_authority_order ON canonical_parent_authority')
+                c.execute('DROP FUNCTION record_seed_authority_order()')
+                c.execute('DROP TABLE seed_authority_order')
         print(
             json.dumps(
                 dict(
                     seed_parents=result["queued"],
                     query_calls=len(calls),
                     injected_query_ms=20,
-                    elapsed_ms=round((time.monotonic() - started) * 1000),
+                    elapsed_ms=round(elapsed * 1000),
                 )
             )
         )
