@@ -123,6 +123,7 @@ class MatchedRangeRerankTests(unittest.TestCase):
                 self.assertIs(output, pool)
                 self.assertEqual(len(provider.calls), 1)
                 self.assertEqual(diagnostics["rerank_status"], "unavailable")
+                self.assertNotIn("rerank_http_status", diagnostics)
                 self.assertIn("rerank", elapsed)
 
     def test_insufficient_deadline_keeps_pool_without_provider_call(self):
