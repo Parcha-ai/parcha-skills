@@ -802,13 +802,15 @@ def _typed_communication_message(event_kind: str, text: str) -> bool:
 
 
 def visible_messages(
-    records: Iterable[LogicalEvidenceRecord],
+    records: Iterable[LogicalEvidenceRecord], *, first_record_ordinal: int = 0,
 ) -> tuple[PassageMessage, ...]:
     """Combine physical segments into exact visible source messages."""
 
     values = iter(records)
     messages: list[PassageMessage] = []
-    expected_ordinal = 0
+    if type(first_record_ordinal) is not int or first_record_ordinal < 0:
+        raise LogicalEvidenceError("passage_logical_record_order_invalid")
+    expected_ordinal = first_record_ordinal
     for first in values:
         if first.ordinal != expected_ordinal or first.segment_ordinal != 0:
             raise LogicalEvidenceError("passage_logical_record_order_invalid")
