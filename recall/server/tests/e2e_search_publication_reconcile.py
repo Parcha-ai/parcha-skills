@@ -206,14 +206,41 @@ class PublicationReconcile(unittest.TestCase):
         self.assertEqual(self.namespace.writes, before)
         self.assertEqual(self.claims(publisher), [])
 
+    def assert_backend_locks_released(self, pid, *, timeout=1.0):
+        # Closing libpq discards the client immediately. PostgreSQL releases
+        # the backend's session locks after processing the socket close.
+        deadline = time.monotonic() + timeout
+        with self.store.connect() as connection:
+            self.assertNotEqual(connection.info.backend_pid, pid,
+                                'discarded backend was returned to the pool')
+            while True:
+                locks = connection.execute("SELECT count(*) AS count FROM pg_locks "
+                    "WHERE locktype='advisory' AND granted AND pid=%s", (pid,)).fetchone()['count']
+                if locks == 0 or time.monotonic() >= deadline:
+                    break
+                time.sleep(.01)
+        self.assertEqual(locks, 0, 'discarded backend retained advisory locks')
+
+    def test_cleanup_observer_rejects_a_live_leaked_lock(self):
+        with self.store.connect() as leaked:
+            leaked.execute('SELECT pg_advisory_lock(7314159)')
+            try:
+                with self.assertRaisesRegex(AssertionError, 'retained advisory locks'):
+                    self.assert_backend_locks_released(leaked.info.backend_pid, timeout=.05)
+            finally:
+                leaked.execute('SELECT pg_advisory_unlock(7314159)')
+
     def test_failed_unlock_discards_session_instead_of_leaking_pool_lock(self):
         self.prepare_search()
         publisher = self.publisher()
         claim = self.claims(publisher)[0]
         execute = psycopg.Connection.execute
 
+        discarded = []
+
         def abort_unlock(connection, query, *args, **kwargs):
             if isinstance(query, str) and query.startswith('SELECT pg_advisory_unlock('):
+                discarded.append((connection, connection.info.backend_pid))
                 return execute(connection, 'SELECT 1/0')
             return execute(connection, query, *args, **kwargs)
 
@@ -221,6 +248,8 @@ class PublicationReconcile(unittest.TestCase):
             with self.assertRaises(psycopg.errors.DivisionByZero):
                 with publisher._publication_lease(self.tenant, self.source, claim['month']) as acquired:
                     self.assertTrue(acquired)
+        self.assertTrue(discarded[0][0].closed)
+        self.assert_backend_locks_released(discarded[0][1])
         # Pool rollback cannot release a session lock. A different backend must
         # be able to acquire it after failed cleanup; reentrant same-session
         # success would hide the bug, so inspect the cluster lock table too.
@@ -240,12 +269,14 @@ class PublicationReconcile(unittest.TestCase):
         claim = self.claims(publisher)[0]
         execute = psycopg.Connection.execute
         acquired_pid = []
+        acquired_connections = []
 
         def lost_ack(connection, query, *args, **kwargs):
             result = execute(connection, query, *args, **kwargs)
             if isinstance(query, str) and query.startswith('SELECT pg_try_advisory_lock('):
                 self.assertTrue(result.fetchone()['acquired'])
                 acquired_pid.append(connection.info.backend_pid)
+                acquired_connections.append(connection)
                 raise OSError('synthetic acquisition acknowledgement loss')
             return result
 
@@ -253,6 +284,8 @@ class PublicationReconcile(unittest.TestCase):
             with self.assertRaises(OSError):
                 with publisher._publication_lease(self.tenant, self.source, claim['month']):
                     self.fail('uncertain lease must not admit work')
+        self.assertTrue(acquired_connections[0].closed)
+        self.assert_backend_locks_released(acquired_pid[0])
         with self.store.connect() as connection:
             locks = connection.execute("SELECT count(*) AS count FROM pg_locks "
                 "WHERE locktype='advisory' AND granted AND pid=%s", (acquired_pid[0],)).fetchone()['count']
