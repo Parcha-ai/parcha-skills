@@ -60,7 +60,28 @@ class Store:
 
 
 class ParquetReceiptSlices(unittest.TestCase):
-    def test_native_proof_batches_cover_every_receipt_without_deadline_renewal(self):
+    def test_background_proof_work_advances_beyond_one_budget_without_retry(self):
+        from recall_server.db import SearchDeadlineExceeded
+        receipts = [item_receipt('source:test', f'event-{i}', 1, 0) for i in range(6000)]
+        store = Store([dict(passage_id='all', receipts=receipts)])
+        clock = [100.0]
+        native = store._execute_bounded
+        def work(connection, sql, parameters, deadline):
+            clock[0] += 1
+            if clock[0] >= deadline:
+                raise SearchDeadlineExceeded()
+            return native(connection, sql, parameters, deadline)
+        owner = CanonicalParquetScanProjector(store, SimpleNamespace(archive=None))
+        candidate = ScanCandidate('tenant:test', 'source:test', date(2026, 1, 1), 1,
+                                  datetime(2026, 1, 1, tzinfo=timezone.utc))
+        with patch('time.monotonic', side_effect=lambda: clock[0]), patch.object(store, '_execute_bounded', side_effect=work), patch.object(parent_membership_read.ReadSettings, 'from_env', return_value=parent_membership_read.ReadSettings()):
+            rows = list(owner._passages(candidate, ['document']))
+        self.assertEqual([row['passage_id'] for row in rows], ['all'])
+        self.assertEqual([len(p[0]) for _, p, _ in store.queries], [500]*12)
+        self.assertEqual([d for _, _, d in store.queries], list(range(105,117)))
+        self.assertEqual(clock[0],112)
+
+    def test_native_proof_units_cover_every_receipt_with_finite_deadlines(self):
         receipts = [item_receipt('source:test', f'event-{i}', 1, 0) for i in range(1001)]
         rows = [dict(passage_id='unproved', receipts=receipts),
                 dict(passage_id='proved', receipts=[receipts[-1]])]
@@ -74,10 +95,10 @@ class ParquetReceiptSlices(unittest.TestCase):
         self.assertEqual([row['passage_id'] for row in actual], ['proved'])
         self.assertEqual([len(parameters[0]) for _, parameters, _ in store.queries], [500, 500, 1])
         self.assertEqual([r for _, parameters, _ in store.queries for r in parameters[0]], receipts)
-        self.assertEqual(len({deadline for _, _, deadline in store.queries}), 1)
+        self.assertEqual(len({deadline for _, _, deadline in store.queries}), 3)
         self.assertEqual(len({sql for sql, _, _ in store.queries}), 1)
         self.assertEqual(store.fetch_sizes, [2000, 2000])
-        self.assertEqual(len(store.restored_deadlines), 1)
+        self.assertEqual(len(store.restored_deadlines), 2)
 
 
     def test_later_proof_refusal_yields_no_earlier_authorized_passage(self):
@@ -101,7 +122,7 @@ class ParquetReceiptSlices(unittest.TestCase):
             with self.assertRaises(SearchDeadlineExceeded):
                 next(iterator)
         self.assertEqual(len(store.queries), 1)
-        self.assertEqual(store.restored_deadlines, [])
+        self.assertEqual(len(store.restored_deadlines), 1)
 
     def test_all_certified_batch_makes_no_fallback_query(self):
         rows = [dict(passage_id='certified', receipts=[item_receipt('source:test', 'event', 1, 0)],

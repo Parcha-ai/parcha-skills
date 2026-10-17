@@ -36,7 +36,37 @@ class SingletonProjectionMembership(SingletonPassageReads):
             connection.execute('UPDATE canonical_passages SET receipts=%s WHERE tenant_id=%s AND passage_id=%s', (receipts, self.tenant, baseline['passage_id']))
         return overrides['passage_id']
 
-    def test_projection_receipt_slices_share_budget_and_preserve_native_union(self):
+    def test_projection_background_fanout_completes_bounded_units_beyond_one_request_budget(self):
+        import time
+        from recall_server import parent_membership_read
+        from recall_server.db import BrainStore
+        from recall_server.projectors import item_receipt
+        survivor = self.receipt_fanout_fixture()
+        receipts = [item_receipt(self.source, f'absent-{i}', 1, 0) for i in range(5999)] + [self.receipt]
+        with self.store.connect() as connection:
+            connection.execute('UPDATE canonical_passages SET receipts=%s WHERE tenant_id=%s AND passage_id<>%s',
+                               (receipts, self.tenant, survivor))
+        native = self.store._execute_bounded
+        operations = []
+        def bounded_work(connection, statement, parameters, deadline):
+            if statement.lstrip().startswith('WITH requested'):
+                began = time.monotonic()
+                BrainStore._execute_bounded(connection, 'SELECT pg_sleep(.08)', (), deadline)
+                result = native(connection, statement, parameters, deadline)
+                operations.append((len(parameters[0]), deadline, time.monotonic()-began, id(connection)))
+                return result
+            return native(connection, statement, parameters, deadline)
+        began = time.monotonic()
+        with patch.object(self.store, 'verified_singleton_receipts', True), patch.object(self.store, 'search_deadline_ms', 450), patch.object(parent_membership_read.ReadSettings, 'from_env', return_value=parent_membership_read.ReadSettings()), patch.object(self.store, '_execute_bounded', bounded_work):
+            rows = list(self.scan._passages(self.candidate, self.documents))
+        self.assertGreater(time.monotonic()-began, .45)
+        self.assertEqual([row['passage_id'] for row in rows], [survivor])
+        self.assertEqual([n for n, _, _, _ in operations], [500]*12)
+        self.assertTrue(all(elapsed < .45 for _, _, elapsed, _ in operations))
+        self.assertEqual(len({connection for _, _, _, connection in operations}), 1)
+        self.assertEqual(len({deadline for _, deadline, _, _ in operations}), 12)
+
+    def test_projection_receipt_units_preserve_native_union_and_snapshot(self):
         from recall_server import receipt_membership, parent_membership_read
         survivor = self.receipt_fanout_fixture()
         native = receipt_membership.lookup_current_search_membership
@@ -49,7 +79,7 @@ class SingletonProjectionMembership(SingletonPassageReads):
         self.assertEqual([row['passage_id'] for row in rows], [survivor])
         self.assertEqual([row['receipts'] for row in rows], [[self.receipt]])
         self.assertEqual([n for n, _, _ in attempts], [500, 500, 2])
-        self.assertEqual(len({deadline for _, deadline, _ in attempts}), 1)
+        self.assertEqual(len({deadline for _, deadline, _ in attempts}), 3)
         self.assertEqual(len({connection for _, _, connection in attempts}), 1)
 
     def test_projection_receipt_slices_keep_snapshot_then_next_request_refuses(self):
@@ -74,25 +104,26 @@ class SingletonProjectionMembership(SingletonPassageReads):
 
     def test_projection_later_slice_cancellation_yields_nothing_and_keeps_queue(self):
         from recall_server import parent_membership_read
-        from recall_server.db import BrainStore, SearchDeadlineExceeded
+        from recall_server.db import BrainStore
         self.receipt_fanout_fixture(valid_first=True)
         original = self.store._execute_bounded
         attempts = []
         def slow(connection, statement, parameters, deadline):
             if statement.lstrip().startswith('WITH requested'):
                 attempts.append(deadline)
-                BrainStore._execute_bounded(connection, 'SELECT pg_sleep(.25)', (), deadline)
+                BrainStore._execute_bounded(connection, 'SELECT pg_sleep(.60)' if len(attempts) == 2 else 'SELECT pg_sleep(.08)', (), deadline)
             return original(connection, statement, parameters, deadline)
         with self.store.connect() as connection:
             before = connection.execute('SELECT generation,changed_at FROM canonical_parquet_scan_queue WHERE tenant_id=%s', (self.tenant,)).fetchall()
         with patch.object(self.store, 'verified_singleton_receipts', True), patch.object(self.store, 'search_deadline_ms', 450), patch.object(parent_membership_read.ReadSettings, 'from_env', return_value=parent_membership_read.ReadSettings()), patch.object(self.store, '_execute_bounded', slow):
-            iterator = self.scan._passages(self.candidate, self.documents)
-            with self.assertRaises(SearchDeadlineExceeded):
-                next(iterator)
+            totals = {'failed': 0}
+            self.assertFalse(self.scan._process(self.candidate, totals))
+        self.assertEqual(totals, {'failed': 1})
         self.assertEqual(len(attempts), 2)
-        self.assertEqual(len(set(attempts)), 1)
+        self.assertEqual(len(set(attempts)), 2)
         with self.store.connect() as connection:
             after = connection.execute('SELECT generation,changed_at FROM canonical_parquet_scan_queue WHERE tenant_id=%s', (self.tenant,)).fetchall()
+            self.assertEqual(connection.execute('SELECT count(*) AS n FROM canonical_parquet_scan_shards WHERE tenant_id=%s', (self.tenant,)).fetchone()['n'], 0)
         self.assertEqual(before, after)
 
     def test_projection_next_cursor_fetch_keeps_original_timeout_allowance(self):
@@ -160,7 +191,7 @@ class SingletonProjectionMembership(SingletonPassageReads):
         self.assertEqual(rows[-1]['passage_id'], survivor)
         self.assertEqual(fetches, [2000, 2000, 2000])
         self.assertEqual(len(proof_deadlines), 4)
-        self.assertEqual(len(set(proof_deadlines[:3])), 1)
+        self.assertEqual(len(set(proof_deadlines[:3])), 3)
         self.assertGreater(proof_deadlines[3], proof_deadlines[0])
 
     def test_projection_stream_preserves_exact_passage_after_admission(self):
