@@ -113,6 +113,24 @@ print(json.dumps({'status':'complete','cleared_documents':3,'cleared_utf8_bytes'
                       'metadata_membership_calls','metadata_membership_ms','metadata_spool_ms'):
             self.assertIn(f'{field}={result[field]}', logs.output[0])
 
+    def test_unknown_claim_identity_reaches_existing_log(self):
+        from io import BytesIO
+        from unittest.mock import Mock
+        result = dict(status='commit_outcome_unknown', cleared_documents=0,
+            cleared_utf8_bytes=0, commit_outcome_unknown=True,
+            unknown_source_id='source:claimed', unknown_native_parent_id='parent\nclaimed',
+            unknown_scope_epoch=17)
+        self.worker.child = Mock(returncode=0, stdout=BytesIO(json.dumps(result).encode()))
+        self.worker.child.poll.return_value = 0
+        with self.assertLogs('recall_server.retirement_supervisor', level='INFO') as logs:
+            observed = self.worker.cycle()
+        self.assertEqual(observed, result)
+        self.assertIn("unknown_source_id='source:claimed'", logs.output[0])
+        self.assertIn("unknown_native_parent_id=" + repr('parent\nclaimed'), logs.output[0])
+        self.assertIn('unknown_scope_epoch=17', logs.output[0])
+        self.assertNotIn('maintenance_epoch', observed)
+        self.assertNotIn('intent_acknowledged', observed)
+
     def test_shutdown_reaps_exact_child_and_refuses_another_launch(self):
         self.worker.cycle(busy=True)
         self.wait_until(lambda: (self.root / "ready").exists())
@@ -129,6 +147,8 @@ print(json.dumps({'status':'complete','cleared_documents':3,'cleared_utf8_bytes'
         self.assertEqual(report["status"], "commit_outcome_unknown")
         self.assertTrue(report["commit_outcome_unknown"])
         self.assertEqual(report["cleared_documents"], 0)
+        for field in ("unknown_source_id", "unknown_native_parent_id", "unknown_scope_epoch"):
+            self.assertNotIn(field, report)
 
     def test_parent_sigterm_reaps_child_and_restores_handler(self):
         before = signal.getsignal(signal.SIGTERM)
