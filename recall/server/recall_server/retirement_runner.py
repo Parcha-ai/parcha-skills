@@ -694,6 +694,9 @@ def run_retirement(
                 report["commit_outcome_unknown"] = True
                 report["status"] = "commit_outcome_unknown"
                 report.update(getattr(error, "cause_details", {}))
+                report.update(unknown_source_id=candidate["source_id"],
+                              unknown_native_parent_id=candidate["native_parent_id"],
+                              unknown_scope_epoch=candidate["scope_epoch"])
         finally:
             report["parent_wall_ms"] += (time.monotonic() - parent_started) * 1000
         # These nested timers cover only acknowledged batches, including an

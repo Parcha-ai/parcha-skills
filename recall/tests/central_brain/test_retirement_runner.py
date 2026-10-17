@@ -208,6 +208,11 @@ class RunnerTests(unittest.TestCase):
             result = runner.run_retirement(Mock(), Mock(), scope=self.scope(), apply=True,
                                            deadline_at=200.)
         self.assertTrue(result['commit_outcome_unknown'])
+        self.assertEqual(result['unknown_source_id'], self.candidate('unknown')['source_id'])
+        self.assertEqual(result['unknown_native_parent_id'], 'unknown')
+        self.assertEqual(result['unknown_scope_epoch'], self.candidate('unknown')['scope_epoch'])
+        self.assertNotIn('maintenance_epoch', result)
+        self.assertNotIn('intent_acknowledged', result)
         self.assertEqual(result['cleared_utf8_bytes'], 13)
         self.assertEqual(result['committed_sql_ms'], 700.)
         self.assertEqual(result['committed_hash_ms'], 150.)
