@@ -602,7 +602,9 @@ CANONICAL_SHOW_TOOL = {
         "Open a receipt, or all source records behind a search passage by copying its "
         "source_id, logical_document_id, revision, manifest_content_sha256 and passage_id "
         "into target. Passage responses paginate full source chunks; follow next_cursor "
-        "until complete. Cite only opened_receipts. This does not reconstruct passage text."
+        "until complete. Oversized receipt targets restore the verified original source "
+        "with the same cursor/page_bytes pagination. Cite only opened_receipts. "
+        "This does not reconstruct passage text."
     ),
     "inputSchema": {
         "type": "object",
@@ -1096,7 +1098,17 @@ def _call_tool(
                 return store.show(**options)
             except (ValueError, TypeError):
                 raise McpProtocolError(-32602, "passage source records unavailable for exact pins") from None
-        _reject_extra(arguments, frozenset({"target", "around", "tail", "prompts"}))
+        canonical = hasattr(store, "_show_passage")
+        allowed = {"target", "around", "tail", "prompts"}
+        if canonical:
+            allowed.update({"cursor", "page_bytes"})
+        _reject_extra(arguments, frozenset(allowed))
+        options = {}
+        if "cursor" in arguments:
+            options["cursor"] = _string(arguments["cursor"], "cursor")
+        if "page_bytes" in arguments:
+            options["page_bytes"] = _integer(arguments["page_bytes"], "page_bytes",
+                default=32_768, minimum=1, maximum=MAX_MCP_RESPONSE_BYTES)
         target = _string(arguments.get("target"), "target")
         around = (
             _date_time(arguments["around"], "around")
@@ -1110,13 +1122,21 @@ def _call_tool(
                 "around and positive tail are mutually exclusive",
             )
         prompts = _boolean(arguments.get("prompts"), "prompts")
-        result = store.show(
-            target,
-            around=around,
-            tail=tail,
-            prompts=prompts,
-            authorized_source=authorized_source,
-        )
+        try:
+            result = store.show(
+                target,
+                around=around,
+                tail=tail,
+                prompts=prompts,
+                authorized_source=authorized_source,
+                **options,
+            )
+        except (ValueError, TypeError) as error:
+            # Corrupt evidence/deadline exceptions retain their server-error
+            # contract; only plain input/current-selection refusals are mapped.
+            if not canonical or type(error) not in (ValueError, TypeError):
+                raise
+            raise McpProtocolError(-32602, "source record unavailable for current receipt") from None
         if result is None:
             raise McpProtocolError(-32602, "receipt not found")
         return result

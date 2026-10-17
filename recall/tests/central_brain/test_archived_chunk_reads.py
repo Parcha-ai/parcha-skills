@@ -80,7 +80,7 @@ class ReaderStore:
         self.live = True
 
     @contextmanager
-    def connect(self):
+    def connect(self, *, timeout=None):
         yield self
 
     def _execute_bounded(self, connection, sql, values, deadline_at):

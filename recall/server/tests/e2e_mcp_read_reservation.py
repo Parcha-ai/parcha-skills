@@ -149,6 +149,20 @@ class ReadReservation(unittest.TestCase):
             self.assertLess(elapsed, 2000)
         self.serving.flush_authorization_audit()
 
+    def test_reserved_checkout_honors_caller_timeout_and_recovers(self):
+        view = self.serving.read_only_view()
+        with contextlib.ExitStack() as held:
+            for _ in range(self.serving.reserved_read_connections):
+                held.enter_context(view.connect())
+            started = time.monotonic()
+            with self.assertRaises(PoolTimeout):
+                with view.connect(timeout=.05):
+                    self.fail("exhausted reserved pool admitted a read")
+            self.assertLess(time.monotonic() - started, 1)
+        with view.connect(timeout=.5) as connection:
+            self.assertTrue(connection.read_only)
+            self.assertEqual(connection.execute("SELECT 1 AS value").fetchone()["value"], 1)
+
     def test_http_search_survives_general_syncrep_commit_stall(self):
         arguments = {"query": "Sapphire archive receipt", "limit": 10}
         before = self.tool("recall_search", arguments)
