@@ -17,6 +17,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Callable
 
+from contracts.source_units import resolve_claude_tool_source_unit
 from .boundary_identity import native_family_id, protected_family_ids
 from .private_holdout import _private_path
 from .retrieval import EvaluationInputError, receipt_source
@@ -39,6 +40,16 @@ def _read_page(root, spec):
     def require(ok, code):
         if not ok:
             raise ValueError(code)
+
+    legacy_units = (None, 'subagent_handback.complete.v1', 'assistant_final.complete.v1')
+    new_units = any(s.get('source_unit') not in legacy_units for p in spec['passages'] for s in p['spans'])
+
+    def unique(pairs):
+        result = {}
+        for key, value in pairs:
+            require(key not in result, 'tool_source_unit_invalid')
+            result[key] = value
+        return result
 
     def body(record):
         return json.dumps(record['content'], ensure_ascii=False, sort_keys=True, separators=(',', ':')) if 'content' in record else record.get('text', record.get('content_fragment', ''))
@@ -90,7 +101,7 @@ def _read_page(root, spec):
             for i, line in enumerate(raw.splitlines()):
                 ordinal = part['first_record_ordinal'] + i
                 if ordinal in needed:
-                    record = json.loads(line)
+                    record = json.loads(line, object_pairs_hook=unique) if new_units else json.loads(line)
                     require(record['ordinal'] == ordinal and ordinal not in records, 'record_ordinal_mismatch')
                     records[ordinal] = record
         require(set(records) == needed, 'required_record_missing')
@@ -126,7 +137,14 @@ def _read_page(root, spec):
             parts, receipts = [], []
             for si, span in enumerate(passage['spans']):
                 first, original = groups[span['record_ordinal']]
-                raw = visible(original).encode()
+                unit = span.get('source_unit')
+                if unit in legacy_units:
+                    raw = visible(original).encode()
+                else:
+                    require(spec['source_id'].startswith('claude:'), 'tool_source_unit_invalid')
+                    resolved, origin = resolve_claude_tool_source_unit(original, unit)
+                    require(first['roles'] == (['assistant'] if origin == 'tool_input' else ['user']), 'nonvisible_role')
+                    raw = resolved.encode()
                 start, end = span['source_byte_start'], span['source_byte_end']
                 require(0 <= start < end <= len(raw), 'source_span_out_of_bounds')
                 text = raw[start:end].decode(); parts.append(text); receipts.extend(first['receipts'])
@@ -134,7 +152,8 @@ def _read_page(root, spec):
                     fragments.append({'passage_id': passage['passage_id'], 'span_index': si,
                         'start': offset, 'end': min(offset + 900, len(text)), 'length': len(text),
                         'text': text[offset:offset + 900], 'event_native_id': first['event_native_id'],
-                        'occurred_at': first['occurred_at'], 'ordinal': first['ordinal'], 'receipts': first['receipts']})
+                        'occurred_at': first['occurred_at'], 'ordinal': first['ordinal'], 'receipts': first['receipts'],
+                        **({'source_unit': unit, 'source_origin': origin} if unit not in legacy_units else {})})
             text = '\n'.join(parts)
             for span, part in zip(passage['spans'], parts):
                 require(text.encode()[span['passage_byte_start']:span['passage_byte_end']].decode() == part, 'passage_coordinate_mismatch')
@@ -152,7 +171,7 @@ def _read_page(root, spec):
         return result
     except (ValueError, KeyError, TypeError, OSError, IndexError, UnicodeError) as error:
         # Do not echo provider text, file contents or JSON decoder details.
-        codes = {'manifest_advanced_or_mismatch', 'logical_identity_mismatch', 'native_parent_mismatch', 'part_hash_mismatch', 'nonvisible_role', 'nonvisible_content', 'native_identity_ambiguous', 'native_identity_changed', 'native_identity_unavailable', 'source_span_out_of_bounds', 'passage_coordinate_mismatch', 'selected_receipt_mismatch'}
+        codes = {'manifest_advanced_or_mismatch', 'logical_identity_mismatch', 'native_parent_mismatch', 'part_hash_mismatch', 'nonvisible_role', 'nonvisible_content', 'native_identity_ambiguous', 'native_identity_changed', 'native_identity_unavailable', 'source_span_out_of_bounds', 'passage_coordinate_mismatch', 'selected_receipt_mismatch', 'tool_source_unit_invalid'}
         return {'error': str(error) if type(error) is ValueError and str(error) in codes else 'source_verification_failed'}
 
 
@@ -188,7 +207,14 @@ class CandidateCapture:
 
     def _call(self, client, spec, prefix):
         encoded = base64.b64encode(gzip.compress(json.dumps(spec, separators=(',', ':')).encode(), mtime=0)).decode()
-        program = "python3 - <<'RECALL_CAPTURE'\nfrom pathlib import Path\nimport json, base64, gzip\n" + inspect.getsource(_read_page) + '\n' + inspect.getsource(_page_stdout) + f"\nSPEC = '{encoded}'\nprint(_page_stdout(_read_page(Path('/docs/d1'), json.loads(gzip.decompress(base64.b64decode(SPEC))))), end='')\nRECALL_CAPTURE"
+        new_units = any(s.get('source_unit') not in (None, 'subagent_handback.complete.v1', 'assistant_final.complete.v1')
+                        for p in spec['passages'] for s in p['spans'])
+        resolver = ''
+        if new_units:
+            source = inspect.getsource(resolve_claude_tool_source_unit).encode()
+            packed = base64.b64encode(gzip.compress(source, mtime=0)).decode()
+            resolver = f"TOOL_UNIT_RESOLVER = '{packed}'\nexec(gzip.decompress(base64.b64decode(TOOL_UNIT_RESOLVER)))\n"
+        program = "python3 - <<'RECALL_CAPTURE'\nfrom pathlib import Path\nimport json, base64, gzip\n" + resolver + inspect.getsource(_read_page) + '\n' + inspect.getsource(_page_stdout) + f"\nSPEC = '{encoded}'\nprint(_page_stdout(_read_page(Path('/docs/d1'), json.loads(gzip.decompress(base64.b64decode(SPEC))))), end='')\nRECALL_CAPTURE"
         _require(len(program.encode()) <= 16000, 'capture_program_bound')
         args = {'targets': [{'logical_document_id': spec['logical_document_id'], 'alias': 'd1'}], 'program': program, 'timeout_seconds': 30}
         with self.lock:
@@ -211,7 +237,7 @@ class CandidateCapture:
             else:
                 _require(len(records) == 1, 'capture_payload_invalid')
             if payload.get('error'):
-                _require(payload['error'] in {'manifest_advanced_or_mismatch', 'logical_identity_mismatch', 'native_parent_mismatch', 'part_hash_mismatch', 'nonvisible_role', 'nonvisible_content', 'native_identity_ambiguous', 'native_identity_changed', 'native_identity_unavailable', 'source_span_out_of_bounds', 'passage_coordinate_mismatch', 'selected_receipt_mismatch', 'source_verification_failed'}, 'capture_payload_invalid')
+                _require(payload['error'] in {'manifest_advanced_or_mismatch', 'logical_identity_mismatch', 'native_parent_mismatch', 'part_hash_mismatch', 'nonvisible_role', 'nonvisible_content', 'native_identity_ambiguous', 'native_identity_changed', 'native_identity_unavailable', 'source_span_out_of_bounds', 'passage_coordinate_mismatch', 'selected_receipt_mismatch', 'tool_source_unit_invalid', 'source_verification_failed'}, 'capture_payload_invalid')
                 receipt['payload'] = payload
                 raise EvaluationInputError(payload['error'])
             fields = {'manifest_sha256', 'revision', 'family'}
@@ -268,7 +294,10 @@ class CandidateCapture:
                 _require(isinstance(part['spans'], list) and isinstance(part['receipts'], list) and bool(part['spans'] or part['receipts']), 'capture_metadata_invalid')
                 span_fields = {'record_ordinal', 'record_count', 'source_byte_start', 'source_byte_end', 'passage_byte_start', 'passage_byte_end'}
                 for span in part['spans']:
-                    _require(isinstance(span, dict) and span_fields <= set(span) <= span_fields | {'message_index'} and all(type(v) is int and v >= 0 for v in span.values()), 'capture_metadata_invalid')
+                    _require(isinstance(span, dict) and span_fields <= set(span) <= span_fields | {'message_index', 'source_unit', 'origin'}, 'capture_metadata_invalid')
+                    _require(all(type(span[k]) is int and span[k] >= 0 for k in span_fields | ({'message_index'} if 'message_index' in span else set())), 'capture_metadata_invalid')
+                    _require(span.get('source_unit') is None or isinstance(span['source_unit'], str), 'capture_metadata_invalid')
+                    _require(span.get('origin') is None or isinstance(span['origin'], dict), 'capture_metadata_invalid')
                 _require(all(isinstance(r, str) and len(r) <= 2048 and receipt_source(r) == args['source_id'] for r in part['receipts']), 'capture_source_mismatch')
                 if current is None:
                     current = {k: part[k] for k in headers}; current.update(spans=[], receipts=[])
@@ -327,6 +356,11 @@ class CandidateCapture:
             spans = [{k: s[k] for k in fields} for s in passage['spans']]
             _require(len(spans) <= 128 and all(type(v) is int and v >= 0 for s in spans for v in s.values()))
             _require(all(0 < s['record_count'] <= 2000 and s['source_byte_start'] < s['source_byte_end'] and s['passage_byte_start'] < s['passage_byte_end'] for s in spans))
+            for span, original in zip(spans, passage['spans'], strict=True):
+                if 'source_unit' in original:
+                    _require(original['source_unit'] is None or isinstance(original['source_unit'], str))
+                    if original['source_unit'] not in (None, 'subagent_handback.complete.v1', 'assistant_final.complete.v1'):
+                        span['source_unit'] = original['source_unit']
             _require(isinstance(passage['passage_id'], str) and re.fullmatch(r'psg_[0-9a-f]{30,32}', passage['passage_id']) is not None)
             spec['passages'].append({'passage_id': passage['passage_id'], 'spans': spans, 'receipts': passage['receipts']})
         _require(len({p['passage_id'] for p in spec['passages']}) == len(spec['passages']))
@@ -390,10 +424,15 @@ class CandidateCapture:
                     _require(chunk['start'] == cursor and chunk['end'] == cursor + len(chunk['text']) and chunk['length'] == chunks[0]['length'], 'capture_fragment_gap')
                     _require(type(chunk['ordinal']) is int and chunk['ordinal'] == span['record_ordinal'], 'capture_fragment_ordinal')
                     _require(all(chunk[k] == chunks[0][k] for k in ('event_native_id', 'occurred_at', 'receipts')), 'capture_fragment_identity')
+                    if span.get('source_unit') is not None:
+                        kind = 'tool_input' if span['source_unit'].startswith('claude.tool-input.') else 'tool_result'
+                        _require(chunk.get('source_unit') == span['source_unit'] and chunk.get('source_origin') == kind, 'capture_fragment_identity')
                     cursor = chunk['end']
                 _require(cursor == chunks[0]['length'], 'capture_fragment_incomplete')
                 parts.append(''.join(c['text'] for c in chunks))
                 spans.append({**span, **{k: chunks[0][k] for k in ('event_native_id', 'occurred_at', 'receipts')}})
+                if span.get('source_unit') is not None:
+                    spans[-1]['source_origin'] = chunks[0]['source_origin']
             text = '\n'.join(parts)
             _require(summary == {'passage_id': passage['passage_id'], 'bytes': len(text.encode()), 'sha256': _sha(text.encode())}, 'capture_passage_hash_mismatch')
             _require(set(passage['receipts']) == {r for span in spans for r in span['receipts']}, 'capture_passage_receipt_mismatch')
