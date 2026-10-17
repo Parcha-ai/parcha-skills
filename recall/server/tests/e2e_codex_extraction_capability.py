@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Schema90 compatibility before activation, using disposable native PostgreSQL.
 
-The role/version DDL is a future test fixture, never applied by runtime migrate.
-The existing publisher still produces only its existing extraction versions.
+The fixture reconstructs schema89 and applies the separately reviewed role/version
+DDL. Old-writer publication is explicit even after the new default ships.
 """
 import json
 import os
@@ -46,6 +46,18 @@ def scenario(admin_dsn, root, retired):
     store, runtime = original.TrackedStore(dsn), None
     try:
         store.migrate(retire_postgres_plane=retired)
+        # Isolate the original89→90 compatibility witness after activation ships.
+        # No tool rows exist yet. This is disposable fixture DDL only.
+        with store.connect() as connection:
+            connection.execute("""ALTER TABLE canonical_passages
+                DROP CONSTRAINT canonical_passages_roles_check1,
+                ADD CONSTRAINT canonical_passages_roles_check1
+                    CHECK(roles <@ ARRAY['assistant','user']::text[])""")
+            for field in ('requested_extraction_version','applied_extraction_version'):
+                connection.execute(sql.SQL("ALTER TABLE canonical_passage_documents DROP CONSTRAINT {}, ADD CONSTRAINT {} CHECK ({} IN ('legacy','tool_groups_v1'))").format(
+                    sql.Identifier('canonical_passage_documents_'+field+'_check'),
+                    sql.Identifier('canonical_passage_documents_'+field+'_check'),sql.Identifier(field)))
+            connection.execute('DELETE FROM schema_migrations WHERE version=90')
         tenant, source, _, projection, _, _ = original.fixture(store, root, count=2)
         with store.connect() as connection:
             port = connection.info.port
@@ -63,7 +75,8 @@ def scenario(admin_dsn, root, retired):
         before = reader.show(receipt)
         projector = CanonicalPassageProjector(runtime, projection, policy=DEFAULT_PASSAGE_POLICY,
                                              bound_tenant_id=tenant)
-        report = projector.project_pending(tenant_id=tenant, batch_size=1, max_batches=1, concurrency=1)
+        with patch('recall_server.passage_index._document_extraction_version', return_value='legacy'):
+            report = projector.project_pending(tenant_id=tenant, batch_size=1, max_batches=1, concurrency=1)
         assert report['documents'] == 1 and report['unavailable'] == 0, report
         with runtime.connect() as connection:
             row = connection.execute('SELECT * FROM canonical_passages WHERE tenant_id=%s ORDER BY ordinal LIMIT 1', (tenant,)).fetchone()
@@ -102,8 +115,9 @@ def scenario(admin_dsn, root, retired):
         assert reader.show(receipt) == before
         # A new legacy document still follows the existing native queue/write path.
         tenant2, _, _, projection2, _, _ = original.fixture(store, root, count=1)
-        report = CanonicalPassageProjector(runtime, projection2, policy=DEFAULT_PASSAGE_POLICY,
-            bound_tenant_id=tenant2).project_pending(tenant_id=tenant2, batch_size=1, max_batches=1, concurrency=1)
+        with patch('recall_server.passage_index._document_extraction_version', return_value='legacy'):
+            report = CanonicalPassageProjector(runtime, projection2, policy=DEFAULT_PASSAGE_POLICY,
+                bound_tenant_id=tenant2).project_pending(tenant_id=tenant2, batch_size=1, max_batches=1, concurrency=1)
         assert report['documents'] == 1 and report['unavailable'] == 0, report
         with store.connect() as connection:
             state = connection.execute('SELECT requested_extraction_version,applied_extraction_version FROM canonical_passage_documents WHERE tenant_id=%s', (tenant2,)).fetchone()

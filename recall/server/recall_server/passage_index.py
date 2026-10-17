@@ -13,12 +13,12 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, replace
 from datetime import datetime
 from io import BytesIO
-from typing import Any, Callable, Iterable, Iterator
+from typing import Any, Callable, ClassVar, Iterable, Iterator
 
 import psycopg
 
 from . import parent_membership_enrollment, passage_append, membership_remainder
-from .tool_passage_projection import extract_tool_event_groups, tool_evidence_context
+from .tool_passage_projection import extract_codex_tool_event_groups, extract_tool_event_groups, tool_evidence_context
 from .logical_evidence import (
     LogicalEvidenceError,
     LogicalEvidenceProjectionStore,
@@ -83,14 +83,18 @@ PASSAGE_ORDINAL_PARK_OFFSET = 1 << 30
 
 
 def _document_extraction_version(source_id: str, requested: str | None) -> str:
-    """Keep recorded requests; first Claude projections include typed tools."""
+    """Keep recorded requests; first provider projections include typed tools."""
     if requested is not None:
         return requested
+    if source_id.startswith("codex:"):
+        return "codex_tool_groups_v1"
     return "tool_groups_v1" if source_id.startswith("claude:") else "legacy"
 
 
 @dataclass(frozen=True)
 class PassageCandidate:
+    supported_extraction_versions: ClassVar[frozenset[str]] = frozenset(
+        {"legacy", "tool_groups_v1", "codex_tool_groups_v1"})
     tenant_id: str
     source_id: str
     logical_document_id: str
@@ -600,7 +604,8 @@ class CanonicalPassageProjector:
         from .control import ControlPlane
 
         tenant_id = self._tenant(tenant_id)
-        if tenant_id is None or extraction_version != "tool_groups_v1":
+        if (tenant_id is None or extraction_version not in {"tool_groups_v1", "codex_tool_groups_v1"}
+            or (extraction_version == "codex_tool_groups_v1" and not source_id.startswith("codex:"))):
             raise ValueError("unsupported_document_extraction_request")
         key = (tenant_id, source_id, logical_document_id)
         with self.store.connect() as connection, connection.transaction():
@@ -637,6 +642,9 @@ class CanonicalPassageProjector:
                 (tenant_id, source_id, row['native_parent_id'])).fetchone()
             if forgetting:
                 raise ValueError("document_extraction_forget_pending")
+            if (extraction_version != "codex_tool_groups_v1"
+                and "codex_tool_groups_v1" in (row['requested_extraction_version'], row['applied_extraction_version'])):
+                raise ValueError("document_extraction_downgrade_refused")
             if row['requested_extraction_version'] == row['applied_extraction_version'] == extraction_version:
                 return {"status": "current", "extraction_version": extraction_version}
             connection.execute("""UPDATE canonical_passage_documents
@@ -910,9 +918,10 @@ class CanonicalPassageProjector:
         incremental: bool = False,
     ) -> PreparedPassageDocument:
         policy = self.policy if policy is None else policy
-        if candidate.extraction_version not in {"legacy", "tool_groups_v1"}:
+        if (candidate.extraction_version not in PassageCandidate.supported_extraction_versions
+            or (candidate.extraction_version == "codex_tool_groups_v1" and not candidate.source_id.startswith("codex:"))):
             raise LogicalEvidenceError("unsupported_document_extraction_version")
-        grouped_tools = candidate.extraction_version == "tool_groups_v1"
+        grouped_tools = candidate.extraction_version != "legacy"
         manifest = self.logical_projection.read_manifest(
             candidate.manifest_reference,
             tenant_id=candidate.tenant_id,
@@ -1039,7 +1048,9 @@ class CanonicalPassageProjector:
         coverage = None
         tool_messages = ()
         if grouped_tools:
-            groups, coverage = extract_tool_event_groups(source_records)
+            extractor = (extract_codex_tool_event_groups
+                         if candidate.extraction_version == "codex_tool_groups_v1" else extract_tool_event_groups)
+            groups, coverage = extractor(source_records)
             tool_messages = tuple(message for group in groups for message in group.messages)
             # Build each provider block independently. Its message indexes are
             # group-local, so later visible arrivals cannot rekey old tool spans.

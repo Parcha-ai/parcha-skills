@@ -74,7 +74,7 @@ class ExpectedSchemaVersionsTests(unittest.TestCase):
                     self.versions(latest, native_file)
 
     def test_unknown_latest_is_not_implicitly_allowed(self):
-        for latest in (69, 90):
+        for latest in (69, 91):
             with self.subTest(latest=latest):
                 with self.assertRaisesRegex(AssertionError, "unreviewed latest"):
                     self.versions(latest, False)
@@ -82,3 +82,7 @@ class ExpectedSchemaVersionsTests(unittest.TestCase):
     def test_document_extraction_version_is_explicitly_supported(self):
         self.assertEqual(self.versions(89, False), [*range(1, 71), *range(72, 90)])
         self.assertEqual(self.versions(89, True), list(range(1, 90)))
+
+    def test_codex_extraction_version_is_explicitly_supported(self):
+        self.assertEqual(self.versions(90, False), [*range(1, 71), *range(72, 91)])
+        self.assertEqual(self.versions(90, True), list(range(1, 91)))

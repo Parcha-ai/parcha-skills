@@ -64,7 +64,9 @@ def scenario(admin_dsn, root, retired):
         # Real original queue hydration/preparation/commit with the new columns.
         projector = CanonicalPassageProjector(runtime, projection, policy=DEFAULT_PASSAGE_POLICY,
                                              bound_tenant_id=tenant)
-        report = projector.project_pending(tenant_id=tenant, batch_size=1, max_batches=1, concurrency=1)
+        # Reproduce the original legacy writer, not the new Codex default.
+        with patch('recall_server.passage_index._document_extraction_version', return_value='legacy'):
+            report = projector.project_pending(tenant_id=tenant, batch_size=1, max_batches=1, concurrency=1)
         assert report['documents'] == 1 and report['unavailable'] == 0, report
         with store.connect() as connection:
             state = connection.execute('SELECT requested_extraction_version,applied_extraction_version,extraction_coverage FROM canonical_passage_documents WHERE tenant_id=%s', (tenant,)).fetchone()

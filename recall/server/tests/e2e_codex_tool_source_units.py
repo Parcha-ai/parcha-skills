@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Disposable PostgreSQL + real logical archive + existing selected-source reader.
 
-Tool span metadata is a test-only canonical fixture: production emission remains
-disabled. Public metadata/source-open owners are real; exec runs locally against
+Tool span metadata is a test-only canonical fixture independent of the production
+extractor. Public metadata/source-open owners are real; exec runs locally against
 their verified archived fixture rather than invoking a remote sandbox service.
 """
 import json
@@ -12,6 +12,7 @@ import tempfile
 import uuid
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 RECALL = Path(__file__).resolve().parents[2]
 for directory in (RECALL, RECALL / 'server', RECALL / 'tests'):
@@ -55,8 +56,11 @@ def main():
             logical=CanonicalLogicalEvidenceProjector(store,projection,bound_tenant_id=tenant,raw_archive=archive)
             logical.seed_backfill(tenant_id=tenant)
             logical.project_pending(tenant_id=tenant,batch_size=10,max_batches=1,upload_concurrency=1)
-            CanonicalPassageProjector(store,projection,policy=PassagePolicy(1024,128),bound_tenant_id=tenant).project_pending(
-                tenant_id=tenant,batch_size=10,max_batches=1,concurrency=1)
+            # Keep this independent reader-contract fixture on its original
+            # visible projection; the publisher has a separate native test.
+            with patch('recall_server.passage_index._document_extraction_version',return_value='legacy'):
+                CanonicalPassageProjector(store,projection,policy=PassagePolicy(1024,128),bound_tenant_id=tenant).project_pending(
+                    tenant_id=tenant,batch_size=10,max_batches=1,concurrency=1)
             with store.connect() as connection:
                 document=connection.execute('SELECT * FROM canonical_evidence_documents WHERE tenant_id=%s AND source_id=%s AND native_parent_id=%s',(tenant,source,this_parent)).fetchone()
                 row=connection.execute('SELECT * FROM canonical_passages WHERE tenant_id=%s AND source_id=%s AND logical_document_id=%s',(tenant,source,document['logical_document_id'])).fetchone()
