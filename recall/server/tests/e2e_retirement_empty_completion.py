@@ -227,6 +227,15 @@ class EmptyCompletion(unittest.TestCase):
             self.assertEqual(connection.execute('SELECT count(*) AS n FROM canonical_chunks WHERE tenant_id=%s',
                                                 (self.tenant,)).fetchone()['n'], 1)
 
+    def test_no_current_documents_cannot_become_noop_completion(self):
+        self.drain()
+        with self.store.connect() as connection:
+            connection.execute('UPDATE canonical_documents SET is_current=false,deleted_at=now() WHERE tenant_id=%s', (self.tenant,))
+        with patch.object(retirement, 'retire_parent_chunks', wraps=retirement.retire_parent_chunks) as full:
+            result = self.run_parent(1)
+        self.assertEqual(full.call_count, 1)
+        self.assertEqual(result['completed_noop_parents'], 0)
+
     def test_missing_profile_without_physical_rows_is_not_completion_evidence(self):
         self.drain()
         with self.store.connect() as connection:
@@ -287,7 +296,7 @@ class EmptyCompletion(unittest.TestCase):
         def append_after_observation(connection, sql, *args, **kwargs):
             nonlocal appended
             result = execute(connection, sql, *args, **kwargs)
-            if 'SELECT bool_and(document.chunk_receipt_profile' in sql and not appended:
+            if 'END AS drained' in sql and not appended:
                 appended = True
                 self.fixture.ingest('turn/three', 'Concurrent collector ACK before the status write')
             return result

@@ -336,15 +336,20 @@ def _complete_without_physical_work(store, *, scope, principal_id, manifest, sco
             _fail('cursor')
         # No chunk text/deletion/ordinal filter: a retained empty or deleted
         # chunk prevents this path. A missing physical row is not admission.
-        drained = query('''SELECT bool_and(document.chunk_receipt_profile IS NOT DISTINCT FROM 1
-                AND NOT EXISTS (SELECT 1 FROM canonical_chunks chunk
-                    WHERE chunk.tenant_id=document.tenant_id AND chunk.source_id=document.source_id
-                      AND chunk.document_id=document.document_id)) AS drained
-            FROM canonical_documents document
-            JOIN canonical_events event USING(tenant_id,source_id,event_id)
-            WHERE document.tenant_id=%s AND document.source_id=%s
-              AND coalesce(event.native_parent_id,event.native_id)=%s
-              AND document.is_current AND document.deleted_at IS NULL''', scope).fetchone()['drained']
+        drained = query('''WITH current_documents AS NOT MATERIALIZED (
+                SELECT document.tenant_id,document.source_id,document.document_id,document.chunk_receipt_profile
+                FROM canonical_documents document
+                JOIN canonical_events event USING(tenant_id,source_id,event_id)
+                WHERE document.tenant_id=%s AND document.source_id=%s
+                  AND coalesce(event.native_parent_id,event.native_id)=%s
+                  AND document.is_current AND document.deleted_at IS NULL)
+            SELECT CASE WHEN EXISTS (SELECT 1 FROM current_documents)
+                THEN NOT EXISTS (SELECT 1 FROM current_documents document
+                    WHERE document.chunk_receipt_profile IS DISTINCT FROM 1
+                       OR EXISTS (SELECT 1 FROM canonical_chunks chunk
+                           WHERE chunk.tenant_id=document.tenant_id AND chunk.source_id=document.source_id
+                             AND chunk.document_id=document.document_id))
+                END AS drained''', scope).fetchone()['drained']
         if drained is not True:
             return None
         # Append may queue work independently of the catalog lock. Check again
