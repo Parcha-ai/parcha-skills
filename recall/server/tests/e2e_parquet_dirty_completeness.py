@@ -4,8 +4,8 @@ import hashlib
 import unittest
 from unittest.mock import patch
 from psycopg import sql
-from recall_server.control import ControlPlane, SecretBox
 from e2e_parent_membership_enrollment import ParentEnrollmentTests
+from recall_server.control import ControlPlane, SecretBox
 from recall_server.logical_evidence import LogicalEvidenceProjectionStore
 from recall_server.logical_evidence_projection import CanonicalLogicalEvidenceProjector
 from recall_server.parquet_scan import CanonicalParquetScanProjector
