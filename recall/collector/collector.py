@@ -58,8 +58,9 @@ PRIVATE_KEY_BLOCK = re.compile(
 class CollectorRuntimeError(RuntimeError):
     """A stable, content-free collector failure for local health surfaces."""
 
-    def __init__(self, error_code: str):
+    def __init__(self, error_code: str, *, snapshot_diagnostics: dict[str, Any] | None = None):
         self.error_code = error_code
+        self.snapshot_diagnostics = snapshot_diagnostics
         super().__init__(error_code)
 
 
@@ -94,9 +95,21 @@ def snapshot_identity(value) -> tuple[int, ...]:
 def snapshot_hashes(path: Path, observed, size: int, prefix_size: int | None,
                     deadline: float) -> tuple[str, str | None]:
     """Read a fixed snapshot; confirm its digest once if the same file grows."""
+    started_at = time.monotonic()
+    bytes_read = 0
+    phase = "initial"
+
     def check_deadline() -> None:
-        if time.monotonic() >= deadline:
-            raise CollectorRuntimeError("source_snapshot_deadline")
+        now = time.monotonic()
+        if now >= deadline:
+            raise CollectorRuntimeError("source_snapshot_deadline", snapshot_diagnostics={
+                "path_sha256": hashlib.sha256(os.fsencode(path)).hexdigest(),
+                "observed_size_bytes": size,
+                "bytes_read": bytes_read,
+                "remaining_budget_ms_at_entry": round((deadline - started_at) * 1000, 3),
+                "elapsed_ms": round((now - started_at) * 1000, 3),
+                "phase": phase,
+            })
 
     def check_stat(before, after) -> bool:
         if snapshot_identity(before) == snapshot_identity(after):
@@ -107,6 +120,7 @@ def snapshot_hashes(path: Path, observed, size: int, prefix_size: int | None,
         raise CollectorRuntimeError("source_snapshot_changed")
 
     def read_snapshot(source) -> tuple[str, str | None]:
+        nonlocal bytes_read
         digest = hashlib.sha256()
         prefix = digest.hexdigest() if prefix_size == 0 else None
         offset = 0
@@ -117,6 +131,7 @@ def snapshot_hashes(path: Path, observed, size: int, prefix_size: int | None,
             if prefix_size is not None and offset < prefix_size < end:
                 end = prefix_size
             block = source.read(end - offset)
+            bytes_read += len(block)
             check_deadline()
             if not block:
                 raise CollectorRuntimeError("source_snapshot_changed")
@@ -137,6 +152,7 @@ def snapshot_hashes(path: Path, observed, size: int, prefix_size: int | None,
         if grew:
             # An appender need not become idle. Read only the same observed
             # bytes again, once; a differing prefix refuses the checkpoint.
+            phase = "growth_confirmation"
             confirmed = read_snapshot(source)
             finished = os.fstat(source.fileno())
             check_stat(current, finished)
