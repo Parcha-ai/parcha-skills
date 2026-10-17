@@ -59,7 +59,8 @@ class InlineCertificates(unittest.TestCase):
         self.assertEqual(result, [dict(logical_document_id='document', passage_id='certified', revision=1,
                                       receipts=[item_receipt('source:test', 'event', 1, 0)])])
         self.assertEqual(store.fetch_sizes, [2000,2000])
-        self.assertEqual(len(store.restored_deadlines), 1)
+        # Both the data FETCH and the final EOF FETCH own a bounded allowance.
+        self.assertEqual(len(store.restored_deadlines), 2)
 
     def partition(self, rows):
         return reader.partition_fetched(selected=rows, settings=reader.ReadSettings(True, 'fixture'),
