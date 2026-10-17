@@ -55,6 +55,11 @@ class Store:
                     dict(source_id=s, document_id=d) for s, d in self.history
                 ]
             )
+        if "locked_parents AS MATERIALIZED" in q:
+            return SimpleNamespace(fetchall=lambda: [
+                dict(source_id=s, document_id=d)
+                for s, d in zip(p[0], p[1], strict=True)
+            ])
         if "updated_documents AS" not in q:
             keys = list(zip(p[0], p[1]))
             rows = [
@@ -91,7 +96,8 @@ class SelectionTests(unittest.TestCase):
         t = CanonicalBodyThinner(s, tenant_id="t")
         t.thin(batch_size=1, committed_keys=(("t", "s", "x"),))
         self.assertEqual(s.mutations, [[("s", "a")]])
-        self.assertEqual(len(s.calls), 5)
+        self.assertEqual(len(s.calls), 6)
+        self.assertEqual(sum("locked_parents AS MATERIALIZED" in q for q, _ in s.calls), 1)
         s.history = [("s", "b")]
         t.thin(batch_size=1)
         self.assertEqual(s.mutations[-1], [("s", "x")])
