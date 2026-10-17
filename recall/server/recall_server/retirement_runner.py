@@ -609,6 +609,20 @@ def run_retirement(
             before_parent(candidate)
         parent_started = time.monotonic()
         try:
+            certification_request = None
+            if (metadata_mode == "singleton" and membership_certification is not None
+                    and membership_certification.enabled):
+                from . import membership_remainder
+                try:
+                    certification_request = membership_remainder.retain_retirement(
+                        store, scope=dict(tenant_id=key[0], source_id=key[1],
+                                          principal_id=scope.principal_id),
+                        manifest=candidate["manifest"], settings=membership_certification,
+                        deadline_at=deadline_at)
+                except Exception:
+                    # No retirement mutation has started. An uncertain queue
+                    # COMMIT may leave safe work, never an untracked cleared tail.
+                    raise ChunkRetirementError("retirement_certification_admission_unavailable") from None
             selected_limits = parent_limits if parent_limits_for is None else parent_limits_for(candidate)
             if not isinstance(selected_limits, ParentRetirementLimits):
                 raise ChunkRetirementError("parent_retirement_limits_invalid")
@@ -656,6 +670,9 @@ def run_retirement(
                         deadline_at=min(deadline_at, certification_started + 3),
                         should_stop=should_stop)
                     report["membership_certified_passages"] += certified["certified_passages"]
+                    if certified["status"] in {"enrolled", "empty"} and certification_request is not None:
+                        membership_remainder.change_cursor(store, certification_request,
+                            certification_request["checkpoint"], deadline_at=deadline_at)
                     if certified["status"] == "failed":
                         report["membership_failed_parents"] += 1
                     elif certified["status"] != "enrolled":

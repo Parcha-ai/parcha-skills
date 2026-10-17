@@ -46,6 +46,47 @@ def key(row):
     return row["tenant_id"], row["source_id"], row["logical_document_id"]
 
 
+def retain_retirement(store, *, scope, manifest, settings, deadline_at):
+    """Commit a scheduling request before retirement can invalidate certificates.
+
+    Existing publication or certification work wins. No proof cursor or authority
+    is invented: resume rechecks the current publication and proves membership.
+    """
+    if not settings.enabled:
+        return None
+    with native._connect(store, deadline_at) as connection, connection.transaction():
+        available = native._query(store, connection, """SELECT EXISTS(
+            SELECT 1 FROM pg_attribute
+            WHERE attrelid=to_regclass('canonical_passage_projection_queue')
+              AND attname='certification_checkpoint' AND atttypid='jsonb'::regtype
+              AND NOT attisdropped) AS available""", (), deadline_at).fetchone()
+        if not available['available']:
+            return None
+        if not native._authorized(store, connection, scope, deadline_at):
+            raise PermissionError('retirement_certification_unauthorized')
+        current = CURRENT + """ AND evidence.native_parent_id=%s
+            AND evidence.revision=%s AND evidence.document_content_sha256=%s
+            AND evidence.manifest_content_sha256=%s"""
+        row = native._query(store, connection, """WITH current_scope AS ("""
+            + current + """) INSERT INTO canonical_passage_projection_queue
+            (tenant_id,source_id,logical_document_id,revision,reason,certification_checkpoint)
+            SELECT %s,%s,%s,revision,'certification',
+              jsonb_build_object('version',1,'epoch',%s::text,'after','',
+                'revision',revision,'source_sha256',source_sha256,
+                'manifest_sha256',manifest_sha256,'policy',policy,
+                'authority_generation',authority_generation)
+            FROM current_scope WHERE NOT logical_pending
+            ON CONFLICT(tenant_id,source_id,logical_document_id) DO NOTHING
+            RETURNING tenant_id,source_id,logical_document_id,generation,
+                certification_checkpoint AS checkpoint""",
+            (scope['tenant_id'], scope['source_id'], manifest['logical_document_id'],
+             manifest['native_parent_id'], manifest['revision'],
+             manifest['document_content_sha256'], manifest['manifest_content_sha256'],
+             scope['tenant_id'], scope['source_id'], manifest['logical_document_id'],
+             settings.binding_epoch), deadline_at).fetchone()
+    return row
+
+
 def retain(connection, candidate, settings):
     """Retain after publication; None alone requests the pre085 legacy hook."""
     if not settings.enabled:
