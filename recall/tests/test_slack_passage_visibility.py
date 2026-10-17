@@ -145,3 +145,30 @@ class SlackVisibilityTest(unittest.TestCase):
         self.assertEqual([p.text for p in self.passages(records)], [TEXT])
         with self.assertRaisesRegex(Exception, "segment_incomplete"):
             self.passages(records[:-1])
+
+    def test_typed_document_text_preserves_owner_without_inventing_author(self):
+        record = replace(slack_record(), content={
+            "kind": "document.v1", "document_id": "slack-file:T123:F123",
+            "mime_type": "application/pdf", "name": "decision.pdf",
+            "content_fidelity": "complete", "text": TEXT,
+        })
+        owner = ActorLink("actor_" + "a" * 32, "owner")
+        for links in ((), (owner,)):
+            records = logical_records(record, links)
+            self.assertEqual(records[0].roles, ())
+            passages = self.passages(records)
+            self.assertEqual([p.text for p in passages], [TEXT])
+            self.assertEqual(passages[0].actor_links, links)
+            self.assertEqual(passages[0].receipts, records[0].receipts)
+            for role in ("system", "developer", "tool"):
+                self.assertEqual(self.passages((replace(records[0], roles=(role,)),)), ())
+
+    def test_documents_without_extracted_text_are_not_promoted(self):
+        record = logical_records(slack_record())[0]
+        for content in (
+            {"kind": "document.v1"},
+            {"kind": "document.v1", "text": "   "},
+            {"kind": "document.v1", "text": {"text": TEXT}},
+            {"kind": [], "text": TEXT},
+        ):
+            self.assertEqual(self.passages((replace(record, text=json.dumps(content)),)), ())
