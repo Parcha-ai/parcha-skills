@@ -2224,6 +2224,7 @@ class CanonicalPassageProjector:
         documents = passages = stale = requeued = unavailable = batches = 0
         deleted = retained = 0
         membership_certified = membership_failed = membership_deferred = 0
+        membership_failures = []
         membership_elapsed_ms = 0
         preparation_counts = Counter()
         while batches < max_batches:
@@ -2286,12 +2287,17 @@ class CanonicalPassageProjector:
                                 settings=self.membership_certification, deadline_at=certification_deadline)
                             status['membership_certified'] = certification['certified_passages']
                             status['membership_failed'] = int(certification['status'] == 'failed')
+                            if 'failure' in certification:
+                                status['membership_failure'] = certification['failure']
                             status['membership_deferred'] = int(
                                 certification['status'] not in {'enrolled', 'failed'})
-                        except Exception:
+                        except Exception as error:
                             # Publication and its queue ACK have committed. Optional
                             # proof failure must never replay publication or ingest.
                             status['membership_failed'] = 1
+                            status['membership_failure'] = parent_membership_enrollment.certification_failure(
+                                error, source_id=candidate.source_id,
+                                logical_document_id=candidate.logical_document_id)
                         finally:
                             status['membership_elapsed_ms'] = max(
                                 0, round((time.monotonic() - certification_started) * 1000))
@@ -2334,6 +2340,8 @@ class CanonicalPassageProjector:
                                 continue
                             membership_certified += int(status.get('membership_certified', 0))
                             membership_failed += int(status.get('membership_failed', 0))
+                            if 'membership_failure' in status:
+                                membership_failures.append(status['membership_failure'])
                             membership_deferred += int(status.get('membership_deferred', 0))
                             membership_elapsed_ms += int(status.get('membership_elapsed_ms', 0))
                             documents += 1
@@ -2367,6 +2375,7 @@ class CanonicalPassageProjector:
                 if certification_deadline is not None:
                     certification_started = time.monotonic()
                     try:
+                        row = None
                         certification_rows = membership_remainder.pending(self.store,
                             tenant_id=tenant_id, limit=certification_batch_size,
                             deadline_at=certification_deadline)
@@ -2377,9 +2386,14 @@ class CanonicalPassageProjector:
                                 settings=self.membership_certification, deadline_at=certification_deadline)
                             membership_certified += outcome['certified_passages']
                             membership_failed += int(outcome['status'] == 'failed')
+                            if 'failure' in outcome:
+                                membership_failures.append(outcome['failure'])
                             membership_deferred += int(outcome['status'] not in {'enrolled', 'failed'})
-                    except Exception:
+                    except Exception as error:
                         membership_failed += 1
+                        membership_failures.append(parent_membership_enrollment.certification_failure(
+                            error, source_id=row["source_id"] if row is not None else None,
+                            logical_document_id=row["logical_document_id"] if row is not None else None))
                     finally:
                         membership_elapsed_ms += max(0, round((time.monotonic()-certification_started)*1000))
         phase_started = time.monotonic()
@@ -2397,6 +2411,7 @@ class CanonicalPassageProjector:
             "documents": documents,
             "membership_certified_passages": membership_certified,
             "membership_failed_documents": membership_failed,
+            "membership_failures": membership_failures,
             "membership_deferred_documents": membership_deferred,
             # Sum of optional owner durations; concurrent hooks may overlap.
             "membership_elapsed_ms": membership_elapsed_ms,
@@ -2411,7 +2426,7 @@ class CanonicalPassageProjector:
             "pending": int(pending),
             # Prepare/commit are accumulated owner durations and can overlap;
             # commit includes cap/connection waits. Other phases are coordinator
-            # wall time. No per-document identifiers or passage text are retained.
+            # wall time. Failure diagnostics contain identities but no passage text.
             "warmup_ms": max(0, round(warmup_seconds * 1000)),
             "pending_ms": max(0, round(pending_seconds * 1000)),
             "prepare_ms": max(0, round(prepare_seconds * 1000)),
