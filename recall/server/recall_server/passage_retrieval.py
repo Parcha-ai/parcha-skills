@@ -650,10 +650,11 @@ def merge_dense_pools(
 ) -> tuple[list[dict[str, Any]], int]:
     """Union the global dense pool with a second pass (H2-h window, H2-m clause).
 
-    Both pools hold one row per logical document. Documents the global pass
-    already returned keep their row; new documents from the second pass join
-    the pool, and the union is re-ordered by dense score (stable, so ties keep
-    the arms' recency order). Returns the pool and how many rows were added.
+    Passage rows are identified by source, parent and passage ID. Distinct
+    passages from the same parent survive; repeated passages retain their
+    strongest comparable score. Legacy document rows keep the primary row.
+    The union is sorted stably by score, preserving arm order for ties.
+    Returns the pool and how many distinct rows were added.
 
     ``align_by_rank``: a clause pass scores against a different query vector,
     so its cosine scores are not comparable with the global pass. Its rows
@@ -666,7 +667,11 @@ def merge_dense_pools(
 
     if not windowed:
         return primary, 0
-    seen = {row["logical_document_id"] for row in primary}
+    def identity(row: dict[str, Any]) -> tuple[Any, ...]:
+        if row.get("passage_id"):
+            return ("passage", row.get("source_id"), row["logical_document_id"], row["passage_id"])
+        return ("document", row["logical_document_id"])
+
     if align_by_rank and primary:
         ladder = sorted((float(row["score"]) for row in primary), reverse=True)
         aligned = []
@@ -674,11 +679,23 @@ def merge_dense_pools(
             score = ladder[min(rank, len(ladder) - 1)]
             aligned.append({**row, "score": score})
         windowed = aligned
-    added = [row for row in windowed if row["logical_document_id"] not in seen]
-    if not added:
+    merged = list(primary)
+    positions = {identity(row): index for index, row in enumerate(merged)}
+    added = 0
+    changed = False
+    for row in windowed:
+        key = identity(row)
+        index = positions.get(key)
+        if index is None:
+            positions[key] = len(merged)
+            merged.append(row)
+            added += 1
+        elif row.get("passage_id") and float(row["score"]) > float(merged[index]["score"]):
+            merged[index] = {**merged[index], "score": row["score"]}
+            changed = True
+    if not added and not changed:
         return primary, 0
-    merged = sorted(primary + added, key=lambda row: -float(row["score"]))
-    return merged, len(added)
+    return sorted(merged, key=lambda row: -float(row["score"])), added
 
 
 def fuse_document_rankings(
