@@ -147,6 +147,7 @@ class ClaimDiagnosticTests(unittest.TestCase):
                 "status",
                 "attempted_parents",
                 "completed_parent_proofs",
+                "completed_noop_parents",
                 "failed_parents",
                 "partial_parents",
                 "batches",
