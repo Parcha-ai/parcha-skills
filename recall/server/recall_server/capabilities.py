@@ -25,6 +25,7 @@ from . import (
     PASSAGE_APPEND_CHECKPOINT_VERSION,
     MEMBERSHIP_REMAINDER_VERSION,
     AUDIT_MAINTENANCE_VERSION,
+    LOGICAL_ACTOR_CHECKPOINT_VERSION,
 )
 
 
@@ -228,7 +229,9 @@ def assess_snapshot(snapshot: dict[str, Any], profile: str = "production") -> di
                       + ([MEMBERSHIP_REMAINDER_VERSION]
                          if MEMBERSHIP_REMAINDER_VERSION in versions else [])
                       + ([AUDIT_MAINTENANCE_VERSION]
-                         if AUDIT_MAINTENANCE_VERSION in versions else []))
+                         if AUDIT_MAINTENANCE_VERSION in versions else [])
+                      + ([LOGICAL_ACTOR_CHECKPOINT_VERSION]
+                         if LOGICAL_ACTOR_CHECKPOINT_VERSION in versions else []))
     if (RETIREMENT_POLICY_VERSION in versions
             and RETIREMENT_DETACHMENT_VERSION not in versions):
         raise CapabilityError("schema_drift")
@@ -246,6 +249,9 @@ def assess_snapshot(snapshot: dict[str, Any], profile: str = "production") -> di
         raise CapabilityError("schema_drift")
     if (AUDIT_MAINTENANCE_VERSION in versions
             and RETIREMENT_MAINTENANCE_VERSION not in versions):
+        raise CapabilityError("schema_drift")
+    if (LOGICAL_ACTOR_CHECKPOINT_VERSION in versions
+            and LOGICAL_APPEND_CAPABILITY_VERSION not in versions):
         raise CapabilityError("schema_drift")
     if versions != expected:
         raise CapabilityError("schema_drift")
