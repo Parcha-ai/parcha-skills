@@ -115,8 +115,9 @@ class SelectiveExperiment(unittest.TestCase):
         def measured(connection,sql,values,deadline):
             statements.append(sql)
             return execute(connection,sql,values,deadline)
-        with patch.object(self.store,'_execute_bounded',measured):proof,rows,cost=self.capture()
-        self.assertFalse(any('retirement_metadata' in str(q) for q in statements))
+        with patch.object(self.store,'_execute_bounded',measured), \
+                patch('recall_server.parent_chunk_proof._capture', side_effect=AssertionError('selected proof invoked full metadata capture')):
+            proof,rows,cost=self.capture()
         print(json.dumps(dict(experiment='selected2_of12',sql_statements=len(statements),
             archive_gets=sum(self.archive.reads.values()),selected_part_bytes=cost['selected_part_bytes'],
             selected_documents=cost['selected_documents'],full_parent_metadata_capture=False)))

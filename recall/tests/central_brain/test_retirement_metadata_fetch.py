@@ -1,14 +1,13 @@
-"""Metadata fetch keeps the existing proof bounds while avoiding a second request."""
+"""One bounded metadata stream retains the original proof and deadline limits."""
 from contextlib import nullcontext
 from pathlib import Path
 import sys
 import time
-import types
 import unittest
 from unittest.mock import patch
 
 sys.path[:0] = [str(Path(__file__).resolve().parents[2]), str(Path(__file__).resolve().parents[2] / 'server')]
-from recall_server import parent_chunk_proof as proof
+from recall_server import parent_chunk_proof as proof, receipt_membership
 from recall_server.chunk_retirement import ChunkRetirementError, ParentRetirementLimits
 from recall_server.db import SearchDeadlineExceeded
 
@@ -25,9 +24,9 @@ class Connection:
     def __init__(self, rows):
         self.rows = rows
         self.requests = []
-        self.deadline_calls = 0
-        self.result_mode = 'normal'
+        self.deadlines = []
         self.failure = None
+        self.closed = False
 
     def transaction(self):
         return nullcontext()
@@ -35,78 +34,65 @@ class Connection:
     def execute(self, query):
         assert query == 'SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY'
 
-    def cursor(self, name=None):
+    def cursor(self):
         connection = self
 
         class Cursor:
-            result = 0
-
             def __enter__(self):
                 return self
 
             def __exit__(self, *_):
-                pass
+                connection.closed = True
 
-            def execute(self, query, args=None, **kwargs):
-                if name:
-                    assert name == 'retirement_metadata'
-                    return
-                connection.requests.append((query.as_string(), kwargs))
+            def stream(self, query, args, *, size):
+                connection.requests.append((query, args, size))
                 if connection.failure:
                     raise connection.failure
-
-            def fetchmany(self, count):
-                raise AssertionError('legacy separate FETCH request')
-
-            def fetchone(self):
-                return {'set_config': '1min'} if connection.result_mode != 'bad-setting' else {}
-
-            def nextset(self):
-                self.result += 1
-                return (self.result == 1 and connection.result_mode != 'missing-fetch') or connection.result_mode == 'extra-result'
-
-            def fetchall(self):
-                batch, connection.rows = connection.rows[:256], connection.rows[256:]
-                return batch if connection.result_mode != 'oversized-fetch' else [metadata(i) for i in range(257)]
+                yield from connection.rows
 
         return Cursor()
 
 
 class Store:
-    def __init__(self, connection):
+    def __init__(self, connection, verified=False):
         self.connection = connection
+        self.verified_singleton_receipts = verified
 
     def connect(self):
         return nullcontext(self.connection)
 
     def _set_statement_deadline(self, connection, deadline):
-        connection.deadline_calls += 1
+        connection.deadlines.append(deadline)
+        if deadline is not None and deadline <= time.monotonic():
+            raise SearchDeadlineExceeded('search deadline exceeded')
 
     def _execute_bounded(self, *args):
         return type('Parts', (), {'fetchall': lambda self: []})()
 
 
 class MetadataFetchTests(unittest.TestCase):
-    def capture(self, connection, *, deadline=None, **limits):
+    def capture(self, connection, *, deadline=None, verified=False, **limits):
         catalog = {'manifest': {'logical_document_id': 'logical', 'revision': 1}, 'queue': None}
         with proof.ParentMetadataSpool(max_bytes=1024**2) as spool:
             self.spool_path = Path(spool.directory.name)
             with patch.object(proof, 'read_parent_catalog', return_value=catalog):
-                return proof._capture(Store(connection), spool, ('tenant', 'source', 'parent'),
+                return proof._capture(Store(connection, verified), spool, ('tenant', 'source', 'parent'),
                                       ParentRetirementLimits(**limits), deadline or time.monotonic() + 60)
 
-    def test_fixed_256_rows_and_one_request_per_fetch(self):
+    def test_fixed_256_result_chunks_and_one_metadata_request(self):
         connection = Connection([metadata(i) for i in range(257)])
         self.assertEqual(self.capture(connection)[2:], (257, 257))
-        self.assertEqual(len(connection.requests), 3)
-        self.assertEqual(connection.deadline_calls, 1)  # Before DECLARE only.
-        for query, options in connection.requests:
-            self.assertIn('FETCH FORWARD 256 FROM "retirement_metadata"', query)
-            self.assertIn("set_config('statement_timeout'", query)
-            self.assertEqual(options, {'prepare': False})
+        self.assertEqual(len(connection.requests), 1)
+        self.assertEqual(len(connection.deadlines), 1)
+        query, args, size = connection.requests[0]
+        self.assertEqual(size, 256)
+        self.assertIn('SELECT selected.*,items.chunks FROM (', query)
+        limits = ParentRetirementLimits()
+        self.assertEqual(args, ('tenant', 'source', 'parent', limits.max_documents+1, limits.batch_chunks+1))
+        self.assertTrue(connection.closed)
         self.assertFalse(self.spool_path.exists())
 
-    def test_expired_before_fetch_and_original_error_identity(self):
+    def test_expired_before_stream_and_original_error_identity(self):
         connection = Connection([metadata(1)])
         with self.assertRaises(SearchDeadlineExceeded):
             self.capture(connection, deadline=time.monotonic() - 1)
@@ -116,17 +102,31 @@ class MetadataFetchTests(unittest.TestCase):
         with self.assertRaises(RuntimeError) as caught:
             self.capture(connection)
         self.assertIs(caught.exception, sentinel)
+        self.assertTrue(connection.closed)
         self.assertFalse(self.spool_path.exists())
 
-    def test_remaining_deadline_recomputed_without_extending_it(self):
+    def test_pipeline_refresh_reuses_absolute_deadline_and_bounded_membership(self):
         connection = Connection([metadata(i) for i in range(257)])
-        start = time.monotonic()
-        ticks = iter((start, start + .25, start + .49))
-        with patch.object(proof, 'time', types.SimpleNamespace(monotonic=lambda: next(ticks))):
-            self.capture(connection, deadline=start + .5)
-        durations = [int(query.split("statement_timeout', '", 1)[1].split('ms', 1)[0])
-                     for query, _ in connection.requests]
-        self.assertTrue(0 < durations[2] <= 10 < durations[1] <= 250 < durations[0] <= 500)
+        batches = []
+        deadline = time.monotonic() + 60
+
+        def verified(*args, documents, deadline_at, **kwargs):
+            self.assertEqual(deadline_at, deadline)
+            batches.append(len(documents))
+            return {row['document_id']: row['chunks'] for row in documents}
+
+        with patch.object(receipt_membership, 'verified_document_chunks', verified):
+            self.assertEqual(self.capture(connection, deadline=deadline, verified=True)[2:], (257, 257))
+        self.assertEqual(connection.deadlines, [deadline, deadline])
+        self.assertEqual(batches, [256, 1])
+
+    def test_midstream_deadline_discards_spool(self):
+        connection = Connection([metadata(i) for i in range(3)])
+        with patch.object(proof, '_check_deadline', side_effect=[None, SearchDeadlineExceeded('search deadline exceeded')]):
+            with self.assertRaises(SearchDeadlineExceeded):
+                self.capture(connection)
+        self.assertTrue(connection.closed)
+        self.assertFalse(self.spool_path.exists())
 
     def test_row_chunk_and_serialized_byte_budgets_still_refuse(self):
         for limits in ({'max_documents': 1}, {'max_chunks': 1}):
@@ -139,12 +139,15 @@ class MetadataFetchTests(unittest.TestCase):
             self.capture(Connection([row]))
         self.assertFalse(self.spool_path.exists())
 
-    def test_exact_two_result_sets_and_batch_bound_required(self):
-        for mode in ('bad-setting', 'missing-fetch', 'extra-result', 'oversized-fetch'):
-            with self.subTest(mode=mode), self.assertRaises(ChunkRetirementError):
-                connection = Connection([metadata(1)])
-                connection.result_mode = mode
-                self.capture(connection)
+    def test_unexpected_metadata_shape_still_refuses(self):
+        for extra in ('row', 'chunk'):
+            row = metadata(1)
+            if extra == 'row':
+                row['unexpected'] = True
+            else:
+                row['chunks'][0]['unexpected'] = True
+            with self.subTest(extra=extra), self.assertRaises(ChunkRetirementError):
+                self.capture(Connection([row]))
             self.assertFalse(self.spool_path.exists())
 
 

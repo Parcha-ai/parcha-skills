@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Actual cursor transport parity, bounded metadata, and cancellation."""
+"""Actual stream chunk parity, bounded metadata, and cancellation."""
 # ruff: noqa: E402
 from contextlib import nullcontext
 import hashlib
@@ -15,7 +15,6 @@ import weakref
 from unittest.mock import patch
 
 import psycopg
-from psycopg import sql
 
 SERVER = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(SERVER.parent), str(SERVER)]
@@ -41,24 +40,21 @@ class CaptureBatching(unittest.TestCase):
         cls.root.cleanup()
 
     def capture(self, *, batch=None, deadline=True, delay=0, cancel=False, limits=None, timeout=30):
-        fetches = []
-        original_execute = psycopg.Cursor.execute
-        original_fetchmany = psycopg.ServerCursor.fetchmany
-        def execute(cursor, query, params=None, **kwargs):
-            rendered = query.as_string(cursor.connection) if isinstance(query, sql.Composable) else str(query)
-            if 'FETCH FORWARD ' in rendered and 'retirement_metadata' in rendered:
-                fetches.append(rendered)
-                time.sleep(delay)  # Explicit simulated network RTT; not production measurement.
+        streams = []
+        original_stream = psycopg.Cursor.stream
+        def stream(cursor, query, *args, **kwargs):
+            if "SELECT selected.*,items.chunks FROM (" in query:
+                streams.append(kwargs['size'])
+                time.sleep(delay)  # Explicit simulated query RTT; not production measurement.
                 if cancel:
-                    query = rendered.replace('FETCH FORWARD ', 'SELECT pg_sleep(1); FETCH FORWARD ')
-            return original_execute(cursor, query, params, **kwargs)
-        def fetchmany(cursor, size=0):
-            if cursor.name == 'retirement_metadata':
-                fetches.append(size)
-            return original_fetchmany(cursor, size)
+                    query = query.replace(
+                        "SELECT selected.*,items.chunks FROM (",
+                        "SELECT selected.*,items.chunks FROM (SELECT pg_sleep(1)) pause CROSS JOIN (",
+                    )
+            yield from original_stream(cursor, query, *args, **kwargs)
         started = time.monotonic()
         with patch.object(proof, '_CAPTURE_FETCH_ROWS', batch, create=True) if batch else nullcontext():
-            with patch.object(psycopg.Cursor, 'execute', execute), patch.object(psycopg.ServerCursor, 'fetchmany', fetchmany):
+            with patch.object(psycopg.Cursor, 'stream', stream):
                 with proof.ParentMetadataSpool(max_bytes=256 * 1024**2) as spool:
                     result = proof._capture(self.store, spool, self.scope, limits or ParentRetirementLimits(),
                                             time.monotonic() + (.03 if cancel else timeout) if deadline else None)
@@ -70,16 +66,18 @@ class CaptureBatching(unittest.TestCase):
                     rows = result[2:]
         return dict(digest=digest.hexdigest(), rows=rows, payload_bytes=payload_bytes,
                     peak_rss_kib=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
-                    fetches=len(fetches), elapsed_ms=(time.monotonic() - started) * 1000)
+                    streams=len(streams), result_chunk_sizes=streams, elapsed_ms=(time.monotonic() - started) * 1000)
 
-    def test_257_rows_use_two_data_fetches_plus_eof(self):
+    def test_257_rows_use_one_stream_with_bounded_result_chunks(self):
         result = self.capture()
         self.assertEqual(result['rows'], (257, 257))
-        self.assertEqual(result['fetches'], 3)
+        self.assertEqual(result['streams'], 1)
+        self.assertEqual(result['result_chunk_sizes'], [256])
 
-    def test_same_spool_with_and_without_deadline_and_old_batch(self):
+    def test_same_spool_with_and_without_deadline_and_different_result_chunks(self):
         results = [self.capture(batch=32), self.capture(batch=128), self.capture(), self.capture(deadline=False)]
-        self.assertEqual([r['fetches'] for r in results], [10, 4, 3, 3])
+        self.assertEqual([r['streams'] for r in results], [1, 1, 1, 1])
+        self.assertEqual([r['result_chunk_sizes'] for r in results], [[32], [128], [256], [256]])
         self.assertEqual(len({r['digest'] for r in results}), 1)
         self.assertEqual(len({r['payload_bytes'] for r in results}), 1)
         self.assertFalse(self.archive.reads)
@@ -116,7 +114,7 @@ class CaptureBatching(unittest.TestCase):
                 connection.execute("UPDATE canonical_events SET canonical_redacted=jsonb_set(canonical_redacted,'{type}',to_jsonb('assistant'::text)) WHERE tenant_id=%s", (self.tenant,))
         self.assertFalse(self.archive.reads)
 
-    def test_real_fetch_timeout_rolls_back_for_both_batches(self):
+    def test_real_stream_timeout_rolls_back_for_all_result_chunk_sizes(self):
         for batch in (32, 128, 256):
             with self.subTest(batch=batch), self.assertRaises((SearchDeadlineExceeded, psycopg.errors.QueryCanceled)):
                 self.capture(batch=batch, cancel=True)
@@ -155,35 +153,28 @@ class CaptureBatching(unittest.TestCase):
             self.scope, self.archive = previous_scope, previous_archive
             fixture.doCleanups()
 
-    def test_consumed_batch_released_before_next_real_fetch(self):
+    def test_consumed_membership_batch_released_before_next_batch(self):
         from recall_server import receipt_membership
         class Members(dict):
             pass
         class Rows(list):
             pass
         references = []
-        fetch_cursors = set()
-        original_execute, original_fetchall = psycopg.Cursor.execute, psycopg.Cursor.fetchall
+        original_batches = proof.ParentMetadataSpool.membership_batches
         original_member = receipt_membership.verified_document_chunks
         def member(*args, **kwargs):
             result = Members(original_member(*args, **kwargs))
             references.append(weakref.ref(result))
             return result
-        def execute(cursor, query, params=None, **kwargs):
-            rendered = query.as_string(cursor.connection) if isinstance(query, sql.Composable) else str(query)
-            if 'FETCH FORWARD ' in rendered and 'retirement_metadata' in rendered:
+        def batches(spool):
+            for documents in original_batches(spool):
                 self.assertTrue(all(ref() is None for ref in references),
-                                'previous decoded batch survives into the next FETCH')
-                fetch_cursors.add(id(cursor))
-            return original_execute(cursor, query, params, **kwargs)
-        def fetchall(cursor):
-            rows = original_fetchall(cursor)
-            if id(cursor) in fetch_cursors:
-                fetch_cursors.remove(id(cursor))
-                rows = Rows(rows)
+                                'previous decoded batch survives into the next membership batch')
+                rows = Rows(documents)
                 references.append(weakref.ref(rows))
-            return rows
-        with patch.object(psycopg.Cursor, 'execute', execute), patch.object(psycopg.Cursor, 'fetchall', fetchall), patch.object(self.store, 'verified_singleton_receipts', True), patch.object(receipt_membership, 'verified_document_chunks', member):
+                yield rows
+                rows = documents = None
+        with patch.object(proof.ParentMetadataSpool, 'membership_batches', batches), patch.object(self.store, 'verified_singleton_receipts', True), patch.object(receipt_membership, 'verified_document_chunks', member):
             self.assertEqual(self.capture()['rows'], (257, 257))
         self.assertTrue(all(ref() is None for ref in references))
 
@@ -196,7 +187,7 @@ class CaptureBatching(unittest.TestCase):
     def test_controlled_rtt_same_rows_and_spool(self):
         old, new = self.capture(batch=32, delay=.02), self.capture(delay=.02)
         self.assertEqual(old['digest'], new['digest'])
-        self.assertEqual((old['fetches'], new['fetches']), (10, 3))
+        self.assertEqual((old['streams'], new['streams']), (1, 1))
         print(json.dumps(dict(contract='capture-batch-rtt.v1', simulated_rtt_ms=20, old=old, new=new), sort_keys=True))
 
 
@@ -233,7 +224,7 @@ class CaptureBatching(unittest.TestCase):
         new = self.capture(delay=.01, timeout=90)
         self.assertEqual(old['rows'], (46001, 46001))
         self.assertEqual(old['digest'], new['digest'])
-        self.assertEqual((old['fetches'], new['fetches']), (1439, 181))
+        self.assertEqual((old['streams'], new['streams']), (1, 1))
         print(json.dumps(dict(contract='capture-scale-rtt.v1', simulated_rtt_ms=10, old=old, new=new), sort_keys=True))
 
 

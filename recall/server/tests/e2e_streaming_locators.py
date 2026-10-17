@@ -63,19 +63,17 @@ def setup(store, root, count=10):
 
 
 def metadata_fetch_protocol(store, root):
-    """Real portal results, deadline cancellation and cleanup through _capture."""
+    """Real streamed results, deadline cancellation and cleanup through _capture."""
     scope, _, _ = setup(store, root, count=257)
     before = state(store, scope)
-    execute = psycopg.Cursor.execute
+    stream = psycopg.Cursor.stream
     statements = []
 
     def observed(cursor, query, *args, **kwargs):
-        text = query.as_string() if isinstance(query, psycopg.sql.Composable) else str(query)
-        if text.startswith("SELECT set_config('statement_timeout',") and '; FETCH FORWARD' in text:
-            statements.append(text)
-            assert kwargs == {'prepare': False}
-            assert text.endswith('FETCH FORWARD 256 FROM "retirement_metadata"')
-        return execute(cursor, query, *args, **kwargs)
+        if "SELECT selected.*,items.chunks FROM (" in query:
+            statements.append(query)
+            assert kwargs == {'size': 256}
+        yield from stream(cursor, query, *args, **kwargs)
 
     def capture(deadline):
         path = None
@@ -92,34 +90,39 @@ def metadata_fetch_protocol(store, root):
         finally:
             assert (path is None or not path.exists()) and store.active_connections == 0
 
-    with patch.object(psycopg.Cursor, 'execute', observed):
+    with patch.object(psycopg.Cursor, 'stream', observed):
         capture(time.monotonic() + 30)
-    assert len(statements) == 3  # Two bounded data FETCHes and one empty FETCH.
+    assert len(statements) == 1  # One query, bounded libpq result chunks.
     assert state(store, scope) == before
 
-    for stage in ('setting', 'fetch'):
+    set_deadline = store._set_statement_deadline
+    for stage in ('setting', 'stream'):
         injected = []
 
-        def stalled(cursor, query, *args, **kwargs):
-            text = query.as_string() if isinstance(query, psycopg.sql.Composable) else str(query)
-            if text.startswith("SELECT set_config('statement_timeout',") and '; FETCH FORWARD' in text:
+        def stalled_setting(connection, deadline):
+            if stage == 'setting':
                 assert not injected
                 injected.append(stage)
-                with cursor.connection.cursor() as control:
-                    if stage == 'setting':
-                        execute(control, "SET LOCAL statement_timeout='25ms'")
-                        query = psycopg.sql.SQL(
-                            "SELECT set_config('statement_timeout','50ms',true) "
-                            'FROM (SELECT pg_sleep(2)) delayed; '
-                            'FETCH FORWARD 256 FROM "retirement_metadata"'
-                        )
-                    else:
-                        execute(control, 'CLOSE "retirement_metadata"; '
-                                'DECLARE "retirement_metadata" CURSOR FOR SELECT pg_sleep(2)', prepare=False)
-                # FETCH uses the production remaining deadline, not a test override.
-            return execute(cursor, query, *args, **kwargs)
+                connection.execute("SET LOCAL statement_timeout='25ms'")
+                connection.execute(
+                    "SELECT set_config('statement_timeout','50ms',true) "
+                    'FROM (SELECT pg_sleep(2)) delayed'
+                )
+            return set_deadline(connection, deadline)
 
-        with patch.object(psycopg.Cursor, 'execute', stalled):
+        def stalled_stream(cursor, query, *args, **kwargs):
+            if stage == 'stream' and "SELECT selected.*,items.chunks FROM (" in query:
+                assert not injected
+                injected.append(stage)
+                query = query.replace(
+                    "SELECT selected.*,items.chunks FROM (",
+                    "SELECT selected.*,items.chunks FROM (SELECT pg_sleep(2)) pause CROSS JOIN (",
+                )
+                # The stream uses the production remaining deadline.
+            yield from stream(cursor, query, *args, **kwargs)
+
+        with patch.object(store, '_set_statement_deadline', stalled_setting), \
+                patch.object(psycopg.Cursor, 'stream', stalled_stream):
             try:
                 capture(time.monotonic() + .5)
             except psycopg.errors.QueryCanceled:

@@ -34,24 +34,24 @@ class CaptureObservability(unittest.TestCase):
         self.addCleanup(worker.close)
         self.store = worker
 
-    def test_real_delayed_fetch_separates_membership_and_spool(self):
+    def test_real_delayed_stream_separates_membership_and_spool(self):
         self.activate_worker()
-        original = psycopg.ServerCursor.execute
+        original = psycopg.Cursor.stream
 
         def delayed(cursor, query, *args, **kwargs):
-            if cursor.name == "retirement_metadata":
+            if "SELECT selected.*,items.chunks FROM (" in query:
                 query = query.replace(
                     "SELECT selected.*,items.chunks FROM (",
                     "SELECT selected.*,items.chunks FROM (SELECT pg_sleep(0.04)) pause CROSS JOIN (",
                 )
-            return original(cursor, query, *args, **kwargs)
+            yield from original(cursor, query, *args, **kwargs)
 
-        with patch.object(psycopg.ServerCursor, "execute", delayed):
+        with patch.object(psycopg.Cursor, "stream", delayed):
             result = self.run_owner()
         self.assertFalse(result["commit_outcome_unknown"])
         self.assertEqual(result["cleared_documents"], 3)
         self.assertEqual(result["metadata_rows"], 3)
-        self.assertEqual(result["metadata_fetches"], 2)  # One data batch plus EOF.
+        self.assertEqual(result["metadata_fetches"], 1)  # One streamed acquisition.
         self.assertEqual(result["metadata_membership_calls"], 1)
         self.assertGreaterEqual(result["metadata_fetch_ms"], 30)
         self.assertGreater(result["metadata_membership_ms"], 0)
@@ -72,22 +72,18 @@ class CaptureObservability(unittest.TestCase):
         self,
     ):
         self.activate_worker()
-        original = psycopg.Cursor.execute
+        original = psycopg.Cursor.stream
 
-        def cancelled(cursor, query, params=None, **kwargs):
-            rendered = (
-                query.as_string(cursor.connection)
-                if hasattr(query, "as_string")
-                else str(query)
-            )
-            if "FETCH FORWARD" in rendered and "retirement_metadata" in rendered:
-                query = (
-                    "SELECT set_config('statement_timeout','20ms',true); SELECT pg_sleep(0.1); "
-                    + rendered[rendered.index("FETCH FORWARD") :]
+        def cancelled(cursor, query, *args, **kwargs):
+            if "SELECT selected.*,items.chunks FROM (" in query:
+                cursor.connection.execute("SET LOCAL statement_timeout='20ms'")
+                query = query.replace(
+                    "SELECT selected.*,items.chunks FROM (",
+                    "SELECT selected.*,items.chunks FROM (SELECT pg_sleep(0.1)) pause CROSS JOIN (",
                 )
-            return original(cursor, query, params, **kwargs)
+            yield from original(cursor, query, *args, **kwargs)
 
-        with patch.object(psycopg.Cursor, "execute", cancelled):
+        with patch.object(psycopg.Cursor, "stream", cancelled):
             result = self.run_owner()
         self.assertTrue(result["commit_outcome_unknown"])
         self.assertEqual(result["error_class"], "QueryCanceled")
@@ -99,7 +95,7 @@ class CaptureObservability(unittest.TestCase):
         self.assertEqual(result["metadata_spool_ms"], 0)
         self.assertFalse(self.archive.reads)
 
-    def test_real_profile_contradiction_keeps_received_rows_but_no_spool_or_clear(self):
+    def test_real_profile_contradiction_discards_staged_rows_without_clear(self):
         self.activate_worker()
         with self.store.connect() as connection:
             connection.execute(
@@ -114,7 +110,7 @@ class CaptureObservability(unittest.TestCase):
         self.assertEqual(result["metadata_fetches"], 1)
         self.assertEqual(result["metadata_membership_calls"], 1)
         self.assertGreater(result["metadata_membership_ms"], 0)
-        self.assertEqual(result["metadata_spool_ms"], 0)
+        self.assertGreater(result["metadata_spool_ms"], 0)
         self.assertFalse(self.archive.reads)
 
 
