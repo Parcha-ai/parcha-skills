@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import math
 import os
 import re
 import threading
@@ -840,6 +841,44 @@ def shingle_similarity(left: frozenset[str], right: frozenset[str]) -> float:
     if not left or not right:
         return 0.0
     return len(left & right) / len(left | right)
+
+
+def diversify_reranked_results(
+    results: list[dict[str, Any]], *, deadline_at: float | None = None,
+) -> list[dict[str, Any]]:
+    """Permute complete native scores with fixed MMR, retaining the first result."""
+    if len(results) < 2:
+        return results
+    relevance = [row.get("rerank_score") for row in results]
+    scores = relevance + [item.get("rerank_score") for row in results
+                          for item in row.get("matching_ranges", ())]
+    if (any(not row.get("matching_ranges") for row in results)
+        or any(isinstance(value, bool) or not isinstance(value, (int, float))
+               or not math.isfinite(value) for value in scores)):
+        return results
+    signatures = []
+    for row in results:
+        if deadline_at is not None and time.monotonic() >= deadline_at:
+            return results
+        text = row["matching_ranges"][0].get("text") or ""
+        if not isinstance(text, str):
+            return results
+        signatures.append(text_shingles(text))
+    selected = [0]
+    remaining = list(range(1, len(results)))
+    similarity = [0.0] * len(results)
+    while remaining:
+        if deadline_at is not None and time.monotonic() >= deadline_at:
+            return results
+        newest = selected[-1]
+        for index in remaining:
+            similarity[index] = max(similarity[index], shingle_similarity(signatures[index], signatures[newest]))
+        chosen = max(remaining, key=lambda index: (.9 * relevance[index] - .1 * similarity[index], -index))
+        selected.append(chosen)
+        remaining.remove(chosen)
+    if deadline_at is not None and time.monotonic() >= deadline_at:
+        return results
+    return [results[index] for index in selected]
 
 
 def similar_document_record(row: dict[str, Any], similarity: float) -> dict[str, Any]:
@@ -2718,6 +2757,9 @@ class PassageHintRetrieval:
                 results, threshold=near_duplicate_threshold(),
             )
             near_duplicate_diagnostics.update(similar_diagnostics)
+        if (rerank_diagnostics.get("rerank_status") == "ok"
+            and float(getattr(self.store, "rerank_blend", DEFAULT_RERANK_BLEND)) == 1.0):
+            results = diversify_reranked_results(results, deadline_at=deadline_at)
         results = [
             {key: value for key, value in row.items() if key != "nominated"}
             for row in results[:limit]
