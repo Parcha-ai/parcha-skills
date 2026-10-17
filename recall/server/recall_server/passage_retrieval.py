@@ -280,13 +280,15 @@ def collapse_document_candidates(
     document the arms placed past ``limit`` can still enter the head; those
     rows carry ``temporal_boost``. Nominations follow the boosted head.
     ``passage_budget="admitted"`` reallocates the legacy range count by passage
-    RRF while preserving every admitted parent; an integer freezes that capacity
+    RRF while preserving every admitted parent's weighted strongest passage.
+    Remaining slots use equal-arm passage RRF; an integer freezes that capacity
     for an authority rebuild. ``None`` retains the legacy per-parent selector.
     """
 
     documents: dict[str, dict[str, Any]] = {}
     nominated_documents: set[tuple[str, str]] = set()
     passage_scores: dict[tuple[str, str, str], float] = {}
+    extra_scores: dict[tuple[str, str, str], float] = {}
     if passage_budget is not None and (
         fusion != "rrf" or (passage_budget != "admitted" and (
             type(passage_budget) is not int
@@ -352,6 +354,7 @@ def collapse_document_candidates(
                 identity = (row["source_id"], document_id, range_key)
                 if identity not in seen_passages:
                     passage_scores[identity] = passage_scores.get(identity, 0.0) + weight / (60 + rank)
+                    extra_scores[identity] = extra_scores.get(identity, 0.0) + 1 / (60 + rank)
                     seen_passages.add(identity)
             prior = value["_ranges"].get(range_key)
             arm_top = value["_arm_tops"].get(leg_name)
@@ -461,7 +464,9 @@ def collapse_document_candidates(
                 represented.add(key[:2])
         if len(selected_passages) > budget:
             raise ValueError("admitted parents exceed native passage capacity")
-        for key in ordered_passages:
+        # Preserve the weighted parent floor above; remaining evidence slots
+        # use agreement across arms without importing their parent-routing priors.
+        for key in sorted(available, key=lambda key: (-extra_scores[key], key)):
             if len(selected_passages) >= budget:
                 break
             selected_passages.add(key)
@@ -1255,6 +1260,14 @@ class PassageHintRetrieval:
         still constrain those bodies before reranking."""
 
         return self._filter_time_ranges(results, legs)
+
+    def _balanced_passages_enabled(self) -> bool:
+        return (
+            getattr(self.store, "rerank_runtime", None) is not None
+            and getattr(self.store, "fusion_mode", DEFAULT_FUSION_MODE) == "rrf"
+            and os.environ.get("RECALL_SEARCH_BALANCED_PASSAGES", "1").strip().lower()
+            not in {"0", "off", "false"}
+        )
 
     def __init__(
         self,
@@ -2589,11 +2602,7 @@ class PassageHintRetrieval:
             window_boost=window_boost,
             source_boost=source_boost,
         )
-        balanced_passages = (
-            rerank_runtime is not None and fusion_mode == "rrf"
-            and os.environ.get("RECALL_SEARCH_BALANCED_PASSAGES", "1").strip().lower()
-            not in {"0", "off", "false"}
-        )
+        balanced_passages = self._balanced_passages_enabled()
         if balanced_passages:
             collapse_options["passage_budget"] = "admitted"
         results = collapse_document_candidates(legs, **collapse_options)
