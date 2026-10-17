@@ -100,16 +100,32 @@ def synthetic_manifest() -> dict:
 
 
 class DatabaseCapabilityContractTest(unittest.TestCase):
+    def test_parquet_dirty_epoch_is_optional_without_raising_mandatory_floor(self):
+        snapshot = healthy_snapshot()
+        snapshot['migration_versions'] = list(range(1, 70))
+        self.assertEqual(assess_snapshot(snapshot)['schema_version'], 69)
+        snapshot['migration_versions'].append(88)
+        self.assertEqual(assess_snapshot(snapshot)['schema_version'], 88)
+        for versions in (
+            [v for v in snapshot['migration_versions'] if v != 61],
+            [v for v in snapshot['migration_versions'] if v != 69],
+            snapshot['migration_versions'] + [88],
+            snapshot['migration_versions'] + [89],
+        ):
+            with self.subTest(versions=versions), self.assertRaisesRegex(CapabilityError, 'schema_drift'):
+                assess_snapshot(dict(snapshot, migration_versions=versions))
+
     def test_actor_checkpoint_is_optional_and_requires_append_capability(self):
         for present in (False, True):
             snapshot = healthy_snapshot()
             snapshot['migration_versions'] = [v for v in snapshot['migration_versions'] if v != 87]
             if present:
                 snapshot['migration_versions'].append(87)
+                snapshot['migration_versions'].sort()
             self.assertEqual(assess_snapshot(snapshot)['status'], 'ready')
         for versions in ([v for v in snapshot['migration_versions'] if v != 79],
                          snapshot['migration_versions'] + [87],
-                         snapshot['migration_versions'] + [88]):
+                         snapshot['migration_versions'] + [89]):
             with self.assertRaises(CapabilityError):
                 assess_snapshot(dict(snapshot, migration_versions=versions))
 
@@ -123,7 +139,7 @@ class DatabaseCapabilityContractTest(unittest.TestCase):
             self.assertEqual(assess_snapshot(snapshot)['status'], 'ready')
         for versions in ([v for v in snapshot['migration_versions'] if v != 78],
                          snapshot['migration_versions'] + [86],
-                         snapshot['migration_versions'] + [88]):
+                         snapshot['migration_versions'] + [89]):
             with self.assertRaises(CapabilityError):
                 assess_snapshot(dict(snapshot, migration_versions=versions))
 
@@ -279,7 +295,7 @@ class DatabaseCapabilityContractTest(unittest.TestCase):
         for retired in (False, True):
             for marker in (False, True):
                 snapshot = healthy_snapshot()
-                snapshot["migration_versions"] = [v for v in snapshot["migration_versions"] if v not in (82,83,84,85,86,87)]
+                snapshot["migration_versions"] = [v for v in snapshot["migration_versions"] if v not in (82,83,84,85,86,87,88)]
                 baseline_version = max(snapshot["migration_versions"])
                 if not retired:
                     snapshot["migration_versions"].remove(67)
@@ -331,7 +347,7 @@ class DatabaseCapabilityContractTest(unittest.TestCase):
     def test_parent_certificate_marker_requires_generation_and_keeps_unknown_version_fence(self):
         for marker in (False,True):
             snapshot=healthy_snapshot()
-            snapshot['migration_versions']=[v for v in snapshot['migration_versions'] if v not in (83,84,85,86,87)]
+            snapshot['migration_versions']=[v for v in snapshot['migration_versions'] if v not in (83,84,85,86,87,88)]
             baseline=max(snapshot['migration_versions'])
             if marker:
                 snapshot['migration_versions'].append(83)
@@ -341,7 +357,7 @@ class DatabaseCapabilityContractTest(unittest.TestCase):
                 if marker or removed!=82:
                     with self.assertRaisesRegex(CapabilityError,'schema_drift'):
                         assess_snapshot(invalid)
-            for extra in ([88],[83,83]):
+            for extra in ([89],[83,83]):
                 invalid=dict(snapshot,migration_versions=snapshot['migration_versions']+extra)
                 with self.assertRaisesRegex(CapabilityError,'schema_drift'):
                     assess_snapshot(invalid)
