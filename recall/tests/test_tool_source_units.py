@@ -150,7 +150,7 @@ class ToolUnitCaptureTest(unittest.TestCase):
                     self.assertTrue(all(len(args['program'].encode())<=16000 for _,args,_ in client.calls))
                     for _,args,_ in client.calls:
                         encoded=re.search(r"TOOL_UNIT_RESOLVER = '([^']+)'",args['program']).group(1)
-                        self.assertEqual(gzip.decompress(base64.b64decode(encoded)),inspect.getsource(resolve).encode())
+                        self.assertEqual(gzip.decompress(base64.b64decode(encoded)),(inspect.getsource(resolve)+'\n'+inspect.getsource(capture._read_page)+'\n'+inspect.getsource(capture._page_stdout)).encode())
 
     def test_two_passages_maximum_supported_spans_preserve_program_bound(self):
         original=''.join(chr(65+i%26)for i in range(256))
