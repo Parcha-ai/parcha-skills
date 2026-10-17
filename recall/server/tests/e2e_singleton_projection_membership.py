@@ -18,6 +18,83 @@ class SingletonProjectionMembership(SingletonPassageReads):
         self.candidate = ScanCandidate(self.tenant, self.source, row['bucket_start'], row['generation'], row['changed_at'])
         self.documents = [self.args['logical_document_id']]
 
+    def receipt_fanout_fixture(self, *, valid_first=False):
+        from psycopg import sql
+        from recall_server.projectors import item_receipt
+        self.scan_fixture()
+        self.fanout_document = self.baseline(self.receipt)['document_id']
+        self.admit_fixture(self.fanout_document)
+        with self.store.connect() as connection:
+            baseline = connection.execute('SELECT * FROM canonical_passages WHERE tenant_id=%s LIMIT 1', (self.tenant,)).fetchone()
+            columns = [row['attname'] for row in connection.execute("SELECT attname FROM pg_attribute WHERE attrelid='canonical_passages'::regclass AND attnum>0 AND NOT attisdropped AND attgenerated='' ORDER BY attnum").fetchall()]
+            overrides = dict(passage_id='psg_' + 'f' * 32, ordinal=baseline['ordinal'] + 1)
+            selected = [sql.Placeholder() if key in overrides else sql.Identifier(key) for key in columns]
+            statement = sql.SQL('INSERT INTO canonical_passages ({}) SELECT {} FROM canonical_passages WHERE tenant_id=%s AND passage_id=%s').format(sql.SQL(',').join(map(sql.Identifier, columns)), sql.SQL(',').join(selected))
+            connection.execute(statement, tuple(overrides[key] for key in columns if key in overrides) + (self.tenant, baseline['passage_id']))
+            missing = [item_receipt(self.source, f'missing-{i}', 1, 0) for i in range(1001)]
+            receipts = ([self.receipt] + missing) if valid_first else (missing + [self.receipt])
+            connection.execute('UPDATE canonical_passages SET receipts=%s WHERE tenant_id=%s AND passage_id=%s', (receipts, self.tenant, baseline['passage_id']))
+        return overrides['passage_id']
+
+    def test_projection_receipt_slices_share_budget_and_preserve_native_union(self):
+        from recall_server import receipt_membership, parent_membership_read
+        survivor = self.receipt_fanout_fixture()
+        native = receipt_membership.lookup_current_search_membership
+        attempts = []
+        def record(*args, **kwargs):
+            attempts.append((len(kwargs['receipts']), kwargs['deadline_at'], id(kwargs['connection'])))
+            return native(*args, **kwargs)
+        with patch.object(self.store, 'verified_singleton_receipts', True), patch.object(parent_membership_read.ReadSettings, 'from_env', return_value=parent_membership_read.ReadSettings()), patch.object(receipt_membership, 'lookup_current_search_membership', record):
+            rows = list(self.scan._passages(self.candidate, self.documents))
+        self.assertEqual([row['passage_id'] for row in rows], [survivor])
+        self.assertEqual([row['receipts'] for row in rows], [[self.receipt]])
+        self.assertEqual([n for n, _, _ in attempts], [500, 500, 2])
+        self.assertEqual(len({deadline for _, deadline, _ in attempts}), 1)
+        self.assertEqual(len({connection for _, _, connection in attempts}), 1)
+
+    def test_projection_receipt_slices_keep_snapshot_then_next_request_refuses(self):
+        from recall_server import receipt_membership, parent_membership_read
+        survivor = self.receipt_fanout_fixture()
+        document = self.fanout_document
+        native = receipt_membership.lookup_current_search_membership
+        attempts = []
+        def change_after_first(*args, **kwargs):
+            members = native(*args, **kwargs)
+            attempts.append(len(kwargs['receipts']))
+            if len(attempts) == 1:
+                with self.store.connect() as other:
+                    other.execute('UPDATE canonical_documents SET is_current=false,deleted_at=now() WHERE tenant_id=%s AND document_id=%s', (self.tenant, document))
+            return members
+        with patch.object(self.store, 'verified_singleton_receipts', True), patch.object(parent_membership_read.ReadSettings, 'from_env', return_value=parent_membership_read.ReadSettings()):
+            with patch.object(receipt_membership, 'lookup_current_search_membership', change_after_first):
+                rows = list(self.scan._passages(self.candidate, self.documents))
+            self.assertEqual([row['passage_id'] for row in rows], [survivor])
+            self.assertEqual(attempts, [500, 500, 2])
+            self.assertEqual(list(self.scan._passages(self.candidate, self.documents)), [])
+
+    def test_projection_later_slice_cancellation_yields_nothing_and_keeps_queue(self):
+        from recall_server import parent_membership_read
+        from recall_server.db import BrainStore, SearchDeadlineExceeded
+        self.receipt_fanout_fixture(valid_first=True)
+        original = self.store._execute_bounded
+        attempts = []
+        def slow(connection, statement, parameters, deadline):
+            if statement.lstrip().startswith('WITH requested'):
+                attempts.append(deadline)
+                BrainStore._execute_bounded(connection, 'SELECT pg_sleep(.25)', (), deadline)
+            return original(connection, statement, parameters, deadline)
+        with self.store.connect() as connection:
+            before = connection.execute('SELECT generation,changed_at FROM canonical_parquet_scan_queue WHERE tenant_id=%s', (self.tenant,)).fetchall()
+        with patch.object(self.store, 'verified_singleton_receipts', True), patch.object(self.store, 'search_deadline_ms', 450), patch.object(parent_membership_read.ReadSettings, 'from_env', return_value=parent_membership_read.ReadSettings()), patch.object(self.store, '_execute_bounded', slow):
+            iterator = self.scan._passages(self.candidate, self.documents)
+            with self.assertRaises(SearchDeadlineExceeded):
+                next(iterator)
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual(len(set(attempts)), 1)
+        with self.store.connect() as connection:
+            after = connection.execute('SELECT generation,changed_at FROM canonical_parquet_scan_queue WHERE tenant_id=%s', (self.tenant,)).fetchall()
+        self.assertEqual(before, after)
+
     def test_projection_stream_preserves_exact_passage_after_admission(self):
         self.scan_fixture()
         baseline = list(self.scan._passages(self.candidate, self.documents))

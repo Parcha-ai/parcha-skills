@@ -41,6 +41,7 @@ MAX_SHARD_INDEX = 99_999
 DEFAULT_COMPACTION_FRAGMENTS = 16
 SCAN_DIRTY_ALL = "*"
 PART_TIME_BOUND_CHECKPOINT = 128
+PASSAGE_MEMBERSHIP_RECEIPTS = 500
 
 LOG = logging.getLogger(__name__)
 
@@ -1274,13 +1275,20 @@ class CanonicalParquetScanProjector:
                         # SET LOCAL timeout. Restore this batch's remaining
                         # budget before the next FETCH, without renewing it.
                         self.store._set_statement_deadline(connection, deadline_at)
-                    members = lookup_current_search_membership(
-                        self.store, tenant_id=candidate.tenant_id,
-                        authorized_sources=(candidate.source_id,),
-                        receipts=tuple(dict.fromkeys(receipt for row in fallback for receipt in row["receipts"])),
-                        connection=connection,
-                        deadline_at=deadline_at,
-                    ) if fallback else set()
+                    receipts = tuple(dict.fromkeys(
+                        receipt for row in fallback for receipt in row["receipts"]
+                    ))
+                    members = set()
+                    # Bound receipt fanout without renewing the fetched batch's
+                    # deadline. Finish every proof before yielding any passage.
+                    for offset in range(0, len(receipts), PASSAGE_MEMBERSHIP_RECEIPTS):
+                        members.update(lookup_current_search_membership(
+                            self.store, tenant_id=candidate.tenant_id,
+                            authorized_sources=(candidate.source_id,),
+                            receipts=receipts[offset:offset + PASSAGE_MEMBERSHIP_RECEIPTS],
+                            connection=connection,
+                            deadline_at=deadline_at,
+                        ))
                     for row in rows:
                         if ((candidate.source_id, row["passage_id"]) in certified
                                 or all((candidate.source_id, receipt) in members for receipt in row["receipts"])):
