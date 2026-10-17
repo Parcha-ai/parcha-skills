@@ -140,6 +140,7 @@ jobs:
             e2e_parent_membership_publication.py \
             e2e_membership_remainder.py \
             e2e_membership_queue_initialization.py \
+            e2e_certification_selection_batch.py \
             e2e_membership_seed.py \
             e2e_retirement_membership_certification.py \
             e2e_retirement_certificate_remainder.py \
