@@ -988,7 +988,7 @@ class CanonicalPassageProjector:
                     ),
                 ).fetchone()
                 current = connection.execute(
-                    """SELECT revision,document_content_sha256
+                    """SELECT revision,document_content_sha256,first_occurred_at,last_occurred_at
                          FROM canonical_evidence_documents
                         WHERE tenant_id=%s AND source_id=%s
                           AND logical_document_id=%s""",
@@ -1352,31 +1352,12 @@ class CanonicalPassageProjector:
                     )
                     if deleted.rowcount != 1:
                         raise LogicalEvidenceError("passage_queue_conflict")
-                connection.execute(
-                    """INSERT INTO canonical_parquet_scan_queue(
-                           tenant_id,source_id,bucket_start,
-                           generation,reason,changed_at
-                       )
-                       SELECT document.tenant_id,document.source_id,
-                              month.value::date,1,'logical-update',clock_timestamp()
-                         FROM canonical_evidence_documents document
-                         CROSS JOIN LATERAL generate_series(
-                             date_trunc('month',document.first_occurred_at),
-                             date_trunc('month',document.last_occurred_at),
-                             interval '1 month'
-                         ) month(value)
-                        WHERE document.tenant_id=%s
-                          AND document.source_id=%s
-                          AND document.logical_document_id=%s
-                       ON CONFLICT(tenant_id,source_id,bucket_start)
-                       DO UPDATE SET
-                           generation=canonical_parquet_scan_queue.generation+1,
-                           reason='logical-update',changed_at=clock_timestamp()""",
-                    (
-                        candidate.tenant_id,
-                        candidate.source_id,
-                        candidate.logical_document_id,
-                    ),
+                from .logical_evidence_projection import CanonicalLogicalEvidenceProjector
+                CanonicalLogicalEvidenceProjector._queue_parquet_scan(
+                    connection, tenant_id=candidate.tenant_id,
+                    source_id=candidate.source_id,
+                    ranges=((current["first_occurred_at"], current["last_occurred_at"]),),
+                    reason="logical-update", logical_document_id=candidate.logical_document_id,
                 )
                 # H3-a: the search outbox sees only what this commit changed.
                 # Deleted rows become tombstones; every month an inserted or

@@ -241,12 +241,13 @@ class WritersTest(unittest.TestCase):
     def test_passage_commit_tombstones_deletes_and_enqueues_changed_months(self) -> None:
         source = inspect.getsource(CanonicalPassageProjector._commit)
 
-        parquet = source.index("INSERT INTO canonical_parquet_scan_queue(")
+        parquet = source.index("CanonicalLogicalEvidenceProjector._queue_parquet_scan(")
         tombstones = source.index("write_search_tombstones(")
         outbox = source.index("enqueue_search_outbox(")
         self.assertLess(parquet, tombstones)
         self.assertLess(tombstones, outbox)
         self.assertIn('reason="logical-update"', source)
+        self.assertIn("logical_document_id=candidate.logical_document_id", source)
         # Months come from the passages this commit inserted or deleted (and
         # retained rows whose header was filled), never the whole document.
         self.assertIn("for passage in diff.to_insert", source[outbox:])

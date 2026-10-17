@@ -959,6 +959,49 @@ class BrainStore:
         return {"status": "configured", **profile.to_mapping()}
 
     @staticmethod
+    def _queue_actor_scan(connection: Any, *, tenant_id: str, actor_id: str) -> None:
+        """Invalidate projected actor names in every linked source and month."""
+
+        connection.execute(
+            """WITH affected AS MATERIALIZED (
+                   SELECT DISTINCT document.tenant_id,document.source_id,
+                          document.logical_document_id,month.value::date AS bucket_start
+                     FROM canonical_evidence_document_actors link
+                     JOIN canonical_evidence_documents document
+                       USING(tenant_id,source_id,logical_document_id,revision)
+                     CROSS JOIN LATERAL generate_series(
+                         date_trunc('month',document.first_occurred_at),
+                         date_trunc('month',document.last_occurred_at),interval '1 month'
+                     ) month(value)
+                    WHERE link.tenant_id=%s AND link.actor_id=%s
+               ), queued AS (
+                   INSERT INTO canonical_parquet_scan_queue(
+                       tenant_id,source_id,bucket_start,generation,reason,changed_at
+                   )
+                   SELECT tenant_id,source_id,bucket_start,
+                          1,'logical-update',clock_timestamp()
+                     FROM (SELECT DISTINCT tenant_id,source_id,bucket_start
+                             FROM affected) months
+                    ORDER BY tenant_id,source_id,bucket_start
+                   ON CONFLICT(tenant_id,source_id,bucket_start) DO UPDATE SET
+                       generation=canonical_parquet_scan_queue.generation+1,
+                       reason=CASE WHEN canonical_parquet_scan_queue.reason='backfill'
+                                   THEN 'backfill' ELSE excluded.reason END,
+                       changed_at=clock_timestamp()
+                   RETURNING tenant_id,source_id,bucket_start,changed_at
+               )
+               INSERT INTO canonical_parquet_scan_dirty_documents(
+                   tenant_id,source_id,bucket_start,logical_document_id,reason,queued_at
+               )
+               SELECT affected.tenant_id,affected.source_id,affected.bucket_start,
+                      affected.logical_document_id,'logical-update',queued.changed_at
+                 FROM affected JOIN queued USING(tenant_id,source_id,bucket_start)
+                ORDER BY tenant_id,source_id,bucket_start,logical_document_id
+               ON CONFLICT(tenant_id,source_id,bucket_start,logical_document_id)
+               DO UPDATE SET reason=excluded.reason,queued_at=excluded.queued_at""",
+            (tenant_id, actor_id),
+        )
+    @staticmethod
     def _queue_actor_projection(
         connection: Any,
         *,
@@ -1105,12 +1148,15 @@ class BrainStore:
                     (tenant_id, actor_id, normalized_name),
                 )
                 if existing_actor_id is not None:
-                    conn.execute(
+                    renamed = conn.execute(
                         """UPDATE brain_actors
                               SET display_name=%s,updated_at=now()
-                            WHERE tenant_id=%s AND actor_id=%s""",
-                        (normalized_name, tenant_id, actor_id),
+                            WHERE tenant_id=%s AND actor_id=%s
+                              AND display_name IS DISTINCT FROM %s""",
+                        (normalized_name, tenant_id, actor_id, normalized_name),
                     )
+                    if renamed.rowcount:
+                        self._queue_actor_scan(conn, tenant_id=tenant_id, actor_id=actor_id)
                 actor = conn.execute(
                     """SELECT display_name,actor_kind,active
                          FROM brain_actors
@@ -1538,15 +1584,19 @@ class BrainStore:
                     )
                     or actor_id_for_principal(invitation["tenant_id"], principal_id)
                 )
-                conn.execute(
+                renamed = conn.execute(
                     """INSERT INTO brain_actors(
                            tenant_id,actor_id,actor_kind,display_name
                        ) VALUES (%s,%s,'human',%s)
                        ON CONFLICT(tenant_id,actor_id)
                        DO UPDATE SET display_name=excluded.display_name,
-                                     active=true,updated_at=now()""",
+                                     active=true,updated_at=now()
+                       WHERE brain_actors.display_name IS DISTINCT FROM excluded.display_name
+                          OR NOT brain_actors.active""",
                     (invitation["tenant_id"], actor_id, display_name),
                 )
+                if renamed.rowcount:
+                    self._queue_actor_scan(conn, tenant_id=invitation["tenant_id"], actor_id=actor_id)
                 conn.execute(
                     """INSERT INTO brain_actor_principals(
                            tenant_id,actor_id,principal_id

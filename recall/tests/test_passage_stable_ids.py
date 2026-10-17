@@ -272,6 +272,8 @@ class FakeConnection:
                 {
                     "revision": self.candidate.revision,
                     "document_content_sha256": self.candidate.source_document_sha256,
+                    "first_occurred_at": self.candidate.changed_at,
+                    "last_occurred_at": self.candidate.changed_at,
                 }
             ])
         if sql.lstrip().startswith("SELECT passage_id,ordinal,revision"):
