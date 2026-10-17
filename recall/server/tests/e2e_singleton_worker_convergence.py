@@ -189,22 +189,32 @@ class SingletonWorkerConvergence(SingletonMetadataAdmission):
         first=self.run_parent(metadata_mode='singleton',parent_limits=limits)
         self.assertEqual(first['retired_metadata_chunks'],1)
         self.assertEqual(first['partial_parents'],1)
+        self.assertEqual(first['completed_noop_parents'],0)
         second_result=self.run_parent(metadata_mode='singleton',parent_limits=limits)
         self.assertEqual(second_result['retired_metadata_chunks'],1)
         self.assertEqual(second_result['batches'],1)
         self.assertEqual(second_result['partial_parents'],1)
         self.assertEqual(second_result['completed_parent_proofs'],0)
+        self.assertEqual(second_result['completed_noop_parents'],0)
         self.assertIsNone(self.baseline(original['receipt']))
         self.assertIsNone(self.baseline(second['receipt']))
-        # The selected tail consumes this invocation's one batch. Completion
-        # still requires the original full proof on the next invocation.
+        # The selected tail consumes this invocation's one batch. The next
+        # invocation completes scheduling without recounting a parent proof.
         completion=self.run_parent(metadata_mode='singleton',parent_limits=limits)
-        self.assertEqual(completion['completed_parent_proofs'],1)
+        self.assertEqual(completion['completed_parent_proofs'],0)
+        self.assertEqual(completion['completed_noop_parents'],1)
+        self.assertEqual(completion['failed_parents'],0)
+        self.assertFalse(completion['commit_outcome_unknown'])
         self.assertEqual(completion['retired_metadata_chunks'],0)
         self.assertEqual(completion['cleared_documents'],0)
+        self.assertEqual(completion['cleared_chunks'],0)
+        self.assertEqual(completion['cleared_utf8_bytes'],0)
+        self.assertEqual(completion['archive_gets'],0)
         final=self.run_parent(metadata_mode='singleton')
         self.assertEqual(final['attempted_parents'],0)
         self.assertEqual(final['retired_metadata_chunks'],0)
+        self.assertEqual(final['completed_parent_proofs'],0)
+        self.assertEqual(final['completed_noop_parents'],0)
 
     def test_worker_complete_body_only_parent_requires_explicit_existing_reset(self):
         from recall_server.chunk_retirement import set_parent_retirement_enabled
