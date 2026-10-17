@@ -10,6 +10,7 @@ from psycopg import ServerCursor, sql
 
 from e2e_parent_membership_enrollment import ParentEnrollmentTests
 from recall_server import parent_membership_read as reader
+from recall_server.db import SearchDeadlineExceeded
 from recall_server.logical_evidence import LogicalEvidenceProjectionStore
 from recall_server.parquet_scan import CanonicalParquetScanProjector
 from recall_server.receipt_membership import lookup_current_search_membership
@@ -31,6 +32,69 @@ class ParquetCertificateTests(ParentEnrollmentTests):
         with patch.dict(os.environ, RECALL_PARENT_MEMBERSHIP_READ='1' if enabled else '0',
                         RECALL_PARENT_MEMBERSHIP_EPOCH=epoch):
             return list(self.scan._passages(self.candidate, self.documents))
+
+    def test_cancelled_native_passage_proof_does_not_start_sibling_preservation(self):
+        execute = self.store._execute_bounded
+        attempts = []
+
+        def cancelled(connection, statement, parameters, deadline):
+            if statement.startswith('WITH requested AS MATERIALIZED'):
+                attempts.append(deadline)
+                # Actual PostgreSQL statement cancellation inside the native
+                # receipt proof, without changing its error/cleanup owner.
+                return execute(connection, 'SELECT pg_sleep(0.1)', (), time.monotonic() + 0.02)
+            return execute(connection, statement, parameters, deadline)
+
+        with patch.dict(os.environ, RECALL_PARENT_MEMBERSHIP_READ='0'), \
+             patch.object(self.store, '_execute_bounded', side_effect=cancelled), \
+             patch.object(self.scan, '_preserve_rows', wraps=self.scan._preserve_rows) as preserve:
+            with self.assertRaises(SearchDeadlineExceeded):
+                self.scan._build(self.candidate)
+        self.assertEqual(len(attempts), 1)
+        preserve.assert_not_called()
+        with self.store.connect() as connection:
+            for table in ('canonical_parquet_scan_shards', 'canonical_evidence_cleanup_queue'):
+                self.assertEqual(connection.execute(
+                    'SELECT count(*) AS n FROM ' + table + ' WHERE tenant_id=%s',
+                    (self.tenant,)).fetchone()['n'], 0)
+            queue = connection.execute(
+                'SELECT generation,changed_at FROM canonical_parquet_scan_queue WHERE tenant_id=%s',
+                (self.tenant,)).fetchone()
+        self.assertEqual(queue, dict(generation=self.candidate.generation,
+                                     changed_at=self.candidate.changed_at))
+
+    def test_new_queue_generation_during_preservation_keeps_original_publication_fence(self):
+        preserve = self.scan._preserve_rows
+        proved = []
+        native = lookup_current_search_membership
+
+        def proof(*args, **kwargs):
+            result = native(*args, **kwargs)
+            proved.append(True)
+            return result
+
+        def changed(*args):
+            self.assertTrue(proved)
+            self.assertEqual(self.scan.seed_backfill(tenant_id=self.tenant), 1)
+            return preserve(*args)
+
+        totals = {'stale': 0}
+        with patch.dict(os.environ, RECALL_PARENT_MEMBERSHIP_READ='0'), \
+             patch('recall_server.receipt_membership.lookup_current_search_membership', side_effect=proof), \
+             patch.object(self.scan, '_preserve_rows', side_effect=changed):
+            self.assertTrue(self.scan._process(self.candidate, totals))
+        self.assertEqual(totals, {'stale': 1})
+        with self.store.connect() as connection:
+            queue = connection.execute(
+                'SELECT generation FROM canonical_parquet_scan_queue WHERE tenant_id=%s',
+                (self.tenant,)).fetchone()
+            self.assertGreater(queue['generation'], self.candidate.generation)
+            self.assertEqual(connection.execute(
+                'SELECT count(*) AS n FROM canonical_parquet_scan_shards WHERE tenant_id=%s',
+                (self.tenant,)).fetchone()['n'], 0)
+            self.assertGreater(connection.execute(
+                'SELECT count(*) AS n FROM canonical_evidence_cleanup_queue WHERE tenant_id=%s',
+                (self.tenant,)).fetchone()['n'], 0)
 
     def test_certified_stream_matches_disabled_without_native_receipt_query(self):
         self.enroll()
