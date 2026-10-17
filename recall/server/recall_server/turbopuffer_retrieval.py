@@ -71,6 +71,29 @@ _SELECTED_AUTHORITY_SQL = """
                                AND cardinality(passage.receipts)>0
 """
 
+# The live reader carries the same certificate record in the catalog snapshot.
+# Disabled and shadow requests retain the original catalog SQL above.
+_CERTIFIED_AUTHORITY_SQL = _SELECTED_AUTHORITY_SQL.replace(
+    'END AS source_unit',
+    """END AS source_unit,
+                                   row_to_json(certificate) AS membership_metadata,
+                                   octet_length(row_to_json(certificate)::text) AS membership_metadata_bytes,
+                                   true AS membership_metadata_complete""").replace(
+    '                             WHERE passage.tenant_id=%s',
+    """                              LEFT JOIN canonical_parent_authority authority
+                                ON authority.tenant_id=evidence.tenant_id
+                               AND authority.source_id=evidence.source_id
+                               AND authority.native_parent_id=evidence.native_parent_id
+                              CROSS JOIN LATERAL (
+                                SELECT passage.source_id,passage.passage_id,passage.policy_fingerprint,
+                                       passage.revision AS passage_revision,
+                                       passage.membership_generation,passage.membership_binding_sha256,
+                                       evidence.native_parent_id,evidence.revision AS manifest_revision,
+                                       projected.revision AS projected_revision,projected.source_document_sha256,
+                                       authority.generation
+                              ) certificate
+                             WHERE passage.tenant_id=%s""")
+
 def _value(row: Any, key: str, default: Any = None) -> Any:
     """Attribute ``key`` of a result row, or ``default``.
 
@@ -403,7 +426,9 @@ class TurbopufferHintRetrieval(PassageHintRetrieval):
                 raise SearchDeadlineExceeded()
             connection.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
             stage_started = time.monotonic()
-            selected = self.store._execute_bounded(connection, _SELECTED_AUTHORITY_SQL,
+            inline_certificates = self.parent_membership_read.enabled and not self.parent_membership_shadow.enabled
+            selected = self.store._execute_bounded(connection,
+                _CERTIFIED_AUTHORITY_SQL if inline_certificates else _SELECTED_AUTHORITY_SQL,
                 (self.tenant_id, self.sources, self.policy_fingerprint,
                  [source for source, _ in requested], [passage for _, passage in requested]),
                 deadline_at).fetchall()
@@ -415,10 +440,13 @@ class TurbopufferHintRetrieval(PassageHintRetrieval):
             stages['receipt_references'] = sum(len(row['receipts']) for row in selected)
             stages['unique_receipts'] = len(receipts)
             certified = set()
-            if self.parent_membership_read.enabled and not self.parent_membership_shadow.enabled:
-                certified, stages['parent_membership_read'] = parent_membership_read.partition(
-                    self.store, connection, selected=selected,
+            if inline_certificates:
+                certified, stages['parent_membership_read'] = parent_membership_read.partition_fetched(
+                    selected=selected,
                     settings=self.parent_membership_read, deadline_at=deadline_at)
+                for row in selected:
+                    for key in ('membership_metadata', 'membership_metadata_bytes', 'membership_metadata_complete'):
+                        row.pop(key)
             elif self.parent_membership_read.enabled:
                 # Shadow comparison must retain actual native proof, not compare
                 # a certificate with a result derived from that same certificate.
