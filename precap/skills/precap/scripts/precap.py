@@ -330,7 +330,8 @@ def scope_prefixes(predicted: set[str]) -> list[str]:
 
 
 def in_scope(path: str, prefixes: list[str]) -> bool:
-    return any(path == p or path.startswith(p) for p in prefixes)
+    """A prefix covers itself and what sits under it, never a longer sibling (`src2/`, `a.py.orig`)."""
+    return any(path == p.rstrip("/") or path.startswith(p.rstrip("/") + "/") for p in prefixes)
 
 
 def drift(
