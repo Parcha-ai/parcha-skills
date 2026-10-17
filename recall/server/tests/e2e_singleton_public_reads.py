@@ -46,8 +46,8 @@ class SingletonPublicReads(fixtures.ReceiptMembershipTests):
         connect, read = self.store.connect, self.archive.read_raw
         active, observed = [0], []
         @contextmanager
-        def counted_connection():
-            with connect() as connection:
+        def counted_connection(**kwargs):
+            with connect(**kwargs) as connection:
                 active[0] += 1
                 try:
                     yield connection
