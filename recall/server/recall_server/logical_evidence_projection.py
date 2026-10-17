@@ -2799,6 +2799,9 @@ class CanonicalLogicalEvidenceProjector:
 
             def refill_during_publication():
                 try:
+                    # Refresh once for arrivals since the coordinator's last
+                    # fill, then use its existing progress cadence when idle.
+                    next_refill = time.monotonic()
                     while not handoff_stop.is_set() and not stopping.is_set() and can_admit():
                         if not pending:
                             break
@@ -2809,7 +2812,9 @@ class CanonicalLogicalEvidenceProjector:
                             _, status = future.result()
                             if status in {"failed", "stale", "adopted"}:
                                 deferred.add(parent_key(candidate))
-                        fill_slots(executor, handoff_stop)
+                        if completed or time.monotonic() >= next_refill:
+                            fill_slots(executor, handoff_stop)
+                            next_refill = time.monotonic() + PROJECTION_PROGRESS_INTERVAL_SECONDS
                 except BaseException as error:
                     errors.append(error)
                     stopping.set()
