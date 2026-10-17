@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 """Codex typed publication through native queue, archive, authority and vendor."""
-import json
 import unittest
 from dataclasses import replace
 from unittest.mock import patch
