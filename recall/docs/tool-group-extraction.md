@@ -1,0 +1,27 @@
+# Document-scoped tool extraction
+
+`CanonicalPassageProjector.request_extraction_version` enrolls one already projected document in `tool_groups_v1`. It requires a source-owner or brain-admin principal, an exact tenant/source/document identity, current revision and document hash. Enrollment and the existing queue update commit together. Migration 089 itself enrolls nothing; both existing and new documents default to `legacy`.
+
+The existing `canonical_passage_documents` row owns requested and applied versions. Requested version survives normal evidence revisions. Applied version and coverage counts update only with a successful projection. Preparation captures the request; commit rechecks it under the existing publication locks. A changed revision, hash, queue generation, request, or pending Forget refuses stale publication. Backfill can recover a missing queue entry when requested and applied differ.
+
+## Evidence and identity
+
+An enrolled document rebuilds fully using the original archive/manifest checks. Legacy visible passages build independently and retain their IDs and embedding inputs. Each Claude provider tool block then produces ordinary token windows with group-local message indexes, exact typed source-unit offsets and original receipts. Windows split at the existing 128-span reader capacity without changing token geometry or discarding leaves. Group-local IDs survive unrelated later visible messages; the existing ordinal movement and outbox handle publication.
+
+The adapter resolves only generic provider-typed input strings or declared result text. It records raw-only dispositions for invalid JSON, unsupported forms, role mismatch, resolver refusal, empty strings and strings without tokens. All raw events remain in their original archive. Codex tool extraction is unsupported in this version. There is no semantic model gate, tool-name exception, minimum text length, complete-report boost or inference that a command executed.
+
+Input/result attribution is separate from source text in stored context headers and compact search results. Tool input does not establish selection or human assent. A tool result's provider `user` envelope does not make it a human statement. `show` continues opening the full original event through the existing receipt/grant/revision/Forget authority. A rerank window contains the grouped literal fields and explicit attribution; it is not a claim that an arbitrarily large enclosing event fits in the rerank budget. The full event remains available through source opening.
+
+Enrolled documents do not read or write the legacy append checkpoint. They rebuild on each revision until a separately reviewed version-aware checkpoint exists. Unenrolled documents retain their existing append behavior. Audit contract #943 reconstructs using the applied version and treats each source unit as a distinct byte domain; the publisher does not modify its verifier or #941's resolver.
+
+## Upgrade and rollback boundary
+
+1. Deploy the schema 89 compatibility predecessor (#943, including #941) to every MCP, worker and managed-worker role before changing SQL. Its capability check accepts schemas 88 and 89 while its schema constant remains 88; existing rows and extraction remain legacy. Then apply migration 089 before starting this publisher: its legacy queue, seed and commit queries require the new columns. Compatible legacy writers can use the additive defaults while every document is still legacy.
+2. Upgrade every passage writer and required reader/audit consumer to the typed-capable release. Confirm no unaware worker remains before submitting any enrollment. Do not enroll during a mixed-writer rollout.
+3. Submit only the reviewed current document pins. The initial rollout is three known missing-evidence parents, not a source-wide enrollment or new-document default change. Check requested/applied version, raw-only counts, native source opening, exact vendor IDs and outbox completion before claiming coverage.
+
+After enrollment, rollback to #941 or an older writer is **unsafe**: it can rebuild legacy passages while leaving the new applied-version column unchanged. The safe boundary retains the typed-capable writer and stops further enrollment requests. If that runtime cannot run safely, pause its worker before a forward fix; do not replace it with a version-unaware writer. No downgrade API or additional runtime flag is introduced. A future rollback baseline must preserve this version guard and extraction contract. The native same-generation test proves a legacy preparation cannot replace an enrolled projection under the supported writer.
+
+The bounded offline cost for the three reviewed captured parents is 1,614 added passages and 2,480,769 passage-text bytes, retaining 19 legacy passages. Their decoded captured exports total 15,297,750 bytes; these are not current live archive-wire sizes. Headers add at most 512 bytes plus the existing separator per new embedding. Current revisions must be pinned again by the operator before enrollment. The 45-parent offline preparation measurement was 3.55 seconds and about 179 MiB peak RSS; it does not estimate fleet-wide costs or prove retrieval acceptance.
+
+New parents remain legacy. Broader coverage requires a separately reviewed default for new parents and its measured workload, not a silent global policy fingerprint change or mass reembedding.

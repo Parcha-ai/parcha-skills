@@ -204,6 +204,30 @@ DEFAULT_PASSAGE_POLICY = PassagePolicy(
 )
 
 
+def _tool_unit(source_unit: str | None) -> bool:
+    return isinstance(source_unit, str) and source_unit.startswith((
+        "claude.tool-input.string.v1#/message/content/",
+        "claude.tool-result.string.v1#/message/content/",
+    ))
+
+
+def _ordered_messages(messages: tuple["PassageMessage", ...]) -> bool:
+    for prior, following in zip(messages, messages[1:]):
+        if following.record_ordinal >= prior.record_ordinal + prior.record_count:
+            continue
+        # One explicitly resolved provider block can contain multiple leaf spans.
+        if not (_tool_unit(prior.source_unit) and _tool_unit(following.source_unit)
+                and prior.source_unit != following.source_unit
+                and prior.origin == following.origin
+                and (prior.record_ordinal, prior.record_count, prior.occurred_at,
+                     prior.roles, prior.receipts) ==
+                    (following.record_ordinal, following.record_count,
+                     following.occurred_at, following.roles, following.receipts)):
+            return False
+    identities = [(m.record_ordinal, m.source_unit) for m in messages]
+    return len(identities) == len(set(identities))
+
+
 @dataclass(frozen=True)
 class PassageMessage:
     record_ordinal: int
@@ -239,7 +263,8 @@ class PassageMessage:
             or isinstance(self.record_count, bool)
             or not isinstance(self.record_count, int)
             or self.record_count < 1
-            or (self.source_unit is not None and self.source_unit not in COMPLETE_SOURCE_UNITS)
+            or (self.source_unit is not None and self.source_unit not in COMPLETE_SOURCE_UNITS
+                and not _tool_unit(self.source_unit))
             or actor_links(self.actor_links) != self.actor_links
         ):
             raise ValueError(
@@ -380,11 +405,37 @@ def _spans(tokens: list[_Token], messages: tuple[PassageMessage, ...]) -> tuple[
                 source_byte_end=source_end,
                 passage_byte_start=passage_offset,
                 passage_byte_end=passage_offset + span_size,
+                source_unit=(messages[message_index].source_unit
+                             if _tool_unit(messages[message_index].source_unit) else None),
                 origin=messages[message_index].origin,
             )
         )
         passage_offset += span_size
     return tuple(spans)
+
+
+def _reader_span_windows(tokens: list[_Token], messages: tuple[PassageMessage, ...]):
+    """Split a tool window to the existing capture reader's128-span capacity.
+
+    See evals/candidate_capture.py capture_metadata_bound. This does not change
+    token overlap or discard leaves: each ordinary window is partitioned after
+    tokenization. Legacy windows retain their byte-identical geometry.
+    """
+    if not any(_tool_unit(messages[t.message_index].source_unit) for t in tokens):
+        yield tokens
+        return
+    start = 0
+    spans = 0
+    prior = None
+    for index, token in enumerate(tokens):
+        if prior is None or token.message_index != prior.message_index or token.byte_start != prior.byte_end:
+            if spans == 128:
+                yield tokens[start:index]
+                start, spans = index, 0
+            spans += 1
+        prior = token
+    if start < len(tokens):
+        yield tokens[start:]
 
 
 def reconstruct_passage(
@@ -395,7 +446,8 @@ def reconstruct_passage(
     for span in passage.spans:
         try:
             message = messages[span.message_index]
-            if message.record_ordinal != span.record_ordinal:
+            if (message.record_ordinal != span.record_ordinal
+                    or (_tool_unit(span.source_unit) and message.source_unit != span.source_unit)):
                 raise ValueError("passage record pointer is stale")
             fragment = message.text.encode()[
                 span.source_byte_start:span.source_byte_end
@@ -578,7 +630,7 @@ def build_passages(
     reports = [i for i, message in enumerate(messages) if message.source_unit in COMPLETE_SOURCE_UNITS]
     if not reports:
         return _build_passages(messages=messages, **arguments)
-    if any(b.record_ordinal < a.record_ordinal + a.record_count for a, b in zip(messages, messages[1:])):
+    if not _ordered_messages(messages):
         raise ValueError("lossless passage records must be unique and ordered")
     groups = []
     start = 0
@@ -597,7 +649,7 @@ def build_passages(
                         and passage.token_count <= DEFAULT_PASSAGE_POLICY.target_tokens
                         and passage.text == messages[start].text)
             spans = tuple(replace(span, message_index=span.message_index + start,
-                                  source_unit=messages[start].source_unit if complete else None)
+                                  source_unit=messages[start].source_unit if complete else span.source_unit)
                           for span in passage.spans)
             identity = passage_identity(tenant_id=tenant_id, source_id=source_id,
                 logical_document_id=logical_document_id, policy_fingerprint=policy.fingerprint,
@@ -634,11 +686,7 @@ def _build_passages(
         if not isinstance(message, PassageMessage):
             raise ValueError("lossless passage message is invalid")
         message.validate()
-    if any(
-        following.record_ordinal
-        < prior.record_ordinal + prior.record_count
-        for prior, following in zip(messages, messages[1:])
-    ):
+    if not _ordered_messages(messages):
         raise ValueError("lossless passage records must be unique and ordered")
 
     encoded_messages = tuple(message.text.encode() for message in messages)
@@ -652,64 +700,65 @@ def _build_passages(
     passages: list[LosslessPassage] = []
     window = list(islice(tokens, policy.target_tokens))
     while window:
-        spans = _spans(window, messages)
-        text = PASSAGE_SEPARATOR.join(
-            encoded_messages[span.message_index][
-                span.source_byte_start:span.source_byte_end
-            ].decode()
-            for span in spans
-        )
-        text_sha256 = hashlib.sha256(text.encode()).hexdigest()
-        occurred = [
-            messages[index].occurred_at
-            for index in dict.fromkeys(
-                span.message_index for span in spans
+        for reader_window in _reader_span_windows(window, messages):
+            spans = _spans(reader_window, messages)
+            text = PASSAGE_SEPARATOR.join(
+                encoded_messages[span.message_index][
+                    span.source_byte_start:span.source_byte_end
+                ].decode()
+                for span in spans
             )
-        ]
-        occurred.sort(
-            key=lambda value: datetime.fromisoformat(
-                value.replace("Z", "+00:00")
+            text_sha256 = hashlib.sha256(text.encode()).hexdigest()
+            occurred = [
+                messages[index].occurred_at
+                for index in dict.fromkeys(
+                    span.message_index for span in spans
+                )
+            ]
+            occurred.sort(
+                key=lambda value: datetime.fromisoformat(
+                    value.replace("Z", "+00:00")
+                )
             )
-        )
-        passages.append(
-            LosslessPassage(
-                tenant_id=tenant_id,
-                source_id=source_id,
-                logical_document_id=logical_document_id,
-                revision=revision,
-                passage_id=passage_identity(
+            passages.append(
+                LosslessPassage(
                     tenant_id=tenant_id,
                     source_id=source_id,
                     logical_document_id=logical_document_id,
+                    revision=revision,
+                    passage_id=passage_identity(
+                        tenant_id=tenant_id,
+                        source_id=source_id,
+                        logical_document_id=logical_document_id,
+                        policy_fingerprint=policy.fingerprint,
+                        text_sha256=text_sha256,
+                        spans=spans,
+                    ),
+                    ordinal=len(passages),
                     policy_fingerprint=policy.fingerprint,
+                    token_count=len(reader_window),
+                    first_occurred_at=occurred[0],
+                    last_occurred_at=occurred[-1],
+                    roles=tuple(sorted({
+                        role
+                        for span in spans
+                        for role in messages[span.message_index].roles
+                    })),
+                    receipts=tuple(dict.fromkeys(
+                        receipt
+                        for span in spans
+                        for receipt in messages[span.message_index].receipts
+                    )),
+                    actor_links=actor_links(
+                        link
+                        for span in spans
+                        for link in messages[span.message_index].actor_links
+                    ),
+                    text=text,
                     text_sha256=text_sha256,
                     spans=spans,
-                ),
-                ordinal=len(passages),
-                policy_fingerprint=policy.fingerprint,
-                token_count=len(window),
-                first_occurred_at=occurred[0],
-                last_occurred_at=occurred[-1],
-                roles=tuple(sorted({
-                    role
-                    for span in spans
-                    for role in messages[span.message_index].roles
-                })),
-                receipts=tuple(dict.fromkeys(
-                    receipt
-                    for span in spans
-                    for receipt in messages[span.message_index].receipts
-                )),
-                actor_links=actor_links(
-                    link
-                    for span in spans
-                    for link in messages[span.message_index].actor_links
-                ),
-                text=text,
-                text_sha256=text_sha256,
-                spans=spans,
+                )
             )
-        )
         if len(window) < policy.target_tokens:
             break
         retained = (
@@ -833,13 +882,12 @@ def _message_origin(source_text: str, visible_text: str) -> dict[str, str] | Non
             "text_sha256": hashlib.sha256(visible_text.encode()).hexdigest()}
 
 
-def visible_messages(
+def _logical_record_groups(
     records: Iterable[LogicalEvidenceRecord], *, first_record_ordinal: int = 0,
-) -> tuple[PassageMessage, ...]:
-    """Combine physical segments into exact visible source messages."""
+) -> Iterator[tuple[LogicalEvidenceRecord, ...]]:
+    """Validate and reassemble the original logical record sequence."""
 
     values = iter(records)
-    messages: list[PassageMessage] = []
     if type(first_record_ordinal) is not int or first_record_ordinal < 0:
         raise LogicalEvidenceError("passage_logical_record_order_invalid")
     expected_ordinal = first_record_ordinal
@@ -870,6 +918,16 @@ def visible_messages(
                 )
             group.append(continuation)
         expected_ordinal += len(group)
+        yield tuple(group)
+
+
+def visible_messages(
+    records: Iterable[LogicalEvidenceRecord], *, first_record_ordinal: int = 0,
+) -> tuple[PassageMessage, ...]:
+    """Combine physical segments into exact visible source messages."""
+    messages: list[PassageMessage] = []
+    for group in _logical_record_groups(records, first_record_ordinal=first_record_ordinal):
+        first = group[0]
         source_text = "".join(record.text for record in group)
         dense_roles = first.roles
         if not dense_roles and (

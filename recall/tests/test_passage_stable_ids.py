@@ -527,6 +527,8 @@ class ShadowDiffTests(unittest.TestCase):
             "logical_document_id": LDOC,
             "revision": 2,
             "policy_fingerprint": POLICY.fingerprint,
+            "requested_extraction_version": "legacy",
+            "applied_extraction_version": "legacy",
             "target_tokens": POLICY.target_tokens,
             "overlap_tokens": POLICY.overlap_tokens,
             "source_document_sha256": "ab" * 32,
