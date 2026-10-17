@@ -17,7 +17,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Callable
 
-from contracts.source_units import resolve_claude_tool_source_unit
+from contracts.source_units import resolve_claude_tool_source_unit, resolve_codex_tool_source_unit
 from .boundary_identity import native_family_id, protected_family_ids
 from .private_holdout import _private_path
 from .retrieval import EvaluationInputError, receipt_source
@@ -112,10 +112,15 @@ def _read_page(root, spec):
                 group = [records[o] for o in range(ordinal, ordinal + count)]
                 first = group[0]
                 require(first['segment_ordinal'] == 0 and first['segment_count'] == count, 'segment_count_mismatch')
-                require(first['roles'] and set(first['roles']) <= {'user', 'assistant'}, 'nonvisible_role')
+                codex_tool = spec['source_id'].startswith('codex:') and span.get('source_unit') not in legacy_units
+                if not codex_tool:
+                    require(first['roles'] and set(first['roles']) <= {'user', 'assistant'}, 'nonvisible_role')
                 require(first['receipts'] and all(r.startswith('recall://' + spec['source_id'] + '/') for r in first['receipts']), 'source_receipt_mismatch')
                 require(all(r['segment_ordinal'] == i and r['segment_count'] == count and r['event_native_id'] == first['event_native_id'] for i, r in enumerate(group)), 'segment_identity_mismatch')
                 text = ''.join(body(r) for r in group)
+                if codex_tool:
+                    _, _, tool = resolve_codex_tool_source_unit(text, span['source_unit'])
+                    require(first['roles'] in ([], [tool['role']]), 'nonvisible_role')
                 groups[ordinal] = (first, text)
                 if spec['source_id'].startswith('claude:'):
                     native = json.loads(text)
@@ -138,8 +143,12 @@ def _read_page(root, spec):
             for si, span in enumerate(passage['spans']):
                 first, original = groups[span['record_ordinal']]
                 unit = span.get('source_unit')
+                tool = None
                 if unit in legacy_units:
                     raw = visible(original).encode()
+                elif spec['source_id'].startswith('codex:'):
+                    resolved, origin, tool = resolve_codex_tool_source_unit(original, unit)
+                    raw = resolved.encode()
                 else:
                     require(spec['source_id'].startswith('claude:'), 'tool_source_unit_invalid')
                     resolved, origin = resolve_claude_tool_source_unit(original, unit)
@@ -153,7 +162,8 @@ def _read_page(root, spec):
                         'start': offset, 'end': min(offset + 900, len(text)), 'length': len(text),
                         'text': text[offset:offset + 900], 'event_native_id': first['event_native_id'],
                         'occurred_at': first['occurred_at'], 'ordinal': first['ordinal'], 'receipts': first['receipts'],
-                        **({'source_unit': unit, 'source_origin': origin} if unit not in legacy_units else {})})
+                        **({'source_unit': unit, 'source_origin': origin} if unit not in legacy_units else {}),
+                        **({'source_tool': tool} if tool is not None else {})})
             text = '\n'.join(parts)
             for span, part in zip(passage['spans'], parts):
                 require(text.encode()[span['passage_byte_start']:span['passage_byte_end']].decode() == part, 'passage_coordinate_mismatch')
@@ -210,11 +220,14 @@ class CandidateCapture:
         new_units = any(s.get('source_unit') not in (None, 'subagent_handback.complete.v1', 'assistant_final.complete.v1')
                         for p in spec['passages'] for s in p['spans'])
         resolver = ''
+        reader = inspect.getsource(_read_page) + '\n' + inspect.getsource(_page_stdout)
         if new_units:
-            source = inspect.getsource(resolve_claude_tool_source_unit).encode()
+            source = (inspect.getsource(resolve_codex_tool_source_unit if spec['source_id'].startswith('codex:')
+                                        else resolve_claude_tool_source_unit) + '\n' + reader).encode()
             packed = base64.b64encode(gzip.compress(source, mtime=0)).decode()
             resolver = f"TOOL_UNIT_RESOLVER = '{packed}'\nexec(gzip.decompress(base64.b64decode(TOOL_UNIT_RESOLVER)))\n"
-        program = "python3 - <<'RECALL_CAPTURE'\nfrom pathlib import Path\nimport json, base64, gzip\n" + resolver + inspect.getsource(_read_page) + '\n' + inspect.getsource(_page_stdout) + f"\nSPEC = '{encoded}'\nprint(_page_stdout(_read_page(Path('/docs/d1'), json.loads(gzip.decompress(base64.b64decode(SPEC))))), end='')\nRECALL_CAPTURE"
+            reader = ''
+        program = "python3 - <<'RECALL_CAPTURE'\nfrom pathlib import Path\nimport json, base64, gzip\n" + resolver + reader + f"\nSPEC = '{encoded}'\nprint(_page_stdout(_read_page(Path('/docs/d1'), json.loads(gzip.decompress(base64.b64decode(SPEC))))), end='')\nRECALL_CAPTURE"
         _require(len(program.encode()) <= 16000, 'capture_program_bound')
         args = {'targets': [{'logical_document_id': spec['logical_document_id'], 'alias': 'd1'}], 'program': program, 'timeout_seconds': 30}
         with self.lock:
@@ -425,14 +438,18 @@ class CandidateCapture:
                     _require(type(chunk['ordinal']) is int and chunk['ordinal'] == span['record_ordinal'], 'capture_fragment_ordinal')
                     _require(all(chunk[k] == chunks[0][k] for k in ('event_native_id', 'occurred_at', 'receipts')), 'capture_fragment_identity')
                     if span.get('source_unit') is not None:
-                        kind = 'tool_input' if span['source_unit'].startswith('claude.tool-input.') else 'tool_result'
+                        kind = 'tool_input' if span['source_unit'].startswith(('claude.tool-input.', 'codex.tool-input.')) else 'tool_result'
                         _require(chunk.get('source_unit') == span['source_unit'] and chunk.get('source_origin') == kind, 'capture_fragment_identity')
+                        _require(chunk.get('source_tool') == chunks[0].get('source_tool'), 'capture_fragment_identity')
                     cursor = chunk['end']
                 _require(cursor == chunks[0]['length'], 'capture_fragment_incomplete')
                 parts.append(''.join(c['text'] for c in chunks))
                 spans.append({**span, **{k: chunks[0][k] for k in ('event_native_id', 'occurred_at', 'receipts')}})
                 if span.get('source_unit') is not None:
                     spans[-1]['source_origin'] = chunks[0]['source_origin']
+                    if span['source_unit'].startswith('codex.'):
+                        _require(isinstance(chunks[0].get('source_tool'), dict), 'capture_fragment_identity')
+                        spans[-1]['source_tool'] = chunks[0]['source_tool']
             text = '\n'.join(parts)
             _require(summary == {'passage_id': passage['passage_id'], 'bytes': len(text.encode()), 'sha256': _sha(text.encode())}, 'capture_passage_hash_mismatch')
             _require(set(passage['receipts']) == {r for span in spans for r in span['receipts']}, 'capture_passage_receipt_mismatch')

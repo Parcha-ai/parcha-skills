@@ -204,6 +204,7 @@ jobs:
             e2e_retrieval_eval.py \
             e2e_passage_metadata.py \
             e2e_tool_source_units.py \
+            e2e_codex_tool_source_units.py \
             e2e_tool_unit_audit.py \
             e2e_tool_extraction_capability.py \
             e2e_tool_group_publication.py \

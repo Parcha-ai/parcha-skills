@@ -80,3 +80,55 @@ def resolve_claude_tool_source_unit(record_text, source_unit):
         return leaf, 'tool_' + kind
     except (ValueError, KeyError, IndexError, TypeError, AttributeError, RecursionError, UnicodeError):
         raise ValueError('tool_source_unit_invalid') from None
+
+
+def resolve_codex_tool_source_unit(record_text, source_unit):
+    """Resolve one literal provider tool string, with its structural provenance.
+
+    Input is an authored request; output is reported tool output. Neither the
+    item type nor optional call identity establishes execution or human assent.
+    JSON-looking strings remain literal, with decoded UTF-8 byte coordinates.
+    """
+    import json
+
+    def refuse():
+        raise ValueError('tool_source_unit_invalid')
+
+    def unique(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                refuse()
+            result[key] = value
+        return result
+
+    try:
+        if not isinstance(record_text, str) or not isinstance(source_unit, str):
+            refuse()
+        value = json.loads(record_text, object_pairs_hook=unique, parse_constant=lambda _: refuse())
+        if value.get('type') != 'response_item' or value.get('channel') == 'analysis':
+            refuse()
+        payload = value['payload']
+        field, kind, role = {
+            'function_call': ('arguments', 'input', 'assistant'),
+            'custom_tool_call': ('input', 'input', 'assistant'),
+            'function_call_output': ('output', 'result', 'tool'),
+            'custom_tool_call_output': ('output', 'result', 'tool'),
+        }[payload['type']]
+        if (source_unit != 'codex.tool-' + kind + '.string.v1#/payload/' + field
+                or payload.get('channel') == 'analysis'
+                or any('role' in item and item['role'] != role for item in (value, payload))):
+            refuse()
+        text = payload[field]
+        if not isinstance(text, str):
+            refuse()
+        text.encode('utf-8')
+        provenance = {'type': payload['type'], 'role': role}
+        for key in ('call_id', 'name'):
+            if key in payload:
+                if not isinstance(payload[key], str):
+                    refuse()
+                provenance[key] = payload[key]
+        return text, 'tool_' + kind, provenance
+    except (ValueError, KeyError, IndexError, TypeError, AttributeError, RecursionError, UnicodeError):
+        raise ValueError('tool_source_unit_invalid') from None

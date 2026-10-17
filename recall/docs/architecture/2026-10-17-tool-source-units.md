@@ -9,7 +9,7 @@ change which records the production projector selects.
 Reuse `PassageSpan.source_unit`, `record_ordinal`, `record_count`, and the existing
 source/passage byte ranges. No database column or receipt format changes.
 
-The first adapter supports Claude's provider-typed message envelope only:
+Claude's adapter supports these provider-typed message envelopes:
 
 - `claude.tool-input.string.v1#<pointer>`: a string leaf under a `tool_use.input`
   block in an assistant message.
@@ -35,8 +35,33 @@ unsupported provider formats cannot resolve a new unit. Provider non-text
 result blocks (including image and reasoning blocks) are not text sources.
 Tool arguments remain literal data, including arguments named `type` or
 `channel`. No new record, leaf-count, depth or pointer-length limits are added.
-The existing caller, program and output bounds remain authoritative. Codex is
-deliberately outside this first adapter.
+The existing caller, program and output bounds remain authoritative.
+
+Codex additionally supports four literal string fields inside a `response_item`
+envelope:
+
+| Provider item type | Source unit | Pointer | Provider role |
+| --- | --- | --- | --- |
+| `function_call` | `codex.tool-input.string.v1` | `/payload/arguments` | assistant |
+| `custom_tool_call` | `codex.tool-input.string.v1` | `/payload/input` | assistant |
+| `function_call_output` | `codex.tool-result.string.v1` | `/payload/output` | tool |
+| `custom_tool_call_output` | `codex.tool-result.string.v1` | `/payload/output` | tool |
+
+The discriminator and pointer are joined with `#`. These fields are literal
+strings, including JSON-looking arguments; arrays/objects and non-text payloads
+remain unsupported by this adapter. Tool names do not select a parser. Optional
+`name` and `call_id` strings are preserved with the item type and provider role
+in `source_tool` provenance. They do not establish completion, success, human
+approval, or a link to another event. Input means an authored request; result
+means reported tool output.
+
+Archived Codex tool events often have no explicit role. Empty archived roles are
+accepted only for a supported source unit after the exact native envelope,
+field and provider type validate. If a role is present in either provider
+envelope or archive metadata, it must agree with the declared input/result
+role. Legacy visible text still requires its original visible role. Analysis
+containers, duplicate keys, wrong provider/type/role, arbitrary metadata paths
+and unknown unit versions are refused. The raw archive is unchanged.
 
 Legacy spans retain historical visible-message coordinates. No changes are
 made to `visible_message_text`, passage identity generation, canonical span
@@ -56,9 +81,9 @@ checks again; source receipt checks still require `opened_receipts`.
 
 The resolver is embedded unchanged in the existing `recall_exec` program only
 when the request contains a new unit; legacy requests omit it.
-Its fixed local source is gzip/base64 encoded for transport and decoded inside
-the reader. Tests compare the decoded source byte for byte with the shared
-function. Source records and unit references never become executable code.
+Its fixed local resolver and reader source use one gzip/base64 payload, decoded
+inside the reader. Tests compare the decoded bytes with the exact shared
+resolver, `_read_page` and `_page_stdout` functions. Source records and unit references never become executable code.
 There is no new endpoint, grant check, archive reader, evidence store, model
 call or alternative verifier. Live authorization, revisions, retirement and
 Forget remain owned by the existing metadata/source-opening/execution path.
@@ -80,24 +105,24 @@ manifest/part changes, exact receipts, UTF-8 splits and origin tampering.
 Retained metadata/capture/span tests cover the legacy path and original size
 limits. The embedded program remains bounded by the unchanged 16,000-byte cap;
 the reader's page cap remains unchanged.
-The retained two-passage fixture with 128 spans per passage uses at most 13,928
-program bytes for legacy spans and 15,828 for new units. The new fixture has
-172 bytes of headroom. Longer variable pointers still obey the existing cap
-and may be refused; this measurement does not promise every string length fits.
-The separate 256-distinct-input-key fixture reads back every leaf and uses at
-most 14,900 program bytes, leaving 1,100 bytes of headroom.
+The retained two-passage fixtures exercise 128 spans per passage for legacy,
+Claude and Codex units, including 256 distinct Claude argument paths. Extending
+the plain reader exceeded the existing cap for a retained Claude fixture;
+bundling the trusted reader with the already-compressed resolver preserves
+capacity. This is an application API guard enforced by MCP, canonical execution
+and deep inspection, not an externally established 16 KB transport limit.
+Reviewing that policy is separate from this compatible source contract.
 
 The native PostgreSQL fixture uses the original metadata and source-opening
 owners, archived files, and generated reader. It verifies both origins and
 refuses revoked grants, an advanced revision, and pending Forget. The fixture
-inserts canonical tool spans only for this test because production emission is
-still disabled. Local execution does not claim remote sandbox verification.
+inserts canonical Codex tool spans only for this test because Codex production
+emission is still disabled. Local execution does not claim remote sandbox verification.
 
-Only a subsequent separately reviewed extractor/selector change may emit these
-new spans into canonical storage. It must use this contract and prove native
-source readback before any publication. This contract does not establish model
-selection quality or a retrieval gain. Today `PassageMessage.validate` accepts
-only the existing complete-report markers, and the builders do not propagate
-generic tool units. Append checkpoints, copy folding, audit grouping and any
-selection/ranking treatment must be reviewed when that later change is made;
-none is implicitly enabled by this reader contract.
+Codex extraction and publication require a separate reviewed change. This
+contract does not enable them, alter requested extraction versions, create a
+new passage policy, modify the schema or change the collector. That later
+publisher must retain provider attribution and explicitly handle tool roles;
+it must not label output as a user decision or invent visible-message roles.
+The existing Claude publisher remains unchanged. This reader contract does
+not establish model selection quality or a retrieval gain.
