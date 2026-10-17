@@ -63,6 +63,9 @@ class Store:
             pass
         elif sql.lstrip().startswith("SELECT source_id,document_id"):
             self.rows = [dict(source_id="s", document_id="a")]
+        elif "locked_parents AS MATERIALIZED" in sql:
+            self.rows = [dict(source_id=source, document_id=document)
+                         for source, document in zip(params[0], params[1], strict=True)]
         elif "updated_documents AS" in sql:
             if self.fail_write:
                 raise QueryCanceled("mutation cancelled")
