@@ -54,6 +54,8 @@ jobs:
       - run: pip-audit -r server/requirements.txt
       - name: Retired job-index lifecycle (isolated PostgreSQL 17)
         run: bash server/tests/run_job_status_index_fixture.sh
+      - name: Parent fallback buffer proof (isolated PostgreSQL 16)
+        run: bash server/tests/run_parent_fallback_fixture.sh
       - name: Fresh-PostgreSQL end-to-end suite
         run: |
           for test in \
@@ -103,7 +105,6 @@ jobs:
             e2e_logical_stream_supersession.py \
             e2e_pool_warmup.py \
             e2e_mcp_read_reservation.py \
-            e2e_logical_parent_fallback.py \
             e2e_cleanup_transaction_waves.py \
             e2e_archive_reference_lifetime.py \
             e2e_archive_admission_races.py \
@@ -150,7 +151,9 @@ jobs:
             e2e_handback_projection.py \
             e2e_publication_parent_lock.py \
             e2e_typed_passage_visibility.py \
+            e2e_typed_document_visibility.py \
             e2e_passage_origin.py \
+            e2e_long_copied_evidence.py \
             e2e_passage_append_tail.py \
             e2e_report_unit_authority.py \
             e2e_assistant_final_units.py \

@@ -840,9 +840,18 @@ def _copied_range_key(source_id: str, item: dict[str, Any]) -> tuple | None:
     """Only canonical origin metadata and authenticated complete bytes identify a copy."""
     spans = item.get("_origin_spans")
     text = item.get("text")
+    canonical_hash = item.get("_origin_text_sha256")
     if (not isinstance(source_id, str) or not source_id.strip()
             or not isinstance(spans, list) or not spans or not isinstance(text, str)
-            or hashlib.sha256(text.encode()).hexdigest() != item.get("_origin_text_sha256")):
+            or not isinstance(canonical_hash, str) or len(canonical_hash) != 64
+            or set(canonical_hash) - set("0123456789abcdef")):
+        return None
+    # Only the native hydrator records this after hashing the complete body
+    # against current canonical authority. A clipped display is not that body.
+    verified_hash = item.get("_origin_verified_text_sha256")
+    if verified_hash is None:
+        verified_hash = hashlib.sha256(text.encode()).hexdigest()
+    if verified_hash != canonical_hash:
         return None
     identities = []
     for span in spans:

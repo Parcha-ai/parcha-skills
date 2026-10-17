@@ -790,8 +790,8 @@ def decode_logical_record(
     return record
 
 
-def _typed_communication_message(event_kind: str, text: str) -> bool:
-    """Typed provider messages are visible even when their person is unknown."""
+def _typed_provider_text(event_kind: str, text: str) -> bool:
+    """Typed messages and extracted documents do not require a conversational role."""
 
     if event_kind != "connector_record":
         return False
@@ -801,7 +801,7 @@ def _typed_communication_message(event_kind: str, text: str) -> bool:
         return False
     return (
         isinstance(content, dict)
-        and content.get("kind") == "communication_message.v1"
+        and content.get("kind") in ("communication_message.v1", "document.v1")
         and isinstance(content.get("text"), str)
         and bool(content["text"].strip())
     )
@@ -874,10 +874,10 @@ def visible_messages(
         dense_roles = first.roles
         if not dense_roles and (
             any(link.relation == "author" for link in first.actor_links)
-            or _typed_communication_message(first.event_kind, source_text)
+            or _typed_provider_text(first.event_kind, source_text)
         ):
             # Visibility and person resolution are separate: typed provider
-            # messages remain searchable without inventing an actor link.
+            # content remains searchable without inventing an actor link.
             dense_roles = ("user",)
         if (
             not first.receipts

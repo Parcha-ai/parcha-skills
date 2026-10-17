@@ -712,6 +712,9 @@ class TurbopufferHintRetrieval(PassageHintRetrieval):
                 bounded, clipped = bounded_search_text(text)
                 for hint in wanted[passage_id]:
                     hint.update({"text": bounded, "text_clipped": clipped, "spans": spans})
+                    # The complete body just matched canonical authority. Keep
+                    # that proof when presentation clips the displayed text.
+                    hint["_origin_verified_text_sha256"] = body_sha256
                 for row in leg_rows.get(passage_id, ()):
                     row.update({
                         "text_redacted": text, "spans": spans, "header_redacted": header,
