@@ -1187,10 +1187,29 @@ class CanonicalParquetScanProjector:
         )
         certificate_columns = """
                           ,passage.tenant_id,passage.source_id,passage.text_sha256,
-                          evidence.manifest_content_sha256""" if read_settings.enabled else ""
+                          evidence.manifest_content_sha256,
+                          row_to_json(certificate) AS membership_metadata,
+                          octet_length(row_to_json(certificate)::text) AS membership_metadata_bytes,
+                          (projected.logical_document_id IS NOT NULL
+                           AND evidence.logical_document_id IS NOT NULL)
+                              AS membership_metadata_complete""" if read_settings.enabled else ""
         certificate_join = """
                      LEFT JOIN canonical_evidence_documents evidence
-                       USING(tenant_id,source_id,logical_document_id)""" if read_settings.enabled else ""
+                       USING(tenant_id,source_id,logical_document_id)
+                     LEFT JOIN canonical_passage_documents projected
+                       USING(tenant_id,source_id,logical_document_id,policy_fingerprint)
+                     LEFT JOIN canonical_parent_authority authority
+                       ON authority.tenant_id=evidence.tenant_id
+                      AND authority.source_id=evidence.source_id
+                      AND authority.native_parent_id=evidence.native_parent_id
+                     CROSS JOIN LATERAL (
+                          SELECT passage.source_id,passage.passage_id,passage.policy_fingerprint,
+                                 passage.revision AS passage_revision,
+                                 passage.membership_generation,passage.membership_binding_sha256,
+                                 evidence.native_parent_id,evidence.revision AS manifest_revision,
+                                 projected.revision AS projected_revision,projected.source_document_sha256,
+                                 authority.generation
+                     ) certificate""" if read_settings.enabled else ""
         membership_predicate = "true" if membership_enabled else """NOT EXISTS (
                           SELECT 1 FROM unnest(passage.receipts) AS receipt(value)
                           LEFT JOIN canonical_chunks chunk
@@ -1264,8 +1283,8 @@ class CanonicalParquetScanProjector:
                     deadline_at = time.monotonic() + self.store.search_deadline_ms / 1000
                     certified = set()
                     if read_settings.enabled:
-                        certified, _ = parent_membership_read.partition(
-                            self.store, connection, selected=rows,
+                        certified, _ = parent_membership_read.partition_fetched(
+                            selected=rows,
                             settings=read_settings, deadline_at=deadline_at,
                         )
                     fallback = [row for row in rows
@@ -1306,7 +1325,9 @@ class CanonicalParquetScanProjector:
                             # Certificate inputs are transient canonical metadata;
                             # the published scan schema and row shape stay intact.
                             if read_settings.enabled:
-                                for key in ("tenant_id", "source_id", "text_sha256", "manifest_content_sha256"):
+                                for key in ("tenant_id", "source_id", "text_sha256", "manifest_content_sha256",
+                                            "membership_metadata", "membership_metadata_bytes",
+                                            "membership_metadata_complete"):
                                     row.pop(key)
                             yield row
 
