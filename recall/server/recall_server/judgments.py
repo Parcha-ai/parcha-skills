@@ -122,6 +122,12 @@ def _unique_object(pairs):
 class UrllibJudgmentTransport:
     """One attempt, verified TLS, no redirects or ambient proxies, bounded body."""
 
+    def __init__(self):
+        try:
+            self._ssl_context = ssl.create_default_context()
+        except Exception:
+            raise JudgmentUnavailable("judgment_transport_error") from None
+
     def post(
         self, *, url: str, headers: dict[str, str], body: dict[str, Any], timeout: float
     ) -> Any:
@@ -141,7 +147,7 @@ class UrllibJudgmentTransport:
         opener = urllib.request.build_opener(
             urllib.request.ProxyHandler({}),
             _RejectRedirect(),
-            urllib.request.HTTPSHandler(context=ssl.create_default_context()),
+            urllib.request.HTTPSHandler(context=self._ssl_context),
         )
         try:
             with opener.open(request, timeout=timeout) as response:

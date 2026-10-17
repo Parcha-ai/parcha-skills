@@ -1391,7 +1391,6 @@ class Collector:
                 append = mode == "append"
                 start_offset = int(row["scanned_offset"]) if append or resume_mode else 0
                 old_active = {item["native_id"]: item for item in self.db.execute("SELECT * FROM active_records WHERE path=?", (path_text,))}
-                seen_native: set[str] = set(old_active) if append else {item["native_id"] for item in self.db.execute("SELECT native_id FROM scan_members WHERE path=?", (path_text,))}
                 complete_end = start_offset
                 complete_records = 0
                 repeats: dict[str, list[int]] = {
@@ -1472,12 +1471,6 @@ class Collector:
                             line_end,
                         ),
                     )
-                    seen_native.add(native_id)
-                    if not append:
-                        self.db.execute(
-                            "INSERT OR IGNORE INTO scan_members(path,native_id) VALUES (?,?)",
-                            (path_text, native_id),
-                        )
 
                 def commit_pending() -> None:
                     commit_item(pending.pop(0))
@@ -1534,28 +1527,16 @@ class Collector:
                         if counts[0] > MAX_IDENTICAL_RECORDS_PER_FILE:
                             counts[1] += 1
                             summary["records_collapsed"] += 1
-                            seen_native.add(native_id)
-                            if not append:
-                                self.db.execute("INSERT OR IGNORE INTO scan_members(path,native_id) VALUES (?,?)", (path_text, native_id))
                             continue
                         privacy = self.privacy.apply(content)
                         privacy_receipts.append(privacy.receipt())
                         if privacy.action == "drop":
-                            seen_native.add(native_id)
-                            if not append:
-                                self.db.execute("INSERT OR IGNORE INTO scan_members(path,native_id) VALUES (?,?)", (path_text, native_id))
                             continue
                         content = privacy.value
                         if not restoring_tombstone and self._acked_record_unchanged(
                             path_text, native_id, content, old_active.get(native_id),
                             line_start, complete_end,
                         ):
-                            seen_native.add(native_id)
-                            if not append:
-                                self.db.execute(
-                                    "INSERT OR IGNORE INTO scan_members(path,native_id) VALUES (?,?)",
-                                    (path_text, native_id),
-                                )
                             continue
                         if self.bulk_manifest_archive:
                             future = None
