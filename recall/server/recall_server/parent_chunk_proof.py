@@ -12,15 +12,13 @@ import tempfile
 import time
 
 import orjson
-from psycopg import sql as pg_sql
 
 from .chunk_bodies import _EXCLUDED_TYPES, _check_deadline, _record_location, _verified_body
-from .db import SearchDeadlineExceeded
 from .locator_backfill_plan import _DOCUMENTS_SQL, _MeteredArchive, _PARENT_SQL
 from .logical_body_proof import iter_parent_bodies
 
 # Metadata only: bodies remain in PostgreSQL/archive; the per-row and spool
-# budgets below still apply. A modest batch reduces capture round trips.
+# budgets below still apply. Streamed rows and native membership requests stay bounded.
 _CAPTURE_FETCH_ROWS = 256
 
 # Attempted acquisition work only; none of these counters authorize mutation.
@@ -100,6 +98,40 @@ class ParentMetadataSpool:
         except sqlite3.Error:
             raise _error('parent_retirement_metadata_invalid') from None
 
+    def membership_batches(self):
+        """Read compact requests, closing each SQLite cursor before payload updates."""
+        last_rowid = 0
+        while True:
+            rows = self.index.execute("""SELECT rowid,document,native,
+                json_extract(payload,'$.revision','$.chunks') FROM documents
+                WHERE rowid>? ORDER BY rowid LIMIT ?""",
+                (last_rowid, _CAPTURE_FETCH_ROWS)).fetchall()
+            if not rows:
+                return
+            last_rowid = rows[-1][0]
+            documents = []
+            for _, document, native, compact in rows:
+                revision, chunks = orjson.loads(compact)
+                documents.append(dict(document_id=document, native_id=native,
+                                      revision=revision, chunks=chunks))
+            rows = None
+            yield documents
+
+    def replace_chunks(self, document_id, chunks):
+        row = orjson.loads(self.index.execute(
+            'SELECT payload FROM documents WHERE document=?', (document_id,)).fetchone()[0])
+        row['chunks'] = chunks
+        row['pg_body_bytes'] = sum(chunk['pg_bytes'] for chunk in chunks)
+        payload = orjson.dumps(row)
+        if len(payload) > 1024**2:
+            raise _error('parent_retirement_metadata_budget')
+        try:
+            # The existing SQLite max_page_count also bounds derived singleton growth.
+            self.index.execute('UPDATE documents SET payload=? WHERE document=?',
+                               (payload, document_id))
+        except sqlite3.Error:
+            raise _error('parent_retirement_metadata_invalid') from None
+
     def claim_native(self, native):
         try:
             self.index.execute('INSERT INTO seen VALUES(?)', (native,))
@@ -170,59 +202,61 @@ def _capture(store, spool, scope, limits, deadline_at, *, capture_metrics=None):
                       FROM canonical_chunks WHERE tenant_id=selected.tenant_id AND source_id=selected.source_id
                         AND document_id=selected.document_id AND deleted_at IS NULL ORDER BY ordinal LIMIT %s) item) items'''
         count, chunk_count = 0, 0
-        with connection.cursor(name='retirement_metadata') as cursor:
-            store._set_statement_deadline(connection, deadline_at)
-            cursor.execute(sql, (*scope, limits.max_documents + 1, limits.batch_chunks + 1))
-            while True:
-                # Attempts include EOF and a deadline refusal before sending FETCH.
-                with _capture_stage(capture_metrics, 'metadata_fetch_ms', 'metadata_fetches'):
-                    if deadline_at is None:
-                        rows = cursor.fetchmany(_CAPTURE_FETCH_ROWS)
-                    else:
-                        remaining_ms = int((deadline_at - time.monotonic()) * 1000)
-                        if remaining_ms <= 0:
-                            raise SearchDeadlineExceeded('search deadline exceeded')
-                        # Keep a fixed metadata-row bound; update the timeout and fetch
-                        # in one request rather than paying a second round trip.
-                        with connection.cursor() as fetch:
-                            fetch.execute(pg_sql.SQL(
-                                "SELECT set_config('statement_timeout', {}, true); "
-                                'FETCH FORWARD {} FROM {}'
-                            ).format(pg_sql.Literal(f'{remaining_ms}ms'),
-                                     pg_sql.Literal(_CAPTURE_FETCH_ROWS), pg_sql.Identifier('retirement_metadata')), prepare=False)
-                            setting = fetch.fetchone()
-                            if (not isinstance(setting, dict) or set(setting) != {'set_config'}
-                                    or not isinstance(setting['set_config'], str) or not fetch.nextset()):
-                                raise _error('parent_retirement_metadata_invalid')
-                            rows = fetch.fetchall()
-                            if len(rows) > _CAPTURE_FETCH_ROWS or fetch.nextset():
-                                raise _error('parent_retirement_metadata_invalid')
-                if not rows:
-                    break
-                if capture_metrics is not None:
-                    capture_metrics['metadata_rows'] += len(rows)
-                if getattr(store, 'verified_singleton_receipts', False):
-                    from .receipt_membership import verified_document_chunks
-                    with _capture_stage(capture_metrics, 'metadata_membership_ms', 'metadata_membership_calls'):
-                        proven = verified_document_chunks(store, connection, tenant_id=scope[0], source_id=scope[1],
-                            documents=rows, deadline_at=deadline_at)
-                    for row in rows:
-                        row['chunks'] = proven[row['document_id']]
-                # Row validation/serialization and SQLite adds; final index commit
-                # and catalog/portal setup remain in total capture time only.
-                with _capture_stage(capture_metrics, 'metadata_spool_ms'):
-                    for row in rows:
+        verify_membership = getattr(store, 'verified_singleton_receipts', False)
+        store._set_statement_deadline(connection, deadline_at)
+        with connection.cursor() as cursor:
+            # Pinned psycopg binary supports bounded libpq result chunks. One
+            # query acquires metadata; only the original verifier can prove it.
+            stream = cursor.stream(sql, (*scope, limits.max_documents + 1,
+                                         limits.batch_chunks + 1), size=_CAPTURE_FETCH_ROWS)
+            if capture_metrics is not None:
+                capture_metrics['metadata_fetches'] += 1
+            try:
+                while True:
+                    with _capture_stage(capture_metrics, 'metadata_fetch_ms'):
+                        row = next(stream, None)
+                    if row is None:
+                        break
+                    if capture_metrics is not None:
+                        capture_metrics['metadata_rows'] += 1
+                    with _capture_stage(capture_metrics, 'metadata_spool_ms'):
                         count += 1
                         chunk_count += len(row['chunks'])
                         if count > limits.max_documents or chunk_count > limits.max_chunks or len(row['chunks']) > limits.batch_chunks:
                             raise _error('parent_retirement_metadata_budget')
+                        if verify_membership:
+                            # Match the native verifier's serialization order, without
+                            # rewriting unchanged physical rows after verification.
+                            row['chunks'] = [{key: chunk[key] for key in
+                                ('ordinal', 'receipt', 'text_sha256', 'pg_bytes')}
+                                for chunk in row['chunks']]
                         row.update(pending=catalog['queue'] is not None,
                                    pg_body_bytes=sum(chunk['pg_bytes'] for chunk in row['chunks']))
                         spool.add_document(row)
                         _check_deadline(deadline_at)
-                # Do not retain consumed metadata and membership maps while
-                # libpq decodes the next bounded batch. The spool owns the proof.
-                rows = proven = row = None
+                    row = None
+            finally:
+                stream.close()
+        if verify_membership:
+            from .receipt_membership import verified_document_chunks
+            # Synchronize the completed stream before native pipelined queries,
+            # preserving the same absolute deadline and repeatable-read snapshot.
+            store._set_statement_deadline(connection, deadline_at)
+            chunk_count = 0
+            for documents in spool.membership_batches():
+                with _capture_stage(capture_metrics, 'metadata_membership_ms', 'metadata_membership_calls'):
+                    proven = verified_document_chunks(store, connection, tenant_id=scope[0], source_id=scope[1],
+                        documents=documents, deadline_at=deadline_at)
+                with _capture_stage(capture_metrics, 'metadata_spool_ms'):
+                    for document in documents:
+                        chunks = proven[document['document_id']]
+                        chunk_count += len(chunks)
+                        if chunk_count > limits.max_chunks or len(chunks) > limits.batch_chunks:
+                            raise _error('parent_retirement_metadata_budget')
+                        if chunks != document['chunks']:
+                            spool.replace_chunks(document['document_id'], chunks)
+                        _check_deadline(deadline_at)
+                documents = proven = document = chunks = None
         spool.index.commit()
     return catalog, parts, count, chunk_count
 

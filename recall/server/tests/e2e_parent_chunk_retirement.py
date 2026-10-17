@@ -335,18 +335,16 @@ def schema68_compatibility(store, root):
 
 
 def metadata_cursor_deadlines(store, root):
-    """Actual portal FETCH stays bounded; timeout policy and cleanup are exact."""
+    """One bounded stream retains exact timeout, proof and cleanup behavior."""
     tenant, source, archive, _, _, texts = fixture(store, root, count=270)
     scope = tenant, source, 'session'
     execute = psycopg.Connection.execute
-    declare = psycopg.ServerCursor.execute
+    stream = psycopg.Cursor.stream
     client_execute = psycopg.Cursor.execute
-    fetch = psycopg.Cursor.fetchall
     spool_class = ParentMetadataSpool
 
     def observed(deadline, *, slow=False):
-        statements, batches, portals, directories = [], [], [], []
-        fetch_cursors = []
+        statements, received, portals, directories = [], [], [], []
         expired_at_entry = deadline <= time.monotonic()
 
         class ObservedSpool(spool_class):
@@ -360,35 +358,25 @@ def metadata_cursor_deadlines(store, root):
                 assert statement != 'SELECT 1', 'metadata capture emitted a dummy ping'
             return execute(connection, statement, *args, **kwargs)
 
-        def trace_declare(cursor, statement, *args, **kwargs):
+        def trace_stream(cursor, statement, *args, **kwargs):
             portals.append(cursor)
+            assert kwargs == {'size': 256}
             if slow:
-                # DECLARE is lazy: this delay runs inside the actual FETCH.
                 statement = statement.replace('SELECT selected.*,items.chunks FROM (',
-                    'SELECT selected.*,items.chunks,pg_sleep(0.05) AS fetch_stall FROM (')
-            return declare(cursor, statement, *args, **kwargs)
+                    'SELECT selected.*,items.chunks FROM (SELECT pg_sleep(2)) pause CROSS JOIN (')
+            for row in stream(cursor, statement, *args, **kwargs):
+                received.append(row['document_id'])
+                yield row
 
         def trace_client(cursor, statement, *args, **kwargs):
             text = statement.as_string() if isinstance(statement, psycopg.sql.Composable) else str(statement)
-            if '; FETCH FORWARD' in text:
-                assert text.endswith('FETCH FORWARD 256 FROM "retirement_metadata"')
-                assert kwargs == {'prepare': False}
-                fetch_cursors.append(cursor)
-                statements.append(text)
+            assert 'FETCH FORWARD' not in text, 'metadata capture still paged over the network'
             return client_execute(cursor, statement, *args, **kwargs)
-
-        def trace_fetch(cursor):
-            rows = fetch(cursor)
-            if any(cursor is item for item in fetch_cursors):
-                batches.append(len(rows))
-                assert len(rows) <= 256
-            return rows
 
         try:
             with patch.object(psycopg.Connection, 'execute', trace_execute), \
-                 patch.object(psycopg.ServerCursor, 'execute', trace_declare), \
+                 patch.object(psycopg.Cursor, 'stream', trace_stream), \
                  patch.object(psycopg.Cursor, 'execute', trace_client), \
-                 patch.object(psycopg.Cursor, 'fetchall', trace_fetch), \
                  patch.object(parent_chunk_proof, 'ParentMetadataSpool', ObservedSpool):
                 with parent_chunk_proof.prove_parent_chunks(store, archive, scope=scope,
                         limits=ParentRetirementLimits(), deadline_at=deadline) as proof:
@@ -408,13 +396,14 @@ def metadata_cursor_deadlines(store, root):
                     snapshot = {key: value for key, value in proof.items() if key != 'spool'}
                     payloads = list(proof['spool'].index.execute(
                         'SELECT native,document,payload,ordinal,verified,proposed_count FROM documents ORDER BY native'))
-            assert batches == [256, 14, 0]
-            # Initial catalog/parts/DECLARE, three FETCHes and final catalog.
-            assert sum("set_config('statement_timeout'" in sql for sql in statements) == 7
+            assert len(received) == len(set(received)) == 270
+            assert len(portals) == 1
+            # Catalog, parts, one stream deadline, then final catalog.
+            assert sum("set_config('statement_timeout'" in sql for sql in statements) == 4
             return snapshot, payloads
         finally:
             if expired_at_entry:
-                assert not portals and not batches, 'expired deadline reached DECLARE/FETCH'
+                assert not portals and not received, 'expired deadline reached streaming query'
             assert all(cursor.closed for cursor in portals)
             assert directories and all(not Path(path).exists() for path in directories)
             assert store.active_connections == 0
@@ -428,13 +417,13 @@ def metadata_cursor_deadlines(store, root):
     except psycopg.errors.QueryCanceled as error:
         assert error.sqlstate == '57014' and error.__context__ is None
     else:
-        raise AssertionError('slow actual FETCH did not time out')
+        raise AssertionError('slow actual stream did not time out')
     try:
         observed(time.monotonic() - 1)
     except SearchDeadlineExceeded:
         pass
     else:
-        raise AssertionError('expired metadata capture reached FETCH')
+        raise AssertionError('expired metadata capture reached stream')
     assert observed(time.monotonic() + 20) == first, 'failed proof changed stored state'
 
 
