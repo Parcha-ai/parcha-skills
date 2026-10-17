@@ -15,7 +15,7 @@ import time
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timezone
 from typing import Any, Callable, Iterable, Iterator
 
@@ -599,6 +599,7 @@ class ScanUpload:
     mode: str = "full"
     documents_dirty: int = 0
     documents_rewritten: int = 0
+    dirty_plan_epoch: str | None = None
 
 
 @dataclass(frozen=True)
@@ -887,6 +888,17 @@ class CanonicalParquetScanProjector:
         if not 1 <= compaction_fragments <= MAX_SHARD_INDEX:
             raise ParquetScanError("parquet_scan_budget_invalid")
         self.compaction_fragments = compaction_fragments
+        self.sparse_plan_epoch = None
+        sparse_enabled = os.environ.get("RECALL_PARQUET_SPARSE_PLAN", "0")
+        if sparse_enabled not in {"0", "1"}:
+            raise ParquetScanError("parquet_sparse_flag_invalid")
+        if sparse_enabled == "1":
+            epoch = os.environ.get("RECALL_PARQUET_DIRTY_EPOCH", "").strip()
+            if not epoch:
+                raise ParquetScanError("parquet_sparse_epoch_required")
+            # A new epoch is required after any interval with older writers.
+            # The protocol and output schema also invalidate prior enrollment.
+            self.sparse_plan_epoch = f"1:{SCAN_SCHEMA_VERSION}:{epoch}"
 
     def seed_backfill(
         self,
@@ -992,7 +1004,9 @@ class CanonicalParquetScanProjector:
                     (identity,),
                 )
 
-    def _documents(self, candidate: ScanCandidate) -> list[dict[str, Any]]:
+    def _documents(
+        self, candidate: ScanCandidate, *, document_ids: Iterable[str] | None = None,
+    ) -> list[dict[str, Any]]:
         """Load month document metadata (no raw parts) ordered by document id."""
 
         bucket_end = _next_month(candidate.bucket_start)
@@ -1033,15 +1047,81 @@ class CanonicalParquetScanProjector:
                              AND queued.native_parent_id=document.native_parent_id
                              AND queued.reason='forget'
                       )
-                    ORDER BY document.logical_document_id""",
+                    """
+                + (" AND document.logical_document_id=ANY(%s)" if document_ids is not None else "")
+                + " ORDER BY document.logical_document_id",
                 (
                     candidate.tenant_id,
                     candidate.source_id,
                     candidate.bucket_start,
                     bucket_end,
-                ),
+                ) + ((list(document_ids),) if document_ids is not None else ()),
             ).fetchall()
         return documents
+
+    def _sparse_inputs(self, candidate: ScanCandidate):
+        """Read dirt and its fragment siblings only after a full-oracle enrollment."""
+        scope = (candidate.tenant_id, candidate.source_id, candidate.bucket_start)
+        with self.store.connect() as connection:
+            shards = connection.execute(
+                """SELECT * FROM canonical_parquet_scan_shards
+                    WHERE tenant_id=%s AND source_id=%s AND bucket_start=%s
+                    ORDER BY dataset,shard_index""", scope,
+            ).fetchall()
+            if (not shards
+                    or {row["dataset"] for row in shards} != set(SCAN_DATASETS)
+                    or any(row.get("dirty_plan_epoch") != self.sparse_plan_epoch for row in shards)):
+                return None
+            dirty = frozenset(row["logical_document_id"] for row in connection.execute(
+                """SELECT logical_document_id FROM canonical_parquet_scan_dirty_documents
+                    WHERE tenant_id=%s AND source_id=%s AND bucket_start=%s""", scope,
+            ).fetchall())
+            if not dirty or SCAN_DIRTY_ALL in dirty:
+                return None
+            rows = connection.execute(
+                """WITH victims AS MATERIALIZED (
+                       SELECT DISTINCT dataset,shard_index
+                         FROM canonical_parquet_scan_fragment_documents
+                        WHERE tenant_id=%s AND source_id=%s AND bucket_start=%s
+                          AND logical_document_id=ANY(%s)
+                   )
+                   SELECT member.dataset,member.shard_index,member.logical_document_id,
+                          member.revision,member.generation_sha256
+                     FROM victims JOIN canonical_parquet_scan_fragment_documents member
+                       USING(dataset,shard_index)
+                    WHERE member.tenant_id=%s AND member.source_id=%s AND member.bucket_start=%s
+                    ORDER BY member.dataset,member.shard_index,member.logical_document_id""",
+                (*scope, sorted(dirty), *scope),
+            ).fetchall()
+        grouped: dict[tuple[str, int], list[FragmentMember]] = {}
+        for row in rows:
+            grouped.setdefault((row["dataset"], int(row["shard_index"])), []).append(
+                FragmentMember(row["logical_document_id"], int(row["revision"]), row["generation_sha256"])
+            )
+        catalog = ScanCatalog(
+            {(row["dataset"], int(row["shard_index"])): row for row in shards},
+            {key: tuple(value) for key, value in grouped.items()}, dirty,
+        )
+        recorded: dict[str, set[str]] = {}
+        for members in catalog.members.values():
+            for member in members:
+                recorded.setdefault(member.logical_document_id, set()).add(member.generation_sha256)
+        documents = self._documents(candidate, document_ids=sorted(dirty | recorded.keys()))
+        current = {row["logical_document_id"]: self._fingerprint(row) for row in documents}
+        if any(recorded[key] != {current.get(key)} for key in recorded.keys() - dirty):
+            # A sibling changed without named dirt. Never infer its other victims
+            # from this partial membership view; let the full oracle recover.
+            return None
+        changed = {key for key in dirty if recorded.get(key, set()) != (
+            {current[key]} if key in current else set())}
+        victims = {key for key, members in catalog.members.items()
+                   if any(member.logical_document_id in changed for member in members)}
+        rewrite = changed & current.keys()
+        # Keep unrelated shard headers: no-current in this subset never means
+        # that the whole month is empty. The original full planner is unchanged.
+        plan = ("delta" if victims or rewrite else "reuse", victims, rewrite,
+                set(dirty) & (current.keys() | recorded.keys()))
+        return documents, catalog, plan
 
     def _attach_parts(
         self,
@@ -1778,11 +1858,15 @@ class CanonicalParquetScanProjector:
         allow_compaction: bool = True,
     ) -> ScanUpload:
         started = time.perf_counter()
-        documents = self._documents(candidate)
-        catalog = self._catalog(candidate)
-        mode, victims, rewrite, dirty = self._plan(
-            candidate, documents, catalog, allow_compaction=allow_compaction
-        )
+        sparse = (self._sparse_inputs(candidate)
+                  if self.sparse_plan_epoch and not allow_compaction and not _rebuild else None)
+        if sparse is None:
+            documents = self._documents(candidate)
+            catalog = self._catalog(candidate)
+            plan = self._plan(candidate, documents, catalog, allow_compaction=allow_compaction)
+        else:
+            documents, catalog, plan = sparse
+        mode, victims, rewrite, dirty = plan
         if _rebuild:
             mode, victims, rewrite = "full", set(catalog.shards), {
                 document["logical_document_id"] for document in documents
@@ -1810,6 +1894,7 @@ class CanonicalParquetScanProjector:
                 False,
                 mode="reuse",
                 documents_dirty=len(dirty),
+                dirty_plan_epoch=self.sparse_plan_epoch,
             )
         bucket_start = datetime.combine(
             candidate.bucket_start,
@@ -1992,6 +2077,7 @@ class CanonicalParquetScanProjector:
                     mode=mode,
                     documents_dirty=len(dirty),
                     documents_rewritten=len(rewrite_documents),
+                    dirty_plan_epoch=self.sparse_plan_epoch,
                 )
             if upload.pending_members["documents"] and not upload.rows_seen["documents"]:
                 ensure_datasets = tuple(set(ensure_datasets) | {"documents"})
@@ -2036,7 +2122,7 @@ class CanonicalParquetScanProjector:
             round((finished - started) * 1_000),
             mode,
         )
-        return result
+        return replace(result, dirty_plan_epoch=self.sparse_plan_epoch)
 
     @staticmethod
     def _enqueue_cleanup(connection: Any, references: Iterable[dict[str, Any]]) -> None:
@@ -2199,6 +2285,15 @@ class CanonicalParquetScanProjector:
                                    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)""",
                                 member_rows,
                             )
+                if upload.dirty_plan_epoch is not None:
+                    if upload.dirty_plan_epoch != self.sparse_plan_epoch:
+                        raise ParquetScanError("parquet_sparse_epoch_changed")
+                    connection.execute(
+                        """UPDATE canonical_parquet_scan_shards SET dirty_plan_epoch=%s
+                            WHERE tenant_id=%s AND source_id=%s AND bucket_start=%s
+                              AND dirty_plan_epoch IS DISTINCT FROM %s""",
+                        (upload.dirty_plan_epoch, *scope, upload.dirty_plan_epoch),
+                    )
                 # Only the dirt this build read: rows queued after the claim
                 # (a document that changed while the month was being built)
                 # stay for the next delta. The whole-month marker a seed

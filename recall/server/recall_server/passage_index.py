@@ -1390,6 +1390,8 @@ class CanonicalPassageProjector:
                     reason="logical-update",
                 )
         result = {"status": "committed", **diff.counters}
+        if durable_certification is None:
+            result["membership_legacy"] = True
         if durable_certification:
             result["membership_durable"] = True
         return result
@@ -2111,7 +2113,7 @@ class CanonicalPassageProjector:
                 commit_elapsed = time.monotonic() - commit_started
                 should_certify = (status['status'] == 'committed'
                                   and self.membership_certification.enabled
-                                  and not status.get('membership_durable'))
+                                  and status.get('membership_legacy', False))
                 passage_ids = (tuple(passage.passage_id for passage in prepared.passages)
                                if should_certify else ())
                 status['archive_bytes_read'] = prepared.archive_bytes_read

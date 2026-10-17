@@ -86,6 +86,7 @@ jobs:
             e2e_passage_callback_quantum.py \
             e2e_worker_connection_admission.py \
             e2e_logical_slot_refill.py \
+            e2e_logical_refill_polling.py \
             e2e_logical_admission_isolation.py \
             e2e_passage_parent_progress.py \
             e2e_passage_dispatch_order.py \
@@ -125,6 +126,7 @@ jobs:
             e2e_codex_archive_restore.py \
             e2e_parquet_scan_fragments.py \
             e2e_parquet_dirty_completeness.py \
+            e2e_parquet_sparse_planning.py \
             e2e_scan_upstream_completeness.py \
             e2e_search_outbox.py \
             e2e_search_publication_reconcile.py \
@@ -137,6 +139,7 @@ jobs:
             e2e_parent_membership_enrollment.py \
             e2e_parent_membership_publication.py \
             e2e_membership_remainder.py \
+            e2e_membership_queue_initialization.py \
             e2e_membership_seed.py \
             e2e_retirement_membership_certification.py \
             e2e_retirement_certificate_remainder.py \
