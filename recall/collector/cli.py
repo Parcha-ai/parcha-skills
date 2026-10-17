@@ -33,6 +33,8 @@ def _run_once(collector: Collector, canonical_writer, harness: str) -> dict:
         # Do not let a successful flush clear it before health is reported.
         # watch retries at its ordinary interval, outside the request deadline.
         scan = {"scan_complete": False, "error_code": error.error_code}
+        if error.error_code == "source_snapshot_deadline" and error.snapshot_diagnostics is not None:
+            scan["snapshot_diagnostics"] = error.snapshot_diagnostics
         flush = {"status": "skipped", "reason": "scan_failed"}
     else:
         flush = collector.flush()
