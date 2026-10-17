@@ -268,7 +268,7 @@ def resume(store, row, *, settings, deadline_at):
                     native._query(
                         store,
                         connection,
-                        """SELECT passage_id FROM canonical_passages
+                        """SELECT passage_id,cardinality(receipts) AS receipt_count FROM canonical_passages
                     WHERE tenant_id=%s AND source_id=%s AND logical_document_id=%s
                       AND policy_fingerprint=%s AND passage_id>%s
                     ORDER BY passage_id LIMIT %s""",
@@ -308,7 +308,17 @@ def resume(store, row, *, settings, deadline_at):
                     status="enrolled" if removed else "changed",
                     certified_passages=certified,
                 )
-            ids = tuple(value["passage_id"] for value in rows)
+            # Commit complete passages within one native 512-receipt proof
+            # quantum. A single larger passage remains indivisible; its full
+            # native proof must succeed before the cursor can advance.
+            prefix = []
+            receipt_count = 0
+            for value in rows:
+                if prefix and receipt_count + value["receipt_count"] > 512:
+                    break
+                prefix.append(value["passage_id"])
+                receipt_count += value["receipt_count"]
+            ids = tuple(prefix)
             outcome = native.certify_published_passages(
                 store,
                 tenant_id=row["tenant_id"],
