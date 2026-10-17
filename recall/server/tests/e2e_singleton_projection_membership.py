@@ -95,6 +95,74 @@ class SingletonProjectionMembership(SingletonPassageReads):
             after = connection.execute('SELECT generation,changed_at FROM canonical_parquet_scan_queue WHERE tenant_id=%s', (self.tenant,)).fetchall()
         self.assertEqual(before, after)
 
+    def test_projection_next_cursor_fetch_keeps_original_timeout_allowance(self):
+        from contextlib import contextmanager
+        from psycopg import sql
+        from recall_server import parent_membership_read
+        from recall_server.db import BrainStore
+        survivor = self.receipt_fanout_fixture(valid_first=True)
+        with self.store.connect() as connection:
+            columns = [row['attname'] for row in connection.execute("SELECT attname FROM pg_attribute WHERE attrelid='canonical_passages'::regclass AND attnum>0 AND NOT attisdropped AND attgenerated='' ORDER BY attnum").fetchall()]
+            selected = [sql.Placeholder() if key in ('passage_id', 'ordinal') else sql.Identifier(key) for key in columns]
+            statement = sql.SQL('INSERT INTO canonical_passages ({}) SELECT {} FROM canonical_passages WHERE tenant_id=%s AND passage_id=%s').format(sql.SQL(',').join(map(sql.Identifier, columns)), sql.SQL(',').join(selected))
+            values = []
+            for ordinal in range(1999):
+                overrides = dict(passage_id=f'psg_{ordinal:032x}', ordinal=ordinal + 2)
+                values.append(tuple(overrides[key] for key in columns if key in overrides) + (self.tenant, survivor))
+            with connection.cursor() as cursor:
+                cursor.executemany(statement, values)
+            # Exactly the final row is fetched in the next named-cursor batch.
+            connection.execute("UPDATE canonical_passages SET first_occurred_at=first_occurred_at+interval '1 second',last_occurred_at=last_occurred_at+interval '1 second' WHERE tenant_id=%s AND passage_id=%s", (self.tenant, survivor))
+        fetches = []
+        class Cursor:
+            def __init__(self, native):
+                object.__setattr__(self, 'native', native)
+            def __getattr__(self, name):
+                return getattr(self.native, name)
+            def __setattr__(self, name, value):
+                setattr(self.native, name, value)
+            def __enter__(self):
+                self.native.__enter__()
+                return self
+            def __exit__(self, *args):
+                return self.native.__exit__(*args)
+            def execute(self, statement, parameters):
+                # The volatile expression executes during the actual second
+                # FETCH, not as an unrelated delay before the cursor advances.
+                statement = "SELECT batch.*, CASE WHEN batch.passage_id=%s THEN pg_sleep(.25) END AS fixture_delay FROM (" + statement + ") batch"
+                return self.native.execute(statement, (survivor, *parameters))
+            def fetchmany(self, size):
+                fetches.append(size)
+                return self.native.fetchmany(size)
+        class Connection:
+            def __init__(self, native):
+                self.native = native
+            def __getattr__(self, name):
+                return getattr(self.native, name)
+            def cursor(self, *, name):
+                return Cursor(self.native.cursor(name=name))
+        original_connect = self.store.connect
+        @contextmanager
+        def delayed_cursor():
+            with original_connect() as connection:
+                yield Connection(connection)
+        native = self.store._execute_bounded
+        proof_deadlines = []
+        def slow_first(connection, statement, parameters, deadline):
+            if statement.lstrip().startswith('WITH requested'):
+                proof_deadlines.append(deadline)
+                if len(proof_deadlines) == 1:
+                    BrainStore._execute_bounded(connection, 'SELECT pg_sleep(.30)', (), deadline)
+            return native(connection, statement, parameters, deadline)
+        with patch.object(self.store, 'verified_singleton_receipts', True), patch.object(self.store, 'search_deadline_ms', 500), patch.object(parent_membership_read.ReadSettings, 'from_env', return_value=parent_membership_read.ReadSettings()), patch.object(self.store, 'connect', delayed_cursor), patch.object(self.store, '_execute_bounded', slow_first):
+            rows = list(self.scan._passages(self.candidate, self.documents))
+        self.assertEqual(len(rows), 2000)
+        self.assertEqual(rows[-1]['passage_id'], survivor)
+        self.assertEqual(fetches, [2000, 2000, 2000])
+        self.assertEqual(len(proof_deadlines), 4)
+        self.assertEqual(len(set(proof_deadlines[:3])), 1)
+        self.assertGreater(proof_deadlines[3], proof_deadlines[0])
+
     def test_projection_stream_preserves_exact_passage_after_admission(self):
         self.scan_fixture()
         baseline = list(self.scan._passages(self.candidate, self.documents))

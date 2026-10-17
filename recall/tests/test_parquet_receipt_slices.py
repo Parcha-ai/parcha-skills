@@ -18,6 +18,7 @@ class Store:
         self.rows = rows
         self.queries = []
         self.fetch_sizes = []
+        self.restored_deadlines = []
         self.allowed = set(rows[-1]['receipts'])
 
     @contextmanager
@@ -53,6 +54,10 @@ class Store:
     def fetchall(self):
         return self.result
 
+    def _set_statement_deadline(self, connection, deadline):
+        assert connection is self
+        self.restored_deadlines.append(deadline)
+
 
 class ParquetReceiptSlices(unittest.TestCase):
     def test_native_proof_batches_cover_every_receipt_without_deadline_renewal(self):
@@ -72,6 +77,7 @@ class ParquetReceiptSlices(unittest.TestCase):
         self.assertEqual(len({deadline for _, _, deadline in store.queries}), 1)
         self.assertEqual(len({sql for sql, _, _ in store.queries}), 1)
         self.assertEqual(store.fetch_sizes, [2000, 2000])
+        self.assertEqual(len(store.restored_deadlines), 1)
 
 
     def test_later_proof_refusal_yields_no_earlier_authorized_passage(self):
@@ -95,6 +101,7 @@ class ParquetReceiptSlices(unittest.TestCase):
             with self.assertRaises(SearchDeadlineExceeded):
                 next(iterator)
         self.assertEqual(len(store.queries), 1)
+        self.assertEqual(store.restored_deadlines, [])
 
     def test_all_certified_batch_makes_no_fallback_query(self):
         rows = [dict(passage_id='certified', receipts=[item_receipt('source:test', 'event', 1, 0)],
