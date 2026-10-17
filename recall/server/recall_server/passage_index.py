@@ -82,6 +82,13 @@ PASSAGE_COMMIT_WORKERS = 8
 PASSAGE_ORDINAL_PARK_OFFSET = 1 << 30
 
 
+def _document_extraction_version(source_id: str, requested: str | None) -> str:
+    """Keep recorded requests; first Claude projections include typed tools."""
+    if requested is not None:
+        return requested
+    return "tool_groups_v1" if source_id.startswith("claude:") else "legacy"
+
+
 @dataclass(frozen=True)
 class PassageCandidate:
     tenant_id: str
@@ -738,7 +745,7 @@ class CanonicalPassageProjector:
                               PARTITION BY queue.tenant_id,queue.source_id,queue.logical_document_id
                           ),0) AS estimated_bytes,
                           evidence.document_content_sha256,
-                          coalesce(projected.requested_extraction_version,'legacy') AS extraction_version,
+                          projected.requested_extraction_version AS extraction_version,
                           evidence.manifest_artifact_id,
                           evidence.manifest_storage_backend,
                           evidence.manifest_object_key,
@@ -824,7 +831,8 @@ class CanonicalPassageProjector:
                         self._reference(row, prefix="part_")
                         for row in values
                     ),
-                    extraction_version=first["extraction_version"],
+                    extraction_version=_document_extraction_version(
+                        first["source_id"], first["extraction_version"]),
                 )
             )
         return tuple(candidates)
@@ -1115,7 +1123,8 @@ class CanonicalPassageProjector:
                     or int(current["revision"]) != candidate.revision
                     or current["document_content_sha256"]
                     != candidate.source_document_sha256
-                    or (extraction['requested_extraction_version'] if extraction else 'legacy')
+                    or _document_extraction_version(candidate.source_id,
+                        extraction['requested_extraction_version'] if extraction else None)
                     != candidate.extraction_version
                 ):
                     return {"status": "stale"}
@@ -1256,8 +1265,8 @@ class CanonicalPassageProjector:
                            policy_fingerprint,target_tokens,overlap_tokens,
                            source_document_sha256,dense_message_count,
                            dense_message_bytes,passage_count
-                           ,applied_extraction_version,extraction_coverage
-                       ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)
+                           ,requested_extraction_version,applied_extraction_version,extraction_coverage
+                       ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)
                        ON CONFLICT(tenant_id,source_id,logical_document_id)
                        DO UPDATE SET
                            revision=excluded.revision,
@@ -1283,6 +1292,7 @@ class CanonicalPassageProjector:
                         prepared.dense_message_count,
                         prepared.dense_message_bytes,
                         len(prepared.passages),
+                        candidate.extraction_version,
                         candidate.extraction_version,
                         json.dumps(prepared.extraction_coverage) if prepared.extraction_coverage is not None else None,
                     ),
