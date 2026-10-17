@@ -119,6 +119,8 @@ def _read(plane, connection, tenant_id, principal_id, expected, deadline, *, loc
     store = plane.store
     source, native = expected['source_id'], expected['native_id']
     scope = (tenant_id, source)
+    connector = 'codex.jsonl' if source.startswith('codex:') else 'claude.jsonl'
+    harness = 'codex' if connector == 'codex.jsonl' else 'claude'
     require_retirement_owner(store, connection, scope, principal_id, deadline, lock=lock)
     # Unlike ordinary exact-owner maintenance, this exceptional correction
     # always requires the explicit existing company-admin predicate.
@@ -162,7 +164,7 @@ def _read(plane, connection, tenant_id, principal_id, expected, deadline, *, loc
     deletion_id = marker_content.get('deletion_id')
     if (marker['kind'] != 'tombstone'
             or payload.get('principal_id') != source_row['owner_principal_id']
-            or payload.get('provenance', {}).get('connector_id') != 'claude.jsonl'
+            or payload.get('provenance', {}).get('connector_id') != connector
             or payload.get('content', {}).get('target_native_id') != native
             or not isinstance(deletion_id, str) or not deletion_id
             or hashlib.sha256(canonical_json(marker_content)).hexdigest() != marker['content_sha256']
@@ -215,8 +217,19 @@ def _read(plane, connection, tenant_id, principal_id, expected, deadline, *, loc
         _refuse('content_changed')
     metadata = original['canonical_redacted']
     if (original['kind'] != 'transcript_record'
-            or metadata.get('provenance', {}).get('connector_id') != 'claude.jsonl'):
+            or metadata.get('provenance', {}).get('connector_id') != connector):
         _refuse('lineage_changed')
+    if connector == 'codex.jsonl':
+        # Codex recovery is limited to source-bound native collector commits.
+        # Both the captured original and obsolete marker must retain that lineage.
+        jobs = query('''SELECT event.event_id,job.connector_id,job.status
+            FROM canonical_events event JOIN canonical_ingest_jobs job USING(tenant_id,source_id,job_id)
+            WHERE event.tenant_id=%s AND event.source_id=%s AND event.event_id=ANY(%s)''',
+            (*scope, [expected['original_event_id'], expected['marker_event_id']])).fetchall()
+        if (metadata.get('provenance', {}).get('harness') != harness
+                or len(jobs) != 2
+                or any(job['connector_id'] != connector or job['status'] != 'committed' for job in jobs)):
+            _refuse('lineage_changed')
     publication_metadata = metadata
     full_provenance = False
     if metadata.get('principal_id') != source_row['owner_principal_id']:
@@ -225,7 +238,7 @@ def _read(plane, connection, tenant_id, principal_id, expected, deadline, *, loc
         if any(key in metadata for key in ('principal_id', 'visibility', 'content_type')):
             _refuse('lineage_changed')
         provenance = metadata.get('provenance', {})
-        if (provenance.get('harness') != 'claude'
+        if (provenance.get('harness') != harness
                 or type(provenance.get('connector_schema_version')) is not int
                 or provenance['connector_schema_version'] != 1
                 or type(provenance.get('collector_version')) is not int
@@ -240,9 +253,9 @@ def _read(plane, connection, tenant_id, principal_id, expected, deadline, *, loc
             event.canonical_redacted={historical} AS full_provenance
             FROM canonical_events event JOIN canonical_ingest_jobs job USING(tenant_id,source_id,job_id)
             WHERE event.tenant_id=%s AND event.source_id=%s AND event.event_id=%s
-              AND event.body_location='raw' AND job.connector_id='claude.jsonl'
+              AND event.body_location='raw' AND job.connector_id=%s
             ''',
-            (*scope, expected['original_event_id'])).fetchone()
+            (*scope, expected['original_event_id'], connector)).fetchone()
         if accepted is None:
             _refuse('lineage_changed')
         full_provenance = accepted['compact'] is not True
@@ -318,7 +331,7 @@ def recover_collector_history(plane, *, tenant_id, principal_id, expected, opera
                     after = _read(plane, conn, tenant_id, principal_id, expected, deadline, lock=True)
                     if after != before:
                         _refuse('snapshot_changed')
-                    result = plane._write_authorized_document(conn, tenant_id=tenant_id, connector_id='claude.jsonl',
+                    result = plane._write_authorized_document(conn, tenant_id=tenant_id, connector_id=metadata['provenance']['connector_id'],
                         artifact=before['artifact'], event=event, text_redacted=encoded_content.decode())
                     if result['revision'] != 3 or result['inserted'] != 1:
                         _refuse('revision_changed')

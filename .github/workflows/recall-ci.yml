@@ -66,6 +66,7 @@ jobs:
             e2e_collector_retention_policy.py \
             e2e_legacy_cleanup_ack.py \
             e2e_collector_history_recovery.py \
+            e2e_codex_cleanup_recovery.py \
             e2e_recovery_deadline_pipeline.py \
             e2e_collector_history_lock_outcome.py \
             e2e_collector_history_compacted.py \
