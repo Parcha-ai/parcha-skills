@@ -137,7 +137,20 @@ def _visible_message(
                     and isinstance(block.get("text"), str) for block in payload["content"])
             and tuple(dict.fromkeys(_text_blocks(payload["content"]))) == blocks
         )
-        return "\n".join(blocks), COMPLETE_ASSISTANT_FINAL_UNIT if final else None
+        # Claude may split one API response into separate captured envelopes.
+        # Mark only this completed visible envelope; never join by API message ID.
+        claude_complete = (
+            value.get("type") == "assistant"
+            and isinstance(message, dict)
+            and message.get("role") == "assistant"
+            and message.get("stop_reason") == "end_turn"
+            and isinstance(message.get("content"), list)
+            and bool(message["content"])
+            and all(isinstance(block, dict) and block.get("type") == "text"
+                    and isinstance(block.get("text"), str) for block in message["content"])
+            and tuple(dict.fromkeys(_text_blocks(message["content"]))) == blocks
+        )
+        return "\n".join(blocks), COMPLETE_ASSISTANT_FINAL_UNIT if final or claude_complete else None
     # Claude can deliver its final report through this named tool instead of a
     # text block. Keep existing visible projections (and their offsets) intact.
     if (
