@@ -37,18 +37,30 @@ class RunnerWindows(unittest.TestCase):
         from recall_server import parent_chunk_window as window_owner
         with patch('recall_server.parent_chunk_proof.prove_parent_chunks',wraps=prove_parent_chunks)as full, \
                 patch.object(window_owner,'retire_window',wraps=window_owner.retire_window)as windows:
-            result=self.run_parent(max_batches=6)
+            # Six selected windows ACK the bodies; the unchanged EOF owner
+            # requires its own remaining batch to certify completion.
+            result=self.run_parent(max_batches=7)
         self.assertEqual(result['cleared_documents'],12)
         self.assertEqual(result['completed_parent_proofs'],1)
-        self.assertEqual(result['batches'],6)
+        self.assertEqual(result['batches'],7)
         self.assertEqual(full.call_count,1)
-        self.assertEqual(result['archive_gets'],32)
+        self.assertEqual(result['archive_gets'],36)
         tail = windows.call_args.kwargs
         self.assertEqual(full.call_args.kwargs['limits'],tail['limits'])
         self.assertEqual(full.call_args.kwargs['deadline_at'],tail['deadline_at'])
         self.assertEqual(tail['limits'].max_batches,1)
         self.assertLess(tail['limits'].max_archive_bytes,runner.RunnerLimits().max_archive_bytes)
         self.assertLess(tail['limits'].max_clear_bytes,self.limits.max_clear_bytes)
+
+    def test_exact_six_batches_ack_bodies_then_restart_completes(self):
+        result = self.run_parent(max_batches=6)
+        self.assertEqual(result['cleared_documents'], 12)
+        self.assertEqual(result['batches'], 6)
+        self.assertEqual(result['completed_parent_proofs'], 0)
+        self.assertFalse(result['commit_outcome_unknown'])
+        resumed = self.run_parent(max_batches=1)
+        self.assertEqual(resumed['cleared_documents'], 0)
+        self.assertEqual(resumed['completed_parent_proofs'], 1)
 
     def test_same_attempt_clear_budget_stops_after_first_window(self):
         with self.store.connect() as c:

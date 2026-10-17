@@ -161,7 +161,7 @@ def _discover(archive, scope, manifest, parts, start, limits, deadline):
     return events, dict(discovery_archive_bytes=consumed,discovery_archive_gets=gets)
 
 
-def prepare_window(store, archive, *, scope, principal_id, limits, deadline_at, remaining_bytes=None, required_scope_epoch=None, finish_tail=False):
+def prepare_window(store, archive, *, scope, principal_id, limits, deadline_at, remaining_bytes=None, required_scope_epoch=None):
     from .chunk_retirement import ChunkRetirementError, _parent_progress, require_retirement_owner
     remaining_bytes = limits.max_clear_bytes if remaining_bytes is None else remaining_bytes
     if type(remaining_bytes) is not int or not 0 <= remaining_bytes <= limits.max_clear_bytes:
@@ -184,10 +184,6 @@ def prepare_window(store, archive, *, scope, principal_id, limits, deadline_at, 
     identity = manifest_identity(manifest)
     cursor = progress['last_record_ordinal'] if progress['manifest_artifact_id'] == identity['manifest_artifact_id'] else -1
     plan = parent_retirement_plan(scope,identity)
-    if finish_tail and 0 <= manifest['record_count']-cursor-1 <= min(MAX_DOCUMENTS,limits.batch_documents):
-        # The cursor selects an owner, never authorizes completion. Full proof
-        # can clear the final tail and complete in the same remaining batch.
-        return dict(handoff_full_parent=True,plan=plan,scope_epoch=progress['scope_epoch'])
     events, cost = _discover(archive,scope,manifest,parts,cursor+1,limits,deadline_at)
     if not events:
         return dict(handoff_full_parent=True,plan=plan,cost=cost,scope_epoch=progress['scope_epoch'])
@@ -310,7 +306,7 @@ def recheck_coverage(store, connection, scope, coverage, progress, manifest, dea
 
 
 def retire_window(store, archive, *, scope, principal_id, limits, deadline_at, reviewed_plan,
-                  metadata_mode='keep', remaining_bytes=None, should_stop=None, required_scope_epoch=None, finish_tail=False):
+                  metadata_mode='keep', remaining_bytes=None, should_stop=None, required_scope_epoch=None):
     from .chunk_retirement import _retire_parent_batch, _require_singleton_archive_runtime, retire_parent_chunks
     if metadata_mode not in ('keep','singleton'):
         _fail('metadata_mode')
@@ -321,7 +317,7 @@ def retire_window(store, archive, *, scope, principal_id, limits, deadline_at, r
     if should_stop is not None and should_stop():
         return dict(status='stopped',complete=False)
     window = prepare_window(store,archive,scope=scope,principal_id=principal_id,limits=limits,
-        deadline_at=deadline_at,remaining_bytes=remaining_bytes,required_scope_epoch=required_scope_epoch,finish_tail=finish_tail)
+        deadline_at=deadline_at,remaining_bytes=remaining_bytes,required_scope_epoch=required_scope_epoch)
     if window['plan']!=reviewed_plan:
         _fail('plan_changed')
     if window['handoff_full_parent']:
@@ -384,7 +380,7 @@ def retire_parent_windows(store, archive, *, tenant_id, source_id, native_parent
                     limits=replace(limits,max_batches=limits.max_batches-totals['batches'],
                         max_clear_bytes=clear_left,max_archive_bytes=archive_left),
                     remaining_bytes=clear_left,deadline_at=deadline_at,reviewed_plan=reviewed_plan,
-                    required_scope_epoch=required_scope_epoch,metadata_mode=metadata_mode,should_stop=should_stop,finish_tail=True)
+                    required_scope_epoch=required_scope_epoch,metadata_mode=metadata_mode,should_stop=should_stop)
             except ChunkRetirementError as error:
                 clear_limited = error.error_code == 'parent_retirement_window_clear_budget_hold'
                 archive_limited = (error.error_code == 'parent_retirement_window_archive_budget' and totals['batches'] > 0)
