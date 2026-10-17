@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import sys
 import unittest
+from dataclasses import dataclass
 from pathlib import Path
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -13,10 +15,50 @@ from evals.passage_index_audit import (  # noqa: E402
     PassageIndexAuditError,
     _choose_sample,
     _span_coverage,
+    _extraction_arguments,
 )
 
 
 class PassageIndexAuditTest(unittest.TestCase):
+    def test_applied_version_requires_explicit_projector_capability(self):
+        @dataclass(frozen=True)
+        class LegacyCandidate:
+            revision: int = 1
+        with patch('evals.passage_index_audit.PassageCandidate', LegacyCandidate):
+            self.assertEqual(_extraction_arguments('legacy'), {})
+            with self.assertRaisesRegex(PassageIndexAuditError, 'version-aware projector'):
+                _extraction_arguments('tool_groups_v1')
+        @dataclass(frozen=True)
+        class VersionedCandidate(LegacyCandidate):
+            extraction_version: str = 'legacy'
+        with patch('evals.passage_index_audit.PassageCandidate', VersionedCandidate):
+            self.assertEqual(_extraction_arguments('tool_groups_v1'),
+                             {'extraction_version': 'tool_groups_v1'})
+            self.assertEqual(_extraction_arguments('legacy'), {'extraction_version': 'legacy'})
+            with self.assertRaisesRegex(PassageIndexAuditError, 'unsupported applied'):
+                _extraction_arguments('tool_groups_future')
+
+    def test_distinct_source_units_at_same_record_keep_independent_byte_coverage(self):
+        document = dict(tenant_id='tenant:test', source_id='claude:test',
+                        logical_document_id='ldoc_' + '1' * 32,
+                        dense_message_count=3, dense_message_bytes=12, passage_count=2)
+        identity = {k: document[k] for k in ('tenant_id', 'source_id', 'logical_document_id')}
+        first = 'claude.tool-input.string.v1#/message/content/1/input/report'
+        second = 'claude.tool-input.string.v1#/message/content/1/input/options/0/message'
+        spans = [dict(record_ordinal=0, record_count=1, source_byte_start=0,
+                      source_byte_end=4, **({'source_unit': unit} if unit else {}))
+                 for unit in (None, first, second)]
+        passages = [{**identity, 'spans': spans[:1]}, {**identity, 'spans': spans[1:]}]
+        self.assertEqual(_span_coverage([document], passages)['message_bytes'], 12)
+        # The legacy field and other sibling cannot fill a missing prefix here.
+        spans[2]['source_byte_start'] = 1
+        with self.assertRaisesRegex(PassageIndexAuditError, 'uncovered byte'):
+            _span_coverage([document], passages)
+        spans[2]['source_byte_start'] = 0
+        spans[2]['source_byte_end'] = 3
+        with self.assertRaisesRegex(PassageIndexAuditError, 'disagrees'):
+            _span_coverage([document], passages)
+
     def test_span_coverage_accepts_complete_overlapping_ranges(self) -> None:
         document = {
             "tenant_id": "tenant:company:test",
