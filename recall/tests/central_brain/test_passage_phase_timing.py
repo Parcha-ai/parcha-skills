@@ -95,7 +95,7 @@ class PassagePhaseTimingTest(unittest.TestCase):
                 return candidates
 
             def _commit(self, prepared):
-                return {**super()._commit(prepared), "status": "committed"}
+                return {**super()._commit(prepared), "status": "committed", "membership_legacy": True}
 
         projector = Legacy(Store(Clock()))
         projector.membership_certification = parent_membership_enrollment.CertificationSettings(

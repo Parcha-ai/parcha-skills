@@ -1809,6 +1809,14 @@ cursor advances only after an acknowledged certificate batch. Interrupted proof
 can safely run again against current generation, bindings, live grants, and Forget.
 No archive hydration, embedding, or source publication repeats for this phase.
 
+On schema 85 and later, a first or legacy publication without a generation also
+retains this queue row, with a null generation and an empty proof cursor. The
+consumer rotates the row in a short committed transaction, releases its queue
+locks, then uses the original authorized initializer for never-certified parents.
+It rereads the publication binding before proving any passages. Missing generation
+beside a prior certificate is never reset. This initialization shares the same
+three-second allowance; only pre-85 publication uses the direct legacy proof hook.
+
 New source publication and admitted repairs supersede an optional cursor.
 Source status, scan freshness, and publication pending counts exclude this
 phase. A changed epoch or binding, revoked authority, malformed checkpoint, or
