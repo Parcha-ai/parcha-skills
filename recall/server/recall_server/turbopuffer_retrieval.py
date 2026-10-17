@@ -46,10 +46,10 @@ SPARSE_LIMIT = 400
 MAX_SPARSE_TOKENS = 8
 
 
-_SELECTED_AUTHORITY_SQL = """
+_SELECTED_AUTHORITY_TEMPLATE = """
                             SELECT passage.tenant_id,passage.source_id,passage.passage_id,
                                    passage.logical_document_id,passage.text_sha256,passage.receipts,
-                                   passage.spans AS origin_spans,
+                                   {certificate_columns}passage.spans AS origin_spans,
                                    evidence.revision,evidence.manifest_object_key,
                                    evidence.manifest_content_sha256,
                                    CASE WHEN jsonb_array_length(passage.spans)=1
@@ -70,6 +70,17 @@ _SELECTED_AUTHORITY_SQL = """
                                )
                                AND cardinality(passage.receipts)>0
 """
+
+# Presence only screens impossible optional lookups. Non-NULL values still need
+# the original same-snapshot generation/epoch/binding verification.
+_SELECTED_AUTHORITY_SQL = _SELECTED_AUTHORITY_TEMPLATE.format(certificate_columns="")
+_CERTIFICATE_PRESENCE_SQL = _SELECTED_AUTHORITY_TEMPLATE.format(
+    certificate_columns=(
+        "passage.membership_generation AS _membership_generation,"
+        "passage.membership_binding_sha256 AS _membership_binding_sha256,"
+    ),
+)
+
 
 def _value(row: Any, key: str, default: Any = None) -> Any:
     """Attribute ``key`` of a result row, or ``default``.
@@ -403,7 +414,9 @@ class TurbopufferHintRetrieval(PassageHintRetrieval):
                 raise SearchDeadlineExceeded()
             connection.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
             stage_started = time.monotonic()
-            selected = self.store._execute_bounded(connection, _SELECTED_AUTHORITY_SQL,
+            read_certificates = self.parent_membership_read.enabled and not self.parent_membership_shadow.enabled
+            catalog_sql = _CERTIFICATE_PRESENCE_SQL if read_certificates else _SELECTED_AUTHORITY_SQL
+            selected = self.store._execute_bounded(connection, catalog_sql,
                 (self.tenant_id, self.sources, self.policy_fingerprint,
                  [source for source, _ in requested], [passage for _, passage in requested]),
                 deadline_at).fetchall()
@@ -415,10 +428,18 @@ class TurbopufferHintRetrieval(PassageHintRetrieval):
             stages['receipt_references'] = sum(len(row['receipts']) for row in selected)
             stages['unique_receipts'] = len(receipts)
             certified = set()
-            if self.parent_membership_read.enabled and not self.parent_membership_shadow.enabled:
+            if read_certificates:
+                candidates = []
+                for row in selected:
+                    generation = row.pop('_membership_generation', None)
+                    binding = row.pop('_membership_binding_sha256', None)
+                    if generation is not None and binding is not None:
+                        candidates.append(row)
                 certified, stages['parent_membership_read'] = parent_membership_read.partition(
-                    self.store, connection, selected=selected,
+                    self.store, connection, selected=candidates,
                     settings=self.parent_membership_read, deadline_at=deadline_at)
+                stages['parent_membership_read']['certificate_candidates'] = len(candidates)
+                stages['parent_membership_read']['fallback_passages'] = len(selected) - len(certified)
             elif self.parent_membership_read.enabled:
                 # Shadow comparison must retain actual native proof, not compare
                 # a certificate with a result derived from that same certificate.
