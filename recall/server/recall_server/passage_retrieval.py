@@ -65,7 +65,10 @@ LIVENESS_OVERSAMPLE = 2
 # matched by search; they stay reachable through recall_scan records.
 IDENTIFIER_TOKEN_RE = re.compile(
     r"(?:"
-    r"[A-Za-z0-9_-]*\d[A-Za-z0-9_-]*"          # anything with a digit: ids, versions, ports
+    r"[0-9]+(?:\.[0-9]+){2}"                  # bare major.minor.patch versions
+    r"(?:-[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*)?"  # optional prerelease
+    r"(?:\+[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*)?" # optional build metadata
+    r"|[A-Za-z0-9_-]*\d[A-Za-z0-9_-]*"          # anything with a digit: ids, versions, ports
     r"|[A-Za-z][A-Za-z0-9]*(?:[_./:#-][A-Za-z0-9]+)+"  # snake_case, dotted, paths, k8s names
     r"|[A-Z][a-z]+(?:[A-Z][a-z0-9]+)+"           # CamelCase symbols
     r"|[A-Z]+_[A-Z0-9_]+"                       # ALL_CAPS constants with a separator

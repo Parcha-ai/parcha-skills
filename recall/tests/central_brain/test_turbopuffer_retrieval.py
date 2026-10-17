@@ -163,6 +163,26 @@ class ArmTests(unittest.TestCase):
         self.assertEqual([r["passage_id"] for r in rows], ["psg_" + "0" * 31 + "1"])
         self.assertEqual(scoped._sparse_candidates("6076", **common)[1], "skipped-actor-scope")
 
+    def test_bare_version_in_original_query_reaches_existing_sparse_arm(self) -> None:
+        client = FakeTurbopuffer()
+        ns = self._seed(client)
+        ns.write(upsert_rows=[passage_row(catalog_passage(20, "release 3.39.0 rollback note"))])
+        retrieval, _ = self._retrieval(client)
+        rows, status = retrieval._sparse_candidates(
+            "release rollback note", original_query="What changed in 3.39.0?",
+            since=None, until=None, candidate_limit=40, actor_ids=None, actor_relations=None,
+            deadline_at=time.monotonic() + 5,
+        )
+        self.assertEqual(status, "ok")
+        self.assertEqual([row["passage_id"] for row in rows], ["psg_" + f"{20:032x}"])
+        self.assertEqual(ns.queries[-1]["rank_by"], ("text", "BM25", "3.39.0"))
+        self.assertEqual(ns.queries[-1]["filters"], ("And", [
+            ("source_id", "In", ["codex:linux:test"]),
+            ("policy_fingerprint", "Eq", "fp-policy"),
+            ("text", "ContainsAllTokens", "3.39.0"),
+        ]))
+        self.assertEqual(ns.queries[-1]["limit"], 80)
+
     def test_statuses_on_failure_and_deadline(self) -> None:
         client = FakeTurbopuffer()
         ns = self._seed(client)

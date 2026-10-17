@@ -3017,6 +3017,29 @@ class AllCommonLexicalTests(unittest.TestCase):
 
 
 class IdentifierSigilTests(unittest.TestCase):
+    def test_bare_three_component_versions_are_identifiers(self) -> None:
+        from recall_server.passage_retrieval import identifier_tokens
+
+        self.assertEqual(identifier_tokens("release 3.39.0 and 12.7.14"), ["3.39.0", "12.7.14"])
+
+    def test_bare_version_prerelease_build_and_existing_token_bounds(self) -> None:
+        from recall_server.passage_retrieval import identifier_tokens
+
+        self.assertEqual(
+            identifier_tokens("(7.12.4-RC.2), 7.12.4-rc.2 0.9.0+build.17 2.0.0-beta+linux.4 v3.39.0"),
+            ["7.12.4-rc.2", "0.9.0+build.17", "2.0.0-beta+linux.4", "v3.39.0"],
+        )
+        self.assertEqual(identifier_tokens(" ".join(f"1.2.{n}" for n in range(12))),
+                         [f"1.2.{n}" for n in range(8)])
+
+    def test_bare_version_grammar_does_not_admit_decimals_addresses_or_prose(self) -> None:
+        from recall_server.passage_retrieval import identifier_tokens
+
+        for text in ("1.25", "127.0.0.1", "1..2.3", "1.2.3.4", "1.2.3-", "1.2.3+",
+                     "1.2.3-rc..1", "1.2.3/notes", "ordinary prose API MCP"):
+            with self.subTest(text=text):
+                self.assertEqual(identifier_tokens(text), [])
+
     def test_hash_prefixed_numbers_are_identifiers(self) -> None:
         from recall_server.passage_retrieval import identifier_tokens
         tokens = identifier_tokens("what did Greptile flag on PR #6076 around May 2-4?")
