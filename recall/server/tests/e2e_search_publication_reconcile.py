@@ -4,10 +4,12 @@ import json
 import sys
 import time
 import unittest
+import uuid
 from pathlib import Path
 from unittest.mock import patch
 
 import psycopg
+from psycopg import sql
 from psycopg.types.json import Jsonb
 
 RECALL = Path(__file__).resolve().parents[2]
@@ -42,6 +44,54 @@ class PublicationReconcile(unittest.TestCase):
             'mode': 'explicit_forget', 'reason': 'owner_requested',
             'requested_at': '2026-10-15T00:00:00Z', 'idempotency_key': 'forget-late-upsert',
         })
+
+    def test_inflight_equal_watermark_publishes_physical_receipts(self):
+        with patch.object(self.store, 'verified_singleton_receipts', False):
+            self._assert_inflight_equal_watermark_publishes()
+
+    def test_inflight_equal_watermark_publishes_native_verified_receipts(self):
+        with patch.object(self.store, 'verified_singleton_receipts', True):
+            self._assert_inflight_equal_watermark_publishes()
+
+    def _assert_inflight_equal_watermark_publishes(self):
+        self.prepare_search()
+        publisher=self.publisher()
+        claim=self.claims(publisher)[0]
+        late_id='psg_'+uuid.uuid4().hex
+        with self.store.connect() as pending:
+            columns=[r['column_name'] for r in pending.execute(
+                "SELECT column_name FROM information_schema.columns WHERE table_name='canonical_passages' "
+                "AND is_generated='NEVER' AND column_name<>'created_at' ORDER BY ordinal_position").fetchall()]
+            # Keep DEFAULT now(): the actual writer's transaction-start timestamp.
+            expressions=[sql.Literal(late_id) if n=='passage_id' else
+                         sql.SQL('ordinal+1') if n=='ordinal' else sql.Identifier(n) for n in columns]
+            statement=sql.SQL('INSERT INTO canonical_passages ({}) SELECT {} FROM canonical_passages '
+                'WHERE tenant_id=%s LIMIT 1 RETURNING created_at').format(
+                    sql.SQL(',').join(map(sql.Identifier,columns)),sql.SQL(',').join(expressions))
+            created=pending.execute(statement,(self.tenant,)).fetchone()['created_at']
+            # A real publisher finishes while the second passage remains invisible.
+            first=publisher.drain(tenant_id=self.tenant,max_months=10)
+            self.assertEqual(first['failed'],0)
+            self.assertNotIn(late_id,self.namespace.rows)
+            with self.store.connect() as observed:
+                watermark=publisher.shard_watermark(observed,claim)
+            self.assertEqual(watermark,created,'fixture must hit the actual active transaction boundary')
+            enqueue_search_outbox(pending,tenant_id=self.tenant,source_id=self.source,
+                                  months=[claim['month']],reason='logical-update')
+        writes_before=len(self.namespace.writes)
+        second=publisher.drain(tenant_id=self.tenant,max_months=10)
+        self.assertEqual(second['failed'],0)
+        self.assertEqual(self.claims(publisher),[])
+        self.assertIn(late_id,self.namespace.rows,'native incremental ACK skipped an equal-watermark commit')
+        new_writes=self.namespace.writes[writes_before:]
+        sent={row['id'] for write in new_writes for row in write.get('upsert_rows',[])}
+        self.assertEqual(sent,{late_id},'older-than-watermark rows must stay excluded')
+        self.assertEqual(len(self.namespace.rows),2)
+        writes_after=len(self.namespace.writes)
+        idle=publisher.drain(tenant_id=self.tenant,max_months=10)
+        self.assertEqual(idle['months'],0)
+        self.assertEqual(len(self.namespace.writes),writes_after)
+        self.assertEqual(len(self.namespace.rows),2)
 
     def test_late_upsert_after_forget_delete_ack_has_durable_repair(self):
         self.plane.evidence_projector = self.projector
