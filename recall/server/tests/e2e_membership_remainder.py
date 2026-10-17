@@ -13,6 +13,218 @@ from e2e_passage_receipt_repair import Repair
 
 
 class MembershipRemainderTests(ParentMembershipPublicationTests):
+    def receipt_weighted_parent(self, counts=(400, 400, 100)):
+        # Synthetic fanout on native current rows: exercise actual membership,
+        # ownership, certificate commits and durable queue CAS, not archive I/O.
+        self.ingest("turn/receipt-fanout", "Synthetic evidence paragraph. " * 3000)
+        self.interrupted_publication()
+        with self.store.connect() as c:
+            passages = c.execute("SELECT passage_id FROM canonical_passages WHERE tenant_id=%s ORDER BY passage_id",
+                                 (self.tenant,)).fetchall()
+            self.assertGreaterEqual(len(passages), len(counts))
+            ids = tuple(row["passage_id"] for row in passages[:len(counts)])
+            c.execute("DELETE FROM canonical_passages WHERE tenant_id=%s AND NOT(passage_id=ANY(%s))",
+                      (self.tenant, list(ids)))
+            c.execute("""INSERT INTO canonical_chunks
+                (tenant_id,source_id,chunk_id,document_id,ordinal,receipt,text_redacted,text_sha256)
+                SELECT tenant_id,source_id,chunk_id||'-fanout-'||n,document_id,n,
+                    split_part(receipt,'#',1)||'#item='||n,text_redacted,text_sha256
+                FROM canonical_chunks CROSS JOIN generate_series(1,%s) AS n
+                WHERE tenant_id=%s AND receipt=%s""",
+                (sum(counts), self.tenant, self.receipt))
+            receipts = [self.receipt.split("#", 1)[0] + "#item=" + str(n)
+                        for n in range(1, sum(counts) + 1)]
+            start = 0
+            for passage, count in zip(ids, counts):
+                c.execute("UPDATE canonical_passages SET receipts=%s,membership_generation=NULL,"
+                          "membership_binding_sha256=NULL WHERE tenant_id=%s AND passage_id=%s",
+                          (receipts[start:start+count], self.tenant, passage))
+                start += count
+        self.refresh_scope()
+        self.scope["limits"] = dict(passages=128, receipt_references=20000, metadata_bytes=8*1024*1024)
+        return ids
+
+    def test_receipt_prefix_survives_later_native_query_cancel(self):
+        ids = self.receipt_weighted_parent()
+        original = self.store._execute_bounded
+        ownership_calls = []
+
+        def cancel_second(connection, statement, parameters, deadline):
+            if statement == enrollment._OWNERS:
+                ownership_calls.append(tuple(parameters[0]))
+                if len(ownership_calls) == 2:
+                    return original(connection, "SELECT pg_sleep(1)", (),
+                                    min(deadline, time.monotonic() + .01))
+            return original(connection, statement, parameters, deadline)
+
+        with patch.object(self.store, "_execute_bounded", side_effect=cancel_second):
+            first = self.run_cycle()
+        self.assertEqual(first["membership_failed_documents"], 1)
+        self.assertEqual(first["membership_failures"][0]["sqlstate"], "57014")
+        self.assertEqual(first["membership_certified_passages"], 1)
+        self.assertEqual(self.queued()[0]["checkpoint"]["after"], ids[0])
+        self.assertEqual(self.compare()["certified_passages"], 1)
+        second = self.run_cycle()
+        self.assertEqual(second["membership_certified_passages"], 2)
+        self.assertEqual(self.queued(), [])
+        self.assertEqual(self.compare()["certified_passages"], 3)
+        self.assertEqual(self.compare()["disagreements"], 0)
+
+    def test_oversized_first_passage_is_proved_whole_without_skipping(self):
+        ids = self.receipt_weighted_parent((513, 1))
+        original = enrollment.certify_published_passages
+        attempted = []
+
+        def record(*args, **kwargs):
+            attempted.append(tuple(kwargs["passage_ids"]))
+            return original(*args, **kwargs)
+
+        with patch.object(enrollment, "certify_published_passages", side_effect=record):
+            outcome = self.run_cycle()
+        self.assertEqual(attempted, [(ids[0],), (ids[1],)])
+        self.assertEqual(outcome["membership_certified_passages"], 2)
+        self.assertEqual(self.queued(), [])
+        self.assertEqual(self.compare()["certified_passages"], 2)
+        self.assertEqual(self.compare()["disagreements"], 0)
+
+    def test_receipt_prefix_includes_exact_quantum_boundary(self):
+        ids = self.receipt_weighted_parent((400, 112, 1))
+        original = enrollment.certify_published_passages
+        attempted = []
+
+        def record(*args, **kwargs):
+            attempted.append(tuple(kwargs["passage_ids"]))
+            return original(*args, **kwargs)
+
+        with patch.object(enrollment, "certify_published_passages", side_effect=record):
+            result = self.run_cycle()
+        self.assertEqual(attempted, [ids[:2], ids[2:]])
+        self.assertEqual(result["membership_certified_passages"], 3)
+        self.assertEqual(self.queued(), [])
+        self.assertEqual(self.compare()["disagreements"], 0)
+
+    def test_duplicate_receipts_count_conservatively_without_losing_passages(self):
+        ids = self.receipt_weighted_parent((400, 200))
+        with self.store.connect() as c:
+            for passage, count in zip(ids, (400, 200)):
+                c.execute("UPDATE canonical_passages SET receipts=array_fill(receipts[1],ARRAY[%s]) "
+                          "WHERE tenant_id=%s AND passage_id=%s", (count, self.tenant, passage))
+        original = enrollment.certify_published_passages
+        attempted = []
+
+        def record(*args, **kwargs):
+            attempted.append(tuple(kwargs["passage_ids"]))
+            return original(*args, **kwargs)
+
+        with patch.object(enrollment, "certify_published_passages", side_effect=record):
+            result = self.run_cycle()
+        self.assertEqual(attempted, [(ids[0],), (ids[1],)])
+        self.assertEqual(result["membership_certified_passages"], 2)
+        self.assertEqual(self.compare()["certified_passages"], 2)
+        self.assertEqual(self.compare()["disagreements"], 0)
+        self.assertEqual(self.queued(), [])
+
+    def test_first_prefix_cancellation_makes_no_durable_progress(self):
+        self.receipt_weighted_parent()
+        before = self.queued()
+        original = self.store._execute_bounded
+
+        def cancel(connection, statement, parameters, deadline):
+            if statement == enrollment._OWNERS:
+                return original(connection, "SELECT pg_sleep(1)", (),
+                                min(deadline, time.monotonic() + .01))
+            return original(connection, statement, parameters, deadline)
+
+        with patch.object(self.store, "_execute_bounded", side_effect=cancel):
+            outcome = self.run_cycle()
+        self.assertEqual(outcome["membership_certified_passages"], 0)
+        self.assertEqual(outcome["membership_failures"][0]["sqlstate"], "57014")
+        after = self.queued()
+        self.assertEqual(after[0]["generation"], before[0]["generation"])
+        self.assertEqual(after[0]["checkpoint"]["after"], "")
+        # The synthetic chunk insertion advanced native authority after queueing;
+        # refreshing that generation is allowed, advancing unproved IDs is not.
+        with self.store.connect() as c:
+            current = c.execute(remainder.CURRENT, remainder.key(after[0])).fetchone()
+        self.assertEqual(after[0]["checkpoint"]["authority_generation"], current["authority_generation"])
+        self.assertEqual(self.compare()["certified_passages"], 0)
+        self.assertEqual(self.compare()["native_allowed_passages"], 3)
+
+    def prefix_cursor_interruption(self, *, commit_cursor):
+        ids = self.receipt_weighted_parent()
+        original = remainder.change_cursor
+
+        def interrupted(*args, **kwargs):
+            if kwargs.get("after") is not None:
+                if commit_cursor:
+                    original(*args, **kwargs)
+                raise OSError("synthetic cursor response interruption")
+            return original(*args, **kwargs)
+
+        with patch.object(remainder, "change_cursor", side_effect=interrupted):
+            first = self.run_cycle()
+        self.assertEqual(first["membership_certified_passages"], 1)
+        self.assertEqual(self.queued()[0]["checkpoint"]["after"], ids[0] if commit_cursor else "")
+        self.assertEqual(self.compare()["certified_passages"], 1)
+        second = self.run_cycle()
+        self.assertEqual(second["membership_certified_passages"], 2 if commit_cursor else 3)
+        self.assertEqual(self.queued(), [])
+        self.assertEqual(self.compare()["certified_passages"], 3)
+        self.assertEqual(self.compare()["disagreements"], 0)
+
+    def test_prefix_certificate_ack_without_cursor_ack_reproves(self):
+        self.prefix_cursor_interruption(commit_cursor=False)
+
+    def test_prefix_cursor_lost_ack_resumes_after_committed_prefix(self):
+        self.prefix_cursor_interruption(commit_cursor=True)
+
+    def test_edit_between_prefixes_invalidates_prior_certificates(self):
+        ids = self.receipt_weighted_parent()
+        original = remainder.change_cursor
+        changed = []
+
+        def edited(*args, **kwargs):
+            result = original(*args, **kwargs)
+            if kwargs.get("after") == ids[0] and not changed:
+                changed.append(True)
+                self.edit()
+            return result
+
+        with patch.object(remainder, "change_cursor", side_effect=edited):
+            outcome = self.run_cycle()
+        self.assertEqual(outcome["membership_certified_passages"], 1)
+        self.assertEqual(self.queued()[0]["checkpoint"]["after"], ids[0])
+        self.assertEqual(self.compare()["certified_passages"], 0)
+        self.assertEqual(self.compare()["disagreements"], 0)
+
+    def test_forget_between_prefixes_blocks_later_proof(self):
+        from recall_server.canonical import CanonicalLifecycleError
+
+        ids = self.receipt_weighted_parent()
+        original = remainder.change_cursor
+        forgotten = []
+        request = dict(contract="recall.forget-request.v1", schema_version=1,
+            tenant_id=self.tenant, principal_id=self.principal, source_id=self.source,
+            target_receipt=self.receipt, mode="explicit_forget", reason="owner_requested",
+            requested_at="2026-10-14T00:01:00Z", idempotency_key="prefix-forget")
+
+        def forget(*args, **kwargs):
+            result = original(*args, **kwargs)
+            if kwargs.get("after") == ids[0] and not forgotten:
+                forgotten.append(True)
+                with patch.object(self.archive, "delete_internal_raw_bounded", side_effect=OSError("synthetic cleanup failure")):
+                    with self.assertRaisesRegex(CanonicalLifecycleError, "archive_delete_failed"):
+                        self.plane.forget(request)
+            return result
+
+        with patch.object(remainder, "change_cursor", side_effect=forget):
+            outcome = self.run_cycle()
+        self.assertEqual(outcome["membership_certified_passages"], 1)
+        compared = self.compare()
+        self.assertEqual(compared["certified_passages"], 0)
+        self.assertEqual(compared["native_allowed_passages"], 0)
+        self.assertEqual(compared["disagreements"], 0)
+
     def test_native_query_cancel_retains_failure_scope_and_queue_for_restart(self):
         self.interrupted_publication()
         before = self.queued()
