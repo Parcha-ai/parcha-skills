@@ -305,6 +305,111 @@ def recheck_coverage(store, connection, scope, coverage, progress, manifest, dea
         _fail('witness_changed')
 
 
+def _advance_without_physical_work(store, *, scope, principal_id, reviewed_plan,
+                                   required_scope_epoch, limits, deadline_at):
+    """Advance scheduling over current admitted rows; never assert archive proof."""
+    from .chunk_retirement import (
+        ChunkRetirementError, _parent_progress, _try_parent_native_locks,
+        require_retirement_owner,
+    )
+    started = time.monotonic()
+    with store.connect() as connection, connection.transaction():
+        def query(sql, values=()):
+            return store._execute_bounded(connection, sql, values, deadline_at)
+        require_retirement_owner(store, connection, scope[:2], principal_id, deadline_at)
+        if not _try_parent_native_locks(query, scope, [dict(native_id=scope[2])]):
+            raise ChunkRetirementError('parent_retirement_lock_busy')
+        # Publication/thinning take this lock; restore holds it FOR SHARE.
+        query('''SELECT 1 FROM canonical_evidence_documents
+            WHERE tenant_id=%s AND source_id=%s AND native_parent_id=%s
+            FOR UPDATE NOWAIT''', scope).fetchone()
+        current = read_parent_catalog(store, connection, scope, deadline_at)
+        manifest = manifest_identity(current['manifest'])
+        if parent_retirement_plan(scope, manifest) != reviewed_plan:
+            _fail('plan_changed')
+        progress = _parent_progress(store, connection, scope, deadline_at, lock=True)
+        if (not progress or not progress['enabled'] or required_scope_epoch is not None
+                and progress['scope_epoch'] != required_scope_epoch):
+            raise ChunkRetirementError('parent_retirement_disabled')
+        _witnesses(store, connection, scope, (), deadline_at)
+        if current['queue'] is not None:
+            _fail('pending')
+        cursor = progress['last_record_ordinal'] if progress['manifest_artifact_id'] == manifest['manifest_artifact_id'] else -1
+        bound = min(MAX_DOCUMENTS, limits.batch_documents)
+        rows = query('''SELECT document.document_id,document.native_id,
+                document.body_record_ordinal,document.body_record_count,
+                document.chunk_receipt_profile,
+                EXISTS(SELECT 1 FROM canonical_chunks chunk
+                    WHERE chunk.tenant_id=document.tenant_id AND chunk.source_id=document.source_id
+                      AND chunk.document_id=document.document_id) AS physical_row
+            FROM canonical_documents document
+            JOIN canonical_events event USING(tenant_id,source_id,event_id)
+            WHERE document.tenant_id=%s AND document.source_id=%s
+              AND coalesce(event.native_parent_id,event.native_id)=%s
+              AND document.is_current AND document.deleted_at IS NULL
+              AND (document.body_record_ordinal IS NULL OR document.body_record_count IS NULL
+                OR document.body_record_ordinal<0 OR document.body_record_count<1
+                OR document.body_record_ordinal::bigint+document.body_record_count>%s)
+            ORDER BY document.body_record_ordinal NULLS FIRST,document.document_id
+            LIMIT %s FOR UPDATE OF document NOWAIT''', (*scope, cursor+1, bound+1)).fetchall()
+        selected, through = [], cursor
+        for index, row in enumerate(rows[:bound]):
+            first, count = row['body_record_ordinal'], row['body_record_count']
+            if (type(first) is not int or type(count) is not int or first != through+1 or count < 1
+                    or first+count > manifest['record_count'] or row['chunk_receipt_profile'] != 1
+                    or row['physical_row']):
+                break
+            # A duplicate/overlapping locator must not fall behind the new cursor.
+            if index+1 < len(rows) and (rows[index+1]['body_record_ordinal'] is None
+                    or rows[index+1]['body_record_ordinal'] < first+count):
+                break
+            selected.append(row)
+            through = first+count-1
+        complete = through == manifest['record_count']-1
+        if not selected and not (complete and not rows):
+            return None
+        if not _try_parent_native_locks(query, scope, selected):
+            raise ChunkRetirementError('parent_retirement_lock_busy')
+        witnesses = _witnesses(store, connection, scope, tuple(row['native_id'] for row in selected), deadline_at, lock=True)
+        for row in selected:
+            witness = witnesses[row['native_id']]
+            if witness is None or witness['is_tombstone'] or any(witness[key] != row[key]
+                    for key in ('document_id', 'body_record_ordinal', 'body_record_count')):
+                _fail('witness_changed')
+        if complete:
+            # Same whole-parent no-work predicate as the reviewed EOF scheduler.
+            # No deletion/ordinal/text filter: even an empty retained row blocks it.
+            drained = query('''WITH current_documents AS NOT MATERIALIZED (
+                    SELECT document.tenant_id,document.source_id,document.document_id,document.chunk_receipt_profile
+                    FROM canonical_documents document
+                    JOIN canonical_events event USING(tenant_id,source_id,event_id)
+                    WHERE document.tenant_id=%s AND document.source_id=%s
+                      AND coalesce(event.native_parent_id,event.native_id)=%s
+                      AND document.is_current AND document.deleted_at IS NULL)
+                SELECT CASE WHEN EXISTS (SELECT 1 FROM current_documents)
+                    THEN NOT EXISTS (SELECT 1 FROM current_documents document
+                        WHERE document.chunk_receipt_profile IS DISTINCT FROM 1
+                           OR EXISTS (SELECT 1 FROM canonical_chunks chunk
+                               WHERE chunk.tenant_id=document.tenant_id AND chunk.source_id=document.source_id
+                                 AND chunk.document_id=document.document_id))
+                    END AS drained''', scope).fetchone()['drained']
+            if drained is not True or len(rows) > len(selected):
+                return None
+        changed = query('''UPDATE canonical_chunk_retirement_progress progress
+            SET manifest_artifact_id=%s,last_record_ordinal=%s,status=%s,updated_at=clock_timestamp()
+            WHERE tenant_id=%s AND source_id=%s AND native_parent_id=%s
+              AND NOT EXISTS (SELECT 1 FROM canonical_evidence_document_queue queued
+                WHERE queued.tenant_id=progress.tenant_id AND queued.source_id=progress.source_id
+                  AND queued.native_parent_id=progress.native_parent_id)''',
+            (manifest['manifest_artifact_id'], through, 'complete' if complete else 'partial', *scope)).rowcount
+        if changed != 1:
+            _fail('pending')
+        _check_deadline(deadline_at)
+    return dict(status='complete' if complete else 'partial', complete=complete, batches=1,
+        completion_proof='no_remaining_physical_work' if complete else None,
+        skipped_records=through-cursor, sql_ms=(time.monotonic()-started)*1000)
+
+
 def retire_window(store, archive, *, scope, principal_id, limits, deadline_at, reviewed_plan,
                   metadata_mode='keep', remaining_bytes=None, should_stop=None, required_scope_epoch=None):
     from .chunk_retirement import _retire_parent_batch, _require_singleton_archive_runtime, retire_parent_chunks
@@ -316,6 +421,12 @@ def retire_window(store, archive, *, scope, principal_id, limits, deadline_at, r
         return dict(status='stopped',complete=False)
     if should_stop is not None and should_stop():
         return dict(status='stopped',complete=False)
+    if metadata_mode == 'singleton':
+        skipped = _advance_without_physical_work(store, scope=scope, principal_id=principal_id,
+            reviewed_plan=reviewed_plan, required_scope_epoch=required_scope_epoch, limits=limits,
+            deadline_at=min(deadline_at,time.monotonic()+5))
+        if skipped is not None:
+            return skipped
     window = prepare_window(store,archive,scope=scope,principal_id=principal_id,limits=limits,
         deadline_at=deadline_at,remaining_bytes=remaining_bytes,required_scope_epoch=required_scope_epoch)
     if window['plan']!=reviewed_plan:
@@ -341,7 +452,7 @@ def retire_window(store, archive, *, scope, principal_id, limits, deadline_at, r
 def retire_parent_windows(store, archive, *, tenant_id, source_id, native_parent_id,
                           apply, reviewed_plan, limits, deadline_at, required_scope_epoch,
                           owner_principal_id, should_stop=None, metadata_mode='keep'):
-    """Use one claimed attempt budget; only the original EOF proof completes it."""
+    """Use one attempt budget; distinguish physical no-work from archive proof."""
     from dataclasses import replace
     import psycopg
     from .chunk_retirement import ChunkRetirementError, _parent_scope, _parent_deadline

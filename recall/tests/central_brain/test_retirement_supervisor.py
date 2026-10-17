@@ -113,6 +113,21 @@ print(json.dumps({'status':'complete','cleared_documents':3,'cleared_utf8_bytes'
                       'metadata_membership_calls','metadata_membership_ms','metadata_spool_ms'):
             self.assertIn(f'{field}={result[field]}', logs.output[0])
 
+    def test_scheduling_completion_is_logged_separately_from_archive_proofs(self):
+        from io import BytesIO
+        from unittest.mock import Mock
+        for counters in ({'completed_noop_parents': 2, 'completed_parent_proofs': 1}, {}):
+            with self.subTest(counters=counters):
+                result = dict(status='complete', cleared_documents=0,
+                    cleared_utf8_bytes=0, **counters)
+                self.worker.child = Mock(returncode=0, stdout=BytesIO(json.dumps(result).encode()))
+                self.worker.child.poll.return_value = 0
+                with self.assertLogs('recall_server.retirement_supervisor', level='INFO') as logs:
+                    observed = self.worker.cycle()
+                self.assertEqual(observed, result)
+                for field in ('completed_noop_parents', 'completed_parent_proofs'):
+                    self.assertIn(f'{field}={counters.get(field)}', logs.output[0])
+
     def test_unknown_claim_identity_reaches_existing_log(self):
         from io import BytesIO
         from unittest.mock import Mock
