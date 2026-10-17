@@ -322,7 +322,7 @@ def resume(store, row, *, settings, deadline_at):
             if outcome["status"] != "enrolled":
                 if outcome["status"] not in ("failed", "deadline", "busy", "changed"):
                     change_cursor(store, row, checkpoint, deadline_at=deadline_at)
-                return dict(status=outcome["status"], certified_passages=certified)
+                return dict(outcome, certified_passages=certified)
             if outcome["certified_passages"] != len(ids):
                 raise ValueError("certification_batch_incomplete")
             if not change_cursor(
@@ -331,10 +331,12 @@ def resume(store, row, *, settings, deadline_at):
                 return dict(status="changed", certified_passages=certified)
             checkpoint = dict(checkpoint, after=ids[-1])
         return dict(status="deadline", certified_passages=certified)
-    except Exception:
+    except Exception as error:
         # Earlier commits remain acknowledged work; the uncertain batch's cursor
         # stays unchanged and a later ordinary slice can safely reprove it.
-        return dict(status="failed", certified_passages=certified)
+        return dict(status="failed", certified_passages=certified,
+                    failure=native.certification_failure(error, source_id=row["source_id"],
+                        logical_document_id=row["logical_document_id"]))
 
 
 def seed_history(

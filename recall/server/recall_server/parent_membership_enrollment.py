@@ -332,6 +332,26 @@ class CertificationSettings:
         return cls(enabled=value=='1',binding_epoch=os.environ.get('RECALL_PARENT_MEMBERSHIP_EPOCH',''))
 
 
+def certification_failure(error, *, source_id=None, logical_document_id=None,
+                          native_parent_id=None):
+    """Retain attempted scope and exception metadata, never exception text."""
+    state = None
+    # BrainStore wraps QueryCanceled in SearchDeadlineExceeded with a cause.
+    # Match the existing retirement diagnostic's bounded direct/cause lookup.
+    for candidate in (error, error.__cause__):
+        try:
+            value = getattr(candidate, 'sqlstate', None)
+            if isinstance(value, str) and len(value) == 5 and all(
+                    char in '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ' for char in value):
+                state = value
+                break
+        except Exception:
+            pass
+    return dict(error_class=type(error).__name__, sqlstate=state,
+                source_id=source_id, logical_document_id=logical_document_id,
+                native_parent_id=native_parent_id)
+
+
 def certify_published_passages(store, *, tenant_id, source_id, logical_document_id,
                                passage_ids, settings, deadline_at):
     """Enroll committed publication metadata within one finite caller budget.
@@ -360,10 +380,12 @@ def certify_published_passages(store, *, tenant_id, source_id, logical_document_
                 principal_id=owner['owner_principal_id'],native_parent_id=owner['native_parent_id'],
                 passage_ids=passage_ids[start:start+limits['passages']],limits=limits,
                 binding_epoch=settings.binding_epoch,deadline_at=deadline_at)
-        except Exception:
+        except Exception as error:
             # Earlier batches have committed. Report those acknowledged writes
             # even when a later batch fails; they are not a current-coverage claim.
-            return dict(status='failed',certified_passages=certified)
+            return dict(status='failed',certified_passages=certified,
+                failure=certification_failure(error, source_id=source_id,
+                    logical_document_id=logical_document_id, native_parent_id=owner['native_parent_id']))
         if outcome['status']=='enrolled':
             certified+=outcome['passages']
         else:

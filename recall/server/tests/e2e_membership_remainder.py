@@ -13,6 +13,40 @@ from e2e_passage_receipt_repair import Repair
 
 
 class MembershipRemainderTests(ParentMembershipPublicationTests):
+    def test_native_query_cancel_retains_failure_scope_and_queue_for_restart(self):
+        self.interrupted_publication()
+        before = self.queued()
+
+        def cancelled(*args, **kwargs):
+            with self.store.connect() as connection:
+                self.store._execute_bounded(connection, "SELECT pg_sleep(1)", (),
+                    time.monotonic() + .01)
+
+        with patch.object(enrollment, "enroll_parent_passages", side_effect=cancelled):
+            result = self.run_cycle()
+        self.assertEqual(result["membership_failed_documents"], 1)
+        self.assertEqual(result["membership_certified_passages"], 0)
+        self.assertEqual(result["membership_failures"], [dict(
+            error_class="SearchDeadlineExceeded", sqlstate="57014", source_id=self.source,
+            native_parent_id="session", logical_document_id=before[0]["logical_document_id"])])
+        self.assertEqual(self.queued(), before)
+        resumed = self.run_cycle()
+        self.assertEqual(resumed["documents"], 0)
+        self.assertEqual(resumed["membership_failures"], [])
+        self.assertEqual(self.queued(), [])
+        self.assertEqual(self.compare()["disagreements"], 0)
+
+    def test_queue_selection_failure_does_not_invent_parent_identity(self):
+        self.interrupted_publication()
+        before = self.queued()
+        with patch.object(remainder, "pending", side_effect=OSError("private diagnostic text")):
+            result = self.run_cycle()
+        self.assertEqual(result["membership_failed_documents"], 1)
+        self.assertEqual(result["membership_failures"], [dict(error_class="OSError",
+            sqlstate=None, source_id=None, native_parent_id=None, logical_document_id=None)])
+        self.assertEqual(self.queued(), before)
+        self.assertNotIn("private diagnostic text", repr(result))
+
     def test_empty_early_queue_does_not_spend_proof_budget_during_source_work(self):
         from recall_server.projection_worker import run_projection_worker
 

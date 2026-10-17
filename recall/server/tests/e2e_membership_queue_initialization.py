@@ -154,7 +154,9 @@ class QueueInitializationTests(ParentMembershipPublicationTests):
             raise OSError('lost initializer commit response')
         with patch.object(enrollment, 'initialize_published_parent_generation', side_effect=lost):
             result = self.resume(row)
-        self.assertEqual(result, dict(status='failed', certified_passages=0))
+        self.assertEqual(result, dict(status='failed', certified_passages=0,
+            failure=dict(error_class='OSError', sqlstate=None, source_id=row['source_id'],
+                logical_document_id=row['logical_document_id'], native_parent_id=None)))
         self.assertEqual(self.pending(), [row])
         self.assertIsNotNone(self.generation())
         with patch.object(enrollment, 'initialize_published_parent_generation', side_effect=AssertionError('already initialized')):
@@ -225,7 +227,9 @@ class QueueInitializationTests(ParentMembershipPublicationTests):
             before = connection.execute('SELECT changed_at FROM canonical_passage_projection_queue WHERE tenant_id=%s', (self.tenant,)).fetchone()['changed_at']
         with patch.object(enrollment, 'initialize_published_parent_generation', side_effect=OSError('initializer unavailable')):
             result = self.resume(row)
-        self.assertEqual(result, dict(status='failed', certified_passages=0))
+        self.assertEqual(result, dict(status='failed', certified_passages=0,
+            failure=dict(error_class='OSError', sqlstate=None, source_id=row['source_id'],
+                logical_document_id=row['logical_document_id'], native_parent_id=None)))
         with self.store.connect() as connection:
             after = connection.execute('SELECT changed_at,certification_checkpoint FROM canonical_passage_projection_queue WHERE tenant_id=%s', (self.tenant,)).fetchone()
         self.assertGreater(after['changed_at'], before)
