@@ -84,6 +84,8 @@ The retained two-passage fixture with 128 spans per passage uses at most 13,928
 program bytes for legacy spans and 15,828 for new units. The new fixture has
 172 bytes of headroom. Longer variable pointers still obey the existing cap
 and may be refused; this measurement does not promise every string length fits.
+The separate 256-distinct-input-key fixture reads back every leaf and uses at
+most 14,900 program bytes, leaving 1,100 bytes of headroom.
 
 The native PostgreSQL fixture uses the original metadata and source-opening
 owners, archived files, and generated reader. It verifies both origins and

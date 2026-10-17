@@ -183,6 +183,23 @@ class ToolUnitCaptureTest(unittest.TestCase):
                 self.assertFalse(row['complete_selected_passages']);self.assertNotIn('text',row)
                 self.assertEqual(row['error'],'tool_source_unit_invalid')
 
+    def test_maximum_spans_with_distinct_ordinary_input_keys(self):
+        values={f'field_{i:03d}':chr(65+i%26)for i in range(256)}
+        content=envelope();content['message']['content'][0]['input']=values
+        hit=tool_mount(self.mount,content=content)
+        hit['matching_ranges']=[]
+        for p in range(2):
+            spans=[dict(record_ordinal=0,record_count=1,source_byte_start=0,
+                        source_byte_end=1,passage_byte_start=i*2,passage_byte_end=i*2+1,
+                        source_unit=f'claude.tool-input.string.v1#/message/content/0/input/field_{p*128+i:03d}')for i in range(128)]
+            text='\n'.join(values[f'field_{p*128+i:03d}']for i in range(128))
+            hit['matching_ranges'].append(dict(passage_id='psg_'+str(p)*32,text=text[:3],
+                spans=spans,receipts=[RECEIPT]))
+        row,client=self.run_capture(hit)
+        self.assertTrue(row['complete_selected_passages'],row)
+        self.assertEqual(row['text'],'\n'.join(values.values()))
+        self.assertTrue(all(len(args['program'].encode())<=16000 for _,args,_ in client.calls))
+
     def test_wrong_provider_record_role_duplicate_keys_and_bounds_fail(self):
         duplicate=json.dumps(envelope()).replace('"message": "Caf','"message": "first", "message": "Caf')
         for change in ['duplicate','role','envelope','end','utf8','receipt']:
