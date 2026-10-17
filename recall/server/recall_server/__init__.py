@@ -39,6 +39,8 @@ MEMBERSHIP_REMAINDER_VERSION = 85
 AUDIT_MAINTENANCE_VERSION = 86
 # Optional event-only actor completeness; disabled by default.
 LOGICAL_ACTOR_CHECKPOINT_VERSION = 87
+# Optional full-oracle dirty-plan enrollment; no sparse reads enabled by DDL.
+PARQUET_DIRTY_PLAN_VERSION = 88
 # Optional until a delayed Slack body needs a terminal-identity ACK.
 SUPPRESSED_ARTIFACT_SCHEMA_VERSION = 77
 MANDATORY_SCHEMA_VERSION = 69
