@@ -119,6 +119,16 @@ class CertificationSelectionTests(ParentMembershipPublicationTests):
         )
         self.assertEqual(len(remaining), 2)
 
+    def test_worker_preserves_configured_batch_above_body_projection_maximum(self):
+        self.ready_parents()
+        outcome = self.worker_cycle(self.publisher(), batch_size=1001)
+        self.assertEqual(outcome["membership_failed_documents"], 0)
+        self.assertGreater(outcome["membership_certified_passages"], 0)
+        self.assertEqual(remainder.pending(
+            self.store, tenant_id=self.tenant, limit=10,
+            deadline_at=time.monotonic() + 3,
+        ), [])
+
     def test_expired_first_proof_does_not_attempt_other_selected_parents(self):
         parents = self.ready_parents()
         original = enrollment.certify_published_passages

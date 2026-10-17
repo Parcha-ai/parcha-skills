@@ -2065,7 +2065,7 @@ class CanonicalPassageProjector:
             or not 1 <= concurrency <= 32
             or isinstance(certification_batch_size, bool)
             or not isinstance(certification_batch_size, int)
-            or not 1 <= certification_batch_size <= MAX_PASSAGE_PROJECTION_BATCH
+            or certification_batch_size < 1
         ):
             raise ValueError("passage projection budget is invalid")
         phase_started = time.monotonic()
