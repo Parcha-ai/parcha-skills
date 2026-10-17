@@ -14,6 +14,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime
 from io import BytesIO
 from typing import Any, Callable, ClassVar, Iterable, Iterator
+from types import SimpleNamespace
 
 import psycopg
 
@@ -25,10 +26,14 @@ from .logical_evidence import (
 )
 from .passage_projection import (
     MAX_PASSAGE_HEADER_BYTES,
+    COMPLETE_SOURCE_UNITS,
     LOGICAL_DOCUMENT_ID_RE,
     PASSAGE_EMBEDDING_SEPARATOR,
     LosslessPassage,
     PassagePolicy,
+    PassageSpan,
+    reconstruct_passage,
+    visible_message_text,
     build_passages,
     canonical_spans_json,
     decode_logical_record,
@@ -119,6 +124,116 @@ class PreparedPassageDocument:
     archive_bytes_read: int = 0
     archive_parts_read: int = 0
     extraction_coverage: dict[str, Any] | None = None
+    legacy_migration: dict[str, Any] | None = None
+
+
+_LEGACY_PASSAGES = """SELECT passage_id,ordinal,revision,text_sha256,receipts,spans
+    FROM canonical_passages WHERE tenant_id=%s AND source_id=%s
+      AND logical_document_id=%s ORDER BY ordinal"""
+_MIGRATION_FIELDS = ('revision', 'source_document_sha256', 'policy_fingerprint',
+                     'requested_extraction_version', 'applied_extraction_version')
+
+
+def _legacy_result_intervals(old, messages, passages, groups, current_receipts):
+    """Prove the narrow old-visible-text to single typed result-leaf migration."""
+    normal = {(m.record_ordinal, m.record_count): m for m in messages}
+    # Use the native emitted unit: an oversized complete final can be split
+    # into ordinary windows instead of carrying its complete-message marker.
+    normal_units = {}
+    for passage in passages:
+        for span in passage.spans:
+            normal_units.setdefault((span.record_ordinal, span.record_count), set()).add(span.source_unit)
+    historical = dict(normal)
+    leaves = {}
+    for group in groups:
+        if group.evidence_kind != 'tool_result':
+            continue
+        for message in group.messages:
+            key = (message.record_ordinal, message.record_count)
+            leaves.setdefault(key, []).append(message)
+            historical[key] = replace(message, text=visible_message_text(group.full_event_text),
+                                      source_unit=None, origin=None)
+    tool_receipts = {r for values in leaves.values() for m in values for r in m.receipts}
+    if not any(tool_receipts.intersection(row['receipts']) for row in old):
+        return None
+    obligations = []
+    lost_tool = unsupported = False
+
+    def reconstruct(row, source):
+        spans = tuple(PassageSpan(**span) for span in row['spans'])
+        mapped = {}
+        for span in spans:
+            message = source.get((span.record_ordinal, span.record_count))
+            # A single old span can be located by its exact immutable receipts
+            # even when a same-time arrival changes the record ordinal.
+            if len(spans) == 1 and (message is None or list(message.receipts) != row['receipts']):
+                matches = [m for m in source.values() if m.record_count == span.record_count
+                           and list(m.receipts) == row['receipts']]
+                if len(matches) != 1:
+                    raise ValueError('historical_domain_unsupported')
+                message = matches[0]
+            if message is None:
+                raise ValueError('historical_domain_unsupported')
+            mapped[span.message_index] = message
+        indexed = {span.message_index: replace(mapped[span.message_index], record_ordinal=span.record_ordinal)
+                   for span in spans}
+        receipts = list(dict.fromkeys(r for span in spans for r in indexed[span.message_index].receipts))
+        text = reconstruct_passage(SimpleNamespace(spans=spans), indexed)
+        if receipts != row['receipts'] or hashlib.sha256(text.encode()).hexdigest() != row['text_sha256']:
+            raise ValueError('historical_commitment_mismatch')
+        for span in spans:
+            message = indexed[span.message_index]
+            length = len(message.text.encode())
+            if not 0 <= span.source_byte_start < span.source_byte_end <= length:
+                raise ValueError('historical_domain_unsupported')
+            if span.source_unit is not None and not (
+                span.source_unit in COMPLETE_SOURCE_UNITS and span.source_unit == message.source_unit
+                and span.source_byte_start == 0 and span.source_byte_end == length
+            ):
+                raise ValueError('historical_domain_unsupported')
+        return spans, mapped
+
+    for row in old:
+        live = current_receipts.intersection(row['receipts'])
+        if not live:
+            continue  # Actual source removal/revision is not a preservation obligation.
+        if live != set(row['receipts']):
+            unsupported = True
+            if tool_receipts.intersection(row['receipts']):
+                lost_tool = True
+            continue
+        try:
+            spans, source = reconstruct(row, normal)
+        except (KeyError, TypeError, ValueError, AttributeError):
+            try:
+                spans, source = reconstruct(row, historical)
+            except (KeyError, TypeError, ValueError, AttributeError):
+                unsupported = True
+                lost_tool |= bool(tool_receipts.intersection(row['receipts']))
+                continue
+        for span in spans:
+            message = source[span.message_index]
+            key = (message.record_ordinal, message.record_count)
+            unit = None
+            if key not in normal or normal[key].text != message.text:
+                lost_tool = True
+                candidates = leaves.get(key, ())
+                if len(candidates) != 1 or candidates[0].text != message.text or candidates[0].receipts != message.receipts:
+                    unsupported = True
+                    continue
+                unit = candidates[0].source_unit
+            else:
+                units = normal_units.get(key, set())
+                if len(units) != 1:
+                    unsupported = True
+                    continue
+                unit = next(iter(units))
+            obligations.append((*key, unit, span.source_byte_start, span.source_byte_end))
+    if not lost_tool:
+        return None
+    if unsupported:
+        raise LogicalEvidenceError('legacy_tool_migration_required')
+    return obligations
 
 
 @dataclass(frozen=True)
@@ -916,6 +1031,7 @@ class CanonicalPassageProjector:
         *,
         policy: PassagePolicy | None = None,
         incremental: bool = False,
+        _migrate_legacy: bool = False,
     ) -> PreparedPassageDocument:
         policy = self.policy if policy is None else policy
         if (candidate.extraction_version not in PassageCandidate.supported_extraction_versions
@@ -938,12 +1054,18 @@ class CanonicalPassageProjector:
         ):
             raise LogicalEvidenceError("passage_manifest_catalog_mismatch")
         state = self._append_state(candidate) if policy == self.policy else None
+        if ((incremental or _migrate_legacy) and not grouped_tools
+            and candidate.source_id.startswith('claude:') and state is None):
+            # Append reuse is optional; the prior publication needed to preserve
+            # historical tool coverage is not. Retry through the existing queue.
+            raise LogicalEvidenceError('legacy_tool_migration_required')
         checkpoint = (state.get('projected') or {}).get('append_checkpoint') if state else None
         bodies = {}
         archive_bytes_read = archive_parts_read = 0
 
         def full_fallback():
-            full = self._prepare(candidate, policy=policy, incremental=False)
+            full = self._prepare(candidate, policy=policy, incremental=False,
+                                 _migrate_legacy=_migrate_legacy or incremental)
             return replace(full, archive_bytes_read=full.archive_bytes_read + archive_bytes_read,
                            archive_parts_read=full.archive_parts_read + archive_parts_read)
 
@@ -1016,7 +1138,12 @@ class CanonicalPassageProjector:
         try:
             # Enrolled documents currently rebuild fully. Read verified archive
             # parts once; the two views keep visible-message coordinates intact.
-            source_records = tuple(records()) if grouped_tools else records()
+            migration_check = ((incremental or _migrate_legacy) and not grouped_tools and not resume
+                and candidate.source_id.startswith('claude:')
+                and state and state.get('projected')
+                and state['projected'].get('requested_extraction_version') == 'legacy'
+                and state['projected'].get('applied_extraction_version') == 'legacy')
+            source_records = tuple(records()) if grouped_tools or migration_check else records()
             messages = visible_messages(source_records, first_record_ordinal=first_record)
         except LogicalEvidenceError:
             if resume:
@@ -1046,11 +1173,29 @@ class CanonicalPassageProjector:
             except (ValueError, IndexError, UnicodeDecodeError):
                 return full_fallback()
         coverage = None
+        groups = None
+        migration = None
+        obligations = None
+        if migration_check:
+            with self.store.connect() as connection:
+                old = connection.execute(_LEGACY_PASSAGES, (candidate.tenant_id, candidate.source_id,
+                    candidate.logical_document_id)).fetchall()
+            groups, coverage = extract_tool_event_groups(source_records)
+            obligations = _legacy_result_intervals(old, messages, passages, groups,
+                {r for record in source_records for r in record.receipts})
+            if obligations is not None:
+                migration = dict(projected={k: state['projected'][k] for k in _MIGRATION_FIELDS},
+                                 passages_sha256=passage_append.digest(old))
+                candidate = replace(candidate, extraction_version='tool_groups_v1')
+                grouped_tools = True
+            else:
+                coverage = None
         tool_messages = ()
         if grouped_tools:
             extractor = (extract_codex_tool_event_groups
                          if candidate.extraction_version == "codex_tool_groups_v1" else extract_tool_event_groups)
-            groups, coverage = extractor(source_records)
+            if groups is None:
+                groups, coverage = extractor(source_records)
             tool_messages = tuple(message for group in groups for message in group.messages)
             # Build each provider block independently. Its message indexes are
             # group-local, so later visible arrivals cannot rekey old tool spans.
@@ -1061,6 +1206,21 @@ class CanonicalPassageProjector:
                     revision=candidate.revision, messages=group.messages, policy=policy):
                     combined.append(replace(passage, ordinal=len(combined)))
             passages = tuple(combined)
+        if obligations is not None:
+            intervals = {}
+            for passage in passages:
+                for span in passage.spans:
+                    intervals.setdefault((span.record_ordinal, span.record_count, span.source_unit), []).append(
+                        (span.source_byte_start, span.source_byte_end))
+            for ordinal, count, unit, start, end in obligations:
+                for left, right in sorted(intervals.get((ordinal, count, unit), ())):
+                    if left > start:
+                        break
+                    start = max(start, right)
+                    if start >= end:
+                        break
+                if start < end:
+                    raise LogicalEvidenceError('legacy_tool_migration_required')
         checkpoint = (passage_append.make_checkpoint(candidate, manifest, messages, passages,
             policy, previous=resume) if not grouped_tools and state and state['available'] else None)
         return PreparedPassageDocument(
@@ -1074,6 +1234,7 @@ class CanonicalPassageProjector:
             archive_bytes_read=archive_bytes_read,
             archive_parts_read=archive_parts_read,
             extraction_coverage=coverage,
+            legacy_migration=migration,
         )
 
     def _commit(self, prepared: PreparedPassageDocument) -> dict[str, Any]:
@@ -1113,7 +1274,8 @@ class CanonicalPassageProjector:
                         candidate.logical_document_id,
                     ),
                 ).fetchone()
-                extraction = connection.execute("""SELECT requested_extraction_version
+                extraction = connection.execute("""SELECT requested_extraction_version,applied_extraction_version,
+                    revision,source_document_sha256,policy_fingerprint
                     FROM canonical_passage_documents
                     WHERE tenant_id=%s AND source_id=%s AND logical_document_id=%s FOR UPDATE""",
                     (candidate.tenant_id, candidate.source_id, candidate.logical_document_id)).fetchone()
@@ -1136,9 +1298,21 @@ class CanonicalPassageProjector:
                     != candidate.source_document_sha256
                     or _document_extraction_version(candidate.source_id,
                         extraction['requested_extraction_version'] if extraction else None)
-                    != candidate.extraction_version
+                    != ('legacy' if prepared.legacy_migration else candidate.extraction_version)
                 ):
                     return {"status": "stale"}
+                if prepared.legacy_migration:
+                    old = connection.execute(_LEGACY_PASSAGES + ' FOR UPDATE',
+                        (candidate.tenant_id, candidate.source_id, candidate.logical_document_id)).fetchall()
+                    if (candidate.extraction_version != 'tool_groups_v1'
+                        or not candidate.source_id.startswith('claude:')
+                        or extraction != prepared.legacy_migration['projected']
+                        or passage_append.digest(old) != prepared.legacy_migration['passages_sha256']):
+                        return {"status": "stale"}
+                    connection.execute("""UPDATE canonical_passage_documents
+                        SET requested_extraction_version='tool_groups_v1'
+                        WHERE tenant_id=%s AND source_id=%s AND logical_document_id=%s""",
+                        (candidate.tenant_id, candidate.source_id, candidate.logical_document_id))
                 existing = connection.execute(
                     """SELECT passage_id,ordinal,revision,
                               first_occurred_at,last_occurred_at,
@@ -2249,7 +2423,7 @@ class CanonicalPassageProjector:
                 try:
                     prepared = self._prepare(candidate, incremental=True)
                 except LogicalEvidenceError as error:
-                    if str(error) not in {"logical_evidence_not_found", "logical_evidence_unavailable"}:
+                    if str(error) not in {"logical_evidence_not_found", "logical_evidence_unavailable", "legacy_tool_migration_required"}:
                         raise
                     return {"status": str(error)}, time.monotonic() - preparation_started, 0.0
                 preparation_elapsed = time.monotonic() - preparation_started
@@ -2332,7 +2506,7 @@ class CanonicalPassageProjector:
                                 # reserved pool connection, outside commit owners.
                                 requeued_in_batch += self._requeue_missing(candidate)
                                 continue
-                            if status["status"] == "logical_evidence_unavailable":
+                            if status["status"] in {"logical_evidence_unavailable", "legacy_tool_migration_required"}:
                                 unavailable_in_batch += 1
                                 continue
                             if status["status"] == "stale":
