@@ -96,6 +96,35 @@ class EmptyCompletion(unittest.TestCase):
             return connection.execute('SELECT * FROM canonical_chunk_retirement_progress WHERE tenant_id=%s',
                                       (self.tenant,)).fetchone()
 
+    def test_inline_parent_finishes_after_thinning_and_native_metadata_retirement(self):
+        from e2e_thinning_retirement_transition import ThinningRetirement
+
+        lifecycle = ThinningRetirement('runTest')
+        lifecycle.store = self.store
+        lifecycle.setUp()
+        self.addCleanup(lifecycle.doCleanups)
+        # Retain the existing inline -> rearm -> physical retirement assertions.
+        lifecycle.test_thinning_after_eof_reaches_newly_eligible_metadata()
+        before = lifecycle.ledger()
+        self.assertEqual(before['status'], 'partial')
+        with patch.object(lifecycle.archive, 'read_raw',
+                          side_effect=AssertionError('drained archive reopened')) as read:
+            finished = lifecycle.run_parent(1)
+        read.assert_not_called()
+        self.assertEqual(finished['completed_noop_parents'], 1)
+        self.assertEqual(finished['completed_parent_proofs'], 0)
+        self.assertEqual(finished['failed_parents'], 0)
+        self.assertFalse(finished['commit_outcome_unknown'])
+        self.assertEqual(finished['cleared_utf8_bytes'], 0)
+        self.assertEqual(finished['retired_metadata_chunks'], 0)
+        after = lifecycle.ledger()
+        self.assertEqual(after['status'], 'complete')
+        self.assertEqual(after['scope_epoch'], before['scope_epoch'] + 1)
+        for field in ('last_record_ordinal', 'cumulative_cleared_documents',
+                      'cumulative_cleared_chunks', 'cumulative_cleared_utf8_bytes'):
+            self.assertEqual(after[field], before[field])
+        self.assertEqual(lifecycle.run_parent(1)['attempted_parents'], 0)
+
     def ledger(self):
         with self.store.connect() as connection:
             return connection.execute('SELECT * FROM canonical_chunk_retirement_progress WHERE tenant_id=%s',
