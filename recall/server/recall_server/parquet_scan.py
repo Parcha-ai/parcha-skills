@@ -949,7 +949,8 @@ class CanonicalParquetScanProjector:
                           AND queue.bucket_start=month.value::date
                         WHERE document.tenant_id=%s
                           AND (%s::text IS NULL OR document.source_id=%s)
-                       ON CONFLICT DO NOTHING""",
+                       ON CONFLICT(tenant_id,source_id,bucket_start,logical_document_id)
+                       DO UPDATE SET reason='backfill',queued_at=excluded.queued_at""",
                     (SCAN_DIRTY_ALL, tenant_id, source_id, source_id),
                 )
         return max(0, result.rowcount)
@@ -1013,7 +1014,10 @@ class CanonicalParquetScanProjector:
         bucket_end = _next_month(candidate.bucket_start)
         with self.store.connect() as connection:
             documents = connection.execute(
-                """SELECT document.*,
+                """SELECT document.tenant_id,document.source_id,
+                          document.logical_document_id,document.native_parent_id,
+                          document.revision,document.document_content_sha256,
+                          document.part_count,
                           pointer.policy_fingerprint AS passage_policy_fingerprint,
                           pointer.source_document_sha256 AS passage_source_sha256,
                           pointer.passage_count,
@@ -1700,8 +1704,8 @@ class CanonicalParquetScanProjector:
 
         Returns ``(mode, victims, rewrite, dirty)``: ``mode`` is ``reuse``
         (nothing changed), ``delta`` (only intersecting fragments), ``full``
-        (every fragment; backfill or first build), or ``compaction`` (a full
-        rebuild forced by fragment count or dead-document ratio).
+        (every fragment; backfill or first build), or ``compaction`` (repack all fragments, rebuilding changed documents
+        when the existing catalog is complete).
         """
 
         current = {
@@ -1755,8 +1759,18 @@ class CanonicalParquetScanProjector:
         # changed document rewrote all 374 parts (20 min) on a hint the
         # old sweep left behind.
         sweep_hint = catalog.compaction or candidate.reason == "compaction"
+        # Compaction can repack current immutable rows. Incomplete catalogs and
+        # explicit canonical backfills must retain the original full rebuild.
+        preserve_complete = (
+            datasets_complete and set(catalog.members) <= all_parts
+            and all(catalog.members.get(identity) or shard["row_count"] == 0
+                    for identity, shard in catalog.shards.items())
+            and not (SCAN_DIRTY_ALL in catalog.dirty and not catalog.compaction)
+        )
+        compact_rewrite = ((stale | uncovered) & set(current)
+                           if preserve_complete else set(current))
         if allow_compaction and sweep_hint and catalog.fragmented(self.compaction_fragments):
-            return "compaction", all_parts, set(current), dirty
+            return "compaction", all_parts, compact_rewrite, dirty
         # A seed backfill marks the month with the whole-month sentinel; a
         # bare 'backfill' queue reason with no marker is a leftover (the
         # sweep's row outliving its sentinel after a generation race) and
@@ -1773,7 +1787,7 @@ class CanonicalParquetScanProjector:
             catalog.fragmented(self.compaction_fragments)
             or len(stale) * 2 > len(recorded)
         ):
-            return "compaction", all_parts, set(current), dirty
+            return "compaction", all_parts, compact_rewrite, dirty
         effective = stale | uncovered
         victims: set[tuple[str, int]] = set()
         # Datasets pack independently: a shared metadata fragment must not pull
@@ -2445,12 +2459,14 @@ class CanonicalParquetScanProjector:
                                generation,reason,changed_at
                            ) VALUES (%s,%s,%s,1,'backfill',clock_timestamp())
                            ON CONFLICT(tenant_id,source_id,bucket_start)
-                           DO UPDATE SET
-                               generation=canonical_parquet_scan_queue.generation+1,
-                               reason='backfill',changed_at=clock_timestamp()
+                           DO NOTHING
                            RETURNING generation,changed_at""",
                         scope,
                     ).fetchone()
+                    if queued is None:
+                        # A producer queued work after the sweep's nomination.
+                        # Its generation and explicit rebuild intent win.
+                        continue
                     connection.execute(
                         """INSERT INTO canonical_parquet_scan_dirty_documents(
                                tenant_id,source_id,bucket_start,

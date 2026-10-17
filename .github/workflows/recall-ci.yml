@@ -132,6 +132,8 @@ jobs:
             e2e_parquet_scan_fragments.py \
             e2e_parquet_dirty_completeness.py \
             e2e_parquet_sparse_planning.py \
+            e2e_parquet_compaction_reuse.py \
+            e2e_parquet_worker_fairness.py \
             e2e_scan_upstream_completeness.py \
             e2e_search_outbox.py \
             e2e_search_publication_reconcile.py \

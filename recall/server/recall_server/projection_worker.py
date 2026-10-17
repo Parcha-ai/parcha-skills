@@ -7,7 +7,7 @@ import threading
 import time
 import urllib.error
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 from http.client import RemoteDisconnected
 from typing import Any
 
@@ -17,7 +17,10 @@ from .embedding_ledger import (
     validate_daily_cap,
     window_total,
 )
-from .logical_evidence_projection import CanonicalLogicalEvidenceProjector
+from .logical_evidence_projection import (
+    CanonicalLogicalEvidenceProjector,
+    PROJECTION_PROGRESS_INTERVAL_SECONDS,
+)
 from .search_outbox import search_outbox_pending
 from .passage_index import CanonicalPassageProjector, CertificationBudget
 from .parquet_scan import CanonicalParquetScanProjector
@@ -182,6 +185,26 @@ class BackgroundBodyThinner:
 
     def __exit__(self, *_args):
         self.close()
+
+
+def _parquet_with_publication(scan, publish_search, **kwargs):
+    """Drain committed search work while one native scan settles."""
+    if publish_search is None:
+        return scan.project_pending(**kwargs)
+    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="recall-parquet") as pool:
+        future = pool.submit(scan.project_pending, **kwargs)
+        while not wait((future,), timeout=PROJECTION_PROGRESS_INTERVAL_SECONDS)[0]:
+            try:
+                publish_search()
+            except BaseException:
+                # Never abandon a transaction or start another scan after a callback
+                # fails. Preserve that error while observing any scan settlement error.
+                try:
+                    future.result()
+                except Exception:
+                    LOG.exception("parquet settlement failed during publication failure")
+                raise
+        return future.result()
 
 
 def run_projection_worker(
@@ -501,7 +524,9 @@ def run_projection_worker(
                 or int(projected.get("documents", 0)) > 0
             )
             scanned = (
-                scan.project_pending(
+                _parquet_with_publication(
+                    scan,
+                    publish_search if search_plane is not None else None,
                     tenant_id=tenant_id,
                     batch_size=1 if freshness_busy else min(4, logical_batch_size),
                     # Return to fresh admission after one complete source-month
