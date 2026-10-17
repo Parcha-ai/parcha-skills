@@ -201,8 +201,11 @@ def _artifact_reference(
 
 def _extraction_arguments(version: str) -> dict[str, str]:
     """Bind the applied extraction without treating an old builder as capable."""
-    if version not in {'legacy', 'tool_groups_v1'}:
+    if version not in {'legacy', 'tool_groups_v1', 'codex_tool_groups_v1'}:
         raise PassageIndexAuditError("unsupported applied extraction version")
+    if (version == 'codex_tool_groups_v1'
+            and version not in getattr(PassageCandidate, 'supported_extraction_versions', ())):
+        raise PassageIndexAuditError("applied extraction requires a version-aware projector")
     if 'extraction_version' in PassageCandidate.__dataclass_fields__:
         return {'extraction_version': version}
     if version != 'legacy':

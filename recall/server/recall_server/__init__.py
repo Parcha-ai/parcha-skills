@@ -44,6 +44,8 @@ PARQUET_DIRTY_PLAN_VERSION = 88
 # Additive per-document extraction metadata; the separately deployed publisher
 # requires it. Compatibility alone does not enroll or extract any document.
 DOCUMENT_EXTRACTION_VERSION = 89
+# Compatibility precedes the separate Codex publisher and its typed-role DDL.
+CODEX_EXTRACTION_VERSION = 90
 # Optional until a delayed Slack body needs a terminal-identity ACK.
 SUPPRESSED_ARTIFACT_SCHEMA_VERSION = 77
 MANDATORY_SCHEMA_VERSION = 69
