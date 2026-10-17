@@ -99,7 +99,6 @@ class Opening(unittest.TestCase):
         with patch.object(logical,'MAX_RESTORED_RECORD_BYTES',1024),self.assertRaises(LogicalEvidenceError):self.call()
     def test_outer_deadline_not_renewed(self):
         from recall_server.db import SearchDeadlineExceeded
-        from recall_server import canonical_retrieval as retrieval
         original=self.reader._receipt_event
         def delayed(*args,**kwargs):
             row=original(*args,**kwargs);time.sleep(.03);return row
