@@ -1978,16 +1978,18 @@ class CanonicalParquetScanProjector:
         removed = tuple(sorted(victims))
         timing = _ScanStreamTiming()
         try:
-            first, last = timing.call(
-                "preserve", self._preserve_rows,
-                candidate, catalog, victims, rewrite, documents, upload
-            )
+            # Finish the native passage stream before copying unchanged siblings.
+            # A failed proof must not first pay for their archive reads/uploads.
             for passage in timing.passages(self._passages(candidate, sorted(members))):
                 upload.add(
                     "passages",
                     self._passage_row(candidate, passage),
                     member=members[passage["logical_document_id"]],
                 )
+            first, last = timing.call(
+                "preserve", self._preserve_rows,
+                candidate, catalog, victims, rewrite, documents, upload
+            )
             with _PartReadAhead(self.archive, _read_ahead_parts(
                 rewrite_documents, bucket_start, bucket_end
             )) as read_part:
