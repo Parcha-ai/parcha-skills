@@ -2,7 +2,7 @@
 import unittest
 
 from tests.central_brain.test_core_deployment import healthy_snapshot
-from recall_server import SCHEMA_VERSION
+from recall_server import PARQUET_DIRTY_PLAN_VERSION
 from recall_server.capabilities import CapabilityError, assess_snapshot
 
 
@@ -16,7 +16,7 @@ class SlackDeletionSchemaCompatibility(unittest.TestCase):
                 self.assertEqual(assess_snapshot(snapshot)['status'], 'ready')
 
     def test_77_cannot_hide_a_missing_mandatory_or_unknown_version(self):
-        for versions in ([*range(1, 69), 77], [*range(1, 70), 77, SCHEMA_VERSION + 1], [*range(1, 70), 77, 77]):
+        for versions in ([*range(1, 69), 77], [*range(1, 70), 77, PARQUET_DIRTY_PLAN_VERSION + 1], [*range(1, 70), 77, 77]):
             with self.subTest(versions=versions):
                 snapshot = healthy_snapshot()
                 snapshot['migration_versions'] = versions
