@@ -170,6 +170,7 @@ class ProjectionWorkerTest(unittest.TestCase):
                 )
                 self.assertEqual(len(admitted), 1)
                 self.assertEqual(admitted[0]["batch_size"], expected)
+                self.assertEqual(admitted[0]["certification_batch_size"], batch)
                 self.assertEqual(admitted[0]["max_batches"], 1)
                 self.assertEqual(admitted[0]["concurrency"], concurrency)
                 self.assertEqual(logical.kwargs["batch_size"], 500)

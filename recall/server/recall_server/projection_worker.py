@@ -413,6 +413,9 @@ def run_projection_worker(
                     concurrency=passage_concurrency,
                     on_progress=publish_search if search_plane is not None else None,
                     certification_budget=certification_budget,
+                    # Sequential metadata proof shares the cycle deadline, not
+                    # the concurrent body-preparation wave's row limit.
+                    certification_batch_size=passage_batch_size,
                 )
                 passage_elapsed_ms += elapsed_ms(phase_started)
                 phase_elapsed["passage_elapsed_ms"] = passage_elapsed_ms
