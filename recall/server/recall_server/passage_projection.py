@@ -12,6 +12,8 @@ from typing import Iterable, Iterator
 
 import orjson
 
+from contracts.source_units import codex_tool_source_unit_role
+
 from .actor_attribution import ActorLink, actor_links
 from .logical_evidence import LogicalEvidenceError, LogicalEvidenceRecord
 from .passage_representations import DocumentContext, _metadata_lines
@@ -205,10 +207,10 @@ DEFAULT_PASSAGE_POLICY = PassagePolicy(
 
 
 def _tool_unit(source_unit: str | None) -> bool:
-    return isinstance(source_unit, str) and source_unit.startswith((
+    return codex_tool_source_unit_role(source_unit) is not None or (isinstance(source_unit, str) and source_unit.startswith((
         "claude.tool-input.string.v1#/message/content/",
         "claude.tool-result.string.v1#/message/content/",
-    ))
+    )))
 
 
 def _ordered_messages(messages: tuple["PassageMessage", ...]) -> bool:
@@ -241,6 +243,7 @@ class PassageMessage:
     origin: dict[str, str] | None = None
 
     def validate(self) -> None:
+        provider_role = codex_tool_source_unit_role(self.source_unit)
         if (
             isinstance(self.record_ordinal, bool)
             or not isinstance(self.record_ordinal, int)
@@ -249,7 +252,8 @@ class PassageMessage:
             or not self.occurred_at
             or not isinstance(self.roles, tuple)
             or not self.roles
-            or not set(self.roles) <= VISIBLE_DENSE_ROLES
+            or (self.roles != (provider_role,) if provider_role is not None
+                else not set(self.roles) <= VISIBLE_DENSE_ROLES)
             or tuple(sorted(set(self.roles))) != self.roles
             or not isinstance(self.receipts, tuple)
             or not self.receipts
@@ -268,7 +272,7 @@ class PassageMessage:
             or actor_links(self.actor_links) != self.actor_links
         ):
             raise ValueError(
-                "dense passage messages require visible user/assistant records"
+                "passage messages require visible user/assistant records or exact typed tool roles"
             )
         try:
             parsed = datetime.fromisoformat(
@@ -686,6 +690,11 @@ def _build_passages(
         if not isinstance(message, PassageMessage):
             raise ValueError("lossless passage message is invalid")
         message.validate()
+        if codex_tool_source_unit_role(message.source_unit) is not None and (
+            not source_id.startswith("codex:")
+            or any(not receipt.startswith("recall://" + source_id + "/") for receipt in message.receipts)
+        ):
+            raise ValueError("typed Codex passage source does not match its receipts")
     if not _ordered_messages(messages):
         raise ValueError("lossless passage records must be unique and ordered")
 

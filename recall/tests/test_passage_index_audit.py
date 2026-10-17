@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 import unittest
+from typing import ClassVar
 from dataclasses import dataclass
 from pathlib import Path
 from unittest.mock import patch
@@ -20,6 +21,24 @@ from evals.passage_index_audit import (  # noqa: E402
 
 
 class PassageIndexAuditTest(unittest.TestCase):
+    def test_codex_applied_version_requires_declared_support(self):
+        @dataclass(frozen=True)
+        class VersionedCandidate:
+            extraction_version: str = 'legacy'
+
+        with patch('evals.passage_index_audit.PassageCandidate', VersionedCandidate):
+            with self.assertRaisesRegex(PassageIndexAuditError, 'version-aware projector'):
+                _extraction_arguments('codex_tool_groups_v1')
+
+        @dataclass(frozen=True)
+        class CodexCandidate(VersionedCandidate):
+            supported_extraction_versions: ClassVar[frozenset[str]] = frozenset(
+                {'legacy', 'tool_groups_v1', 'codex_tool_groups_v1'})
+
+        with patch('evals.passage_index_audit.PassageCandidate', CodexCandidate):
+            self.assertEqual(_extraction_arguments('codex_tool_groups_v1'),
+                             {'extraction_version': 'codex_tool_groups_v1'})
+
     def test_applied_version_requires_explicit_projector_capability(self):
         @dataclass(frozen=True)
         class LegacyCandidate:

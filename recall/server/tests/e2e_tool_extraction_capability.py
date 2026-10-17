@@ -69,13 +69,13 @@ def scenario(admin_dsn, root, retired):
         with store.connect() as connection:
             state = connection.execute('SELECT requested_extraction_version,applied_extraction_version,extraction_coverage FROM canonical_passage_documents WHERE tenant_id=%s', (tenant,)).fetchone()
             assert state == dict(requested_extraction_version='legacy', applied_extraction_version='legacy', extraction_coverage=None)
-            connection.execute('INSERT INTO schema_migrations(version) VALUES(90)')
+            connection.execute('INSERT INTO schema_migrations(version) VALUES(91)')
         try:
             probe_database(app_dsn, profile='local-fixture')
         except CapabilityError as error:
             assert error.code == 'schema_drift'
         else:
-            raise AssertionError('unknown schema90 accepted')
+            raise AssertionError('unknown schema91 accepted')
     finally:
         if runtime is not None:
             runtime.close()
@@ -94,7 +94,7 @@ def main():
                             RECALL_TPUF_CLIENT_FACTORY='tests.central_brain.fake_turbopuffer:factory',
                             RECALL_TPUF_FAKE_STATE=str(root / 'vendor-fixture.json')):
                 scenario(os.environ['RECALL_DATABASE_URL'], root, retired)
-    print('PASS original runtime: schema88/89 startup, exact reads, legacy publication, both planes, unknown90 refusal')
+    print('PASS original runtime: schema88/89 startup, exact reads, legacy publication, both planes, unknown91 refusal')
 
 
 if __name__ == '__main__':
