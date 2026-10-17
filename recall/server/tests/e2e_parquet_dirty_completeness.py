@@ -200,7 +200,9 @@ class DirtyCompleteness(ParentEnrollmentTests):
             )
             expected = set()
             for n, source in enumerate((self.source, other)):
-                digest = hashlib.md5(("synthetic-clone-" + str(n)).encode()).hexdigest()
+                digest = hashlib.sha256(
+                    ("synthetic-clone-" + str(n)).encode()
+                ).hexdigest()[:32]
                 logical = "ldoc_" + digest
                 copy(
                     "canonical_evidence_documents",
