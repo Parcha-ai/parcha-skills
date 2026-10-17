@@ -106,7 +106,8 @@ class ParquetReceiptSlices(unittest.TestCase):
     def test_all_certified_batch_makes_no_fallback_query(self):
         rows = [dict(passage_id='certified', receipts=[item_receipt('source:test', 'event', 1, 0)],
                      tenant_id='tenant:test', source_id='source:test', text_sha256='f'*64,
-                     manifest_content_sha256='a'*64)]
+                     manifest_content_sha256='a'*64, membership_metadata={},
+                     membership_metadata_bytes=0, membership_metadata_complete=True)]
         store = Store(rows)
         store._set_statement_deadline = lambda connection, deadline: None
         owner = CanonicalParquetScanProjector(store, SimpleNamespace(archive=None))
@@ -114,7 +115,7 @@ class ParquetReceiptSlices(unittest.TestCase):
                                   datetime(2026, 1, 1, tzinfo=timezone.utc))
         with patch.object(parent_membership_read.ReadSettings, 'from_env',
                           return_value=parent_membership_read.ReadSettings(enabled=True, binding_epoch="fixture")), \
-             patch.object(parent_membership_read, 'partition', return_value=({('source:test', 'certified')}, {})):
+             patch.object(parent_membership_read, 'partition_fetched', return_value=({('source:test', 'certified')}, {})):
             actual = list(owner._passages(candidate, ['document']))
         self.assertEqual([row['passage_id'] for row in actual], ['certified'])
         self.assertEqual(store.queries, [])

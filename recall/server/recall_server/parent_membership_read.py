@@ -1,4 +1,5 @@
 """Exact current certificates may replace only per-receipt membership proof."""
+from contextlib import contextmanager
 from dataclasses import dataclass
 import os
 import time
@@ -36,6 +37,42 @@ def partition(store, connection, *, selected, settings, deadline_at):
     rollback preserves the original transaction for native receipt proof, whose
     deadline is unchanged. These keys never add sources or bypass the catalog.
     """
+    @contextmanager
+    def metadata(metadata_deadline):
+        with connection.transaction():
+            yield store._execute_bounded(connection, _METADATA_SQL,
+                (selected[0]['tenant_id'], [r['source_id'] for r in selected],
+                 [r['passage_id'] for r in selected]), metadata_deadline).fetchall()
+
+    return _partition(selected=selected, settings=settings, deadline_at=deadline_at,
+                      metadata=metadata)
+
+
+def partition_fetched(*, selected, settings, deadline_at):
+    """Validate metadata carried by the Parquet cursor in its existing RR snapshot.
+
+    Missing inner-join counterparts remain incomplete metadata, not omitted
+    passages. The PostgreSQL byte counts cover the identical metadata record
+    used by the separate lookup; body and receipt bytes are not reclassified.
+    """
+    @contextmanager
+    def metadata(metadata_deadline):
+        rows = []
+        size = 0
+        for row in selected:
+            if time.monotonic() >= metadata_deadline:
+                raise SearchDeadlineExceeded()
+            if row['membership_metadata_complete']:
+                rows.append(dict(row['membership_metadata']))
+                size += row['membership_metadata_bytes']
+        yield [dict(row, selected_count=len(rows), metadata_bytes=size) for row in rows] or [
+            dict(selected_count=0, metadata_bytes=0)]
+
+    return _partition(selected=selected, settings=settings, deadline_at=deadline_at,
+                      metadata=metadata)
+
+
+def _partition(*, selected, settings, deadline_at, metadata):
     started = time.monotonic()
 
     def result(keys, status):
@@ -54,22 +91,19 @@ def partition(store, connection, *, selected, settings, deadline_at):
     if metadata_deadline <= started:
         return result(set(), 'serving-reserve')
     try:
-        with connection.transaction():
-            rows = store._execute_bounded(connection, _METADATA_SQL,
-                (selected[0]['tenant_id'], [r['source_id'] for r in selected],
-                 [r['passage_id'] for r in selected]), metadata_deadline).fetchall()
+        with metadata(metadata_deadline) as rows:
             if not rows or rows[0]['metadata_bytes'] > 8388608:
                 return result(set(), 'metadata-budget')
-            metadata = {(r['source_id'], r['passage_id']): r for r in rows if r['selected_count']}
+            by_key = {(r['source_id'], r['passage_id']): r for r in rows if r['selected_count']}
             expected = {(r['source_id'], r['passage_id']) for r in selected}
-            if set(metadata) != expected or len(metadata) != len(selected):
+            if set(by_key) != expected or len(by_key) != len(selected):
                 return result(set(), 'incomplete')
             certified = set()
             for row in selected:
                 if time.monotonic() >= metadata_deadline:
                     raise SearchDeadlineExceeded()
                 key = row['source_id'], row['passage_id']
-                extra = metadata[key]
+                extra = by_key[key]
                 if (extra['generation'] is not None
                         and extra['membership_generation'] == extra['generation']
                         and extra['membership_binding_sha256'] == _binding({**row, **extra},
