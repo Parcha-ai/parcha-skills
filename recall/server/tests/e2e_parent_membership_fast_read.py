@@ -9,6 +9,7 @@ from unittest.mock import patch
 from e2e_parent_membership_enrollment import ParentEnrollmentTests
 from recall_server import parent_membership_read as reader
 from recall_server import parent_membership_shadow as shadow
+from recall_server import turbopuffer_retrieval as retrieval
 from recall_server.db import SearchDeadlineExceeded
 from recall_server.receipt_membership import lookup_current_search_membership
 
@@ -39,7 +40,7 @@ class ParentMembershipFastReadTests(ParentEnrollmentTests):
 
     def test_default_off_preserves_native_inputs_and_does_not_read_certificates(self):
         self.enroll()
-        with patch.object(reader, 'partition', side_effect=AssertionError('disabled')) as certificate:
+        with patch.object(reader, 'partition_fetched', side_effect=AssertionError('disabled')) as certificate:
             with patch('recall_server.receipt_membership.lookup_current_search_membership', wraps=lookup_current_search_membership) as native:
                 result = self.search()
         self.assertTrue(result['results'])
@@ -57,6 +58,21 @@ class ParentMembershipFastReadTests(ParentEnrollmentTests):
         stages = after['diagnostics']['authority_stages']
         self.assertEqual(stages['native_receipts'], 0)
         self.assertEqual(stages['parent_membership_read']['certified_passages'], len(self.ids))
+
+    def test_certified_search_uses_one_catalog_read_without_second_metadata_query(self):
+        self.enroll(); before = self.search(); self.enable()
+        execute = self.store._execute_bounded
+        statements = []
+        def recorded(connection, sql, values, deadline):
+            statements.append(sql)
+            return execute(connection, sql, values, deadline)
+        with patch.object(self.store, '_execute_bounded', side_effect=recorded):
+            after = self.search()
+        self.assertEqual(after['results'], before['results'])
+        self.assertEqual(after['arms'], before['arms'])
+        self.assertEqual(after['diagnostics']['authority_stages']['native_receipts'], 0)
+        self.assertNotIn(reader._METADATA_SQL, statements)
+        self.assertEqual(sum('FROM canonical_passages passage' in sql for sql in statements), 1)
 
     def test_missing_or_wrong_epoch_certificates_use_original_receipts_once(self):
         for epoch in ('synthetic-epoch-a', 'other-epoch'):
@@ -131,42 +147,47 @@ class ParentMembershipFastReadTests(ParentEnrollmentTests):
         self.assertEqual(self.retrieval.sources, [])
         self.assertEqual(self.search()['results'], [])
 
-    def test_metadata_failure_rolls_back_savepoint_and_runs_native_once(self):
-        self.enroll(); before = self.search(); self.enable()
+    def test_joined_catalog_failure_refuses_without_retry_or_body_fetch(self):
+        self.enroll(); self.enable()
         execute = self.store._execute_bounded
+        statements = []
         def failed(c, sql, values, deadline):
-            if sql == reader._METADATA_SQL:
+            statements.append(sql)
+            if sql == retrieval._CERTIFIED_AUTHORITY_SQL:
                 return c.execute('SELECT * FROM deliberately_missing_fast_reader_table')
             return execute(c, sql, values, deadline)
+        self.namespace.queries.clear()
         with patch.object(self.store, '_execute_bounded', side_effect=failed):
             with patch('recall_server.receipt_membership.lookup_current_search_membership', wraps=lookup_current_search_membership) as native:
                 after = self.search()
-        self.assertEqual(after['results'], before['results'])
-        self.assertEqual(native.call_count, 1)
-        self.assertEqual(after['diagnostics']['authority_stages']['parent_membership_read']['status'], 'unavailable')
+        self.assertEqual(after['results'], [])
+        self.assertEqual(after['diagnostics']['authority_status'], 'unavailable')
+        native.assert_not_called()
+        self.assertEqual(statements, [retrieval._CERTIFIED_AUTHORITY_SQL])
+        self.assertFalse(any(query['rank_by'] == ('id', 'asc') for query in self.namespace.queries))
+        self.assertTrue(self.search()['results'])
 
     def test_expired_deadline_never_runs_certificate_or_membership(self):
         self.enroll(); self.enable()
-        with patch.object(reader, 'partition', side_effect=AssertionError('expired')) as certificate:
+        with patch.object(reader, 'partition_fetched', side_effect=AssertionError('expired')) as certificate:
             with self.assertRaises(SearchDeadlineExceeded):
                 self.authorize(time.monotonic() - 1)
         certificate.assert_not_called()
 
-    def test_metadata_timeout_retains_native_fallback_with_original_deadline(self):
+    def test_joined_catalog_timeout_preserves_outer_deadline_without_retry(self):
         self.enroll(); self.enable(); execute = self.store._execute_bounded
+        statements = []
         def delayed(c, sql, values, deadline):
-            if sql == reader._METADATA_SQL:
+            statements.append(sql)
+            if sql == retrieval._CERTIFIED_AUTHORITY_SQL:
                 return execute(c, 'SELECT pg_sleep(0.2)', (), deadline)
             return execute(c, sql, values, deadline)
         with patch.object(self.store, '_execute_bounded', side_effect=delayed):
             with patch('recall_server.receipt_membership.lookup_current_search_membership', wraps=lookup_current_search_membership) as native:
-                deadline = time.monotonic() + 3
-                rows, stages = self.authorize(deadline)
-                self.assertEqual(len(rows), len(self.ids))
-                self.assertEqual(stages['parent_membership_read']['status'], 'deadline')
-                self.assertEqual(native.call_count, 1)
-                self.assertEqual(native.call_args.kwargs['deadline_at'], deadline)
-        # The failed read did not poison the pool or alter any certificate.
+                with self.assertRaises(SearchDeadlineExceeded):
+                    self.authorize(time.monotonic() + .05)
+                native.assert_not_called()
+        self.assertEqual(statements, [retrieval._CERTIFIED_AUTHORITY_SQL])
         rows, stages = self.authorize()
         self.assertEqual(len(rows), len(self.ids)); self.assertEqual(stages['native_receipts'], 0)
 
@@ -210,6 +231,17 @@ class ParentMembershipFastReadTests(ParentEnrollmentTests):
         rows, stages = self.authorize()
         self.assertEqual(len(rows), len(self.ids)); self.assertGreater(stages['native_receipts'], 0)
 
+    def test_receipt_binding_mutation_cannot_reuse_certificate(self):
+        self.enroll(); self.enable()
+        with self.store.connect() as c:
+            c.execute('UPDATE canonical_passages SET receipts=ARRAY[%s] WHERE tenant_id=%s',
+                      ('recall://' + self.source + '/missing?rev=1#item=0', self.tenant))
+        with patch('recall_server.receipt_membership.lookup_current_search_membership', wraps=lookup_current_search_membership) as native:
+            rows, stages = self.authorize()
+        self.assertEqual(rows, [])
+        self.assertEqual(stages['parent_membership_read']['certified_passages'], 0)
+        self.assertEqual(native.call_count, 1)
+
     def test_read_setting_requires_explicit_epoch(self):
         self.assertFalse(reader.ReadSettings().enabled)
         with self.assertRaises(ValueError):
@@ -217,22 +249,22 @@ class ParentMembershipFastReadTests(ParentEnrollmentTests):
 
     def test_concurrent_edit_keeps_one_snapshot_and_next_request_rejects(self):
         self.enroll(); before = self.search(); self.enable()
-        original = reader.partition
+        original = reader.partition_fetched
         def edited(*args, **kwargs):
             self.edit()
             return original(*args, **kwargs)
-        with patch.object(reader, 'partition', side_effect=edited):
+        with patch.object(reader, 'partition_fetched', side_effect=edited):
             after = self.search()
         self.assertEqual(after['results'], before['results'])
         self.assertEqual(self.search()['results'], [])
 
     def test_concurrent_manifest_publication_uses_snapshot_then_falls_back(self):
-        self.enroll(); self.enable(); original = reader.partition
+        self.enroll(); self.enable(); original = reader.partition_fetched
         def published(*args, **kwargs):
             with self.store.connect() as c:
                 c.execute('UPDATE canonical_evidence_documents SET manifest_content_sha256=%s WHERE tenant_id=%s', ('a' * 64, self.tenant))
             return original(*args, **kwargs)
-        with patch.object(reader, 'partition', side_effect=published):
+        with patch.object(reader, 'partition_fetched', side_effect=published):
             rows, stages = self.authorize()
         self.assertEqual(len(rows), len(self.ids)); self.assertEqual(stages['native_receipts'], 0)
         rows, stages = self.authorize()
@@ -245,6 +277,54 @@ class ParentMembershipFastReadTests(ParentEnrollmentTests):
             result = self.search()
         self.assertEqual(native.call_count, 1)
         self.assertEqual(result['diagnostics']['authority_stages']['parent_membership_shadow']['disagreements'], 0)
+
+    def test_inline_metadata_matches_original_postgresql_record_and_byte_count(self):
+        self.enroll()
+        with self.store.connect() as c, c.transaction():
+            c.execute('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY')
+            original = c.execute(reader._METADATA_SQL,
+                (self.tenant, [self.source] * len(self.ids), list(self.ids))).fetchall()
+            inline = c.execute(retrieval._CERTIFIED_AUTHORITY_SQL,
+                (self.tenant, [self.source], self.retrieval.policy_fingerprint,
+                 [self.source] * len(self.ids), list(self.ids))).fetchall()
+        expected = {(row['source_id'], row['passage_id']):
+            {k: v for k, v in row.items() if k not in ('selected_count', 'metadata_bytes')}
+            for row in original}
+        self.assertEqual({(row['source_id'], row['passage_id']): row['membership_metadata']
+                          for row in inline}, expected)
+        self.assertEqual(sum(row['membership_metadata_bytes'] for row in inline), original[0]['metadata_bytes'])
+        self.assertTrue(all(row['membership_metadata_complete'] for row in inline))
+
+    def test_off_and_shadow_use_original_catalog_sql_and_output(self):
+        self.enroll(); before = self.search(); execute = self.store._execute_bounded
+        for shadow_enabled in (False, True):
+            statements = []
+            self.retrieval.parent_membership_read = reader.ReadSettings(
+                enabled=shadow_enabled, binding_epoch='synthetic-epoch-a')
+            self.retrieval.parent_membership_shadow = shadow.ShadowSettings(
+                enabled=shadow_enabled, binding_epoch='synthetic-epoch-a')
+            def recorded(c, sql, values, deadline):
+                statements.append(sql)
+                return execute(c, sql, values, deadline)
+            with patch.object(self.store, '_execute_bounded', side_effect=recorded), patch.object(
+                    reader, 'partition_fetched', side_effect=AssertionError('inline disabled')):
+                after = self.search()
+            self.assertEqual(after['results'], before['results'])
+            self.assertEqual(after['arms'], before['arms'])
+            self.assertIn(retrieval._SELECTED_AUTHORITY_SQL, statements)
+            self.assertNotIn(retrieval._CERTIFIED_AUTHORITY_SQL, statements)
+
+    def test_certificate_never_overrides_malformed_vendor_body(self):
+        self.enroll()
+        for row in self.namespace.rows.values():
+            row['text'] = 'Tampered exact deployment phrase'
+        before = self.search(); self.enable(); result = self.search()
+        self.assertEqual(result['results'], before['results'])
+        self.assertEqual(result['arms'], before['arms'])
+        self.assertEqual(result['diagnostics']['authority_stages']['native_receipts'], 0)
+        self.assertEqual(result['diagnostics']['hydrate_status'], 'partial')
+        self.assertEqual(result['diagnostics']['hydrated_passages'], 0)
+        self.assertTrue(all(not r['text'] for item in result['results'] for r in item['matching_ranges']))
 
     def test_original_verifier_and_catalog_sql_are_unchanged(self):
         from recall_server import receipt_membership, turbopuffer_retrieval
