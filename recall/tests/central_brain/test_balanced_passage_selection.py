@@ -85,7 +85,12 @@ class PassageBudgetTests(unittest.TestCase):
             self.assertEqual(len(store.rerank_runtime.calls), 1)
         self.assertIn('answer', keys(outputs['1']))
         self.assertNotIn('answer', keys(outputs['0']))
-        self.assertEqual(len(keys(outputs['1'])), len(keys(outputs['0'])))
+        # The query allowance can use a fourth range from one parent. Rollback
+        # still returns the original four ranges; neither admits another parent.
+        self.assertEqual(len(keys(outputs['1'])), 5)
+        self.assertEqual(len(keys(outputs['0'])), 4)
+        self.assertEqual({d['logical_document_id'] for d in outputs['1']},
+                         {d['logical_document_id'] for d in outputs['0']})
 
     def test_oversized_admitted_pool_preserves_legacy_instead_of_refusing_search(self):
         legs = (('dense', 1.0, [row(f'p-{i // 4}', f'r-{i}', 1 - i / 2000) for i in range(1400)]),)

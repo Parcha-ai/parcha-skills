@@ -259,7 +259,7 @@ def collapse_document_candidates(
     nominate_per_arm: int = 0,
     window_boost: tuple[str, str, float] | None = None,
     source_boost: tuple[tuple[str, ...], float] | None = None,
-    passage_budget: int | Literal["admitted"] | None = None,
+    passage_budget: int | Literal["admitted", "query"] | None = None,
 ) -> list[dict[str, Any]]:
     """Fuse mechanical hints while keeping their strongest exact ranges.
 
@@ -280,7 +280,9 @@ def collapse_document_candidates(
     document the arms placed past ``limit`` can still enter the head; those
     rows carry ``temporal_boost``. Nominations follow the boosted head.
     ``passage_budget="admitted"`` reallocates the legacy range count by passage
-    RRF while preserving every admitted parent; an integer freezes that capacity
+    RRF while preserving every admitted parent. ``"query"`` instead derives
+    capacity from three passages per configured parent slot, with one per
+    admitted parent as the floor. An integer freezes the selected capacity
     for an authority rebuild. ``None`` retains the legacy per-parent selector.
     """
 
@@ -288,12 +290,12 @@ def collapse_document_candidates(
     nominated_documents: set[tuple[str, str]] = set()
     passage_scores: dict[tuple[str, str, str], float] = {}
     if passage_budget is not None and (
-        fusion != "rrf" or (passage_budget != "admitted" and (
+        fusion != "rrf" or (passage_budget not in ("admitted", "query") and (
             type(passage_budget) is not int
             or not 1 <= passage_budget <= MAX_CANDIDATES_CEILING
         ))
     ):
-        raise ValueError("passage budget requires RRF and admitted or bounded integer capacity")
+        raise ValueError("passage budget requires RRF and query, admitted or bounded integer capacity")
     for leg_name, weight, rows in legs:
         seen_passages: set[tuple[str, str, str]] = set()
         leg_scores, normalized = leg_document_scores(rows, mode=fusion)
@@ -438,6 +440,12 @@ def collapse_document_candidates(
         )
     results = []
     selected_passages: set[tuple[str, str, str]] = set()
+    if passage_budget == "query":
+        # Window fragmentation must not reduce the request's evidence allowance.
+        # Existing arm nominations still receive one passage per admitted parent.
+        passage_budget = max(3 * limit, len(ranked))
+        if passage_budget > MAX_CANDIDATES_CEILING:
+            passage_budget = None
     if passage_budget == "admitted":
         # The legacy selector spends at most three distinct ranges per parent.
         # Compute that exact capacity during this collapse, without rerunning it.
@@ -1255,6 +1263,14 @@ class PassageHintRetrieval:
         still constrain those bodies before reranking."""
 
         return self._filter_time_ranges(results, legs)
+
+    def _balanced_passages_enabled(self) -> bool:
+        return (
+            getattr(self.store, "rerank_runtime", None) is not None
+            and getattr(self.store, "fusion_mode", DEFAULT_FUSION_MODE) == "rrf"
+            and os.environ.get("RECALL_SEARCH_BALANCED_PASSAGES", "1").strip().lower()
+            not in {"0", "off", "false"}
+        )
 
     def __init__(
         self,
@@ -2589,13 +2605,9 @@ class PassageHintRetrieval:
             window_boost=window_boost,
             source_boost=source_boost,
         )
-        balanced_passages = (
-            rerank_runtime is not None and fusion_mode == "rrf"
-            and os.environ.get("RECALL_SEARCH_BALANCED_PASSAGES", "1").strip().lower()
-            not in {"0", "off", "false"}
-        )
+        balanced_passages = self._balanced_passages_enabled()
         if balanced_passages:
-            collapse_options["passage_budget"] = "admitted"
+            collapse_options["passage_budget"] = "query"
         results = collapse_document_candidates(legs, **collapse_options)
         if balanced_passages:
             # Freeze the request's capacity for the authority rebuild. Its input
