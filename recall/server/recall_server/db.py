@@ -223,8 +223,8 @@ class _ReadOnlyStore:
     def __init__(self, store):
         self._store = store
 
-    def connect(self):
-        return self._store.read_connection()
+    def connect(self, *, timeout=None):
+        return self._store.read_connection(timeout=timeout)
 
     def __getattr__(self, name):
         value = getattr(self._store, name)
@@ -375,10 +375,10 @@ class BrainStore:
             return self._pool.connection()
         return self._pool.connection(timeout=timeout)
 
-    def read_connection(self):
+    def read_connection(self, *, timeout=None):
         """Borrow reserved capacity for an explicit read owner, if enabled."""
         if not self.reserved_read_connections:
-            return self.connect()
+            return self.connect(timeout=timeout)
         if self._read_pool is None:
             with self._pool_lock:
                 if self._read_pool is None:
@@ -404,7 +404,9 @@ class BrainStore:
                         pool.close()
                         raise
                     self._read_pool = pool
-        return self._read_pool.connection()
+        if timeout is None:
+            return self._read_pool.connection()
+        return self._read_pool.connection(timeout=timeout)
 
     def read_only_view(self):
         return self._read_view if self.reserved_read_connections else self

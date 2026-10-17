@@ -4647,8 +4647,6 @@ class BoundCanonicalRetrieval:
             if around is not None or tail != 0 or prompts:
                 raise ValueError("unsupported passage show request")
             return self._show_passage(target, cursor=cursor, page_bytes=page_bytes)
-        if cursor is not None or page_bytes is not None:
-            raise ValueError("pagination requires a passage locator")
         if (
             not isinstance(target, str)
             or not target.startswith("recall://")
@@ -4659,27 +4657,43 @@ class BoundCanonicalRetrieval:
             raise ValueError("unsupported canonical show request")
         if not self.authorized_sources:
             return None
+        source_deadline = time.monotonic() + self.store.search_deadline_ms / 1000
         deadline_at = (
-            time.monotonic() + self.store.search_deadline_ms / 1000
-            if self.chunk_body_archive is not None else None
+            source_deadline
+            if self.chunk_body_archive is not None or self.archive is not None else None
         )
-        with self.store.connect() as connection:
+        with self.store.connect(timeout=max(0.001, source_deadline - time.monotonic())) as connection:
             row = self._receipt_event(connection, target, deadline_at=deadline_at)
             if row is None:
                 return None
-            body_sql = "NULL::text" if self.chunk_body_archive is not None else "text_redacted"
-            chunks = self.store._execute_bounded(
-                connection,
-                f"""SELECT ordinal,{body_sql} AS text,receipt
-                   FROM canonical_chunks
-                   WHERE tenant_id=%s AND source_id=%s AND document_id=%s
-                     AND deleted_at IS NULL
-                   ORDER BY ordinal""",
-                (self.tenant_id, row["source_id"], row["document_id"]),
-                deadline_at,
-            ).fetchall()
-            if not chunks and '_admitted_chunk' in row:
-                chunks = [dict(row['_admitted_chunk'])]
+            content = row.get("canonical_redacted", {}).get("content")
+            oversized = (
+                self.archive is not None
+                and isinstance(content, dict)
+                and content.get("contract") == "recall.oversized-projection.v1"
+            )
+            if oversized:
+                chunks = []
+            else:
+                if cursor is not None or page_bytes is not None:
+                    raise ValueError("pagination requires an oversized receipt or passage locator")
+                body_sql = "NULL::text" if self.chunk_body_archive is not None else "text_redacted"
+                chunks = self.store._execute_bounded(
+                    connection,
+                    f"""SELECT ordinal,{body_sql} AS text,receipt
+                       FROM canonical_chunks
+                       WHERE tenant_id=%s AND source_id=%s AND document_id=%s
+                         AND deleted_at IS NULL
+                       ORDER BY ordinal""",
+                    (self.tenant_id, row["source_id"], row["document_id"]),
+                    deadline_at,
+                ).fetchall()
+                if not chunks and '_admitted_chunk' in row:
+                    chunks = [dict(row['_admitted_chunk'])]
+        if oversized:
+            from .oversized_show import show_oversized
+            return show_oversized(self, target, cursor=cursor, page_bytes=page_bytes,
+                                  deadline_at=source_deadline)
         if self.chunk_body_archive is not None:
             for chunk in chunks:
                 chunk["source_id"] = row["source_id"]
