@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import ssl
 import sys
 import time
 import threading
@@ -479,6 +480,51 @@ class JudgmentHttpTest(unittest.TestCase):
         self.assertEqual(proxies[0].proxies, {})
         self.assertEqual(request.call_count, 1)
 
+    def test_transport_reuses_verified_context_but_not_request_handlers(self):
+        class Response(io.BytesIO):
+            status = 200
+            headers = {}
+
+        contexts = ssl.create_default_context
+        build_opener = urllib.request.build_opener
+        with mock.patch("ssl.create_default_context", wraps=contexts) as create, mock.patch(
+            "urllib.request.build_opener", wraps=build_opener
+        ) as build, mock.patch(
+            "urllib.request.OpenerDirector.open",
+            side_effect=[Response(b'{"ok":1}'), Response(b'{"ok":2}')],
+        ) as opened:
+            transport = UrllibJudgmentTransport()
+            for number in (1, 2):
+                self.assertEqual(transport.post(
+                    url=ENDPOINT, headers={}, body={"request": number}, timeout=.5
+                ), {"ok": number})
+            self.assertEqual(create.call_count, 1)
+            self.assertEqual(opened.call_count, 2)
+            first, second = (call.args for call in build.call_args_list)
+            self.assertTrue(all(a is not b for a, b in zip(first, second, strict=True)))
+            tls = [next(h for h in handlers if isinstance(h, urllib.request.HTTPSHandler))
+                   for handlers in (first, second)]
+            self.assertIs(tls[0]._context, tls[1]._context)
+            self.assertEqual(tls[0]._context.verify_mode, ssl.CERT_REQUIRED)
+            self.assertTrue(tls[0]._context.check_hostname)
+            for handlers in (first, second):
+                proxy = next(h for h in handlers if isinstance(h, urllib.request.ProxyHandler))
+                redirect = next(h for h in handlers if isinstance(h, urllib.request.HTTPRedirectHandler))
+                self.assertEqual(proxy.proxies, {})
+                self.assertIsNone(redirect.redirect_request(None, None, 302, "", {}, "https://evil.example"))
+            UrllibJudgmentTransport()
+            self.assertEqual(create.call_count, 2)
+
+    def test_context_initialization_failure_is_content_free_and_never_dispatches(self):
+        with mock.patch("ssl.create_default_context", side_effect=OSError("private trust-store path")), mock.patch(
+            "urllib.request.build_opener"
+        ) as build:
+            with self.assertRaises(JudgmentUnavailable) as caught:
+                UrllibJudgmentTransport()
+        self.assertEqual(caught.exception.code, "judgment_transport_error")
+        self.assertNotIn("private", str(caught.exception))
+        build.assert_not_called()
+
     def test_bounded_response_and_invalid_json(self):
         class Response(io.BytesIO):
             status = 200
@@ -534,22 +580,25 @@ class JudgmentHttpTest(unittest.TestCase):
         thread.start()
         try:
             endpoint = f"http://127.0.0.1:{server.server_port}/typesafe/v1/systemone"
-            result = JudgmentClient(endpoint=endpoint, broker_key="synthetic").judge(
-                state="A synthetic café request",
-                questions=primitive_questions(),
-            )
+            with mock.patch("ssl.create_default_context", wraps=ssl.create_default_context) as create:
+                client = JudgmentClient(endpoint=endpoint, broker_key="synthetic")
+                results = [client.judge(
+                    state="A synthetic café request",
+                    questions=primitive_questions(),
+                ) for _ in range(2)]
+                self.assertEqual(create.call_count, 1)
         finally:
             server.shutdown()
             server.server_close()
             thread.join(timeout=1)
-        self.assertEqual(len(captured), 1)
-        path, headers, body = captured[0]
-        self.assertEqual(path, "/typesafe/v1/systemone")
-        self.assertEqual(headers["Content-Type"], "application/json")
-        self.assertEqual(headers["Authorization"], "Bearer synthetic")
-        self.assertIn("café".encode(), body)
-        self.assertEqual(json.loads(body)["model"], JEV_MODEL)
-        self.assertEqual(result.answers["urgent"].noul, 0.92)
+        self.assertEqual(len(captured), 2)
+        for (path, headers, body), result in zip(captured, results, strict=True):
+            self.assertEqual(path, "/typesafe/v1/systemone")
+            self.assertEqual(headers["Content-Type"], "application/json")
+            self.assertEqual(headers["Authorization"], "Bearer synthetic")
+            self.assertIn("café".encode(), body)
+            self.assertEqual(json.loads(body)["model"], JEV_MODEL)
+            self.assertEqual(result.answers["urgent"].noul, 0.92)
 
 
 if __name__ == "__main__":
