@@ -155,6 +155,7 @@ jobs:
             e2e_typed_document_visibility.py \
             e2e_passage_origin.py \
             e2e_long_copied_evidence.py \
+            e2e_dense_identity_ownership.py \
             e2e_passage_append_tail.py \
             e2e_report_unit_authority.py \
             e2e_assistant_final_units.py \

@@ -77,6 +77,14 @@ class SettingsTests(unittest.TestCase):
 
 
 class ArmTests(unittest.TestCase):
+    def test_dense_identity_dedup_preserves_source_and_parent_ownership(self):
+        row = dict(source_id="one", logical_document_id="parent", passage_id="passage", text_sha256="same", score=1.)
+        rows = [row, dict(row, score=.8), dict(row, source_id="two"),
+                dict(row, logical_document_id="other"), dict(row, passage_id="different")]
+        kept = plane_retrieval.dedupe_identities(rows)
+        self.assertEqual(kept, [rows[0], *rows[2:]])
+        self.assertIs(kept[0], row)
+
     def _retrieval(self, client, **kwargs):
         store = RerankWiringTests._Store()
         original_execute = store._execute_bounded
@@ -114,7 +122,7 @@ class ArmTests(unittest.TestCase):
         self.assertEqual(clauses[4], ("actor_keys", "ContainsAny", ["author:a1"]))
         self.assertEqual(scope_filters(sources=["s1"], policy_fingerprint="fp", since=None, until=None, actor_ids=["a1"], actor_relations=None)[-1], ("actor_ids", "ContainsAny", ["a1"]))
 
-    def test_dense_arm_embeds_nothing_locally_and_dedupes_texts(self) -> None:
+    def test_dense_arm_preserves_equal_text_owned_by_different_parents(self) -> None:
         client = FakeTurbopuffer()
         ns = self._seed(client)
         retrieval, _ = self._retrieval(client)
@@ -129,12 +137,13 @@ class ArmTests(unittest.TestCase):
         # The arm reads catalog attributes only: no bodies over the wire.
         self.assertEqual(set(ns.queries[-1]["include_attributes"]), set(plane_retrieval.CATALOG_ATTRIBUTES))
         self.assertFalse(set(ns.queries[-1]["include_attributes"]) & set(plane_retrieval.BODY_ATTRIBUTES))
-        # Only the authorized source; the two identical texts (same hash) collapse to one row.
+        # Equal bytes do not establish shared authority for different parents.
         self.assertTrue(all(row["source_id"] == "codex:linux:test" for row in rows))
         self.assertEqual(rows[0]["logical_document_id"], LDOC)
         hashes = [r["text_sha256"] for r in rows]
-        self.assertEqual(len(hashes), len(set(hashes)))
-        self.assertEqual(len(rows), 2)
+        self.assertEqual(len(hashes), 3)
+        self.assertEqual(len(set(hashes)), 2)
+        self.assertEqual(len(rows), 3)
         self.assertEqual(rows[0]["text_redacted"], "")  # the body arrives with hydration
         self.assertGreater(rows[0]["score"], rows[-1]["score"])
 
