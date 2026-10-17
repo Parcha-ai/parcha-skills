@@ -60,10 +60,14 @@ class QueuedCompactionTests(unittest.TestCase):
         self.assertEqual(helper.rows(after.shards, archive), helper.rows(full.references, full_archive))
 
     def test_idle_actual_queued_path_retains_compaction(self):
-        _, _, changed, catalog, archive = self.fixture()
+        helper, _, changed, catalog, archive = self.fixture()
         result = self.run_queue(changed, catalog, archive, 1)
         self.assertEqual(result.mode, 'compaction')
-        self.assertEqual(result.documents_rewritten, len(changed))
+        self.assertEqual(result.documents_rewritten, 1)
+        self.assertEqual(archive.reads, ['document:0'])
+        self.assertEqual(set(result.removed), set(catalog.shards))
+        self.assertLess(len(result.references), len(catalog.shards))
+        helper.assert_full_parity(changed, catalog, archive, result)
 
     def test_busy_compaction_only_hint_reuses_identical_base(self):
         _, docs, _, catalog, archive = self.fixture()
