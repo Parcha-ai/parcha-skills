@@ -41,6 +41,65 @@ def _hint(query: str) -> tuple[str, str, str] | None:
 
 
 class ParserTableTests(unittest.TestCase):
+    def test_explicit_utc_minute_preserves_supplied_precision(self) -> None:
+        hint = parse_temporal_hint("the run on February 29, 2024 at 23:59 UTC", now=NOW)
+        assert hint is not None
+        self.assertEqual(hint.since, "2024-02-29T23:59:00+00:00")
+        self.assertEqual(hint.until, "2024-02-29T23:59:59.999999+00:00")
+        self.assertEqual(hint.span, "February 29, 2024 at 23:59 UTC")
+        self.assertEqual(hint.confidence, "exact")
+        self.assertTrue(hint.day_level)
+
+    def test_utc_minute_does_not_choose_between_distinct_dates(self) -> None:
+        hint = parse_temporal_hint(
+            "compare January 3, 2024 at 12:15 UTC with December 3, 2024", now=NOW,
+        )
+        assert hint is not None
+        self.assertEqual(hint.since, "2024-01-03T00:00:00+00:00")
+        self.assertEqual(hint.until, "2024-01-03T23:59:59+00:00")
+
+    def test_explicit_utc_minute_uses_existing_date_forms(self) -> None:
+        for phrase in ("2024-02-29", "29 February 2024", "2/29/2024"):
+            with self.subTest(phrase=phrase):
+                hint = parse_temporal_hint(f"the run on {phrase} at 00:00 UTC", now=NOW)
+                assert hint is not None
+                self.assertEqual(hint.since, "2024-02-29T00:00:00+00:00")
+                self.assertEqual(hint.until, "2024-02-29T00:00:59.999999+00:00")
+                self.assertTrue(window_intersects(
+                    "2024-02-29T00:00:59.999999Z", "2024-02-29T00:00:59.999999Z",
+                    hint.since, hint.until,
+                ))
+                self.assertFalse(window_intersects(
+                    "2024-02-29T00:01:00Z", "2024-02-29T00:01:00Z",
+                    hint.since, hint.until,
+                ))
+
+    def test_utc_minute_requires_unambiguous_valid_clock_and_zone(self) -> None:
+        for suffix in (
+            "at 12:15", "at 12:15 PST", "at 12:15 UTC+01:00",
+            "at 24:00 UTC", "at 12:60 UTC", "at 12:15:30 UTC",
+            "at 12:15 UTC or 13:15 UTC", "at 12:15 UTC or 13:15 PST",
+            "around 12:15 UTC", "at about 12:15 UTC",
+        ):
+            with self.subTest(suffix=suffix):
+                hint = parse_temporal_hint(f"May 3, 2024 {suffix}", now=NOW)
+                assert hint is not None
+                self.assertEqual(hint.since, "2024-05-03T00:00:00+00:00")
+                self.assertEqual(hint.until, "2024-05-03T23:59:59+00:00")
+        no_year = parse_temporal_hint("May 3 at 12:15 UTC", now=NOW)
+        assert no_year is not None
+        self.assertEqual(no_year.since, "2026-05-03T00:00:00+00:00")
+        self.assertEqual(no_year.until, "2026-05-03T23:59:59+00:00")
+
+    def test_utc_minute_preserves_hedges_invalid_dates_and_future_behavior(self) -> None:
+        for date_phrase in ("around May 3, 2024", "2023-02-29", "2027-01-01"):
+            with self.subTest(date_phrase=date_phrase):
+                old = parse_temporal_hint(date_phrase, now=NOW)
+                actual = parse_temporal_hint(date_phrase + " at 12:15 UTC", now=NOW)
+                self.assertEqual(actual, old)
+        future_clock = parse_temporal_hint("September 14, 2026 at 13:00 UTC", now=NOW)
+        self.assertEqual(future_clock, parse_temporal_hint("September 14, 2026", now=NOW))
+
     POSITIVE = [
         # explicit dates
         ("the deploy on 2026-05-03 failed", ("2026-05-03", "2026-05-03", "exact")),
@@ -381,6 +440,33 @@ class SearchWiringTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertIsNone(calls[0]["since"])
         self.assertTrue(all("temporal_boost" not in row for row in on["results"]))
+
+    def test_utc_minute_reuses_one_existing_window_pass(self) -> None:
+        calls: list[dict] = []
+        with mock.patch.dict(os.environ, {}, clear=True):
+            response = self._search(
+                self._retrieval(self._Store(), dense_calls=calls),
+                "the run on May 3, 2026 at 12:15 UTC",
+            )
+        self.assertEqual(len(calls), 2)
+        self.assertIsNone(calls[0]["since"])
+        self.assertEqual(calls[1]["since"], "2026-05-03T12:15:00+00:00")
+        self.assertEqual(calls[1]["until"], "2026-05-03T12:15:59.999999+00:00")
+        self.assertEqual(calls[0]["candidate_limit"], calls[1]["candidate_limit"])
+        self.assertLessEqual(calls[1]["deadline_at"], calls[0]["deadline_at"])
+        self.assertEqual(response["diagnostics"]["dense_window_status"], "ok")
+
+    def test_explicit_caller_scope_still_wins_over_utc_minute(self) -> None:
+        calls: list[dict] = []
+        retrieval = self._retrieval(self._Store(), dense_calls=calls)
+        with mock.patch.dict(os.environ, {}, clear=True):
+            response = retrieval.search(
+                "the run on May 3, 2026 at 12:15 UTC", lexical_query="run",
+                since="2026-01-01T00:00:00+00:00", until=None, limit=10, now=NOW,
+            )
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["since"], "2026-01-01T00:00:00+00:00")
+        self.assertNotIn("temporal_hint", response["diagnostics"])
 
     def test_wide_loose_hint_boosts_without_a_window_pass(self) -> None:
         calls: list[dict] = []
