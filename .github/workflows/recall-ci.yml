@@ -159,6 +159,7 @@ jobs:
             e2e_time_clip_rerank.py \
             e2e_singleton_parent_receipts.py \
             e2e_singleton_projection_membership.py \
+            e2e_parquet_membership_certificates.py \
             e2e_parquet_deadline_isolation.py \
             e2e_singleton_maintenance_membership.py \
             e2e_singleton_metadata_restore.py \

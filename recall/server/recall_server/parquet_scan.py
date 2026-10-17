@@ -1098,6 +1098,18 @@ class CanonicalParquetScanProjector:
             return
         bucket_end = _next_month(candidate.bucket_start)
         membership_enabled = getattr(self.store, "verified_singleton_receipts", False)
+        from . import parent_membership_read
+
+        read_settings = (
+            parent_membership_read.ReadSettings.from_env()
+            if membership_enabled else parent_membership_read.ReadSettings()
+        )
+        certificate_columns = """
+                          ,passage.tenant_id,passage.source_id,passage.text_sha256,
+                          evidence.manifest_content_sha256""" if read_settings.enabled else ""
+        certificate_join = """
+                     LEFT JOIN canonical_evidence_documents evidence
+                       USING(tenant_id,source_id,logical_document_id)""" if read_settings.enabled else ""
         membership_predicate = "true" if membership_enabled else """NOT EXISTS (
                           SELECT 1 FROM unnest(passage.receipts) AS receipt(value)
                           LEFT JOIN canonical_chunks chunk
@@ -1127,7 +1139,9 @@ class CanonicalParquetScanProjector:
                           coalesce(attributed.actor_names,ARRAY[]::text[]) AS actor_names,
                           coalesce(attributed.actor_relations,ARRAY[]::text[])
                               AS actor_relations
+                          {certificate_columns}
                      FROM canonical_passages passage
+                     {certificate_join}
                      LEFT JOIN LATERAL (
                           SELECT array_agg(link.actor_id ORDER BY link.actor_id,link.relation)
                                      AS actor_ids,
@@ -1166,15 +1180,35 @@ class CanonicalParquetScanProjector:
                 from .receipt_membership import lookup_current_search_membership
 
                 while rows := cursor.fetchmany(cursor.itersize):
+                    deadline_at = time.monotonic() + self.store.search_deadline_ms / 1000
+                    certified = set()
+                    if read_settings.enabled:
+                        certified, _ = parent_membership_read.partition(
+                            self.store, connection, selected=rows,
+                            settings=read_settings, deadline_at=deadline_at,
+                        )
+                    fallback = [row for row in rows
+                                if (candidate.source_id, row["passage_id"]) not in certified]
+                    if not fallback:
+                        # RELEASE SAVEPOINT retains the metadata phase's short
+                        # SET LOCAL timeout. Restore this batch's remaining
+                        # budget before the next FETCH, without renewing it.
+                        self.store._set_statement_deadline(connection, deadline_at)
                     members = lookup_current_search_membership(
                         self.store, tenant_id=candidate.tenant_id,
                         authorized_sources=(candidate.source_id,),
-                        receipts=tuple(dict.fromkeys(receipt for row in rows for receipt in row["receipts"])),
+                        receipts=tuple(dict.fromkeys(receipt for row in fallback for receipt in row["receipts"])),
                         connection=connection,
-                        deadline_at=time.monotonic() + self.store.search_deadline_ms / 1000,
-                    )
+                        deadline_at=deadline_at,
+                    ) if fallback else set()
                     for row in rows:
-                        if all((candidate.source_id, receipt) in members for receipt in row["receipts"]):
+                        if ((candidate.source_id, row["passage_id"]) in certified
+                                or all((candidate.source_id, receipt) in members for receipt in row["receipts"])):
+                            # Certificate inputs are transient canonical metadata;
+                            # the published scan schema and row shape stay intact.
+                            if read_settings.enabled:
+                                for key in ("tenant_id", "source_id", "text_sha256", "manifest_content_sha256"):
+                                    row.pop(key)
                             yield row
 
     def _catalog(self, candidate: ScanCandidate) -> ScanCatalog:
