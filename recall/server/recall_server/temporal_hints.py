@@ -16,6 +16,8 @@ Grammar (case-insensitive unless noted; ``now`` resolves the defaults):
 * Month-name dates ``May 3``, ``May 3rd``, ``3 May``, ``May 3, 2026``,
   ``Sep 14 2026``; day ranges ``May 2-4``, ``May 2 to 4``, ``May 2 - May 4``,
   ``May 30 - June 2``, ``between May 2 and May 4``.
+* A single full date followed by ``at HH:MM UTC`` retains that minute.
+  Missing years/zones, multiple clocks/dates, and hedges retain the date hint.
 * Numeric month/day ``5/3``, ``5/3/2026``, ``5/2-5/4`` (US order; both
   parts must be a valid month and day, and the token must stand alone).
 * Month names with an optional year: ``in May``, ``May 2026``, ``early
@@ -163,6 +165,8 @@ NUMBER_WORDS = {
     "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10, "couple of": 2,
     "few": 3,
 }
+
+UTC_MINUTE_RE = re.compile(r"(?<![\w:])(?P<hour>\d{2}):(?P<minute>\d{2})(?![\w:])")
 
 
 @dataclass(frozen=True)
@@ -580,6 +584,51 @@ def _parse_relative(query: str, now: datetime) -> TemporalHint | None:
     return _window(centre - pad, centre + pad, "loose", span, now=now)
 
 
+def _refine_utc_minute(query: str, hint: TemporalHint, now: datetime) -> TemporalHint:
+    """Preserve an explicit UTC minute attached to a full, unhedged date."""
+
+    if (
+        hint.confidence != "exact" or not hint.day_level
+        or hint.since[:10] != hint.until[:10]
+        or re.search(r"\b" + _YEAR + r"\b", hint.span) is None
+        or query.count(hint.span) != 1
+    ):
+        return hint
+    clocks = list(UTC_MINUTE_RE.finditer(query))
+    if len(clocks) != 1:
+        return hint
+    dates = [
+        match
+        for pattern in (ISO_DATE_RE, MONTH_DAY_RE, NUMERIC_DATE_RE)
+        for match in pattern.finditer(query)
+        if pattern is not MONTH_DAY_RE or match.group("day") or match.group("dfirst")
+    ]
+    if len(dates) != 1:
+        return hint
+    clock = clocks[0]
+    date_start = query.index(hint.span)
+    date_end = date_start + len(hint.span)
+    if date_end >= clock.start() or query[date_end:clock.start()].strip().lower() not in {"", "at"}:
+        return hint
+    zone = re.match(r"\s+UTC\b(?![+-])", query[clock.end():], re.IGNORECASE)
+    if zone is None:
+        return hint
+    try:
+        start = datetime.fromisoformat(hint.since).replace(
+            hour=int(clock.group("hour")), minute=int(clock.group("minute")),
+        )
+    except ValueError:
+        return hint
+    if start > now:
+        return hint
+    # Retrieval bounds are inclusive; keep fractional timestamps in the last second.
+    end = start + timedelta(minutes=1) - timedelta(microseconds=1)
+    return TemporalHint(
+        since=start.isoformat(), until=end.isoformat(), confidence="exact",
+        span=query[date_start:clock.end() + zone.end()], day_level=True,
+    )
+
+
 def parse_temporal_hint(query: str, *, now: datetime) -> TemporalHint | None:
     """Return the window a question's date phrase names, or ``None``.
 
@@ -606,7 +655,7 @@ def parse_temporal_hint(query: str, *, now: datetime) -> TemporalHint | None:
     ):
         hint = parser(query, now)
         if hint is not None:
-            return hint
+            return _refine_utc_minute(query, hint, now)
     return None
 
 
