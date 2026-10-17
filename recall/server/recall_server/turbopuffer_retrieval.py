@@ -5,8 +5,9 @@ answered by one turbopuffer namespace per tenant instead of Postgres: the
 dense arm is an ANN query embedded natively (``["Embed", query]``, no
 provider call from this process), the lexical arm is BM25 over the verbatim
 passage text (BM25's OR scoring is the min-should-match the Postgres arm
-emulated), the sparse arm is BM25 over the identifier tokens with a
-``ContainsAllTokens`` filter per identifier. Every arm returns the row shape
+emulated), the sparse arm keeps a ``ContainsAllTokens`` filter per identifier and
+ranks eligible passages by the full lexical query when balanced reranking is
+enabled (identifier-only ranking remains the disabled path). Every arm returns the row shape
 the fusion, nomination, reranker, temporal/source hints and clause passes
 already consume, so nothing above the arms changes.
 """
@@ -381,7 +382,8 @@ class TurbopufferHintRetrieval(PassageHintRetrieval):
         exact = [(TEXT_ATTRIBUTE, "ContainsAllTokens", token) for token in tokens]
         filters.append(("Or", exact) if len(exact) > 1 else exact[0])
         raw, status = self._query(
-            rank_by=(TEXT_ATTRIBUTE, "BM25", " ".join(tokens)),
+            rank_by=(TEXT_ATTRIBUTE, "BM25",
+                     lexical_query if self._balanced_passages_enabled() else " ".join(tokens)),
             filters=filters,
             limit=min(SPARSE_LIMIT, max(candidate_limit, 1) * 2),
             deadline_at=deadline_at,
