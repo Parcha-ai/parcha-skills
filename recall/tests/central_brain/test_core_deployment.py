@@ -110,7 +110,7 @@ class DatabaseCapabilityContractTest(unittest.TestCase):
             [v for v in snapshot['migration_versions'] if v != 61],
             [v for v in snapshot['migration_versions'] if v != 69],
             snapshot['migration_versions'] + [88],
-            snapshot['migration_versions'] + [90],
+            snapshot['migration_versions'] + [91],
         ):
             with self.subTest(versions=versions), self.assertRaisesRegex(CapabilityError, 'schema_drift'):
                 assess_snapshot(dict(snapshot, migration_versions=versions))
@@ -125,7 +125,7 @@ class DatabaseCapabilityContractTest(unittest.TestCase):
             self.assertEqual(assess_snapshot(snapshot)['status'], 'ready')
         for versions in ([v for v in snapshot['migration_versions'] if v != 79],
                          snapshot['migration_versions'] + [87],
-                         snapshot['migration_versions'] + [90]):
+                         snapshot['migration_versions'] + [91]):
             with self.assertRaises(CapabilityError):
                 assess_snapshot(dict(snapshot, migration_versions=versions))
 
@@ -139,7 +139,7 @@ class DatabaseCapabilityContractTest(unittest.TestCase):
             self.assertEqual(assess_snapshot(snapshot)['status'], 'ready')
         for versions in ([v for v in snapshot['migration_versions'] if v != 78],
                          snapshot['migration_versions'] + [86],
-                         snapshot['migration_versions'] + [90]):
+                         snapshot['migration_versions'] + [91]):
             with self.assertRaises(CapabilityError):
                 assess_snapshot(dict(snapshot, migration_versions=versions))
 
@@ -357,7 +357,7 @@ class DatabaseCapabilityContractTest(unittest.TestCase):
                 if marker or removed!=82:
                     with self.assertRaisesRegex(CapabilityError,'schema_drift'):
                         assess_snapshot(invalid)
-            for extra in ([90],[83,83]):
+            for extra in ([91],[83,83]):
                 invalid=dict(snapshot,migration_versions=snapshot['migration_versions']+extra)
                 with self.assertRaisesRegex(CapabilityError,'schema_drift'):
                     assess_snapshot(invalid)

@@ -1,6 +1,17 @@
 """Resolve versioned tool text inside an already authorized source record."""
 
 
+def codex_tool_source_unit_role(source_unit):
+    """Declared provider role for a supported discriminator, not source proof."""
+    if not isinstance(source_unit, str):
+        return None
+    return {
+        'codex.tool-input.string.v1#/payload/arguments': 'assistant',
+        'codex.tool-input.string.v1#/payload/input': 'assistant',
+        'codex.tool-result.string.v1#/payload/output': 'tool',
+    }.get(source_unit)
+
+
 def resolve_claude_tool_source_unit(record_text, source_unit):
     """Return (exact decoded string, input/result origin) for one typed pointer.
 
