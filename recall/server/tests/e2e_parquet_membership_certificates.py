@@ -275,7 +275,7 @@ class ParquetCertificateTests(ParentEnrollmentTests):
             if len(partition_calls) == 1:
                 start = clock()
                 # Expire only the100ms in-memory validation window. No database
-                # timeout is changed; native proof retains the original deadline.
+                # timeout is changed; background proof receives its own bounded operation.
                 with patch.object(reader.time, 'monotonic', side_effect=[start, start + .101, start + .102]):
                     result = original(selected=selected, settings=settings, deadline_at=deadline_at)
                 self.assertEqual(result[1]['status'], 'deadline')
@@ -290,7 +290,7 @@ class ParquetCertificateTests(ParentEnrollmentTests):
             self.assertEqual(self.stream(), baseline)
         self.assertEqual(len(partition_calls), 2)
         self.assertEqual(len(native_deadlines), 1)
-        self.assertEqual(native_deadlines[0], partition_calls[0])
+        self.assertGreater(native_deadlines[0], partition_calls[0])
 
     def test_successful_certificate_restores_timeout_before_next_native_fetch(self):
         self.clone_passages(1, self.physical_receipt)
