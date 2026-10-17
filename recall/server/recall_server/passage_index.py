@@ -2047,9 +2047,12 @@ class CanonicalPassageProjector:
         concurrency: int = 2,
         on_progress: Callable[[], None] | None = None,
         certification_budget: CertificationBudget | None = None,
+        certification_batch_size: int | None = None,
     ) -> dict[str, int | str]:
         tenant_id = self._tenant(tenant_id)
         certification_budget = certification_budget or CertificationBudget()
+        if certification_batch_size is None:
+            certification_batch_size = batch_size
         if (
             isinstance(batch_size, bool)
             or not isinstance(batch_size, int)
@@ -2060,6 +2063,9 @@ class CanonicalPassageProjector:
             or isinstance(concurrency, bool)
             or not isinstance(concurrency, int)
             or not 1 <= concurrency <= 32
+            or isinstance(certification_batch_size, bool)
+            or not isinstance(certification_batch_size, int)
+            or not 1 <= certification_batch_size <= MAX_PASSAGE_PROJECTION_BATCH
         ):
             raise ValueError("passage projection budget is invalid")
         phase_started = time.monotonic()
@@ -2216,7 +2222,8 @@ class CanonicalPassageProjector:
                     certification_started = time.monotonic()
                     try:
                         certification_rows = membership_remainder.pending(self.store,
-                            tenant_id=tenant_id, limit=batch_size, deadline_at=certification_deadline)
+                            tenant_id=tenant_id, limit=certification_batch_size,
+                            deadline_at=certification_deadline)
                         for row in certification_rows:
                             if time.monotonic() >= certification_deadline:
                                 break
