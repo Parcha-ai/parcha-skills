@@ -1013,7 +1013,10 @@ class CanonicalParquetScanProjector:
         bucket_end = _next_month(candidate.bucket_start)
         with self.store.connect() as connection:
             documents = connection.execute(
-                """SELECT document.*,
+                """SELECT document.tenant_id,document.source_id,
+                          document.logical_document_id,document.native_parent_id,
+                          document.revision,document.document_content_sha256,
+                          document.part_count,
                           pointer.policy_fingerprint AS passage_policy_fingerprint,
                           pointer.source_document_sha256 AS passage_source_sha256,
                           pointer.passage_count,

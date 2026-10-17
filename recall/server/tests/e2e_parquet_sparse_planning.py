@@ -1,6 +1,7 @@
 """Sparse metadata planning must match the native full-month build."""
 
 import hashlib
+from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
@@ -173,6 +174,76 @@ class SparsePlanning(ReceiptMembershipTests):
                 )
             }
         self.assertEqual(markers, {self.scan.sparse_plan_epoch})
+
+    def test_document_projection_preserves_native_build_without_unused_metadata(self):
+        self.ingest_parent("alpha", "alpha/one", "Synthetic projection change")
+        self.project()
+        with self.store.connect() as c:
+            c.execute(
+                "UPDATE canonical_evidence_documents SET actor_checkpoint=%s::jsonb "
+                "WHERE tenant_id=%s",
+                (json.dumps({"synthetic_unused_payload": "x" * 12_000}), self.tenant),
+            )
+        candidate = self.candidate()
+        captured = []
+        connect = self.store.connect
+
+        class Capture:
+            def __init__(self, connection):
+                self.connection = connection
+
+            def execute(self, statement, parameters):
+                captured.append((statement, parameters))
+                return self.connection.execute(statement, parameters)
+
+        @contextmanager
+        def capture():
+            with connect() as c:
+                yield Capture(c)
+
+        with patch.object(self.store, "connect", capture):
+            selected = self.scan._documents(candidate)
+        self.assertEqual(len(captured), 1)
+        statement, parameters = captured[0]
+        # The original broad projection, with exactly the native joins, filters
+        # and parameters, supplies the independent value/output comparison.
+        broad_statement = "SELECT document.*, pointer.policy_fingerprint" + statement.split(
+            "pointer.policy_fingerprint", 1
+        )[1]
+        with connect() as c:
+            broad = c.execute(broad_statement, parameters).fetchall()
+        fields = {
+            "tenant_id", "source_id", "logical_document_id", "native_parent_id",
+            "revision", "document_content_sha256", "part_count",
+            "passage_policy_fingerprint", "passage_source_sha256",
+            "passage_count", "actor_links",
+        }
+        self.assertTrue(broad)
+        self.assertTrue(all(row["manifest_object_key"] and row["actor_checkpoint"] for row in broad))
+        self.assertEqual(selected, [{key: row[key] for key in fields} for row in broad])
+        selected_bytes = len(json.dumps(selected, sort_keys=True, default=str).encode())
+        broad_bytes = len(json.dumps(broad, sort_keys=True, default=str).encode())
+        print(json.dumps({"synthetic_metadata_rows": len(broad),
+                          "broad_json_bytes": broad_bytes,
+                          "selected_json_bytes": selected_bytes}))
+        self.assertLess(selected_bytes, broad_bytes - 12_000 * len(broad))
+        self.assertEqual(
+            [self.scan._fingerprint(row) for row in selected],
+            [self.scan._fingerprint(row) for row in broad],
+        )
+        upload = self.scan._build(candidate, allow_compaction=False)
+
+        def broad_documents(candidate, *, document_ids=None):
+            return [dict(row) for row in broad
+                    if document_ids is None or row["logical_document_id"] in document_ids]
+
+        with patch.object(self.scan, "_documents", broad_documents):
+            original = self.scan._build(candidate, allow_compaction=False)
+        self.assertEqual(self.rows(upload), self.rows(original))
+        self.assertEqual(upload.removed, original.removed)
+        self.assertEqual(upload.members, original.members)
+        self.assertEqual(upload.generation_sha256, original.generation_sha256)
+        self.assertEqual(self.scan._commit(candidate, upload), "committed")
 
     def test_changed_document_reads_only_affected_metadata_with_full_oracle_parity(
         self,
