@@ -295,7 +295,7 @@ class DatabaseCapabilityContractTest(unittest.TestCase):
         for retired in (False, True):
             for marker in (False, True):
                 snapshot = healthy_snapshot()
-                snapshot["migration_versions"] = [v for v in snapshot["migration_versions"] if v not in (82,83,84,85,86,87,88,89)]
+                snapshot["migration_versions"] = [v for v in snapshot["migration_versions"] if v not in (82,83,84,85,86,87,88,89,90)]
                 baseline_version = max(snapshot["migration_versions"])
                 if not retired:
                     snapshot["migration_versions"].remove(67)
@@ -347,7 +347,7 @@ class DatabaseCapabilityContractTest(unittest.TestCase):
     def test_parent_certificate_marker_requires_generation_and_keeps_unknown_version_fence(self):
         for marker in (False,True):
             snapshot=healthy_snapshot()
-            snapshot['migration_versions']=[v for v in snapshot['migration_versions'] if v not in (83,84,85,86,87,88,89)]
+            snapshot['migration_versions']=[v for v in snapshot['migration_versions'] if v not in (83,84,85,86,87,88,89,90)]
             baseline=max(snapshot['migration_versions'])
             if marker:
                 snapshot['migration_versions'].append(83)

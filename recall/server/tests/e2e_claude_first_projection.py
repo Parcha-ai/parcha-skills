@@ -113,11 +113,14 @@ class ClaudeFirstProjection(unittest.TestCase):
         self.assertIsNone(self.document())
         self.assertEqual(self.projected(), [])
 
-    def test_codex_first_projection_keeps_legacy_and_raw_tool_event(self):
+    def test_existing_codex_legacy_request_keeps_raw_tool_event(self):
         self.source = self.source.replace('claude:', 'codex:', 1)
         raw = self.ingest('input', value={'type': 'response_item', 'payload': {
             'type': 'function_call', 'name': 'shell', 'arguments': '{"command":"echo Sapphire"}'}})
-        self.project()
+        # Preserve the old-writer regression: new Codex defaults are covered
+        # by the separate native Codex publication fixture.
+        with patch.object(passage_index, '_document_extraction_version', return_value='legacy'):
+            self.project()
         self.assertEqual(self.document()['requested_extraction_version'], 'legacy')
         self.assertEqual(self.document()['applied_extraction_version'], 'legacy')
         self.assertIsNone(self.document()['extraction_coverage'])

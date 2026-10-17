@@ -1,0 +1,19 @@
+# Codex tool evidence publication
+
+New Codex parents use `codex_tool_groups_v1` on their first passage projection. Existing document rows keep their requested extraction version, including `legacy` and the earlier Claude-oriented `tool_groups_v1`. A current authorized parent can be explicitly enrolled through the existing `request_extraction_version` operation. No historical bulk enrollment or global policy change is included.
+
+The existing projector groups each supported Codex provider item into one literal field. `function_call.arguments` and `custom_tool_call.input` are authored tool input; the two corresponding output forms are reported tool results. JSON-looking arguments remain literal. The shared source resolver supplies exact source-unit coordinates and provider provenance, including call identity when present. The archive and full source-opening context remain unchanged. Unsupported forms, malformed events and empty fields receive explicit raw-only coverage dispositions.
+
+Tool input does not prove execution, option selection, or human approval. Tool output is reported output, not verified fact or human speech. Search/rerank and source display retain that attribution. No model classifies or filters publication.
+
+The same canonical document row, queue generation, revision/hash checks and transaction own publication. Each enrolled revision is a full rebuild. Ordinary visible passages are built separately, preserving their byte geometry and identities; tool items use existing passage windows and the existing 128-span capacity. Requested and applied versions are committed separately. A stale legacy or old-version preparation cannot overwrite the current request. Forget and grants remain native authority boundaries.
+
+## Rollout and rollback
+
+All three roles must run schema 90-compatible code before migration 090, and no Codex publisher may run before that migration commits. The separate reader/audit predecessor supports this order. A combined publisher rollout can instead use the existing target-image inert worker barrier: deploy MCP, prove managed projection is disabled before deploying managed, deploy the target worker with only the original standby HTTP command, verify the old writer is gone, apply and verify 090, then activate the worker. Bind the actual inert command and deployment in the migration review. Do not infer a disabled managed process merely from a missing service-level environment key if linked environment groups are possible. The publisher capability probe accepts schema 89 during this staging period. The migration changes only role/version constraints and its version marker; it does not change stored requests or enroll documents.
+
+During a mixed-writer rollout, an older writer can win a first projection and create a legacy document. Inspect that finite rollout window and explicitly enroll any intended repairs after all writers are current. The default also covers already queued Codex parents that have never had a passage-document row. Existing rows are not silently reclassified. This is a first-projection boundary, not an event-time cutoff.
+
+Once a Codex document is enrolled, rolling back to a writer that ignores or does not implement `codex_tool_groups_v1` is unsafe. Keep typed-capable writers, stop new explicit admissions if needed, and roll forward with a reviewed correction. Do not claim that reverting only the version marker or default restores old-writer safety.
+
+Full rebuild and embedding work grow with literal tool content. This change is evidence coverage, not an indexing-cost reduction. Broader historical enrollment requires current authorized metadata, exact reviewed per-parent plans/costs, and the original publication/vendor/source acceptance. Raw-only coverage never means complete provider capture.

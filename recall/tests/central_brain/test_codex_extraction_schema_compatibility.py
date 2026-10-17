@@ -1,4 +1,4 @@
-"""Explicit schema90 compatibility precedes Codex extraction activation."""
+"""Retained schema90 compatibility through Codex extraction activation."""
 import unittest
 from recall_server import SCHEMA_VERSION
 from recall_server.capabilities import assess_snapshot, CapabilityError
@@ -6,7 +6,7 @@ from tests.central_brain.test_core_deployment import healthy_snapshot
 
 class CodexExtractionSchemaCompatibilityTests(unittest.TestCase):
     def test_known_90_preserves_both_search_planes(self):
-        self.assertEqual(SCHEMA_VERSION, 89)
+        self.assertEqual(SCHEMA_VERSION, 90)
         for retired in (False, True):
             snapshot = healthy_snapshot()
             snapshot['migration_versions'] = [n for n in range(1, 91) if retired or n != 67]

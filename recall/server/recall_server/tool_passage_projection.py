@@ -8,7 +8,7 @@ from collections import Counter
 import json
 from typing import Iterable
 
-from contracts.source_units import resolve_claude_tool_source_unit
+from contracts.source_units import resolve_claude_tool_source_unit, resolve_codex_tool_source_unit
 from .logical_evidence import LogicalEvidenceRecord
 from .passage_projection import PassageMessage, _logical_record_groups
 
@@ -20,9 +20,9 @@ def tool_evidence_context(spans) -> str:
     kinds = set()
     for span in spans:
         unit = span.get('source_unit') if isinstance(span, dict) else span.source_unit
-        if isinstance(unit, str) and unit.startswith('claude.tool-input.string.v1#'):
+        if isinstance(unit, str) and unit.startswith(('claude.tool-input.string.v1#', 'codex.tool-input.string.v1#')):
             kinds.add('tool_input')
-        elif isinstance(unit, str) and unit.startswith('claude.tool-result.string.v1#'):
+        elif isinstance(unit, str) and unit.startswith(('claude.tool-result.string.v1#', 'codex.tool-result.string.v1#')):
             kinds.add('tool_result')
     if not kinds:
         return ''
@@ -175,5 +175,70 @@ def extract_tool_event_groups(
     coverage = dict(contract=TOOL_PROJECTION_CONTRACT, events=events,
                     tool_blocks=blocks, groups=len(output), string_leaves=leaves,
                     included_string_leaves=sum(len(group.messages) for group in output),
+                    dispositions=dict(sorted(dispositions.items())))
+    return tuple(output), coverage
+
+
+def extract_codex_tool_event_groups(
+    records: Iterable[LogicalEvidenceRecord], *, first_record_ordinal: int = 0,
+) -> tuple[tuple[ToolEventGroup, ...], dict]:
+    """Publish literal strings from supported Codex provider tool items.
+
+    Each item is one group. JSON-looking arguments remain one literal string;
+    the shared source resolver alone authorizes its provider form and coordinates.
+    Unsupported items remain raw and receive an explicit coverage disposition.
+    """
+    output = []
+    dispositions = Counter()
+    events = blocks = leaves = 0
+    for records_group in _logical_record_groups(records, first_record_ordinal=first_record_ordinal):
+        events += 1
+        first = records_group[0]
+        raw = ''.join(record.text for record in records_group)
+        try:
+            event = json.loads(raw, object_pairs_hook=_unique_pairs)
+        except (ValueError, RecursionError):
+            dispositions['invalid_json'] += 1
+            continue
+        payload = event.get('payload') if isinstance(event, dict) else None
+        form = payload.get('type') if isinstance(payload, dict) else None
+        fields = {
+            'function_call': ('arguments', 'input'),
+            'custom_tool_call': ('input', 'input'),
+            'function_call_output': ('output', 'result'),
+            'custom_tool_call_output': ('output', 'result'),
+        }
+        if not isinstance(form, str) or form not in fields:
+            dispositions['unsupported_provider_event'] += 1
+            continue
+        blocks += 1
+        field, kind = fields[form]
+        unit = f'codex.tool-{kind}.string.v1#/payload/{field}'
+        try:
+            text, evidence_kind, provenance = resolve_codex_tool_source_unit(raw, unit)
+        except (ValueError, RecursionError):
+            dispositions['source_unit_refused'] += 1
+            continue
+        role = provenance['role']
+        if first.roles not in ((), (role,)) or not first.receipts:
+            dispositions['provider_role_or_receipts_mismatch'] += 1
+            continue
+        leaves += 1
+        if not text or not text.strip():
+            dispositions['empty_string' if not text else 'no_token_content'] += 1
+            continue
+        origin = dict(evidence_kind=evidence_kind, provider_role=role,
+                      enclosing_pointer='/payload', semantic_role='unknown',
+                      source_tool=provenance)
+        message = PassageMessage(record_ordinal=first.ordinal,
+            record_count=len(records_group), occurred_at=first.occurred_at,
+            roles=(role,), receipts=first.receipts, text=text,
+            actor_links=first.actor_links, source_unit=unit, origin=origin)
+        message.validate()
+        output.append(ToolEventGroup((message,), raw, '/payload', evidence_kind,
+                                     role, provenance.get('call_id')))
+    coverage = dict(contract='recall.codex-tool-event-projection.v1', events=events,
+                    tool_blocks=blocks, groups=len(output), string_leaves=leaves,
+                    included_string_leaves=len(output),
                     dispositions=dict(sorted(dispositions.items())))
     return tuple(output), coverage
