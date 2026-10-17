@@ -416,6 +416,11 @@ class CanonicalLogicalEvidenceProjector:
         if type(append_enabled) is not bool:
             raise LogicalEvidenceError("logical_evidence_budget_invalid")
         self.append_enabled = append_enabled
+        import os
+        actor_reuse = os.environ.get("RECALL_LOGICAL_ACTOR_APPEND_REUSE", "0")
+        if actor_reuse not in {"0", "1"}:
+            raise LogicalEvidenceError("logical_actor_append_flag_invalid")
+        self.actor_append_enabled = actor_reuse == "1"
         self._committed_body_keys: dict[tuple[str, str, str], None] = {}
         self._prefer_recent_admission = False
 
@@ -1849,8 +1854,11 @@ class CanonicalLogicalEvidenceProjector:
                     ("logical-evidence\x1f" + prepared.logical_document_id,),
                 )
                 snapshot_catalog = getattr(upload, "append_snapshot_catalog", None)
-                queue_metadata = ",to_jsonb(queue) AS append_queue" if snapshot_catalog is not None else ""
-                catalog_metadata = ",to_jsonb(canonical_evidence_documents) AS append_catalog" if snapshot_catalog is not None else ""
+                actor_capability = self.actor_append_enabled and connection.execute(
+                    "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=87) AS available"
+                ).fetchone()["available"]
+                queue_metadata = ",to_jsonb(queue) AS append_queue" if snapshot_catalog is not None or actor_capability else ""
+                catalog_metadata = ",to_jsonb(canonical_evidence_documents) AS append_catalog" if snapshot_catalog is not None or actor_capability else ""
                 queued = connection.execute(
                     f"""SELECT generation,changed_at,notification_queued_at{queue_metadata}
                          FROM canonical_evidence_document_queue queue
@@ -1898,6 +1906,12 @@ class CanonicalLogicalEvidenceProjector:
                 append_base = getattr(upload, "append_base_manifest_id", None)
                 if append_base is not None and (current is None or current["manifest_artifact_id"] != append_base):
                     return "stale"
+                from .logical_actor_checkpoint import event_actors, publish_actors, record_checkpoint
+                actor_locators = (getattr(upload, "body_locators", None)
+                    if self.excluded_structural_types == DEFAULT_EXCLUDED_STRUCTURAL_TYPES else None)
+                actors = event_actors(connection, candidate,
+                    current["append_catalog"] if current else None, queued["append_queue"],
+                    actor_locators, retain_queue=retain_queue) if actor_capability else None
                 locator_changes = self._publish_body_locators(
                     connection, candidate, getattr(upload, "body_locators", None),
                     **({"append_window": (snapshot_catalog["append_source_ordinal"],
@@ -1970,6 +1984,9 @@ class CanonicalLogicalEvidenceProjector:
                          prepared.source_id, prepared.logical_document_id,
                          current["revision"], queued["notification_queued_at"]),
                     )
+                    if actor_capability:
+                        publish_actors(connection, prepared, int(current["revision"]),
+                            upload.body_locators.append_source_ordinal if retain_queue else None, actors)
                     capability = self._finish_queue(connection, candidate, queued,
                         restored_manifest['artifact_id'], retain_queue=retain_queue)
                     if capability and capability.get("append_capability"):
@@ -1980,6 +1997,9 @@ class CanonicalLogicalEvidenceProjector:
                             if self.excluded_structural_types == DEFAULT_EXCLUDED_STRUCTURAL_TYPES else None,
                             restored_manifest["artifact_id"],
                         )
+                    if actor_capability:
+                        record_checkpoint(connection, candidate, restored_manifest["artifact_id"],
+                            int(current["revision"]), actor_locators, actors)
                     from .retirement_policy import enroll_published_parent
                     enroll_published_parent(self.store, connection,
                         (candidate.tenant_id, candidate.source_id, candidate.native_parent_id))
@@ -2130,58 +2150,8 @@ class CanonicalLogicalEvidenceProjector:
                             )
                         ],
                     )
-                # Actor links are tiny and derived; rewrite them for the new
-                # revision without touching any passage-level attribution.
-                connection.execute(
-                    """DELETE FROM canonical_evidence_document_actors
-                        WHERE tenant_id=%s AND source_id=%s
-                          AND logical_document_id=%s""",
-                    (
-                        prepared.tenant_id,
-                        prepared.source_id,
-                        prepared.logical_document_id,
-                    ),
-                )
-                connection.execute(
-                    """INSERT INTO canonical_evidence_document_actors(
-                           tenant_id,source_id,logical_document_id,revision,
-                           actor_id,relation
-                       )
-                       SELECT %s,%s,%s,%s,link.actor_id,link.relation
-                         FROM (
-                               SELECT actor.actor_id,actor.relation
-                                 FROM canonical_events event
-                                 JOIN canonical_event_actors actor
-                                   ON actor.tenant_id=event.tenant_id
-                                  AND actor.source_id=event.source_id
-                                  AND actor.event_id=event.event_id
-                                WHERE event.tenant_id=%s
-                                  AND event.source_id=%s
-                                  AND coalesce(
-                                      event.native_parent_id,event.native_id
-                                  )=%s
-                                  AND (%s::bigint IS NULL OR event.source_ordinal<=%s)
-                               UNION
-                               SELECT binding.actor_id,binding.relation
-                                 FROM canonical_source_actor_bindings binding
-                                WHERE binding.tenant_id=%s
-                                  AND binding.source_id=%s
-                         ) link
-                       ON CONFLICT DO NOTHING""",
-                    (
-                        prepared.tenant_id,
-                        prepared.source_id,
-                        prepared.logical_document_id,
-                        prepared.revision,
-                        prepared.tenant_id,
-                        prepared.source_id,
-                        prepared.native_parent_id,
-                        (upload.body_locators.append_source_ordinal if retain_queue else None),
-                        (upload.body_locators.append_source_ordinal if retain_queue else None),
-                        prepared.tenant_id,
-                        prepared.source_id,
-                    ),
-                )
+                publish_actors(connection, prepared, prepared.revision,
+                    upload.body_locators.append_source_ordinal if retain_queue else None, actors)
                 connection.execute(
                     """INSERT INTO canonical_passage_projection_queue(
                            tenant_id,source_id,logical_document_id,revision,
@@ -2242,6 +2212,9 @@ class CanonicalLogicalEvidenceProjector:
                         if self.excluded_structural_types == DEFAULT_EXCLUDED_STRUCTURAL_TYPES else None,
                         manifest_reference["artifact_id"],
                     )
+                if actor_capability:
+                    record_checkpoint(connection, candidate, manifest_reference["artifact_id"],
+                        prepared.revision, actor_locators, actors)
                 from .retirement_policy import enroll_published_parent
                 enroll_published_parent(self.store, connection,
                     (candidate.tenant_id, candidate.source_id, candidate.native_parent_id))

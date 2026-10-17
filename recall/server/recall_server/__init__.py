@@ -1,6 +1,6 @@
 """Recall central BrainStore service."""
 
-SCHEMA_VERSION = 86
+SCHEMA_VERSION = 87
 # H3-e': migration 067 drops the Postgres vector/tsvector plane (passage
 # embeddings, the embedding ledger, canonical_passages.search_vector). It is
 # destructive, so ``migrate`` applies it only when asked to retire the plane
@@ -37,6 +37,10 @@ PASSAGE_APPEND_CHECKPOINT_VERSION = 84
 MEMBERSHIP_REMAINDER_VERSION = 85
 # Optional fixed-cutoff diagnostic audit retirement; NULL never admits a source.
 AUDIT_MAINTENANCE_VERSION = 86
+# Optional event-only actor completeness; disabled by default.
+LOGICAL_ACTOR_CHECKPOINT_VERSION = 87
+# Optional full-oracle dirty-plan enrollment; no sparse reads enabled by DDL.
+PARQUET_DIRTY_PLAN_VERSION = 88
 # Optional until a delayed Slack body needs a terminal-identity ACK.
 SUPPRESSED_ARTIFACT_SCHEMA_VERSION = 77
 MANDATORY_SCHEMA_VERSION = 69
