@@ -41,6 +41,9 @@ AUDIT_MAINTENANCE_VERSION = 86
 LOGICAL_ACTOR_CHECKPOINT_VERSION = 87
 # Optional full-oracle dirty-plan enrollment; no sparse reads enabled by DDL.
 PARQUET_DIRTY_PLAN_VERSION = 88
+# Additive per-document extraction metadata; the separately deployed publisher
+# requires it. Compatibility alone does not enroll or extract any document.
+DOCUMENT_EXTRACTION_VERSION = 89
 # Optional until a delayed Slack body needs a terminal-identity ACK.
 SUPPRESSED_ARTIFACT_SCHEMA_VERSION = 77
 MANDATORY_SCHEMA_VERSION = 69

@@ -110,7 +110,7 @@ class DatabaseCapabilityContractTest(unittest.TestCase):
             [v for v in snapshot['migration_versions'] if v != 61],
             [v for v in snapshot['migration_versions'] if v != 69],
             snapshot['migration_versions'] + [88],
-            snapshot['migration_versions'] + [89],
+            snapshot['migration_versions'] + [90],
         ):
             with self.subTest(versions=versions), self.assertRaisesRegex(CapabilityError, 'schema_drift'):
                 assess_snapshot(dict(snapshot, migration_versions=versions))
@@ -125,7 +125,7 @@ class DatabaseCapabilityContractTest(unittest.TestCase):
             self.assertEqual(assess_snapshot(snapshot)['status'], 'ready')
         for versions in ([v for v in snapshot['migration_versions'] if v != 79],
                          snapshot['migration_versions'] + [87],
-                         snapshot['migration_versions'] + [89]):
+                         snapshot['migration_versions'] + [90]):
             with self.assertRaises(CapabilityError):
                 assess_snapshot(dict(snapshot, migration_versions=versions))
 
@@ -139,7 +139,7 @@ class DatabaseCapabilityContractTest(unittest.TestCase):
             self.assertEqual(assess_snapshot(snapshot)['status'], 'ready')
         for versions in ([v for v in snapshot['migration_versions'] if v != 78],
                          snapshot['migration_versions'] + [86],
-                         snapshot['migration_versions'] + [89]):
+                         snapshot['migration_versions'] + [90]):
             with self.assertRaises(CapabilityError):
                 assess_snapshot(dict(snapshot, migration_versions=versions))
 
@@ -295,7 +295,7 @@ class DatabaseCapabilityContractTest(unittest.TestCase):
         for retired in (False, True):
             for marker in (False, True):
                 snapshot = healthy_snapshot()
-                snapshot["migration_versions"] = [v for v in snapshot["migration_versions"] if v not in (82,83,84,85,86,87,88)]
+                snapshot["migration_versions"] = [v for v in snapshot["migration_versions"] if v not in (82,83,84,85,86,87,88,89)]
                 baseline_version = max(snapshot["migration_versions"])
                 if not retired:
                     snapshot["migration_versions"].remove(67)
@@ -347,7 +347,7 @@ class DatabaseCapabilityContractTest(unittest.TestCase):
     def test_parent_certificate_marker_requires_generation_and_keeps_unknown_version_fence(self):
         for marker in (False,True):
             snapshot=healthy_snapshot()
-            snapshot['migration_versions']=[v for v in snapshot['migration_versions'] if v not in (83,84,85,86,87,88)]
+            snapshot['migration_versions']=[v for v in snapshot['migration_versions'] if v not in (83,84,85,86,87,88,89)]
             baseline=max(snapshot['migration_versions'])
             if marker:
                 snapshot['migration_versions'].append(83)
@@ -357,7 +357,7 @@ class DatabaseCapabilityContractTest(unittest.TestCase):
                 if marker or removed!=82:
                     with self.assertRaisesRegex(CapabilityError,'schema_drift'):
                         assess_snapshot(invalid)
-            for extra in ([89],[83,83]):
+            for extra in ([90],[83,83]):
                 invalid=dict(snapshot,migration_versions=snapshot['migration_versions']+extra)
                 with self.assertRaisesRegex(CapabilityError,'schema_drift'):
                     assess_snapshot(invalid)

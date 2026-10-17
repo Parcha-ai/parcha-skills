@@ -2,7 +2,7 @@
 import itertools
 import unittest
 
-from recall_server import PARQUET_DIRTY_PLAN_VERSION
+from recall_server import DOCUMENT_EXTRACTION_VERSION
 from recall_server.capabilities import CapabilityError, assess_snapshot
 from tests.central_brain.test_core_deployment import healthy_snapshot
 
@@ -26,7 +26,7 @@ class CleanupIndexSchemaTests(unittest.TestCase):
 
     def test_78_cannot_hide_unknown_gaps_duplicates_or_reordering(self):
         complete = list(range(1, 79))
-        for versions in (complete + [PARQUET_DIRTY_PLAN_VERSION + 1], [n for n in complete if n != 68],
+        for versions in (complete + [DOCUMENT_EXTRACTION_VERSION + 1], [n for n in complete if n != 68],
                          [n for n in complete if n != 69], complete + [74],
                          complete[:-2] + [74, 73]):
             with self.subTest(versions=versions):

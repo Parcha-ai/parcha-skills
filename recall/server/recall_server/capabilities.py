@@ -27,6 +27,7 @@ from . import (
     AUDIT_MAINTENANCE_VERSION,
     LOGICAL_ACTOR_CHECKPOINT_VERSION,
     PARQUET_DIRTY_PLAN_VERSION,
+    DOCUMENT_EXTRACTION_VERSION,
 )
 
 
@@ -234,7 +235,9 @@ def assess_snapshot(snapshot: dict[str, Any], profile: str = "production") -> di
                       + ([LOGICAL_ACTOR_CHECKPOINT_VERSION]
                          if LOGICAL_ACTOR_CHECKPOINT_VERSION in versions else [])
                       + ([PARQUET_DIRTY_PLAN_VERSION]
-                         if PARQUET_DIRTY_PLAN_VERSION in versions else []))
+                         if PARQUET_DIRTY_PLAN_VERSION in versions else [])
+                      + ([DOCUMENT_EXTRACTION_VERSION]
+                         if DOCUMENT_EXTRACTION_VERSION in versions else []))
     if (RETIREMENT_POLICY_VERSION in versions
             and RETIREMENT_DETACHMENT_VERSION not in versions):
         raise CapabilityError("schema_drift")
