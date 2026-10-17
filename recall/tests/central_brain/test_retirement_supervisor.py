@@ -113,6 +113,20 @@ print(json.dumps({'status':'complete','cleared_documents':3,'cleared_utf8_bytes'
                       'metadata_membership_calls','metadata_membership_ms','metadata_spool_ms'):
             self.assertIn(f'{field}={result[field]}', logs.output[0])
 
+    def test_noop_completion_counter_reaches_log_with_legacy_default_zero(self):
+        from io import BytesIO
+        from unittest.mock import Mock
+        for supplied in (None, 2):
+            result = dict(status='bounded', cleared_documents=0, cleared_utf8_bytes=0)
+            if supplied is not None:
+                result['completed_noop_parents'] = supplied
+            self.worker.child = Mock(returncode=0, stdout=BytesIO(json.dumps(result).encode()))
+            self.worker.child.poll.return_value = 0
+            with self.assertLogs('recall_server.retirement_supervisor', level='INFO') as logs:
+                observed = self.worker.cycle()
+            self.assertEqual(observed, result)
+            self.assertIn(f'completed_noop_parents={supplied or 0}', logs.output[0])
+
     def test_unknown_claim_identity_reaches_existing_log(self):
         from io import BytesIO
         from unittest.mock import Mock

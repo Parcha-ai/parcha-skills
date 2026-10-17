@@ -196,10 +196,11 @@ class SingletonWorkerConvergence(SingletonMetadataAdmission):
         self.assertEqual(second_result['completed_parent_proofs'],0)
         self.assertIsNone(self.baseline(original['receipt']))
         self.assertIsNone(self.baseline(second['receipt']))
-        # The selected tail consumes this invocation's one batch. Completion
-        # still requires the original full proof on the next invocation.
+        # The selected tail consumes this invocation's one batch. With no
+        # physical rows left, the next claim completes scheduling without a full proof.
         completion=self.run_parent(metadata_mode='singleton',parent_limits=limits)
-        self.assertEqual(completion['completed_parent_proofs'],1)
+        self.assertEqual(completion['completed_parent_proofs'],0)
+        self.assertEqual(completion['completed_noop_parents'],1)
         self.assertEqual(completion['retired_metadata_chunks'],0)
         self.assertEqual(completion['cleared_documents'],0)
         final=self.run_parent(metadata_mode='singleton')

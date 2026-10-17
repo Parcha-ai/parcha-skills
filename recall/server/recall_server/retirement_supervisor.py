@@ -106,7 +106,7 @@ class RetirementSupervisor:
                 "unknown_source_id=%r unknown_native_parent_id=%r unknown_scope_epoch=%s "
                 "committed_sql_ms=%s committed_hash_ms=%s archive_read_ms=%s "
                 "archive_reused_gets=%s archive_reused_bytes=%s "
-                "claim_wall_ms=%s parent_wall_ms=%s metadata_capture_ms=%s retired_metadata_chunks=%s "
+                "claim_wall_ms=%s parent_wall_ms=%s metadata_capture_ms=%s retired_metadata_chunks=%s completed_noop_parents=%s "
                 "metadata_rows=%s metadata_fetches=%s metadata_fetch_ms=%s "
                 "metadata_membership_calls=%s metadata_membership_ms=%s metadata_spool_ms=%s "
                 "maintenance_phase=%s claim_phase=%s sqlstate=%s "
@@ -136,6 +136,7 @@ class RetirementSupervisor:
                 result.get("parent_wall_ms"),
                 result.get("metadata_capture_ms"),
                 result.get("retired_metadata_chunks"),
+                result.get("completed_noop_parents", 0),
                 result.get("metadata_rows"),
                 result.get("metadata_fetches"),
                 result.get("metadata_fetch_ms"),

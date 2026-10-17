@@ -540,6 +540,7 @@ def run_retirement(
         status="bounded",
         attempted_parents=0,
         completed_parent_proofs=0,
+        completed_noop_parents=0,
         failed_parents=0,
         partial_parents=0,
         batches=0,
@@ -650,7 +651,9 @@ def run_retirement(
                 )
             for field in ("metadata_capture_ms", *CAPTURE_DETAIL_FIELDS):
                 report[field] += result.get(field, 0)
-            report["completed_parent_proofs"] += int(result["complete"])
+            noop_complete = result.get("completion_proof") == "no_remaining_physical_work"
+            report["completed_parent_proofs"] += int(result["complete"] and not noop_complete)
+            report["completed_noop_parents"] += int(result["complete"] and noop_complete)
             report["partial_parents"] += int(not result["complete"])
             report["eligible_documents"] += result.get("eligible_documents", 0)
             excluded.update(result.get("excluded", {}))

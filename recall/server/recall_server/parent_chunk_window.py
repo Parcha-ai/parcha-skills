@@ -305,6 +305,63 @@ def recheck_coverage(store, connection, scope, coverage, progress, manifest, dea
         _fail('witness_changed')
 
 
+def _complete_without_physical_work(store, *, scope, principal_id, manifest, scope_epoch, deadline_at):
+    """Complete current-parent scheduling without asserting archive proof."""
+    from .chunk_retirement import (
+        ChunkRetirementError, _parent_progress, _try_parent_native_locks,
+        require_retirement_owner,
+    )
+    started = time.monotonic()
+    with store.connect() as connection, connection.transaction():
+        def query(sql, values=()):
+            return store._execute_bounded(connection, sql, values, deadline_at)
+        require_retirement_owner(store, connection, scope[:2], principal_id, deadline_at)
+        if not _try_parent_native_locks(query, scope, [dict(native_id=scope[2])]):
+            raise ChunkRetirementError('parent_retirement_lock_busy')
+        # Restore holds this catalog row FOR SHARE; publication updates it.
+        query('''SELECT 1 FROM canonical_evidence_documents
+            WHERE tenant_id=%s AND source_id=%s AND native_parent_id=%s
+            FOR UPDATE NOWAIT''', scope).fetchone()
+        current = read_parent_catalog(store, connection, scope, deadline_at)
+        if manifest_identity(current['manifest']) != manifest:
+            raise ChunkRetirementError('parent_retirement_parent_changed')
+        progress = _parent_progress(store, connection, scope, deadline_at, lock=True)
+        if not progress or not progress['enabled'] or progress['scope_epoch'] != scope_epoch:
+            raise ChunkRetirementError('parent_retirement_disabled')
+        _witnesses(store, connection, scope, (), deadline_at)
+        if current['queue'] is not None:
+            _fail('pending')
+        if (progress['manifest_artifact_id'] != manifest['manifest_artifact_id']
+                or progress['last_record_ordinal'] != manifest['record_count'] - 1):
+            _fail('cursor')
+        # No chunk text/deletion/ordinal filter: a retained empty or deleted
+        # chunk prevents this path. A missing physical row is not admission.
+        drained = query('''SELECT bool_and(document.chunk_receipt_profile IS NOT DISTINCT FROM 1
+                AND NOT EXISTS (SELECT 1 FROM canonical_chunks chunk
+                    WHERE chunk.tenant_id=document.tenant_id AND chunk.source_id=document.source_id
+                      AND chunk.document_id=document.document_id)) AS drained
+            FROM canonical_documents document
+            JOIN canonical_events event USING(tenant_id,source_id,event_id)
+            WHERE document.tenant_id=%s AND document.source_id=%s
+              AND coalesce(event.native_parent_id,event.native_id)=%s
+              AND document.is_current AND document.deleted_at IS NULL''', scope).fetchone()['drained']
+        if drained is not True:
+            return None
+        # Append may queue work independently of the catalog lock. Check again
+        # at the status write; later publication invalidates this exact epoch.
+        changed = query('''UPDATE canonical_chunk_retirement_progress progress
+            SET status='complete',updated_at=clock_timestamp()
+            WHERE tenant_id=%s AND source_id=%s AND native_parent_id=%s
+              AND NOT EXISTS (SELECT 1 FROM canonical_evidence_document_queue queued
+                WHERE queued.tenant_id=progress.tenant_id AND queued.source_id=progress.source_id
+                  AND queued.native_parent_id=progress.native_parent_id)''', scope).rowcount
+        if changed != 1:
+            _fail('pending')
+        _check_deadline(deadline_at)
+    return dict(status='complete', complete=True, batches=1,
+                completion_proof='no_remaining_physical_work', sql_ms=(time.monotonic()-started)*1000)
+
+
 def retire_window(store, archive, *, scope, principal_id, limits, deadline_at, reviewed_plan,
                   metadata_mode='keep', remaining_bytes=None, should_stop=None, required_scope_epoch=None):
     from .chunk_retirement import _retire_parent_batch, _require_singleton_archive_runtime, retire_parent_chunks
@@ -321,6 +378,14 @@ def retire_window(store, archive, *, scope, principal_id, limits, deadline_at, r
     if window['plan']!=reviewed_plan:
         _fail('plan_changed')
     if window['handoff_full_parent']:
+        if should_stop is not None and should_stop():
+            return dict(status='stopped',complete=False,**window['cost'])
+        if metadata_mode == 'singleton':
+            completed = _complete_without_physical_work(store, scope=scope, principal_id=principal_id,
+                manifest=window['plan']['manifest'], scope_epoch=window['scope_epoch'],
+                deadline_at=min(deadline_at,time.monotonic()+5))
+            if completed is not None:
+                return completed
         from dataclasses import replace
         # The caller supplies remaining attempt limits, never a fresh budget.
         completion_limits = limits if remaining_bytes is None else replace(limits,max_clear_bytes=remaining_bytes)
@@ -341,7 +406,7 @@ def retire_window(store, archive, *, scope, principal_id, limits, deadline_at, r
 def retire_parent_windows(store, archive, *, tenant_id, source_id, native_parent_id,
                           apply, reviewed_plan, limits, deadline_at, required_scope_epoch,
                           owner_principal_id, should_stop=None, metadata_mode='keep'):
-    """Use one claimed attempt budget; only the original EOF proof completes it."""
+    """Use one claimed budget; distinguish full proof from no remaining physical work."""
     from dataclasses import replace
     import psycopg
     from .chunk_retirement import ChunkRetirementError, _parent_scope, _parent_deadline

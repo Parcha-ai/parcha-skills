@@ -246,6 +246,7 @@ jobs:
             e2e_selective_retirement_experiment.py \
             e2e_parent_retirement_window.py \
             e2e_retirement_window_runner.py \
+            e2e_retirement_empty_completion.py \
             e2e_retirement_tail_first.py \
             e2e_retirement_stream_capture.py \
             e2e_retirement_part_reuse.py \
