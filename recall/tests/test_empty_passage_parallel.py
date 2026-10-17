@@ -22,6 +22,7 @@ class ParallelEmptyRepair(unittest.TestCase):
                 evidence_revision=1, source_document_sha256='a' * 64,
                 document_content_sha256='a' * 64, passage_count=0,
                 policy_fingerprint=policy.fingerprint, target_tokens=policy.target_tokens,
+                requested_extraction_version='legacy', applied_extraction_version='legacy',
                 overlap_tokens=policy.overlap_tokens, part_ordinal=0)
             for prefix in ('manifest_', 'part_'):
                 row.update({prefix + key: value for key, value in dict(

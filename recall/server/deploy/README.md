@@ -114,6 +114,15 @@ Gaps in `shard_index` are normal.
   [--source S]` queues every month of the scope with the `*` sentinel; a content-identical
   month is a no-op (`mode=reuse`) and keeps its objects.
 
+### Document extraction metadata
+
+Migration 089 adds requested/applied extraction versions and coverage counts to
+existing projected-document rows. Deploy the schema-compatible runtime to every
+role before applying it, then upgrade every passage writer before enrolling a
+document. Both existing and new documents default to legacy extraction. Follow
+the [document extraction upgrade and rollback boundary](../../docs/tool-group-extraction.md)
+before enabling typed tool passages; a version-unaware writer is unsafe after enrollment.
+
 ### Optional sparse scan metadata
 
 Migration 088 adds a nullable `dirty_plan_epoch` to the existing shard catalog.
@@ -309,7 +318,7 @@ are supported: versions through 69 are required except optional migration 67,
 which retires the Postgres vector plane and is applied explicitly from the
 turbopuffer plane. Migration 70 adds only a reconciliation performance index;
 serving accepts both schema 69 and 70 and reports the actual recorded version.
-The latest shipped migration is 88; migration 71 remains optional and reserved
+The latest shipped migration is 89; migration 71 remains optional and reserved
 for native-conversation metadata. Migration 72 adds nullable
 `canonical_evidence_document_queue.notification_queued_at`, with no default,
 index, or historical reclassification. Apply it before deploying the notification

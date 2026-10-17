@@ -205,6 +205,7 @@ jobs:
             e2e_tool_source_units.py \
             e2e_tool_unit_audit.py \
             e2e_tool_extraction_capability.py \
+            e2e_tool_group_publication.py \
             e2e_retire_postgres_plane.py \
             e2e_parent_scoped_retrieval.py \
             e2e_archived_chunk_reads.py \

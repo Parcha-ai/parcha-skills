@@ -21,6 +21,7 @@ from psycopg_pool import PoolTimeout
 from .actor_attribution import ACTOR_ID_RE, ACTOR_RELATIONS
 from .db import SearchDeadlineExceeded, bounded_search_text
 from .passage_projection import COMPLETE_SOURCE_UNITS
+from .tool_passage_projection import tool_evidence_context
 from .fusion import (
     ARM_NAMES,
     DEFAULT_FUSION_ALPHAS,
@@ -899,6 +900,12 @@ def fold_copied_evidence(
         folded_groups += 1
     kept = []
     for index, row in enumerate(rows):
+        for item in row['matching_ranges']:
+            # Display attribution from the already-authorized canonical spans;
+            # the metadata proof and copied-evidence authority stay unchanged.
+            attribution = tool_evidence_context(item.get('_origin_spans', item.get('spans')) or ())
+            if attribution:
+                item['evidence_context'] = attribution
         row["matching_ranges"] = [
             {key: value for key, value in item.items() if not key.startswith("_origin_")}
             for range_index, item in enumerate(row["matching_ranges"])

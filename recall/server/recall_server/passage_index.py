@@ -18,6 +18,7 @@ from typing import Any, Callable, Iterable, Iterator
 import psycopg
 
 from . import parent_membership_enrollment, passage_append, membership_remainder
+from .tool_passage_projection import extract_tool_event_groups, tool_evidence_context
 from .logical_evidence import (
     LogicalEvidenceError,
     LogicalEvidenceProjectionStore,
@@ -92,6 +93,7 @@ class PassageCandidate:
     source_document_sha256: str
     manifest_reference: dict[str, Any]
     part_references: tuple[dict[str, Any], ...]
+    extraction_version: str = "legacy"
 
 
 @dataclass(frozen=True)
@@ -105,6 +107,7 @@ class PreparedPassageDocument:
     append_checkpoint_available: bool = False
     archive_bytes_read: int = 0
     archive_parts_read: int = 0
+    extraction_coverage: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -577,6 +580,71 @@ class CanonicalPassageProjector:
             "created_at": created_at,
         }
 
+    def request_extraction_version(
+        self, *, source_id: str, logical_document_id: str, revision: int,
+        source_document_sha256: str, extraction_version: str,
+        principal_id: str, tenant_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Enroll one current projected document and queue its rebuild atomically.
+
+        This maintenance operation uses the existing source-owner/brain-admin
+        authority. No caller can enroll by wildcard, infer a revision, or downgrade.
+        """
+        from .control import ControlPlane
+
+        tenant_id = self._tenant(tenant_id)
+        if tenant_id is None or extraction_version != "tool_groups_v1":
+            raise ValueError("unsupported_document_extraction_request")
+        key = (tenant_id, source_id, logical_document_id)
+        with self.store.connect() as connection, connection.transaction():
+            # Same lock order as logical publication and passage commit.
+            for owner in ("logical-evidence", "lossless-passages"):
+                connection.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s,0))",
+                                   (owner + "\x1f" + logical_document_id,))
+            row = connection.execute("""SELECT evidence.revision,
+                    evidence.document_content_sha256, evidence.native_parent_id,
+                    projected.revision AS projected_revision,
+                    projected.source_document_sha256, projected.policy_fingerprint,
+                    projected.requested_extraction_version, projected.applied_extraction_version,
+                    source.owner_principal_id, grant_row.permission
+                FROM canonical_evidence_documents evidence
+                JOIN canonical_passage_documents projected USING(tenant_id,source_id,logical_document_id)
+                JOIN canonical_sources source USING(tenant_id,source_id)
+                JOIN canonical_source_grants grant_row USING(tenant_id,source_id)
+                WHERE evidence.tenant_id=%s AND evidence.source_id=%s
+                  AND evidence.logical_document_id=%s AND grant_row.principal_id=%s
+                FOR UPDATE OF projected FOR SHARE OF evidence,source,grant_row""",
+                (*key, principal_id)).fetchone()
+            if row is None:
+                raise ValueError("source_or_projected_document_unavailable")
+            if row['owner_principal_id'] != principal_id or row['permission'] != 'owner':
+                ControlPlane._brain_admin(connection, principal_id=principal_id,
+                                          tenant_id=tenant_id, lock=True)
+            if (row['revision'] != revision or row['projected_revision'] != revision
+                or row['document_content_sha256'] != source_document_sha256
+                or row['source_document_sha256'] != source_document_sha256
+                or row['policy_fingerprint'] != self.policy.fingerprint):
+                raise ValueError("document_extraction_catalog_changed")
+            forgetting = connection.execute("""SELECT 1 FROM canonical_evidence_document_queue
+                WHERE tenant_id=%s AND source_id=%s AND native_parent_id=%s AND reason='forget'""",
+                (tenant_id, source_id, row['native_parent_id'])).fetchone()
+            if forgetting:
+                raise ValueError("document_extraction_forget_pending")
+            if row['requested_extraction_version'] == row['applied_extraction_version'] == extraction_version:
+                return {"status": "current", "extraction_version": extraction_version}
+            connection.execute("""UPDATE canonical_passage_documents
+                SET requested_extraction_version=%s
+                WHERE tenant_id=%s AND source_id=%s AND logical_document_id=%s""",
+                (extraction_version, *key))
+            connection.execute("""INSERT INTO canonical_passage_projection_queue(
+                    tenant_id,source_id,logical_document_id,revision,generation,reason,changed_at)
+                VALUES (%s,%s,%s,%s,1,'backfill',clock_timestamp())
+                ON CONFLICT(tenant_id,source_id,logical_document_id) DO UPDATE SET
+                    revision=excluded.revision,
+                    generation=canonical_passage_projection_queue.generation+1,
+                    reason='backfill',changed_at=clock_timestamp()""", (*key, revision))
+            return {"status": "queued", "extraction_version": extraction_version}
+
     def seed_backfill(self, *, tenant_id: str | None = None) -> int:
         tenant_id = self._tenant(tenant_id)
         with self.store.connect() as connection:
@@ -596,6 +664,7 @@ class CanonicalPassageProjector:
                           =evidence.logical_document_id
                       AND projected.revision=evidence.revision
                       AND projected.policy_fingerprint=%s
+                      AND projected.requested_extraction_version=projected.applied_extraction_version
                    WHERE (%s::text IS NULL OR evidence.tenant_id=%s)
                       AND projected.logical_document_id IS NULL
                    ON CONFLICT(tenant_id,source_id,logical_document_id)
@@ -669,6 +738,7 @@ class CanonicalPassageProjector:
                               PARTITION BY queue.tenant_id,queue.source_id,queue.logical_document_id
                           ),0) AS estimated_bytes,
                           evidence.document_content_sha256,
+                          coalesce(projected.requested_extraction_version,'legacy') AS extraction_version,
                           evidence.manifest_artifact_id,
                           evidence.manifest_storage_backend,
                           evidence.manifest_object_key,
@@ -699,6 +769,10 @@ class CanonicalPassageProjector:
                       AND part.source_id=evidence.source_id
                       AND part.logical_document_id=evidence.logical_document_id
                       AND part.revision=evidence.revision
+                     LEFT JOIN canonical_passage_documents projected
+                       ON projected.tenant_id=queue.tenant_id
+                      AND projected.source_id=queue.source_id
+                      AND projected.logical_document_id=queue.logical_document_id
                     ORDER BY notification_priority ASC NULLS LAST,
                              aged_priority DESC,estimated_bytes,
                              queue.changed_at,queue.tenant_id,
@@ -750,6 +824,7 @@ class CanonicalPassageProjector:
                         self._reference(row, prefix="part_")
                         for row in values
                     ),
+                    extraction_version=first["extraction_version"],
                 )
             )
         return tuple(candidates)
@@ -827,6 +902,9 @@ class CanonicalPassageProjector:
         incremental: bool = False,
     ) -> PreparedPassageDocument:
         policy = self.policy if policy is None else policy
+        if candidate.extraction_version not in {"legacy", "tool_groups_v1"}:
+            raise LogicalEvidenceError("unsupported_document_extraction_version")
+        grouped_tools = candidate.extraction_version == "tool_groups_v1"
         manifest = self.logical_projection.read_manifest(
             candidate.manifest_reference,
             tenant_id=candidate.tenant_id,
@@ -867,7 +945,7 @@ class CanonicalPassageProjector:
 
         resume = None
         prefix = ()
-        if incremental and self.append_reuse_enabled and state and isinstance(checkpoint, dict) and checkpoint.get('policy_fingerprint') == policy.fingerprint:
+        if not grouped_tools and incremental and self.append_reuse_enabled and state and isinstance(checkpoint, dict) and checkpoint.get('policy_fingerprint') == policy.fingerprint:
             try:
                 if passage_append.proves_append(checkpoint, state['projected'], candidate, manifest, lambda ordinal: read_part(ordinal, remember=True)):
                     prefix = self._append_prefix(candidate, checkpoint)
@@ -919,7 +997,10 @@ class CanonicalPassageProjector:
                     )
 
         try:
-            messages = visible_messages(records(), first_record_ordinal=first_record)
+            # Enrolled documents currently rebuild fully. Read verified archive
+            # parts once; the two views keep visible-message coordinates intact.
+            source_records = tuple(records()) if grouped_tools else records()
+            messages = visible_messages(source_records, first_record_ordinal=first_record)
         except LogicalEvidenceError:
             if resume:
                 return full_fallback()
@@ -947,18 +1028,33 @@ class CanonicalPassageProjector:
                 passages = prefix + passage_append.resume_passages(messages, resume, arguments)
             except (ValueError, IndexError, UnicodeDecodeError):
                 return full_fallback()
+        coverage = None
+        tool_messages = ()
+        if grouped_tools:
+            groups, coverage = extract_tool_event_groups(source_records)
+            tool_messages = tuple(message for group in groups for message in group.messages)
+            # Build each provider block independently. Its message indexes are
+            # group-local, so later visible arrivals cannot rekey old tool spans.
+            combined = list(passages)
+            for group in groups:
+                for passage in build_passages(tenant_id=candidate.tenant_id,
+                    source_id=candidate.source_id, logical_document_id=candidate.logical_document_id,
+                    revision=candidate.revision, messages=group.messages, policy=policy):
+                    combined.append(replace(passage, ordinal=len(combined)))
+            passages = tuple(combined)
         checkpoint = (passage_append.make_checkpoint(candidate, manifest, messages, passages,
-            policy, previous=resume) if state and state['available'] else None)
+            policy, previous=resume) if not grouped_tools and state and state['available'] else None)
         return PreparedPassageDocument(
             candidate=candidate,
-            dense_message_count=len(messages) + (resume["message_index"] if resume else 0),
-            dense_message_bytes=sum(len(message.text.encode()) for message in messages) + (resume["prefix_message_bytes"] if resume else 0),
+            dense_message_count=len(messages) + len(tool_messages) + (resume["message_index"] if resume else 0),
+            dense_message_bytes=sum(len(message.text.encode()) for message in (*messages, *tool_messages)) + (resume["prefix_message_bytes"] if resume else 0),
             passages=passages,
             append_checkpoint=checkpoint,
             previous_checkpoint=resume,
             append_checkpoint_available=bool(state and state["available"]),
             archive_bytes_read=archive_bytes_read,
             archive_parts_read=archive_parts_read,
+            extraction_coverage=coverage,
         )
 
     def _commit(self, prepared: PreparedPassageDocument) -> dict[str, Any]:
@@ -998,15 +1094,29 @@ class CanonicalPassageProjector:
                         candidate.logical_document_id,
                     ),
                 ).fetchone()
+                extraction = connection.execute("""SELECT requested_extraction_version
+                    FROM canonical_passage_documents
+                    WHERE tenant_id=%s AND source_id=%s AND logical_document_id=%s FOR UPDATE""",
+                    (candidate.tenant_id, candidate.source_id, candidate.logical_document_id)).fetchone()
+                forgetting = (connection.execute("""SELECT 1
+                    FROM canonical_evidence_document_queue queued
+                    JOIN canonical_evidence_documents evidence USING(tenant_id,source_id,native_parent_id)
+                    WHERE evidence.tenant_id=%s AND evidence.source_id=%s
+                      AND evidence.logical_document_id=%s AND queued.reason='forget'""",
+                    (candidate.tenant_id, candidate.source_id, candidate.logical_document_id)).fetchone()
+                    if candidate.extraction_version != 'legacy' else None)
                 if (
                     queued is None
                     or current is None
+                    or forgetting is not None
                     or int(queued["revision"]) != candidate.revision
                     or int(queued["generation"]) != candidate.generation
                     or queued["changed_at"] != candidate.changed_at
                     or int(current["revision"]) != candidate.revision
                     or current["document_content_sha256"]
                     != candidate.source_document_sha256
+                    or (extraction['requested_extraction_version'] if extraction else 'legacy')
+                    != candidate.extraction_version
                 ):
                     return {"status": "stale"}
                 existing = connection.execute(
@@ -1064,6 +1174,12 @@ class CanonicalPassageProjector:
                     )
                     for passage in diff.to_insert
                 }
+                for passage in diff.to_insert:
+                    attribution = tool_evidence_context(passage.spans)
+                    if attribution:
+                        # Keep the existing header bound. Attribution must survive
+                        # truncation; catalog context fills the remaining bytes.
+                        headers[passage.passage_id] = (attribution + '\n' + headers[passage.passage_id]).encode()[:MAX_PASSAGE_HEADER_BYTES].decode(errors='ignore')
                 embed_hashes = {
                     passage.passage_id: passage_embed_sha256(
                         headers[passage.passage_id],
@@ -1140,7 +1256,8 @@ class CanonicalPassageProjector:
                            policy_fingerprint,target_tokens,overlap_tokens,
                            source_document_sha256,dense_message_count,
                            dense_message_bytes,passage_count
-                       ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                           ,applied_extraction_version,extraction_coverage
+                       ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)
                        ON CONFLICT(tenant_id,source_id,logical_document_id)
                        DO UPDATE SET
                            revision=excluded.revision,
@@ -1151,7 +1268,9 @@ class CanonicalPassageProjector:
                                excluded.source_document_sha256,
                            dense_message_count=excluded.dense_message_count,
                            dense_message_bytes=excluded.dense_message_bytes,
-                           passage_count=excluded.passage_count""",
+                           passage_count=excluded.passage_count,
+                           applied_extraction_version=excluded.applied_extraction_version,
+                           extraction_coverage=excluded.extraction_coverage""",
                     (
                         candidate.tenant_id,
                         candidate.source_id,
@@ -1164,6 +1283,8 @@ class CanonicalPassageProjector:
                         prepared.dense_message_count,
                         prepared.dense_message_bytes,
                         len(prepared.passages),
+                        candidate.extraction_version,
+                        json.dumps(prepared.extraction_coverage) if prepared.extraction_coverage is not None else None,
                     ),
                 )
                 if prepared.append_checkpoint_available:
@@ -1592,6 +1713,8 @@ class CanonicalPassageProjector:
                 """SELECT projected.tenant_id,projected.source_id,
                           projected.logical_document_id,projected.revision,
                           projected.policy_fingerprint,projected.target_tokens,
+                          projected.applied_extraction_version,
+                          projected.requested_extraction_version,
                           projected.overlap_tokens,
                           projected.source_document_sha256,
                           projected.passage_count,
@@ -1680,6 +1803,7 @@ class CanonicalPassageProjector:
                 int(first["evidence_revision"]) != int(first["revision"])
                 or first["document_content_sha256"]
                 != first["source_document_sha256"]
+                or first["requested_extraction_version"] != first["applied_extraction_version"]
             ):
                 # The stored projection lags the evidence catalog; the queue
                 # will catch it up. Comparing would measure the append, not
@@ -1705,6 +1829,7 @@ class CanonicalPassageProjector:
                 part_references=tuple(
                     self._reference(row, prefix="part_") for row in values
                 ),
+                extraction_version=first["applied_extraction_version"],
             )
             prepared = self._prepare(candidate, policy=policy)
             if _empty_only:
