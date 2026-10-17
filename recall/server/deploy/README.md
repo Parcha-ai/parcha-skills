@@ -285,7 +285,7 @@ are supported: versions through 69 are required except optional migration 67,
 which retires the Postgres vector plane and is applied explicitly from the
 turbopuffer plane. Migration 70 adds only a reconciliation performance index;
 serving accepts both schema 69 and 70 and reports the actual recorded version.
-The latest shipped migration is 86; migration 71 remains optional and reserved
+The latest shipped migration is 87; migration 71 remains optional and reserved
 for native-conversation metadata. Migration 72 adds nullable
 `canonical_evidence_document_queue.notification_queued_at`, with no default,
 index, or historical reclassification. Apply it before deploying the notification
@@ -1850,3 +1850,30 @@ Exhausted ranges stay idle; this phase does not automatically advance retention
 cutoffs. Disable the source policy to pause work while retaining its pending
 checkpoint. Clear the checkpoint only after pending clears have been reconciled.
 Keep immutable journal and archive objects for the native restore operation.
+
+### Optional logical actor completeness (87)
+
+Deploy schema-compatible images to every writer before applying migration 087.
+`RECALL_LOGICAL_ACTOR_APPEND_REUSE` accepts exactly `0` or `1`, defaults to `0`,
+and is read when the logical publisher is constructed. With it disabled or
+schema 087 absent, publication uses the original full actor union.
+
+Enable only for writers using native ingest/duplicate-attribution/Forget and
+source-binding owners, which dirty the logical queue in the same transaction.
+Direct SQL actor/event edits must explicitly use that native dirtying boundary;
+unannounced SQL edits are not detected by this optimization. Existing raw-SQL
+counterexamples remain documented in the actor attribution contract.
+
+The nullable checkpoint holds at most 64 event actor/relation pairs (16KiB),
+bound to the exact published manifest, revision and complete source ordinal.
+Only an existing native append classification permits reading the suffix.
+Source bindings are queried fresh, including on identical-body repairs.
+Malformed, absent or oversized state takes the full actor union; nothing is
+truncated. The queue-ACK trigger clears completeness for old writers. New writers
+store the checkpoint only after ACK inside the same publication transaction.
+
+Rollback sets the flag to `0` and keeps an 087-compatible image. Leave the column
+and trigger in place; neither provides reader authorization. The native receipt,
+person and Forget verifiers are unchanged. Full initialization can cost an extra
+bounded actor-set query before fallback for parents exceeding 64 distinct links;
+suffix savings depend on the planner and current statistics, not a latency promise.

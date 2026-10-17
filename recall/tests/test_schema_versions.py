@@ -44,6 +44,10 @@ class ExpectedSchemaVersionsTests(unittest.TestCase):
         self.assertEqual(self.versions(86, False), [*range(1, 71), *range(72, 87)])
         self.assertEqual(self.versions(86, True), list(range(1, 87)))
 
+    def test_actor_checkpoint_schema_is_explicitly_supported(self):
+        self.assertEqual(self.versions(87, False), [*range(1, 71), *range(72, 88)])
+        self.assertEqual(self.versions(87, True), list(range(1, 88)))
+
     def test_known_071_can_ship_without_creating_a_gap(self):
         self.assertEqual(self.versions(71, True), list(range(1, 72)))
         self.assertEqual(self.versions(72, True), list(range(1, 73)))
@@ -66,7 +70,7 @@ class ExpectedSchemaVersionsTests(unittest.TestCase):
                     self.versions(latest, native_file)
 
     def test_unknown_latest_is_not_implicitly_allowed(self):
-        for latest in (69, 87):
+        for latest in (69, 88):
             with self.subTest(latest=latest):
                 with self.assertRaisesRegex(AssertionError, "unreviewed latest"):
                     self.versions(latest, False)

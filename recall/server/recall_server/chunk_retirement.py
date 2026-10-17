@@ -25,6 +25,13 @@ MAX_DOCUMENTS = 8
 MAX_PLAN_BYTES = 8 * 1024 * 1024
 PLAN_CONTRACT = 'recall.chunk-retirement-plan.v1'
 EMPTY_SHA256 = hashlib.sha256(b'').hexdigest()
+_PASSAGE_CAUSE_CODES = frozenset({
+    'passage_logical_record_invalid',
+    'passage_logical_record_not_canonical',
+    'passage_logical_record_order_invalid',
+    'passage_logical_record_segment_incomplete',
+    'passage_logical_record_segment_invalid',
+})
 _CHUNKS_SQL = '''SELECT document_id,ordinal,receipt,text_sha256,text_redacted
     FROM canonical_chunks WHERE tenant_id=%s AND source_id=%s AND document_id=ANY(%s)
     AND deleted_at IS NULL ORDER BY document_id,ordinal'''
@@ -633,7 +640,8 @@ def retire_parent_chunks(store, archive, *, tenant_id, source_id, native_parent_
         # Preserve only bounded identifiers, never arbitrary exception text.
         error_class = type(error).__name__
         cause_code = error.args[0] if isinstance(error, (LogicalEvidenceError, LogicalBodyProofError)) and error.args else None
-        if not isinstance(cause_code, str) or not re.fullmatch(r'logical_(?:evidence|body)_[a-z0-9_]{1,64}', cause_code):
+        if (not isinstance(cause_code, str) or (cause_code not in _PASSAGE_CAUSE_CODES
+                and not re.fullmatch(r'logical_(?:evidence|body)_[a-z0-9_]{1,64}', cause_code))):
             cause_code = None
         failure.cause_details = dict(error_class=error_class if len(error_class) <= 80 and error_class.isidentifier() else 'UnknownError',
                                      cause_error_code=cause_code, phase='maintenance')

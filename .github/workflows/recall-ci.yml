@@ -210,6 +210,7 @@ jobs:
             e2e_locator_spool.py \
             e2e_locator_delta_publication.py \
             e2e_logical_append_capability.py \
+            e2e_logical_actor_checkpoint.py \
             e2e_logical_append_reader.py \
             e2e_logical_digest_continuation.py \
             e2e_logical_append_prefix_delta.py \

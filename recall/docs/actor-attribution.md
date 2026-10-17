@@ -138,3 +138,24 @@ enrolls four synthetic employees, gives each separate Codex and Claude sources,
 maps a shared Slack identity, projects logical documents and actor-context
 embeddings, and proves person-filter isolation, assistant exclusion, denied-user
 isolation, collector revocation, and preservation of company history.
+
+
+#### Optional publication checkpoint
+
+Schema 087 and the default-off `RECALL_LOGICAL_ACTOR_APPEND_REUSE` flag add a
+bounded event-only completeness marker to the existing logical catalog. Native
+scalar/batch ingestion, duplicate attribution, Forget and source-binding changes
+already dirty the logical queue transactionally. Only that supported mutation
+boundary permits suffix reuse; source bindings are always queried fresh.
+
+Raw SQL mutations of historical `canonical_event_actors` or event identity/order
+without native dirtying can leave stale completeness. A child cascade cannot
+recover an already-deleted event's parent. These are retained counterexamples,
+not supported shortcuts. Operators performing such edits must dirty the affected
+parents in the same transaction. Direct binding deletion still cannot authorize
+stale person hints: native fresh receipt authority remains unchanged.
+
+Old identical-body repairs may ACK without changing the manifest or ordinal.
+The single queue DELETE trigger therefore clears the optional marker. New
+publication writes its bounded marker after ACK in the same transaction. No
+actor/event mutation trigger, independent generation, cache or queue is added.
