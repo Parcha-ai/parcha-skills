@@ -1409,7 +1409,8 @@ class CanonicalPassageProjector:
                     reason="logical-update",
                 )
         result = {"status": "committed", **diff.counters}
-        result["membership_legacy"] = durable_certification is None
+        if durable_certification is None:
+            result["membership_legacy"] = True
         if durable_certification:
             result["membership_durable"] = True
         return result
