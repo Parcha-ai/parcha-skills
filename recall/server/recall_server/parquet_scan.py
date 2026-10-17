@@ -1279,7 +1279,15 @@ class CanonicalParquetScanProjector:
                     return
                 from .receipt_membership import lookup_current_search_membership
 
-                while rows := cursor.fetchmany(cursor.itersize):
+                while True:
+                    # Background work is bounded per SQL operation, not by the
+                    # variable receipt fanout of a fetched passage batch.
+                    self.store._set_statement_deadline(
+                        connection, time.monotonic() + self.store.search_deadline_ms / 1000,
+                    )
+                    rows = cursor.fetchmany(cursor.itersize)
+                    if not rows:
+                        break
                     deadline_at = time.monotonic() + self.store.search_deadline_ms / 1000
                     certified = set()
                     if read_settings.enabled:
@@ -1289,36 +1297,21 @@ class CanonicalParquetScanProjector:
                         )
                     fallback = [row for row in rows
                                 if (candidate.source_id, row["passage_id"]) not in certified]
-                    if not fallback:
-                        # RELEASE SAVEPOINT retains the metadata phase's short
-                        # SET LOCAL timeout. Restore this batch's remaining
-                        # budget before the next FETCH, without renewing it.
-                        self.store._set_statement_deadline(connection, deadline_at)
                     receipts = tuple(dict.fromkeys(
                         receipt for row in fallback for receipt in row["receipts"]
                     ))
                     members = set()
-                    fetch_allowance = (
-                        deadline_at - time.monotonic()
-                        if len(receipts) > PASSAGE_MEMBERSHIP_RECEIPTS else None
-                    )
-                    # Bound receipt fanout without renewing the fetched batch's
-                    # deadline. Finish every proof before yielding any passage.
+                    # Each existing receipt unit gets one bounded operation.
+                    # This may extend total build time; every proof must still
+                    # finish in the same snapshot before yielding any passage.
                     for offset in range(0, len(receipts), PASSAGE_MEMBERSHIP_RECEIPTS):
                         members.update(lookup_current_search_membership(
                             self.store, tenant_id=candidate.tenant_id,
                             authorized_sources=(candidate.source_id,),
                             receipts=receipts[offset:offset + PASSAGE_MEMBERSHIP_RECEIPTS],
                             connection=connection,
-                            deadline_at=deadline_at,
+                            deadline_at=time.monotonic() + self.store.search_deadline_ms / 1000,
                         ))
-                    if fetch_allowance is not None:
-                        # Each proof shortens SET LOCAL statement_timeout. Only
-                        # after all proofs succeed, restore the original fetch
-                        # allowance for the next cursor batch, not these proofs.
-                        self.store._set_statement_deadline(
-                            connection, time.monotonic() + fetch_allowance,
-                        )
                     for row in rows:
                         if ((candidate.source_id, row["passage_id"]) in certified
                                 or all((candidate.source_id, receipt) in members for receipt in row["receipts"])):
