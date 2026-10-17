@@ -34,5 +34,5 @@ AFTER DELETE ON canonical_evidence_document_queue
 FOR EACH ROW EXECUTE FUNCTION invalidate_logical_actor_checkpoint_on_ack();
 COMMENT ON COLUMN canonical_evidence_documents.actor_checkpoint IS
     'Bounded event-only actor completeness for supported native dirtying owners. NULL forces full actor publication; source bindings are always read fresh.';
-INSERT INTO schema_migrations(version) VALUES(87) ON CONFLICT DO NOTHING;
+INSERT INTO schema_migrations(version) VALUES (87) ON CONFLICT DO NOTHING;
 COMMIT;
