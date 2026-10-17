@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import unittest
@@ -784,8 +785,11 @@ class _DocumentArchive:
         self.records = records
         self.reads = []
         self.uploads = []
+        self.derived = {}
 
     def read_raw(self, reference):
+        if reference["artifact_id"] in self.derived:
+            return self.derived[reference["artifact_id"]]
         document_id = reference["artifact_id"].split(":", 1)[1]
         self.reads.append(document_id)
         return b"".join(
@@ -806,14 +810,15 @@ class _DocumentArchive:
 
     def put_raw(self, **values):
         self.uploads.append(values)
-        ordinal = len(self.uploads)
+        ordinal = len(self.derived) + 1
+        self.derived[f"new:{ordinal}"] = values["payload"]
         return {
             "tenant_id": values["tenant_id"],
             "source_id": values["source_id"],
             "artifact_id": f"new:{ordinal}",
             "storage_backend": "memory",
             "object_key": f"objects/new/{ordinal}",
-            "content_sha256": f"{ordinal:064x}",
+            "content_sha256": hashlib.sha256(values["payload"]).hexdigest(),
             "size_bytes": len(values["payload"]),
             "media_type": values["media_type"],
             "encryption": "test",
@@ -918,6 +923,25 @@ class _FragmentProbe(CanonicalParquetScanProjector):
 
     def _passages(self, _candidate, _document_ids):
         return []
+
+
+def _seed_derived_catalog(documents, catalog, archive):
+    """Give planning fixtures actual immutable parts from the native builder."""
+    originals = {d["logical_document_id"]: d for d in documents}
+    records = dict(archive.records)
+    for document_id in originals:
+        archive.records.setdefault(document_id, 1)
+    for index in sorted({index for _, index in catalog.shards}):
+        ids = {m.logical_document_id for (dataset, ordinal), members in catalog.members.items()
+               if ordinal == index for m in members}
+        built = _FragmentProbe([originals[key] for key in sorted(ids)],
+                               _catalog({}), archive)._build(_candidate())
+        for (dataset, ordinal), reference in built.references.items():
+            shard = catalog.shards[(dataset, index)]
+            shard.update(reference, row_count=built.row_counts[(dataset, ordinal)])
+    archive.records = records
+    archive.reads.clear()
+    archive.uploads.clear()
 
 
 class _CommitResult:
@@ -1326,12 +1350,13 @@ class ParquetFragmentDeltaTest(unittest.TestCase):
             row["generation_sha256"] = f"{index:x}" * 64
         changed = [*documents[:3], {**documents[3], "document_content_sha256": "e" * 64}]
         archive = _DocumentArchive({f"document:{index}": 1 for index in range(4)})
+        _seed_derived_catalog(documents, catalog, archive)
         result = _FragmentProbe(
             changed, catalog, archive, compaction_fragments=2
         )._build(_candidate())
         self.assertEqual(result.mode, "compaction")
         self.assertEqual(set(result.removed), set(catalog.shards))
-        self.assertEqual(len(archive.reads), 4)
+        self.assertEqual(archive.reads, ["document:3"])
         self.assertEqual(
             set(result.references),
             {(dataset, 0) for dataset in SCAN_DATASETS},
@@ -1344,6 +1369,7 @@ class ParquetFragmentDeltaTest(unittest.TestCase):
             dirty={"document:1", "document:2", "document:3"},
         )
         archive = _DocumentArchive({"document:0": 1})
+        _seed_derived_catalog(documents, catalog, archive)
         result = _FragmentProbe([documents[0]], catalog, archive)._build(_candidate())
         self.assertEqual(result.mode, "compaction")
         self.assertEqual(set(result.removed), set(catalog.shards))
@@ -1361,6 +1387,7 @@ class ParquetFragmentDeltaTest(unittest.TestCase):
         for (dataset, index), row in catalog.shards.items():
             row["generation_sha256"] = f"{index:x}" * 64
         archive = _DocumentArchive({f"document:{index}": 1 for index in range(4)})
+        _seed_derived_catalog(documents, catalog, archive)
         result = _FragmentProbe(
             documents, catalog, archive, compaction_fragments=2
         )._build(_candidate())
@@ -1416,7 +1443,9 @@ class ParquetFragmentDeltaTest(unittest.TestCase):
         for (dataset, index), row in many.shards.items():
             row["generation_sha256"] = ("f" * 64) if index == 0 else (f"{index:x}" * 64)
         six = [_month_document(f"document:{index}") for index in range(6)]
-        result = _FragmentProbe(six, many, _DocumentArchive({f"document:{index}": 1 for index in range(6)}), compaction_fragments=3)._build(_candidate(reason="compaction"))
+        many_archive = _DocumentArchive({f"document:{index}": 1 for index in range(6)})
+        _seed_derived_catalog(six, many, many_archive)
+        result = _FragmentProbe(six, many, many_archive, compaction_fragments=3)._build(_candidate(reason="compaction"))
         self.assertEqual(result.mode, "compaction")
         # A real seed backfill (the whole-month marker, no sweep hint) is
         # still a full rebuild.

@@ -51,6 +51,20 @@ class Equivalence(unittest.TestCase):
   decoded=tuple(decode_logical_record(part[:-1],source_id='claude:test')for part in parts)
   old=visible_messages(decoded);self.assertEqual(len(old),2);self.assertEqual(old[0].record_count,2);self.assertEqual(old[0].record_ordinal,1)
   appended=record(4,'new','human-readable new fact');new=visible_messages(decoded+(appended,));self.compare(old,new)
+ def test_claude_completed_envelope_append_matches_full_without_api_id_join(self):
+  from tests.test_assistant_final_units import claude_records
+  from recall_server.passage_projection import visible_messages
+  records=claude_records(text='New complete qualification café λ. '*10)
+  old=visible_messages(records[:1]);completed=visible_messages(records[:2])
+  self.assertEqual(old,completed[:1])
+  self.assertIsNone(old[0].source_unit)
+  self.assertEqual(completed[1].source_unit,COMPLETE_ASSISTANT_FINAL_UNIT)
+  self.compare(old,completed)
+  before=build_passages(messages=old,**dict(A,revision=1))
+  after=build_passages(messages=completed,**A)
+  self.assertEqual((before[0].passage_id,before[0].text,before[0].receipts),
+                   (after[0].passage_id,after[0].text,after[0].receipts))
+  self.compare(completed,visible_messages(records))
  def test_explicit_reuse_switch_rejects_unknown_values(self):
   import os
   from unittest.mock import patch
