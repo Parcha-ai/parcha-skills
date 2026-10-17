@@ -11,7 +11,6 @@ import hashlib
 import json
 import os
 import time
-from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -23,7 +22,7 @@ from recall_server.passage_index import (
     CanonicalPassageProjector,
     PassageCandidate,
 )
-from recall_server.passage_projection import PassagePolicy
+from recall_server.passage_projection import PassagePolicy, canonical_spans_json
 from recall_server.semantic import SemanticRuntime
 
 from .runner import git_dirty, git_sha
@@ -96,7 +95,7 @@ def _span_coverage(
     }
     actual_passages: dict[tuple[str, str, str], int] = {}
     intervals: dict[
-        tuple[str, str, str, int, int],
+        tuple[str, str, str, int, int, str | None],
         list[tuple[int, int]],
     ] = {}
     for passage in passages:
@@ -130,8 +129,11 @@ def _span_coverage(
                 raise PassageIndexAuditError(
                     "passage span boundary is invalid"
                 )
+            source_unit = span.get('source_unit')
+            if source_unit is not None and (not isinstance(source_unit, str) or not source_unit):
+                raise PassageIndexAuditError("passage source unit is invalid")
             intervals.setdefault(
-                (*document, ordinal, record_count),
+                (*document, ordinal, record_count, source_unit),
                 [],
             ).append((start, end))
 
@@ -197,6 +199,17 @@ def _artifact_reference(
     }
 
 
+def _extraction_arguments(version: str) -> dict[str, str]:
+    """Bind the applied extraction without treating an old builder as capable."""
+    if version not in {'legacy', 'tool_groups_v1'}:
+        raise PassageIndexAuditError("unsupported applied extraction version")
+    if 'extraction_version' in PassageCandidate.__dataclass_fields__:
+        return {'extraction_version': version}
+    if version != 'legacy':
+        raise PassageIndexAuditError("applied extraction requires a version-aware projector")
+    return {}
+
+
 def _candidates(
     store: BrainStore,
     sample: list[dict[str, Any]],
@@ -217,6 +230,8 @@ def _candidates(
                SELECT evidence.tenant_id,evidence.source_id,
                       evidence.logical_document_id,evidence.revision,
                       evidence.document_content_sha256,
+                      coalesce(to_jsonb(projected)->>'applied_extraction_version','legacy')
+                          AS applied_extraction_version,
                       evidence.manifest_artifact_id,
                       evidence.manifest_storage_backend,
                       evidence.manifest_object_key,
@@ -240,6 +255,8 @@ def _candidates(
                  JOIN canonical_evidence_documents evidence
                    USING(tenant_id,source_id,logical_document_id)
                  JOIN canonical_evidence_document_parts part
+                   USING(tenant_id,source_id,logical_document_id,revision)
+                 JOIN canonical_passage_documents projected
                    USING(tenant_id,source_id,logical_document_id,revision)
                 ORDER BY evidence.tenant_id,evidence.source_id,
                          evidence.logical_document_id,part.part_ordinal""",
@@ -277,6 +294,7 @@ def _candidates(
                 _artifact_reference(value, prefix="part_")
                 for value in values
             ),
+            **_extraction_arguments(values[0]['applied_extraction_version']),
         )
         for identity, values in grouped.items()
     }
@@ -377,7 +395,7 @@ def _exact_sample(
             or tuple(stored["roles"]) != expected.roles
             or tuple(stored["receipts"]) != expected.receipts
             or stored["spans"]
-            != [asdict(span) for span in expected.spans]
+            != json.loads(canonical_spans_json(expected.spans))
             or stored["text_redacted"] != expected.text
             or stored["text_sha256"] != expected.text_sha256
         ):
