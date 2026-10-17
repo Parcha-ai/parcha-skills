@@ -129,6 +129,8 @@ def _thinning_statement(*, bounded: bool = False, probe: bool = False) -> str:
     projection = ("document.source_id,document.document_id" if probe else
                   """document.tenant_id,document.source_id,
                       document.document_id,document.event_id,
+                      document.is_current,document.body_record_ordinal,
+                      COALESCE(event.native_parent_id,event.native_id) AS native_parent_id,
                       document.text_redacted,
                       octet_length(document.text_redacted)::bigint AS document_bytes,
                       octet_length(event.canonical_redacted::text)::bigint AS event_bytes""")
@@ -191,7 +193,32 @@ def _thinning_statement(*, bounded: bool = False, probe: bool = False) -> str:
                             {document_filter}
                       RETURNING candidate.event_id,
                                 candidate.tenant_id,candidate.source_id,
+                                candidate.native_parent_id,candidate.is_current,
+                                candidate.body_record_ordinal,
                                 candidate.document_bytes,candidate.event_bytes
+                     ), rearmed_retirement AS (
+                         -- Same scheduling reset as invalidate_parent_retirement,
+                         -- grouped over rows this statement actually changed.
+                         -- Native retirement still decides metadata eligibility.
+                         UPDATE canonical_chunk_retirement_progress progress
+                            SET status='pending',scope_epoch=scope_epoch+1,
+                                manifest_artifact_id=NULL,last_record_ordinal=-1,
+                                updated_at=clock_timestamp()
+                           FROM (
+                               SELECT tenant_id,source_id,native_parent_id,
+                                      min(body_record_ordinal) AS first_ordinal
+                                 FROM updated_documents
+                                WHERE is_current AND body_record_ordinal IS NOT NULL
+                                GROUP BY tenant_id,source_id,native_parent_id
+                           ) changed
+                           JOIN canonical_evidence_documents evidence
+                             USING(tenant_id,source_id,native_parent_id)
+                          WHERE progress.tenant_id=changed.tenant_id
+                            AND progress.source_id=changed.source_id
+                            AND progress.native_parent_id=changed.native_parent_id
+                            AND progress.enabled
+                            AND progress.manifest_artifact_id=evidence.manifest_artifact_id
+                            AND progress.last_record_ordinal>=changed.first_ordinal
                      ), updated_events AS (
                          UPDATE canonical_events event
                             SET canonical_redacted={compact_event},
@@ -211,6 +238,45 @@ def _thinning_statement(*, bounded: bool = False, probe: bool = False) -> str:
                                 AS document_bytes,
                             coalesce(sum(event_bytes),0)::bigint AS event_bytes
                        FROM updated_events"""
+
+
+def _thin_selected(connection, tenant_id, keys, batch_size):
+    """Fence eligibility changes with the existing parent catalog lock first."""
+    keys = keys[:batch_size]
+    if not keys:
+        return dict(candidates=0, documents=0, events=0, document_bytes=0, event_bytes=0)
+    sources = [key["source_id"] for key in keys]
+    documents = [key["document_id"] for key in keys]
+    # Lock each parent once, in native scope order, before the original SQL
+    # takes document/event locks. Busy parents remain for the next pass.
+    locked_keys = connection.execute("""WITH requested AS MATERIALIZED (
+            SELECT document.source_id,document.document_id,
+                   COALESCE(event.native_parent_id,event.native_id) AS native_parent_id
+              FROM unnest(%s::text[],%s::text[]) scope(source_id,document_id)
+              JOIN canonical_documents document USING(source_id,document_id)
+              JOIN canonical_events event USING(tenant_id,source_id,event_id)
+             WHERE document.tenant_id=%s AND document.body_location='inline'
+               AND document.deleted_at IS NULL
+        ), locked_parents AS MATERIALIZED (
+            SELECT evidence.source_id,evidence.native_parent_id
+              FROM canonical_evidence_documents evidence
+              JOIN (SELECT DISTINCT source_id,native_parent_id FROM requested) parent
+                USING(source_id,native_parent_id)
+             WHERE evidence.tenant_id=%s
+             ORDER BY evidence.source_id,evidence.native_parent_id
+             FOR UPDATE OF evidence SKIP LOCKED
+        ) SELECT requested.source_id,requested.document_id
+            FROM requested JOIN locked_parents USING(source_id,native_parent_id)
+            ORDER BY requested.source_id,requested.document_id""",
+        (sources, documents, tenant_id, tenant_id)).fetchall()
+    if not locked_keys:
+        return dict(candidates=0, documents=0, events=0, document_bytes=0, event_bytes=0)
+    sources = [key["source_id"] for key in locked_keys]
+    documents = [key["document_id"] for key in locked_keys]
+    source_scope = sorted(set(sources))
+    return connection.execute(_thinning_statement(bounded=True),
+        (tenant_id, sources, documents, source_scope, documents, batch_size,
+         tenant_id, source_scope, tenant_id, source_scope)).fetchone()
 
 
 def thin_canonical_bodies(
@@ -244,10 +310,11 @@ def thin_canonical_bodies(
     documents = events = document_bytes = event_bytes = batches = candidates = 0
     for _ in range(max_batches):
         with store.connect() as connection:
-            row = connection.execute(
-                _thinning_statement(),
+            keys = connection.execute(
+                _thinning_statement(probe=True),
                 (tenant_id, batch_size),
-            ).fetchone()
+            ).fetchall()
+            row = _thin_selected(connection, tenant_id, keys, batch_size)
         current_candidates = int(row["candidates"])
         current = int(row["documents"])
         candidates += current_candidates
@@ -405,15 +472,7 @@ class CanonicalBodyThinner:
                          self._tenant_id, batch_size - len(eligible)),
                     ).fetchall())
             if eligible:
-                sources = [key["source_id"] for key in eligible]
-                documents = [key["document_id"] for key in eligible]
-                source_scope = sorted(set(sources))
-                row = connection.execute(
-                    _thinning_statement(bounded=True),
-                    (self._tenant_id, sources, documents, source_scope,
-                     documents, batch_size, self._tenant_id, source_scope,
-                     self._tenant_id, source_scope),
-                ).fetchone()
+                row = _thin_selected(connection, self._tenant_id, eligible, batch_size)
         # Publish progress only after successful context exit (COMMIT ACK).
         # Keep unselected hints for later batches. Ineligible hints remain
         # bounded and are evicted by new arrivals; history still revisits them.

@@ -13,6 +13,7 @@ import e2e_singleton_metadata_admission as original
 from recall_server import chunk_retirement as retirement
 from recall_server import retirement_runner as runner
 from recall_server.canonical_thinning import thin_canonical_bodies
+from recall_server import canonical_thinning as thinning
 from recall_server.db import BrainStore
 
 
@@ -78,13 +79,104 @@ class ThinningRetirement(unittest.TestCase):
         self.assertEqual(thinned['documents'], 2)
         after = self.ledger()
         self.assertLess(after['last_record_ordinal'], before['last_record_ordinal'])
-        self.assertGreater(after['scope_epoch'], before['scope_epoch'])
+        self.assertEqual(after['scope_epoch'], before['scope_epoch'] + 1)
         second = self.run_parent(2)
         self.assertEqual(second['retired_metadata_chunks'], 2)
         self.assertEqual(second['cleared_utf8_bytes'], 0)
         for receipt in self.receipts:
             self.assertIsNotNone(self.store.resolve(receipt, tenant_id=self.tenant,
                 authorized_sources=(self.source,), chunk_body_archive=self.archive))
+
+    def test_disabled_parent_stays_disabled_after_thinning(self):
+        self.run_parent(2)
+        retirement.set_parent_retirement_enabled(self.store, tenant_id=self.tenant,
+            source_id=self.source, native_parent_id='session', enabled=False)
+        before = self.ledger()
+        self.assertEqual(thin_canonical_bodies(self.store, tenant_id=self.tenant,
+            batch_size=10, max_batches=1)['documents'], 2)
+        self.assertEqual(self.ledger(), before)
+
+    def test_background_thinner_rearms_once_and_preserves_cumulative_work(self):
+        self.run_parent(2)
+        before = self.ledger()
+        result = thinning.CanonicalBodyThinner(self.store, tenant_id=self.tenant).thin(batch_size=10)
+        self.assertEqual(result['documents'], 2)
+        after = self.ledger()
+        self.assertEqual(after['scope_epoch'], before['scope_epoch'] + 1)
+        self.assertEqual(after['last_record_ordinal'], -1)
+        for field in ('cumulative_cleared_documents', 'cumulative_cleared_chunks',
+                      'cumulative_cleared_utf8_bytes'):
+            self.assertEqual(after[field], before[field])
+        self.assertEqual(self.run_parent(2)['retired_metadata_chunks'], 2)
+
+    def test_pending_append_keeps_original_thinning_refusal(self):
+        self.run_parent(2)
+        self.fixture.ingest('turn/new', 'New captured evidence awaiting logical publication')
+        before = self.ledger()
+        self.assertEqual(thin_canonical_bodies(self.store, tenant_id=self.tenant,
+            batch_size=10, max_batches=1)['documents'], 0)
+        self.assertEqual(self.ledger(), before)
+
+    def test_other_parent_intent_is_unchanged(self):
+        other = original.SingletonMetadataAdmission('runTest')
+        other.store = self.store
+        other.setUp()
+        self.addCleanup(other.doCleanups)
+        other.ingest('turn/other', 'Unrelated parent evidence')
+        other.projector.project_pending(tenant_id=other.tenant, batch_size=10,
+                                       max_batches=1, upload_concurrency=1)
+        retirement.set_parent_retirement_enabled(self.store, tenant_id=other.tenant,
+            source_id=other.source, native_parent_id='session', enabled=True)
+        def other_ledger():
+            with self.store.connect() as connection:
+                return connection.execute('SELECT * FROM canonical_chunk_retirement_progress WHERE tenant_id=%s',
+                                          (other.tenant,)).fetchone()
+        before = other_ledger()
+        self.run_parent(2)
+        self.assertEqual(thin_canonical_bodies(self.store, tenant_id=self.tenant,
+            batch_size=10, max_batches=1)['documents'], 2)
+        self.assertEqual(other_ledger(), before)
+
+    def test_thinning_ahead_of_cursor_does_not_restart_prior_work(self):
+        with self.store.connect() as connection:
+            connection.execute("""UPDATE canonical_documents SET body_location='chunks',text_redacted=''
+                WHERE tenant_id=%s AND native_id='turn/one'""", (self.tenant,))
+        self.assertEqual(self.run_parent(1)['retired_metadata_chunks'], 1)
+        before = self.ledger()
+        self.assertEqual(before['last_record_ordinal'], 0)
+        self.assertEqual(thin_canonical_bodies(self.store, tenant_id=self.tenant,
+            batch_size=10, max_batches=1)['documents'], 1)
+        self.assertEqual(self.ledger(), before)
+        self.assertEqual(self.run_parent(1)['retired_metadata_chunks'], 1)
+
+    def test_catalog_lock_skips_transition_until_owner_releases(self):
+        self.run_parent(2)
+        before = self.ledger()
+        with self.store.connect() as locked, locked.transaction():
+            locked.execute("""SELECT 1 FROM canonical_evidence_documents
+                WHERE tenant_id=%s FOR UPDATE""", (self.tenant,)).fetchall()
+            self.assertEqual(thin_canonical_bodies(self.store, tenant_id=self.tenant,
+                batch_size=10, max_batches=1)['documents'], 0)
+            self.assertEqual(self.ledger(), before)
+        self.assertEqual(thin_canonical_bodies(self.store, tenant_id=self.tenant,
+            batch_size=10, max_batches=1)['documents'], 2)
+        self.assertEqual(self.ledger()['scope_epoch'], before['scope_epoch'] + 1)
+
+    def test_transition_and_rearm_roll_back_together(self):
+        self.run_parent(2)
+        before = self.ledger()
+        apply = thinning._thin_selected
+        def interrupt(*args, **kwargs):
+            apply(*args, **kwargs)
+            raise RuntimeError('injected before COMMIT')
+        with patch.object(thinning, '_thin_selected', side_effect=interrupt):
+            with self.assertRaisesRegex(RuntimeError, 'injected'):
+                thin_canonical_bodies(self.store, tenant_id=self.tenant, batch_size=10, max_batches=1)
+        self.assertEqual(self.ledger(), before)
+        with self.store.connect() as connection:
+            rows = connection.execute('SELECT body_location FROM canonical_documents WHERE tenant_id=%s',
+                                      (self.tenant,)).fetchall()
+        self.assertEqual([row['body_location'] for row in rows], ['inline', 'inline'])
 
 
 if __name__ == '__main__':
