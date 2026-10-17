@@ -169,6 +169,8 @@ ALL_READ_TOOLS = (
             "the question warrants; reformulate or split the question when useful. "
             "Results include logical_document_id values for recall_exec and stable "
             "recall:// receipts for exact follow-up. Hits are hints, not proof. "
+            "Passage coordinates are omitted; use recall_passage_metadata with "
+            "the result's exact pins to recover them. "
             "Search covers visible user and assistant text; identifiers that "
             "appear only inside tool output are reachable through recall_scan."
         ),
@@ -937,7 +939,10 @@ def _call_tool(
             else None
         )
         return fit_search_result(
-            clip_search_snippets(store.search(query, filters, limit, authorized_source), snippet_chars)
+            clip_search_snippets(
+                omit_search_spans(store.search(query, filters, limit, authorized_source)),
+                snippet_chars,
+            )
         )
     if name == "recall_exec":
         _reject_extra(arguments, frozenset({"targets", "program", "timeout_seconds"}))
@@ -1176,6 +1181,28 @@ MAX_FITTED_RECEIPTS = 8
 
 def _encoded_result_size(value: dict) -> int:
     return len(json.dumps(_tool_result(value), default=str, sort_keys=True).encode())
+
+
+def omit_search_spans(value: Any) -> Any:
+    """Defer passage coordinates to exact metadata reads, keeping every hint."""
+    if not isinstance(value, dict) or not isinstance(value.get("results"), list):
+        return value
+    return {
+        **value,
+        "results": [
+            {
+                **document,
+                "matching_ranges": [
+                    {**item, "spans": [], "spans_omitted": True}
+                    if isinstance(item, dict) and item.get("spans") else item
+                    for item in document["matching_ranges"]
+                ],
+            }
+            if isinstance(document, dict) and isinstance(document.get("matching_ranges"), list)
+            else document
+            for document in value["results"]
+        ],
+    }
 
 
 def clip_search_snippets(value: Any, snippet_chars: int | None) -> Any:
