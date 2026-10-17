@@ -114,6 +114,30 @@ Gaps in `shard_index` are normal.
   [--source S]` queues every month of the scope with the `*` sentinel; a content-identical
   month is a no-op (`mode=reuse`) and keeps its objects.
 
+### Optional sparse scan metadata
+
+Migration 088 adds a nullable `dirty_plan_epoch` to the existing shard catalog.
+It enables nothing. Sparse metadata planning requires `RECALL_PARQUET_SPARSE_PLAN=1`
+and a nonempty `RECALL_PARQUET_DIRTY_EPOCH`, after **every canonical writer** includes
+the passage and actor-name dirty-document fixes from PR926. The default remains off.
+
+A month first runs the full metadata planner. Its successful catalog commit stamps
+all shard headers with the protocol, scan schema and operator epoch. A content-identical
+month can enroll without rewriting archive objects. Subsequent non-compacting builds
+read all shard headers and dirty IDs, then only the affected fragment memberships and
+the current metadata for dirty documents and their fragment siblings. Existing row,
+receipt, Forget, publication-generation and cleanup checks remain in place.
+
+Missing or different stamps, incomplete dataset headers, unnamed or whole-month dirt,
+compaction-enabled work, and an unexpectedly changed sibling use the full planner.
+This relies on complete supported dirty writers and the existing atomic fragment
+catalog. It does not detect arbitrary direct SQL corruption of membership rows.
+
+Disable sparse planning **before** running older or mixed writers. Use a **new epoch**
+after all writers again support complete dirty-document admission; this forces a fresh
+full metadata pass before reuse. Reusing the old epoch across that interval is unsafe.
+The marker stores no evidence or history, and migration or rollback does not delete it.
+
 ### Search projection outbox (H3-a)
 
 `search_projection_outbox` is the queue for the Lance-on-S3 search plane (H3-b), separate
