@@ -1,16 +1,21 @@
 """Actual Arrow output parity for independently packed dataset fragments."""
 import hashlib
 import json
+import tempfile
 import unittest
 from dataclasses import replace
+from datetime import datetime, timezone
+from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from recall_server.archive import ArchiveCorruption, ArchiveError, ArchiveNotFound
+from recall_server.archive import ArchiveCorruption, ArchiveError, ArchiveNotFound, FilesystemArchiveStore
+from recall_server.db import SearchDeadlineExceeded
 from recall_server.parquet_scan import (
-    FragmentMember, ParquetScanError, ScanCatalog, SCAN_DATASETS, _schemas,
+    FragmentMember, ParquetScanError, ScanCatalog, SCAN_DATASETS, _schemas, _StreamingUpload,
 )
 from tests.central_brain.test_parquet_scan import (
     _candidate, _DocumentArchive, _FragmentProbe, _live_shard, _month_document,
@@ -85,6 +90,87 @@ def catalog_from_upload(upload, dirty=()):
 
 
 class CrossDatasetDeltaTests(unittest.TestCase):
+    def test_changed_packing_under_same_generation_keeps_both_native_archive_objects(self):
+        documents = [_month_document(f'document:{i}') for i in range(2)]
+        probe = Probe(documents, ScanCatalog({}, {}, frozenset()),
+                      Archive({d['logical_document_id']: 1 for d in documents}))
+        rows = list(probe._passages(_candidate(), [d['logical_document_id'] for d in documents]))
+        members = {d['logical_document_id']: FragmentMember(d['logical_document_id'],
+                    d['revision'], probe._fingerprint(d)) for d in documents}
+        with tempfile.TemporaryDirectory() as directory:
+            archive = FilesystemArchiveStore(Path(directory), namespace_key=b'p' * 32)
+            results = []
+            for order in (rows, list(reversed(rows)), rows):
+                upload = _StreamingUpload(SimpleNamespace(archive=archive), _candidate(),
+                    generation='a' * 64, created_at=datetime(2026, 8, 1, tzinfo=timezone.utc))
+                for row in order:
+                    upload.add('passages', probe._passage_row(_candidate(), row),
+                               member=members[row['logical_document_id']])
+                results.append(upload.finish(first=None, last=None, ensure_datasets=('passages',)))
+            first, changed, retry = [r.references[('passages', 0)] for r in results]
+            self.assertEqual(results[0].generation_sha256, results[1].generation_sha256)
+            for field in ('artifact_id', 'object_key', 'content_sha256'):
+                self.assertNotEqual(first[field], changed[field])
+                self.assertEqual(first[field], retry[field])
+            original_rows = decode(archive.read_raw(first))
+            changed_rows = decode(archive.read_raw(changed))
+            self.assertEqual(original_rows, list(reversed(changed_rows)))
+            self.assertEqual(len(original_rows), 2)
+            self.assertEqual({m for r in results for m in r.members[('passages', 0)]},
+                             set(members.values()))
+
+    def test_failed_passage_proof_does_not_read_or_upload_unchanged_fragments(self):
+        _, changed, catalog, archive = self.fixture(records=2)
+        archive.fragment_reads.clear()
+        initial_uploads = len(archive.uploads)
+        problem = SearchDeadlineExceeded("search_deadline_exceeded")
+
+        class FailedProof(Probe):
+            def _passages(self, *_):
+                raise problem
+                yield
+
+        projector = FailedProof(changed, catalog, archive)
+        with self.assertRaises(SearchDeadlineExceeded) as raised:
+            projector._build(_candidate())
+        self.assertIs(raised.exception, problem)
+        self.assertEqual(archive.fragment_reads, [])
+        self.assertEqual(archive.reads, [])
+        self.assertEqual(len(archive.uploads), initial_uploads)
+        self.assertEqual(projector.cleanup, [])
+
+    def test_later_passage_failure_cleans_only_partial_passage_uploads(self):
+        _, changed, catalog, archive = self.fixture(records=2)
+        archive.fragment_reads.clear()
+        initial_uploads = len(archive.uploads)
+        problem = SearchDeadlineExceeded("search_deadline_exceeded")
+        closed = []
+
+        class FailedLaterProof(Probe):
+            def _passages(self, *args):
+                try:
+                    row = next(super()._passages(*args))
+                    for ordinal in range(5):
+                        yield {**row, 'passage_id': f'passage:partial:{ordinal}',
+                               'ordinal': ordinal, 'text_redacted': 'bounded partial row ' * 20}
+                    raise problem
+                finally:
+                    closed.append(True)
+
+        projector = FailedLaterProof(changed, catalog, archive)
+        with mock.patch('recall_server.parquet_scan.PARQUET_RAW_SLICE_BYTES', 512):
+            with self.assertRaises(SearchDeadlineExceeded) as raised:
+                projector._build(_candidate())
+        self.assertIs(raised.exception, problem)
+        self.assertEqual(closed, [True])
+        self.assertEqual(archive.fragment_reads, [])
+        self.assertEqual(archive.reads, [])
+        self.assertGreater(len(archive.uploads), initial_uploads)
+        expected = {f'new:{i + 1}' for i in range(initial_uploads, len(archive.uploads))}
+        self.assertEqual({ref['artifact_id'] for ref in projector.cleanup}, expected)
+        for item in archive.uploads[initial_uploads:]:
+            self.assertIn(':passages:', item['native_id'])
+
     def fixture(self, *, records=100, empty=False):
         documents = [_month_document(f'document:{i}') for i in range(6)]
         for document in documents:

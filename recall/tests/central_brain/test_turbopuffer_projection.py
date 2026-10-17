@@ -189,7 +189,7 @@ class _Catalog:
                     row for row in self.passages
                     if row["source_id"] == source and row["live"]
                     and start <= row["first_occurred_at"] < end
-                    and (since is None or row["created_at"] > since)
+                    and (since is None or row["created_at"] >= since)
                     and (row["first_occurred_at"], row["passage_id"]) > (cursor_time, cursor_id)
                 ),
                 key=lambda row: (row["first_occurred_at"], row["passage_id"]),

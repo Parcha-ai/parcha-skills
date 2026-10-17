@@ -64,6 +64,7 @@ jobs:
             e2e_v2_canonical_plane.py \
             e2e_slack_deletion_ordering.py \
             e2e_collector_retention_policy.py \
+            e2e_collector_legacy_eof.py \
             e2e_legacy_cleanup_ack.py \
             e2e_collector_history_recovery.py \
             e2e_codex_cleanup_recovery.py \
@@ -81,6 +82,7 @@ jobs:
             e2e_storage_legacy_cut.py \
             e2e_canonical_body_thinning.py \
             e2e_bounded_canonical_thinning.py \
+            e2e_thinning_retirement_transition.py \
             e2e_committed_body_keys.py \
             e2e_logical_source_integrity.py \
             e2e_logical_source_fairness.py \

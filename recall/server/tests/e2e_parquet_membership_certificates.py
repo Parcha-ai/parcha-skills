@@ -10,6 +10,7 @@ from psycopg import ServerCursor, sql
 
 from e2e_parent_membership_enrollment import ParentEnrollmentTests
 from recall_server import parent_membership_read as reader
+from recall_server.db import SearchDeadlineExceeded
 from recall_server.logical_evidence import LogicalEvidenceProjectionStore
 from recall_server.parquet_scan import CanonicalParquetScanProjector
 from recall_server.receipt_membership import lookup_current_search_membership
@@ -31,6 +32,105 @@ class ParquetCertificateTests(ParentEnrollmentTests):
         with patch.dict(os.environ, RECALL_PARENT_MEMBERSHIP_READ='1' if enabled else '0',
                         RECALL_PARENT_MEMBERSHIP_EPOCH=epoch):
             return list(self.scan._passages(self.candidate, self.documents))
+
+    def test_cancelled_native_passage_proof_does_not_start_sibling_preservation(self):
+        execute = self.store._execute_bounded
+        attempts = []
+
+        def cancelled(connection, statement, parameters, deadline):
+            if statement.startswith('WITH requested AS MATERIALIZED'):
+                attempts.append(deadline)
+                # Actual PostgreSQL statement cancellation inside the native
+                # receipt proof, without changing its error/cleanup owner.
+                return execute(connection, 'SELECT pg_sleep(0.1)', (), time.monotonic() + 0.02)
+            return execute(connection, statement, parameters, deadline)
+
+        with patch.dict(os.environ, RECALL_PARENT_MEMBERSHIP_READ='0'), \
+             patch.object(self.store, '_execute_bounded', side_effect=cancelled), \
+             patch.object(self.scan, '_preserve_rows', wraps=self.scan._preserve_rows) as preserve:
+            with self.assertRaises(SearchDeadlineExceeded):
+                self.scan._build(self.candidate)
+        self.assertEqual(len(attempts), 1)
+        preserve.assert_not_called()
+        with self.store.connect() as connection:
+            for table in ('canonical_parquet_scan_shards', 'canonical_evidence_cleanup_queue'):
+                self.assertEqual(connection.execute(
+                    'SELECT count(*) AS n FROM ' + table + ' WHERE tenant_id=%s',
+                    (self.tenant,)).fetchone()['n'], 0)
+            queue = connection.execute(
+                'SELECT generation,changed_at FROM canonical_parquet_scan_queue WHERE tenant_id=%s',
+                (self.tenant,)).fetchone()
+        self.assertEqual(queue, dict(generation=self.candidate.generation,
+                                     changed_at=self.candidate.changed_at))
+
+    def test_new_queue_generation_during_preservation_keeps_original_publication_fence(self):
+        preserve = self.scan._preserve_rows
+        proved = []
+        native = lookup_current_search_membership
+
+        def proof(*args, **kwargs):
+            result = native(*args, **kwargs)
+            proved.append(True)
+            return result
+
+        def changed(*args):
+            self.assertTrue(proved)
+            self.assertEqual(self.scan.seed_backfill(tenant_id=self.tenant), 1)
+            return preserve(*args)
+
+        totals = {'stale': 0}
+        with patch.dict(os.environ, RECALL_PARENT_MEMBERSHIP_READ='0'), \
+             patch('recall_server.receipt_membership.lookup_current_search_membership', side_effect=proof), \
+             patch.object(self.scan, '_preserve_rows', side_effect=changed):
+            self.assertTrue(self.scan._process(self.candidate, totals))
+        self.assertEqual(totals, {'stale': 1})
+        with self.store.connect() as connection:
+            queue = connection.execute(
+                'SELECT generation FROM canonical_parquet_scan_queue WHERE tenant_id=%s',
+                (self.tenant,)).fetchone()
+            self.assertGreater(queue['generation'], self.candidate.generation)
+            self.assertEqual(connection.execute(
+                'SELECT count(*) AS n FROM canonical_parquet_scan_shards WHERE tenant_id=%s',
+                (self.tenant,)).fetchone()['n'], 0)
+            self.assertGreater(connection.execute(
+                'SELECT count(*) AS n FROM canonical_evidence_cleanup_queue WHERE tenant_id=%s',
+                (self.tenant,)).fetchone()['n'], 0)
+
+    def test_fetched_metadata_and_bytes_match_original_query_in_same_snapshot(self):
+        self.enroll()
+        connect = self.store.connect
+        compared = []
+        case = self
+        class ComparedCursor(ServerCursor):
+            def fetchmany(self, size=0):
+                rows = super().fetchmany(size)
+                if rows:
+                    metadata = self.connection.execute(reader._METADATA_SQL,
+                        (case.tenant, [row['source_id'] for row in rows],
+                         [row['passage_id'] for row in rows])).fetchall()
+                    expected = {(row['source_id'], row['passage_id']): row for row in metadata}
+                    case.assertEqual(sum(row['membership_metadata_bytes'] for row in rows),
+                                     metadata[0]['metadata_bytes'])
+                    for row in rows:
+                        case.assertTrue(row['membership_metadata_complete'])
+                        extra = dict(expected[row['source_id'], row['passage_id']])
+                        extra.pop('metadata_bytes'); extra.pop('selected_count')
+                        case.assertEqual(row['membership_metadata'], extra)
+                    compared.append(len(rows))
+                return rows
+        class Connection:
+            def __init__(self, connection): self.connection = connection
+            def __getattr__(self, name): return getattr(self.connection, name)
+            def cursor(self, name):
+                return ComparedCursor(self.connection, name, row_factory=self.connection.row_factory)
+        @contextmanager
+        def checking():
+            with connect() as connection:
+                yield Connection(connection)
+        baseline = self.stream(False)
+        with patch.object(self.store, 'connect', side_effect=checking):
+            self.assertEqual(self.stream(), baseline)
+        self.assertEqual(compared, [len(self.ids)])
 
     def test_certified_stream_matches_disabled_without_native_receipt_query(self):
         self.enroll()
@@ -150,12 +250,11 @@ class ParquetCertificateTests(ParentEnrollmentTests):
     def test_incomplete_optional_metadata_keeps_native_passage(self):
         self.enroll()
         baseline = self.stream(False)
-        execute = self.store._execute_bounded
-        def missing(connection, statement, parameters, deadline):
-            if statement == reader._METADATA_SQL:
-                statement = 'SELECT * FROM (' + statement + ') optional_metadata WHERE false'
-            return execute(connection, statement, parameters, deadline)
-        with patch.object(self.store, '_execute_bounded', side_effect=missing):
+        original = reader.partition_fetched
+        def missing(*, selected, **kwargs):
+            selected[0]['membership_metadata_complete'] = False
+            return original(selected=selected, **kwargs)
+        with patch.object(reader, 'partition_fetched', side_effect=missing):
             with patch('recall_server.receipt_membership.lookup_current_search_membership',
                        wraps=lookup_current_search_membership) as native:
                 self.assertEqual(self.stream(), baseline)
@@ -166,24 +265,32 @@ class ParquetCertificateTests(ParentEnrollmentTests):
         self.clone_passages(2000, 'recall://' + self.source + '/missing?rev=1#item=0')
         baseline = self.stream(False)
         self.assertEqual(len(baseline), len(self.ids))
-        execute = self.store._execute_bounded
-        metadata_calls = []
+        original = reader.partition_fetched
+        partition_calls = []
         native_deadlines = []
-        def delayed(connection, statement, parameters, deadline):
-            if statement == reader._METADATA_SQL:
-                metadata_calls.append(deadline)
-                if len(metadata_calls) == 1:
-                    return execute(connection, 'SELECT pg_sleep(0.2)', (), deadline)
-            elif statement.startswith('WITH requested AS MATERIALIZED'):
+        clock = time.monotonic
+        execute = self.store._execute_bounded
+        def delayed(*, selected, settings, deadline_at):
+            partition_calls.append(deadline_at)
+            if len(partition_calls) == 1:
+                start = clock()
+                # Expire only the100ms in-memory validation window. No database
+                # timeout is changed; background proof receives its own bounded operation.
+                with patch.object(reader.time, 'monotonic', side_effect=[start, start + .101, start + .102]):
+                    result = original(selected=selected, settings=settings, deadline_at=deadline_at)
+                self.assertEqual(result[1]['status'], 'deadline')
+                return result
+            return original(selected=selected, settings=settings, deadline_at=deadline_at)
+        def counted(connection, statement, parameters, deadline):
+            if statement.startswith('WITH requested AS MATERIALIZED'):
                 native_deadlines.append(deadline)
             return execute(connection, statement, parameters, deadline)
-        with patch.object(self.store, '_execute_bounded', side_effect=delayed):
+        with patch.object(reader, 'partition_fetched', side_effect=delayed), \
+             patch.object(self.store, '_execute_bounded', side_effect=counted):
             self.assertEqual(self.stream(), baseline)
-        self.assertEqual(len(metadata_calls), 2)
+        self.assertEqual(len(partition_calls), 2)
         self.assertEqual(len(native_deadlines), 1)
-        # The100ms optional phase shares the original6s deadline; it cannot renew it.
-        self.assertGreater(native_deadlines[0] - metadata_calls[0], 5.8)
-        self.assertLessEqual(native_deadlines[0] - metadata_calls[0], 5.91)
+        self.assertGreater(native_deadlines[0], partition_calls[0])
 
     def test_successful_certificate_restores_timeout_before_next_native_fetch(self):
         self.clone_passages(1, self.physical_receipt)
@@ -235,11 +342,11 @@ class ParquetCertificateTests(ParentEnrollmentTests):
     def test_concurrent_edit_keeps_snapshot_then_next_stream_rejects(self):
         self.enroll()
         baseline = self.stream(False)
-        original = reader.partition
+        original = reader.partition_fetched
         def changed(*args, **kwargs):
             self.edit()
             return original(*args, **kwargs)
-        with patch.object(reader, 'partition', side_effect=changed):
+        with patch.object(reader, 'partition_fetched', side_effect=changed):
             self.assertEqual(self.stream(), baseline)
         self.assertEqual(self.stream(), [])
 
@@ -286,7 +393,7 @@ class ParquetCertificateTests(ParentEnrollmentTests):
             self.assertEqual(self.stream(), baseline)
         self.assertEqual(native.call_count, 1)
 
-    def test_no_certificate_overhead_is_one_optional_query_per_batch(self):
+    def test_no_certificate_overhead_needs_no_second_metadata_query(self):
         original = self.store._execute_bounded
         statements = []
         def counted(connection, statement, parameters, deadline):
@@ -296,7 +403,7 @@ class ParquetCertificateTests(ParentEnrollmentTests):
         with patch.object(self.store, '_execute_bounded', side_effect=counted):
             enabled = self.stream()
         enabled_ms = (time.monotonic() - start) * 1000
-        self.assertEqual(sum(statement == reader._METADATA_SQL for statement in statements), 1)
+        self.assertEqual(sum(statement == reader._METADATA_SQL for statement in statements), 0)
         self.assertEqual(sum(statement.startswith('WITH requested AS MATERIALIZED') for statement in statements), 1)
         start = time.monotonic()
         disabled = self.stream(False)

@@ -1265,6 +1265,19 @@ class Collector:
                     scheduling.get("scan_resume_after_path", ""),
                 )
                 paths = paths[split:] + paths[:split]
+                # Spend legacy reproof slots on files with no delivery ledger
+                # first. Keep partial resumes and other work in their slots.
+                legacy = dict(self.db.execute(
+                    "SELECT path, EXISTS(SELECT 1 FROM active_records a "
+                    "WHERE a.path=files.path) FROM files "
+                    "WHERE status='ok' AND snapshot_sha256 IS NULL "
+                    "AND scanned_offset=size AND committed_offset=size"
+                ))
+                priority = iter(sorted(
+                    (path for path in paths if str(path) in legacy),
+                    key=lambda path: legacy[str(path)],
+                ))
+                paths = [next(priority) if str(path) in legacy else path for path in paths]
             for path in paths:
                 if (
                     records_seen >= self.max_scan_records
@@ -1294,11 +1307,11 @@ class Collector:
                     and row["size"] == stat.st_size
                     and row["mtime_ns"] == stat.st_mtime_ns
                     and row["fingerprint"] == current_fingerprint
-                    and (not row["snapshot_sha256"]
-                         or row["snapshot_stat"] == current_snapshot_stat)
+                    and row["snapshot_sha256"]
+                    and row["snapshot_stat"] == current_snapshot_stat
                 ):
-                    # Unchanged completed legacy rows retain the prior skip
-                    # contract; this does not retroactively certify their bytes.
+                    # Legacy cursors without a verified snapshot must walk the
+                    # records once; EOF alone does not prove their delivery.
                     self.db.execute("UPDATE files SET last_scan_id=? WHERE path=?", (scan_id, path_text))
                     continue
                 same_snapshot = bool(

@@ -420,6 +420,14 @@ def run_projection_worker(
                 passage_elapsed_ms += elapsed_ms(phase_started)
                 phase_elapsed["passage_elapsed_ms"] = passage_elapsed_ms
                 accumulate(projected, tick)
+                for failure in tick.get("membership_failures", ()):
+                    LOG.warning(
+                        "membership certification failed source_id=%r logical_document_id=%r "
+                        "native_parent_id=%r error_class=%r sqlstate=%r",
+                        failure.get("source_id"), failure.get("logical_document_id"),
+                        failure.get("native_parent_id"), failure.get("error_class"),
+                        failure.get("sqlstate"),
+                    )
                 phase_started = clock()
                 if search_ticks == before_search_ticks:
                     # Drain pre-existing outbox work even when passages were idle.

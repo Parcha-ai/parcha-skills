@@ -104,7 +104,7 @@ _PASSAGE_PAGE_SQL = f"""
        AND passage.source_id=%s
        AND passage.first_occurred_at>=%s
        AND passage.first_occurred_at<%s
-       AND (%s::timestamptz IS NULL OR passage.created_at>%s::timestamptz)
+       AND (%s::timestamptz IS NULL OR passage.created_at>=%s::timestamptz)
        AND (passage.first_occurred_at,passage.passage_id)>(%s,%s)
        AND {_LIVE_PASSAGE_PREDICATE}
      ORDER BY passage.first_occurred_at,passage.passage_id
@@ -440,8 +440,11 @@ class TurbopufferProjector:
         return row["built_at"] if row else None
 
     def read_watermark(self, connection: Any) -> datetime:
-        """Safe ``built_at`` for this projection: nothing committed later than
-        this can carry a ``created_at`` at or before it."""
+        """Inclusive lower bound for the next incremental projection.
+
+        An active transaction can commit later with created_at equal to its
+        transaction start. Replaying that boundary is an idempotent upsert.
+        """
 
         return connection.execute(
             """SELECT LEAST(

@@ -253,6 +253,30 @@ def reset_scope_count_cache() -> None:
         _SCOPE_COUNT_CACHE.clear()
 
 
+def dense_subpass_nominations(
+    full: list[dict[str, Any]], window: list[dict[str, Any]], *, limit: int,
+) -> frozenset[tuple[str, str]] | None:
+    """Share existing dense nomination positions between full and window results."""
+    if not window:
+        return None
+    selected: set[tuple[str, str]] = set()
+    streams = (iter(full), iter(window))
+    while len(selected) < limit:
+        progressed = False
+        for stream in streams:
+            for row in stream:
+                identity = (row["source_id"], row["logical_document_id"])
+                if identity not in selected:
+                    selected.add(identity)
+                    progressed = True
+                    break
+            if len(selected) >= limit:
+                break
+        if not progressed:
+            break
+    return frozenset(selected)
+
+
 def collapse_document_candidates(
     legs: tuple[tuple[str, float, list[dict[str, Any]]], ...],
     *,
@@ -264,6 +288,7 @@ def collapse_document_candidates(
     window_boost: tuple[str, str, float] | None = None,
     source_boost: tuple[tuple[str, ...], float] | None = None,
     passage_budget: int | Literal["admitted"] | None = None,
+    dense_nominations: frozenset[tuple[str, str]] | None = None,
 ) -> list[dict[str, Any]]:
     """Fuse mechanical hints while keeping their strongest exact ranges.
 
@@ -336,7 +361,11 @@ def collapse_document_candidates(
                 },
             )
             if document_id not in seen_documents:
-                if len(seen_documents) < nominate_per_arm:
+                if (
+                    (row["source_id"], document_id) in dense_nominations
+                    if leg_name == "dense" and dense_nominations is not None
+                    else len(seen_documents) < nominate_per_arm
+                ):
                     nominated_documents.add((row["source_id"], document_id))
                 leg_entry = leg_scores[document_id]
                 value["_score"] += leg_weight * float(leg_entry["normalized"])
@@ -654,10 +683,10 @@ def merge_dense_pools(
 ) -> tuple[list[dict[str, Any]], int]:
     """Union the global dense pool with a second pass (H2-h window, H2-m clause).
 
-    Both pools hold one row per logical document. Documents the global pass
-    already returned keep their row; new documents from the second pass join
-    the pool, and the union is re-ordered by dense score (stable, so ties keep
-    the arms' recency order). Returns the pool and how many rows were added.
+    Passage rows use source, parent and passage identity; legacy rows use
+    document identity. The first row for an identity keeps its score and
+    metadata. Distinct passages join the pool, sorted stably by score.
+    Returns the pool and how many distinct rows were added.
 
     ``align_by_rank``: a clause pass scores against a different query vector,
     so its cosine scores are not comparable with the global pass. Its rows
@@ -670,7 +699,12 @@ def merge_dense_pools(
 
     if not windowed:
         return primary, 0
-    seen = {row["logical_document_id"] for row in primary}
+    def identity(row: dict[str, Any]) -> tuple[Any, ...]:
+        if row.get("passage_id"):
+            return ("passage", row.get("source_id"), row["logical_document_id"], row["passage_id"])
+        return ("document", row["logical_document_id"])
+
+    seen = {identity(row) for row in primary}
     if align_by_rank and primary:
         ladder = sorted((float(row["score"]) for row in primary), reverse=True)
         aligned = []
@@ -678,7 +712,12 @@ def merge_dense_pools(
             score = ladder[min(rank, len(ladder) - 1)]
             aligned.append({**row, "score": score})
         windowed = aligned
-    added = [row for row in windowed if row["logical_document_id"] not in seen]
+    added = []
+    for row in windowed:
+        key = identity(row)
+        if key not in seen:
+            seen.add(key)
+            added.append(row)
     if not added:
         return primary, 0
     merged = sorted(primary + added, key=lambda row: -float(row["score"]))
@@ -2372,6 +2411,7 @@ class PassageHintRetrieval:
             else (temporal_settings.window_budget_ms if temporal_settings is not None else 0)
         )
         window_future: Any = None
+        dense_nominations: frozenset[tuple[str, str]] | None = None
 
         def window_pass(text: str, vector: Any) -> tuple[list[dict[str, Any]], str, str, int | None]:
             # H2-h: a day-level hint (hedged or not) also runs the dense arm
@@ -2393,6 +2433,7 @@ class PassageHintRetrieval:
             )
 
         def dense_arms(text: str) -> tuple[list[dict[str, Any]], str, str, int | None]:
+            nonlocal dense_nominations
             # The query is embedded once (inside the dense arm's timing, as
             # before); the windowed pass reuses the vector.
             arm_started = time.monotonic()
@@ -2415,6 +2456,10 @@ class PassageHintRetrieval:
                 # connection.
                 windowed, window_status, window_strategy, _ = window_pass(text, vector)
             merged, added = merge_dense_pools(rows, windowed)
+            if window_status == "ok":
+                dense_nominations = dense_subpass_nominations(
+                    rows, windowed, limit=RERANK_NOMINATE_PER_ARM,
+                )
             window_diagnostics.update({
                 "dense_window_status": window_status,
                 "dense_window_strategy": window_strategy,
@@ -2615,6 +2660,7 @@ class PassageHintRetrieval:
         )
         if balanced_passages:
             collapse_options["passage_budget"] = "admitted"
+            collapse_options["dense_nominations"] = dense_nominations
         results = collapse_document_candidates(legs, **collapse_options)
         if balanced_passages:
             # Freeze the request's capacity for the authority rebuild. Its input
