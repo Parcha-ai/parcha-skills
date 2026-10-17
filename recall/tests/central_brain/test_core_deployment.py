@@ -121,6 +121,7 @@ class DatabaseCapabilityContractTest(unittest.TestCase):
             snapshot['migration_versions'] = [v for v in snapshot['migration_versions'] if v != 87]
             if present:
                 snapshot['migration_versions'].append(87)
+                snapshot['migration_versions'].sort()
             self.assertEqual(assess_snapshot(snapshot)['status'], 'ready')
         for versions in ([v for v in snapshot['migration_versions'] if v != 79],
                          snapshot['migration_versions'] + [87],
