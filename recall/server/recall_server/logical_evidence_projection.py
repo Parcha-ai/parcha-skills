@@ -480,41 +480,7 @@ class CanonicalLogicalEvidenceProjector:
         return tuple(segments)
 
     def _restored_record_text(self, row: dict[str, Any], fallback: str) -> str:
-        if row["raw_media_type"] != OVERSIZED_MEDIA_TYPE:
-            return fallback
-        content = row["oversized_content"]
-        if (
-            self.raw_archive is None
-            or not isinstance(content, dict)
-            or content.get("contract") != "recall.oversized-projection.v1"
-            or content.get("full_record_available") is not True
-            or content.get("archive_encoding") != "gzip"
-            or isinstance(content.get("full_size_bytes"), bool)
-            or not isinstance(content.get("full_size_bytes"), int)
-            or not 1 <= content["full_size_bytes"] <= MAX_RESTORED_RECORD_BYTES
-            or not isinstance(content.get("full_content_sha256"), str)
-        ):
-            raise LogicalEvidenceError("logical_evidence_full_record_unavailable")
-        try:
-            compressed = self.raw_archive.read_raw(self._reference(row, prefix="raw_"))
-            with gzip.GzipFile(fileobj=io.BytesIO(compressed)) as source:
-                payload = source.read(MAX_RESTORED_RECORD_BYTES + 1)
-            if (
-                len(payload) != content["full_size_bytes"]
-                or len(payload) > MAX_RESTORED_RECORD_BYTES
-                or hashlib.sha256(payload).hexdigest() != content["full_content_sha256"]
-            ):
-                raise LogicalEvidenceError("logical_evidence_full_record_corrupt")
-            text = payload.decode()
-            if not isinstance(json.loads(text), dict):
-                raise LogicalEvidenceError("logical_evidence_full_record_corrupt")
-            return text
-        except LogicalEvidenceError:
-            raise
-        except Exception:
-            raise LogicalEvidenceError(
-                "logical_evidence_full_record_unavailable"
-            ) from None
+        return restore_oversized_record(self.raw_archive, row, fallback)
 
     def _event_records(
         self,
@@ -3260,3 +3226,41 @@ class CanonicalLogicalEvidenceProjector:
         if remaining:
             raise LogicalEvidenceError("logical_evidence_delete_incomplete")
         return len(artifact_ids)
+
+
+def restore_oversized_record(raw_archive: Any, row: dict[str, Any], fallback: str) -> str:
+    if row["raw_media_type"] != OVERSIZED_MEDIA_TYPE:
+        return fallback
+    content = row["oversized_content"]
+    if (
+        raw_archive is None
+        or not isinstance(content, dict)
+        or content.get("contract") != "recall.oversized-projection.v1"
+        or content.get("full_record_available") is not True
+        or content.get("archive_encoding") != "gzip"
+        or isinstance(content.get("full_size_bytes"), bool)
+        or not isinstance(content.get("full_size_bytes"), int)
+        or not 1 <= content["full_size_bytes"] <= MAX_RESTORED_RECORD_BYTES
+        or not isinstance(content.get("full_content_sha256"), str)
+    ):
+        raise LogicalEvidenceError("logical_evidence_full_record_unavailable")
+    try:
+        compressed = raw_archive.read_raw(CanonicalLogicalEvidenceProjector._reference(row, prefix="raw_"))
+        with gzip.GzipFile(fileobj=io.BytesIO(compressed)) as source:
+            payload = source.read(MAX_RESTORED_RECORD_BYTES + 1)
+        if (
+            len(payload) != content["full_size_bytes"]
+            or len(payload) > MAX_RESTORED_RECORD_BYTES
+            or hashlib.sha256(payload).hexdigest() != content["full_content_sha256"]
+        ):
+            raise LogicalEvidenceError("logical_evidence_full_record_corrupt")
+        text = payload.decode()
+        if not isinstance(json.loads(text), dict):
+            raise LogicalEvidenceError("logical_evidence_full_record_corrupt")
+        return text
+    except LogicalEvidenceError:
+        raise
+    except Exception:
+        raise LogicalEvidenceError(
+            "logical_evidence_full_record_unavailable"
+        ) from None
