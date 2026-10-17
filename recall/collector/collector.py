@@ -1265,6 +1265,19 @@ class Collector:
                     scheduling.get("scan_resume_after_path", ""),
                 )
                 paths = paths[split:] + paths[:split]
+                # Spend legacy reproof slots on files with no delivery ledger
+                # first. Keep partial resumes and other work in their slots.
+                legacy = dict(self.db.execute(
+                    "SELECT path, EXISTS(SELECT 1 FROM active_records a "
+                    "WHERE a.path=files.path) FROM files "
+                    "WHERE status='ok' AND snapshot_sha256 IS NULL "
+                    "AND scanned_offset=size AND committed_offset=size"
+                ))
+                priority = iter(sorted(
+                    (path for path in paths if str(path) in legacy),
+                    key=lambda path: legacy[str(path)],
+                ))
+                paths = [next(priority) if str(path) in legacy else path for path in paths]
             for path in paths:
                 if (
                     records_seen >= self.max_scan_records
