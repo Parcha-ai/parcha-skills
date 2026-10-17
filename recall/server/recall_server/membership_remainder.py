@@ -47,7 +47,7 @@ def key(row):
 
 
 def retain(connection, candidate, settings):
-    """Called inside the existing publisher transaction, after its passage writes."""
+    """Retain after publication; None alone requests the pre085 legacy hook."""
     if not settings.enabled:
         return False
     available = connection.execute("""SELECT EXISTS(SELECT 1 FROM pg_attribute
@@ -55,13 +55,15 @@ def retain(connection, candidate, settings):
           AND attname='certification_checkpoint' AND atttypid='jsonb'::regtype
           AND NOT attisdropped) AS available""").fetchone()["available"]
     if not available:
-        return False
+        return None
     scope = connection.execute(
         CURRENT,
         (candidate.tenant_id, candidate.source_id, candidate.logical_document_id),
     ).fetchone()
-    if scope is None or scope["authority_generation"] is None:
+    if scope is None:
         return False
+    # Null generation is only a scheduling request for native initialization.
+    # It carries no certified prefix and cannot authorize a reader.
     checkpoint = dict(
         version=1,
         epoch=settings.binding_epoch,
@@ -165,10 +167,14 @@ def resume(store, row, *, settings, deadline_at):
                     and checkpoint.get("version") == 1
                     and checkpoint.get("epoch") == settings.binding_epoch
                     and isinstance(checkpoint.get("after"), str)
-                    and type(checkpoint.get("authority_generation")) is int
-                    and checkpoint["authority_generation"] > 0
+                    and (
+                        (type(checkpoint.get("authority_generation")) is int
+                         and checkpoint["authority_generation"] > 0)
+                        or ("authority_generation" in checkpoint
+                            and checkpoint["authority_generation"] is None
+                            and checkpoint["after"] == "")
+                    )
                     and scope is not None
-                    and scope["authority_generation"] is not None
                     and all(
                         checkpoint.get(name) == scope[name]
                         for name in FIELDS if name != "authority_generation"
@@ -185,6 +191,11 @@ def resume(store, row, *, settings, deadline_at):
                 generation_changed = valid and (
                     checkpoint["authority_generation"] != scope["authority_generation"]
                 )
+                initialize = (valid and checkpoint["authority_generation"] is None
+                              and scope["authority_generation"] is None and not busy)
+                if valid and scope["authority_generation"] is None and not initialize:
+                    # A previously positive binding must never be reset.
+                    valid = checkpoint["authority_generation"] is None
                 if valid and (first_slice or generation_changed):
                     # Fair retries use the existing work-order timestamp, never
                     # a reservation. Release this short queue lock before proof.
@@ -232,9 +243,19 @@ def resume(store, row, *, settings, deadline_at):
                         ),
                         deadline_at,
                     ).fetchall()
-                    if valid and not busy
+                    if valid and not busy and not initialize
                     else []
                 )
+            if initialize:
+                # No queue/catalog lock or connection survives this boundary.
+                # Re-read CURRENT and CAS the original queue on the next pass.
+                initialized = native.initialize_published_parent_generation(
+                    store, tenant_id=row["tenant_id"], source_id=row["source_id"],
+                    logical_document_id=row["logical_document_id"], deadline_at=deadline_at)
+                if initialized != "initialized":
+                    change_cursor(store, row, checkpoint, deadline_at=deadline_at)
+                    return dict(status=initialized, certified_passages=certified)
+                continue
             if not valid:
                 change_cursor(store, row, checkpoint, deadline_at=deadline_at)
                 return dict(status="changed", certified_passages=certified)

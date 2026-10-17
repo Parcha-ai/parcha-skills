@@ -200,6 +200,36 @@ _INITIALIZE_GENERATION = """INSERT INTO canonical_parent_authority
             {ordering}ON CONFLICT DO NOTHING"""
 
 
+def initialize_published_parent_generation(store, *, tenant_id, source_id,
+                                         logical_document_id, deadline_at):
+    """Initialize scheduling metadata without holding durable queue locks.
+
+    This is the original never-certified initializer, not membership proof.
+    Its transaction must finish before the queue cursor or publisher is locked.
+    """
+    with _connect(store, deadline_at) as connection, connection.transaction():
+        owner = _query(store, connection, """SELECT source.owner_principal_id,evidence.native_parent_id
+            FROM canonical_evidence_documents evidence
+            JOIN canonical_sources source USING(tenant_id,source_id)
+            WHERE evidence.tenant_id=%s AND evidence.source_id=%s
+              AND evidence.logical_document_id=%s""",
+            (tenant_id, source_id, logical_document_id), deadline_at).fetchone()
+        if owner is None:
+            return 'unavailable'
+        scope = dict(tenant_id=tenant_id, source_id=source_id,
+                     principal_id=owner['owner_principal_id'])
+        if not _authorized(store, connection, scope, deadline_at):
+            return 'unauthorized'
+        _query(store, connection, _INITIALIZE_GENERATION.format(
+            selection='evidence.tenant_id=%s AND evidence.source_id=%s AND evidence.native_parent_id=%s',
+            passage_selection='', ordering=''),
+            (tenant_id, source_id, owner['native_parent_id']), deadline_at)
+        generation = _query(store, connection, """SELECT generation FROM canonical_parent_authority
+            WHERE tenant_id=%s AND source_id=%s AND native_parent_id=%s""",
+            (tenant_id, source_id, owner['native_parent_id']), deadline_at).fetchone()
+    return 'initialized' if generation is not None else 'unknown-generation'
+
+
 def _enroll(store, scope, deadline_at):
     with _connect(store,deadline_at) as connection, connection.transaction():
         if not _authorized(store,connection,scope,deadline_at):
