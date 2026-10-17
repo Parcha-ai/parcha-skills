@@ -191,9 +191,17 @@ class SingletonWorkerConvergence(SingletonMetadataAdmission):
         self.assertEqual(first['partial_parents'],1)
         second_result=self.run_parent(metadata_mode='singleton',parent_limits=limits)
         self.assertEqual(second_result['retired_metadata_chunks'],1)
-        self.assertEqual(second_result['completed_parent_proofs'],1)
+        self.assertEqual(second_result['batches'],1)
+        self.assertEqual(second_result['partial_parents'],1)
+        self.assertEqual(second_result['completed_parent_proofs'],0)
         self.assertIsNone(self.baseline(original['receipt']))
         self.assertIsNone(self.baseline(second['receipt']))
+        # The selected tail consumes this invocation's one batch. Completion
+        # still requires the original full proof on the next invocation.
+        completion=self.run_parent(metadata_mode='singleton',parent_limits=limits)
+        self.assertEqual(completion['completed_parent_proofs'],1)
+        self.assertEqual(completion['retired_metadata_chunks'],0)
+        self.assertEqual(completion['cleared_documents'],0)
         final=self.run_parent(metadata_mode='singleton')
         self.assertEqual(final['attempted_parents'],0)
         self.assertEqual(final['retired_metadata_chunks'],0)
