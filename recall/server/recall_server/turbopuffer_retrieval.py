@@ -179,16 +179,13 @@ def parse_spans(raw: Any) -> list[Any]:
     return list(raw or [])
 
 
-def dedupe_texts(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Keep the first (best) row per distinct passage text, as the dense SQL did.
+def dedupe_identities(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep each source-owned passage until its own canonical authority check."""
 
-    Catalog-only rows carry the text hash, which identifies the text as well.
-    """
-
-    seen: set[str] = set()
+    seen: set[tuple[str, str, str]] = set()
     kept = []
     for row in rows:
-        key = row.get("text_sha256") or row["passage_id"]
+        key = (row["source_id"], row["logical_document_id"], row["passage_id"])
         if key in seen:
             continue
         seen.add(key)
@@ -333,7 +330,7 @@ class TurbopufferHintRetrieval(PassageHintRetrieval):
             if mapped is not None:
                 rows.append(mapped)
         rows.sort(key=lambda row: -row["score"])
-        return dedupe_texts(rows), "ok", "turbopuffer-ann", None
+        return dedupe_identities(rows), "ok", "turbopuffer-ann", None
 
     def _lexical_candidates(
         self,
