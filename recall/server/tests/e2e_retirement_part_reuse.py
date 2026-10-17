@@ -34,12 +34,12 @@ class RunnerPartReuse(unittest.TestCase):
         self.archive.reads.clear()
         return parts[0]['size_bytes']
 
-    def retire(self, metadata_mode='keep'):
+    def retire(self, metadata_mode='keep', *, max_batches=3):
         with self.store.connect() as connection:
             connection.execute("UPDATE canonical_chunk_retirement_progress SET updated_at=now()-interval '2 minutes' WHERE tenant_id=%s", (self.tenant,))
         return runner.run_retirement(self.store, self.archive,
             scope=runner.RetirementScope(self.tenant,self.principal,(self.source,)), apply=True,
-            limits=runner.RunnerLimits(max_parents=1), parent_limits=replace(self.limits,batch_documents=64,max_batches=3),
+            limits=runner.RunnerLimits(max_parents=1), parent_limits=replace(self.limits,batch_documents=64,max_batches=max_batches),
             # This 256-document fixture checks proof and reuse, not host speed.
             deadline_at=time.monotonic()+60, metadata_mode=metadata_mode)
 
@@ -67,7 +67,8 @@ class RunnerPartReuse(unittest.TestCase):
         from recall_server.parent_chunk_proof import prove_parent_chunks
         self.one_part_parent(192)
         with patch('recall_server.parent_chunk_proof.prove_parent_chunks', wraps=prove_parent_chunks) as proof:
-            result = self.retire()
+            # Three selected-body commits plus the unchanged EOF completion.
+            result = self.retire(max_batches=4)
         self.assertEqual(proof.call_count, 1)
         self.assertEqual(result['cleared_documents'], 192)
         self.assertEqual(result['completed_parent_proofs'], 1)
