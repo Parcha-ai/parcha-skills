@@ -219,8 +219,9 @@ def attribute_canonical_events(
     source_id: str,
     events: Iterable[tuple[str, str, dict[str, Any]]],
     identity_index: ActorIdentityIndex | None = None,
+    changed_event_ids: set[str] | None = None,
 ) -> int:
-    """Persist exact event actors; source contributors remain source bindings."""
+    """Persist actors, optionally collecting only events with newly inserted links."""
 
     prepared = list(events)
     inserted = 0
@@ -239,10 +240,13 @@ def attribute_canonical_events(
                  JOIN canonical_source_actor_bindings binding
                    ON binding.tenant_id=%s AND binding.source_id=%s
                   AND binding.relation IN ('contributor','owner')
-               ON CONFLICT DO NOTHING""",
+               ON CONFLICT DO NOTHING"""
+            + (" RETURNING event_id" if changed_event_ids is not None else ""),
             (tenant_id, source_id, authored_event_ids, tenant_id, source_id),
         )
         inserted += max(0, result.rowcount)
+        if changed_event_ids is not None:
+            changed_event_ids.update(row["event_id"] for row in result.fetchall())
     if identity_index is None:
         return inserted
     derived_identities: list[dict[str, str]] = []
@@ -332,10 +336,13 @@ def attribute_canonical_events(
                   AND identity.namespace=reference.namespace
                   AND identity.subject_hmac_sha256=
                       reference.subject_hmac_sha256
-               ON CONFLICT DO NOTHING""",
+               ON CONFLICT DO NOTHING"""
+            + (" RETURNING event_id" if changed_event_ids is not None else ""),
             (tenant_id, source_id, json.dumps(references), tenant_id),
         )
         inserted += max(0, result.rowcount)
+        if changed_event_ids is not None:
+            changed_event_ids.update(row["event_id"] for row in result.fetchall())
     return inserted
 
 
