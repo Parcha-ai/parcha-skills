@@ -2,6 +2,7 @@
 """Historical indexed tool results migrate with exact attribution on normal rebuild."""
 import json
 import hashlib
+import sys
 import unittest
 from unittest.mock import patch
 
@@ -134,6 +135,44 @@ class LegacyToolMigration(unittest.TestCase):
                 self.assertEqual(self.passages._commit(prepared)['status'], 'committed')
                 self.assertEqual(self.document()['applied_extraction_version'], 'legacy')
                 self.assertFalse(any('claude.tool-' in json.dumps(p['spans']) for p in self.projected()))
+
+    def test_no_historical_tool_overlap_skips_parent_maps(self):
+        for unindexed_tool in (False, True):
+            with self.subTest(unindexed_tool=unindexed_tool):
+                if unindexed_tool:
+                    self.setUp()
+                    self.seed(historical=False)
+                else:
+                    self.ingest_blocks('original', [{'type': 'text', 'text': 'Original human request.'}])
+                    with patch.object(passage_index, '_document_extraction_version', return_value='legacy'):
+                        self.project()
+                before = self.projected()
+                observed = []
+                code = passage_index._legacy_result_intervals.__code__
+
+                def observe(frame, event, result):
+                    if frame.f_code is code and event == 'return':
+                        observed.append({name: len(frame.f_locals[name])
+                            for name in ('normal', 'normal_units', 'historical')
+                            if name in frame.f_locals})
+
+                previous = sys.getprofile()
+                try:
+                    sys.setprofile(observe)
+                    prepared = self.append_and_prepare()
+                finally:
+                    sys.setprofile(previous)
+                self.assertIsNone(prepared.legacy_migration)
+                self.assertEqual(self.passages._commit(prepared)['status'], 'committed')
+                self.assertEqual(self.document()['applied_extraction_version'], 'legacy')
+                self.assertEqual(self.pending(), 0)
+                current = self.projected()
+                self.assertTrue(any('Ordinary new human request.' in p['text_redacted'] for p in current))
+                for old in before:
+                    self.assertTrue(any(set(old['receipts']) <= set(p['receipts']) for p in current))
+                for row in current:
+                    self.grant_and_open(row)
+                self.assertEqual(observed, [{}], 'unused whole-parent migration maps were allocated')
 
     def test_mixed_old_byte_domain_refuses_without_destructive_commit(self):
         self.seed(mixed=True)
