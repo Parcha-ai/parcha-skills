@@ -125,7 +125,7 @@ def fetch_duckdb_release_binary(url: str, *, zip_sha256: str | None) -> bytes:
         return bundle.read("duckdb")
 
 
-def _worker_pool_max_size(args: argparse.Namespace) -> int | None:
+def _worker_pool_max_size(args: argparse.Namespace, *, publication_reserve: int = 2) -> int | None:
     """Size worker pools from real concurrency, not an unrelated floor."""
 
     if args.command in {
@@ -134,11 +134,10 @@ def _worker_pool_max_size(args: argparse.Namespace) -> int | None:
     }:
         return max(4, args.concurrency)
     if args.command == "projection-worker":
-        return max(
-            4,
-            args.passage_concurrency,
-            args.upload_concurrency,
-        )
+        size = max(4, args.passage_concurrency, args.upload_concurrency)
+        # At the existing ceiling, publication takes precedence over additional
+        # simultaneous background SQL checkouts, not configured task slots.
+        return min(32, size + 2) if publication_reserve == 4 else size
     if args.command == "embedding-worker":
         # One connection holds the embedding advisory lock and reads batches;
         # the ledger and lag reads take a second one between batches.
@@ -2179,7 +2178,13 @@ def main() -> None:
                 json.dumps({"status": "rejected", "code": error.code}), file=sys.stderr
             )
             raise SystemExit(2) from None
-    pool_max_size = _worker_pool_max_size(args)
+    # The projection coordinator can run one scan while publishing search.
+    # Each owner needs its existing lease and data connection; keep background
+    # admission unchanged when reserving those four connections.
+    search_settings = (_search_plane_settings(args.search_plane)
+                       if args.command == "projection-worker" else None)
+    publication_reserve = 4 if search_settings is not None else 2
+    pool_max_size = _worker_pool_max_size(args, publication_reserve=publication_reserve)
     store = BrainStore(
         args.dsn,
         semantic_runtime=SemanticRuntime.from_env(),
@@ -2596,7 +2601,7 @@ def main() -> None:
             pending = search_outbox_pending(connection, tenant_id=args.tenant)
         print(json.dumps({"seeded": seeded, "pending": pending}, sort_keys=True))
     elif args.command == "projection-worker":
-        background_store = WorkerWriteStore(store)
+        background_store = WorkerWriteStore(store, publication_reserve=publication_reserve)
         logical = CanonicalLogicalEvidenceProjector(
             background_store,
             LogicalEvidenceProjectionStore(
@@ -2634,7 +2639,6 @@ def main() -> None:
                     tenant_id=args.tenant, seconds=args.retirement_seconds, **metadata_options)
         # H3-b: one client for the life of the process; the phase is skipped
         # entirely (search_plane=None) when turbopuffer is not configured.
-        search_settings = _search_plane_settings(args.search_plane)
         search_plane = None
         if search_settings is not None:
             search_projector = TurbopufferProjector(

@@ -8,18 +8,21 @@ from psycopg_pool import PoolTimeout
 
 
 class WorkerWriteStore:
-    """Leave two general-pool connections for the publication coordinator.
+    """Reserve general-pool connections for the publication coordinator.
 
     Only SQL checkouts consume capacity; archive work remains concurrent. This
     view supports the logical projector and thinner, not arbitrary BrainStore
     methods. Passage and search owners keep the original store.
     """
 
-    def __init__(self, store):
+    def __init__(self, store, *, publication_reserve=2):
+        if (type(publication_reserve) is not int or publication_reserve not in (2, 4)
+                or store.pool_max_size - store.reserved_read_connections <= publication_reserve):
+            raise ValueError("worker publication reservation is invalid")
         self._store = store
         self.pool_max_size = store.pool_max_size
         self.verified_singleton_receipts = store.verified_singleton_receipts
-        self._capacity = store.pool_max_size - store.reserved_read_connections - 2
+        self._capacity = store.pool_max_size - store.reserved_read_connections - publication_reserve
         self._available = self._capacity
         self._condition = threading.Condition()
         self._local = threading.local()
@@ -64,7 +67,7 @@ class WorkerWriteStore:
         if (
             isinstance(minimum_size, bool)
             or not isinstance(minimum_size, int)
-            or not 1 <= minimum_size <= self._capacity + 2
+            or not 1 <= minimum_size <= self.pool_max_size - self._store.reserved_read_connections
             or not 1 <= timeout <= 300
         ):
             raise ValueError("database pool warmup budget is invalid")
