@@ -61,15 +61,19 @@ class RetirementMaintenance:
     def _execute(self, c, sql, args=()):
         return self.store._execute_bounded(c, sql, args, self.deadline)
 
-    def _claim_source(self):
+    def _claim_source(self, attempted=()):
         with self.store.connect() as c, c.transaction():
             if self._execute(c, 'SELECT 1 FROM schema_migrations WHERE version=78').fetchone() is None:
                 return None
             row = self._execute(c, '''SELECT * FROM canonical_retirement_source_policy
                 WHERE capture_complete AND (%s::text IS NULL OR tenant_id=%s)
                   AND maintenance_scheduled_at < clock_timestamp()-interval '30 seconds'
+                  AND NOT EXISTS(SELECT 1 FROM unnest(%s::text[],%s::text[]) seen(tenant,source)
+                    WHERE seen.tenant=canonical_retirement_source_policy.tenant_id
+                      AND seen.source=canonical_retirement_source_policy.source_id)
                 ORDER BY maintenance_scheduled_at,tenant_id,source_id LIMIT 1
-                FOR UPDATE SKIP LOCKED''', (self.tenant_id, self.tenant_id)).fetchone()
+                FOR UPDATE SKIP LOCKED''', (self.tenant_id, self.tenant_id,
+                    [key[0] for key in attempted], [key[1] for key in attempted])).fetchone()
             if row is None:
                 return None
             return self._execute(c, '''UPDATE canonical_retirement_source_policy
@@ -164,11 +168,8 @@ class RetirementMaintenance:
         return enrolled
 
     def cycle(self, *, busy):
-        report = dict(status='disabled', cleared_documents=0, cleared_utf8_bytes=0,
-            archive_bytes=0, enrolled_parents=0, reconciled_intents=0,
-            observed_previous_cleared_documents=0, commit_outcome_unknown=False)
         if not self.enabled:
-            return report
+            return self._source_cycle((), 0, 0, 0)
         budget = min(self.seconds, 5 if busy else self.seconds)
         self.deadline = time.monotonic() + budget
         # Leave one bounded transaction for the final batch and another for
@@ -177,12 +178,49 @@ class RetirementMaintenance:
         reserve = min(5, budget / 4)
         owner_deadline = self.deadline - reserve
         stop_admitting_at = owner_deadline - reserve
+        attempted = []
+        previous = None
+        idle_claim_ms = 0.0
+        while time.monotonic() < stop_admitting_at:
+            result = self._source_cycle(attempted, budget, owner_deadline, stop_admitting_at)
+            if result['status'] == 'no_ready_sources' and previous is not None:
+                return previous
+            if idle_claim_ms:
+                result['claim_wall_ms'] = result.get('claim_wall_ms', 0.0) + idle_claim_ms
+            # Only an idle source hands off its unused budget. Preserve every
+            # productive, refused or uncertain round's original result/counters.
+            if (result['status'] != 'no_ready_parents'
+                    or result.get('commit_outcome_unknown')
+                    or result.get('audit_commit_outcome_unknown')
+                    or result.get('audit_status') in ('unknown', 'deferred')
+                    or any(result.get(name, 0) for name in (
+                        'attempted_parents', 'enrolled_parents', 'reconciled_intents',
+                        'audit_scanned_rows', 'audit_cleared_rows', 'audit_archived_bytes',
+                        'audit_reconciled_rows', 'audit_completed_pages'))):
+                return result
+            previous = result
+            idle_claim_ms = result.get('claim_wall_ms', 0.0)
+        return previous if previous is not None else dict(
+            status='stopped', cleared_documents=0, cleared_utf8_bytes=0,
+            archive_bytes=0, enrolled_parents=0, reconciled_intents=0,
+            observed_previous_cleared_documents=0, commit_outcome_unknown=False)
+
+    def _source_cycle(self, attempted, budget, owner_deadline, stop_admitting_at):
+        report = dict(status='disabled', cleared_documents=0, cleared_utf8_bytes=0,
+            archive_bytes=0, enrolled_parents=0, reconciled_intents=0,
+            observed_previous_cleared_documents=0, commit_outcome_unknown=False)
+        if not self.enabled:
+            return report
         phase = 'source_claim'
         claim_diagnostic = {}
         try:
-            source = self._claim_source()
+            source = self._claim_source(attempted)
             if source is None:
                 return dict(report, status='no_ready_sources')
+            key = source['tenant_id'], source['source_id']
+            if key in attempted:
+                return dict(report, status='no_ready_sources')
+            attempted.append(key)
             scope = RetirementScope(source['tenant_id'], source['principal_id'], (source['source_id'],))
             phase = 'source_authorize'
             with self.store.connect() as c, c.transaction():

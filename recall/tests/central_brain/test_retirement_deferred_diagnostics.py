@@ -9,6 +9,21 @@ from recall_server import retirement_maintenance as maintenance
 
 
 class DeferredDiagnostics(unittest.TestCase):
+    def test_expired_before_first_claim_preserves_zero_report_without_dispatch(self):
+        owner = maintenance.RetirementMaintenance(Mock(), Mock(), enabled=True, seconds=10)
+        original_zero = maintenance.RetirementMaintenance(Mock(), Mock(), enabled=False).cycle(busy=False)
+        with (
+            patch.object(maintenance.time, 'monotonic', side_effect=[100.0, 111.0]),
+            patch.object(owner, '_claim_source') as claim,
+            patch.object(maintenance, 'run_retirement') as retire,
+        ):
+            result = owner.cycle(busy=False)
+        self.assertEqual(result, dict(original_zero, status='stopped'))
+        self.assertEqual(owner.deadline, 110.0)
+        claim.assert_not_called()
+        retire.assert_not_called()
+        owner.store.connect.assert_not_called()
+
     def test_first_parent_claim_keeps_phase_and_original_deferred_outcome(self):
         error = psycopg.errors.LockNotAvailable(PRIVATE)
         store = ClaimStore({'candidate_select': error})
