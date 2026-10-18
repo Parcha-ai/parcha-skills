@@ -105,8 +105,8 @@ class _LogicalWorkSuperseded(Exception):
     """A worker's captured queue state no longer owns this preparation."""
 
 
-class _LogicalAdmissionConnectionClosed(Exception):
-    """Archive HEAD lost its connection before any publication mutation."""
+class _LogicalAdmissionTransportFailure(Exception):
+    """Archive HEAD failed in transport before any publication mutation."""
 
 
 class _LocatorSpool:
@@ -1805,15 +1805,17 @@ class CanonicalLogicalEvidenceProjector:
             with connection.transaction():
                 from .archive_ownership import admit_references
                 from .archive import ArchiveError
-                from botocore.exceptions import ConnectionClosedError
+                from botocore.exceptions import ConnectionClosedError, ReadTimeoutError
                 try:
                     admit_references(connection, self.projection.archive, upload.all_references)
                 except ArchiveError as error:
-                    if type(error) is ArchiveError and isinstance(error.__cause__, ConnectionClosedError):
+                    if type(error) is ArchiveError and isinstance(
+                        error.__cause__, (ConnectionClosedError, ReadTimeoutError)
+                    ):
                         # Carry only this pre-publication failure through rollback.
                         # Authorization, corruption and later SQL/COMMIT failures
                         # retain their existing exception paths.
-                        raise _LogicalAdmissionConnectionClosed from error
+                        raise _LogicalAdmissionTransportFailure from error
                     raise
                 connection.execute(
                     "SELECT pg_advisory_xact_lock(hashtextextended(%s,0))",
@@ -2474,7 +2476,7 @@ class CanonicalLogicalEvidenceProjector:
             if upload is None:
                 return self._commit_empty(candidate)
             status = self._commit(candidate, upload)
-        except _LogicalAdmissionConnectionClosed as error:
+        except _LogicalAdmissionTransportFailure as error:
             # The transaction has unwound. Cleanup/backoff must both succeed
             # before isolating this parent from independent in-flight owners.
             self._schedule_cleanup(upload.cleanup_references)

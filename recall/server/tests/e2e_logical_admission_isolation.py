@@ -46,8 +46,8 @@ class AdmissionFailureIsolation(progress.ParentProgress):
                 return None
             return future.result(timeout=10)
 
-    def test_transient_admission_failure_retains_peer_publication(self):
-        result = self._admission_failure(provider_error(ConnectionClosedError(endpoint_url='https://synthetic.invalid')))
+    def _assert_transport_failure_retains_peer_publication(self, cause):
+        result = self._admission_failure(provider_error(cause))
         self.assertEqual(result['documents'], 1)
         self.assertEqual(result['logical_failed'], 1)
         with self.store.connect() as connection:
@@ -68,6 +68,10 @@ class AdmissionFailureIsolation(progress.ParentProgress):
         self.assertTrue(queued[0]['backed_off'])
         self.assertEqual(queued[0]['last_error_code'], 'ArchiveError')
         self.assertEqual(progress.archive_object_count(self.archive_root), 2)
+
+    def test_transient_admission_failure_retains_peer_publication(self):
+        self._assert_transport_failure_retains_peer_publication(
+            ConnectionClosedError(endpoint_url='https://synthetic.invalid'))
 
     def _assert_no_failed_backoff(self):
         with self.store.connect() as connection:
@@ -107,9 +111,11 @@ class AdmissionFailureIsolation(progress.ParentProgress):
         self._admission_failure(ArchiveCorruption('archive metadata mismatch'), expected=ArchiveCorruption)
         self._assert_no_failed_backoff()
 
-    def test_unreviewed_timeout_still_aborts(self):
-        self._admission_failure(provider_error(ReadTimeoutError(endpoint_url='https://synthetic.invalid')), expected=ArchiveError)
-        self._assert_no_failed_backoff()
+    def test_admission_read_timeout_retains_peer_publication(self):
+        # A bounded HEAD can time out during TLS setup before any publication.
+        # Keep its failed parent queued without discarding independent work.
+        self._assert_transport_failure_retains_peer_publication(
+            ReadTimeoutError(endpoint_url='https://synthetic.invalid'))
 
     def test_cleanup_failure_is_not_reported_as_isolated(self):
         original = self.logical._schedule_cleanup
