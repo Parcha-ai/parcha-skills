@@ -1767,7 +1767,8 @@ class CanonicalPlane:
                         new_native_ids=tuple(item["native_id"] for item in new_rows
                                              if item["revision"] == 1 and not item["is_tombstone"]),
                     )
-                inserted_actor_links = attribute_canonical_events(
+                changed_actor_event_ids: set[str] = set()
+                attribute_canonical_events(
                     connection,
                     tenant_id=tenant_id,
                     source_id=source_id,
@@ -1777,13 +1778,15 @@ class CanonicalPlane:
                         if not result.get("suppressed_deleted_events")
                     ),
                     identity_index=self.actor_identity_index,
+                    changed_event_ids=changed_actor_event_ids,
                 )
                 duplicate_native_ids = [
                     item["native_id"]
                     for item, result in zip(prepared, results, strict=True)
                     if result["duplicate_events"] and not result.get("suppressed_deleted_events")
+                    and item["event_id"] in changed_actor_event_ids
                 ]
-                if inserted_actor_links and duplicate_native_ids:
+                if duplicate_native_ids:
                     mark_logical_evidence_dirty(
                         connection,
                         tenant_id=tenant_id,
