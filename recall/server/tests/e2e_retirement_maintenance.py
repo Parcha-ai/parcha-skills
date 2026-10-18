@@ -55,6 +55,184 @@ class MaintenanceTests(unittest.TestCase):
         with self.store.connect() as c:
             return c.execute('SELECT * FROM canonical_retirement_source_policy WHERE tenant_id=%s AND source_id=%s', self.key[:2]).fetchone()
 
+    def empty_source_first(self):
+        from e2e_logical_evidence_projection import insert_source
+        empty = self.source + ':empty'
+        scope = runner.RetirementScope(self.tenant, self.scope.principal_id, (empty,))
+        with self.store.connect() as c:
+            insert_source(c, self.tenant, self.scope.principal_id, empty)
+            c.execute("INSERT INTO canonical_source_grants VALUES(%s,%s,%s,'owner',now())",
+                      (self.tenant, self.scope.principal_id, empty))
+        policy.start_policy(self.store, scope=scope)
+        self.assertTrue(policy.capture_baseline(self.store, scope=scope)['complete'])
+        policy.set_policy_enabled(self.store, scope=scope,
+            reviewed_plan=policy.policy_plan(self.store, scope=scope), enabled=True)
+        with self.store.connect() as c:
+            c.execute("UPDATE canonical_retirement_source_policy SET maintenance_scheduled_at='1970-01-01' WHERE tenant_id=%s AND source_id=%s", (self.tenant, empty))
+            c.execute("UPDATE canonical_retirement_source_policy SET maintenance_scheduled_at='1970-01-02' WHERE tenant_id=%s AND source_id=%s", self.key[:2])
+        return empty
+
+    def test_empty_source_hands_remaining_round_to_live_source(self):
+        self.activate()
+        self.ready()
+        empty = self.empty_source_first()
+        before = self.state()
+        self.archive.reads.clear()
+        report = self.worker(seconds=10).cycle(busy=False)
+        self.assertEqual(report['cleared_documents'], 2, report)
+        self.assertEqual(report['completed_parent_proofs'], 1, report)
+        self.assertEqual(report['completed_noop_parents'], 0, report)
+        self.assertFalse(report['commit_outcome_unknown'])
+        self.assertGreater(sum(self.archive.reads.values()), 0)
+        self.assertEqual(self.state()['cumulative_cleared_documents'],
+                         before['cumulative_cleared_documents'] + 2)
+        with self.store.connect() as c:
+            self.assertEqual(c.execute("SELECT count(*) AS n FROM canonical_chunk_retirement_progress WHERE tenant_id=%s AND source_id=%s", (self.tenant, empty)).fetchone()['n'], 0)
+            self.assertEqual(c.execute("SELECT count(*) AS n FROM canonical_retirement_source_policy WHERE tenant_id=%s AND maintenance_epoch=1 AND maintenance_intent IS NULL", (self.tenant,)).fetchone()['n'], 2)
+
+    def source_epochs(self):
+        with self.store.connect() as c:
+            return {row['source_id']: row['maintenance_epoch'] for row in c.execute(
+                'SELECT source_id,maintenance_epoch FROM canonical_retirement_source_policy WHERE tenant_id=%s',
+                (self.tenant,)).fetchall()}
+
+    def test_all_empty_sources_exit_once_even_if_schedule_is_rearmed(self):
+        self.activate()
+        self.ready()
+        empty = self.empty_source_first()
+        set_parent_retirement_enabled(self.store, **self.target, enabled=False)
+        execute = self.store._execute_bounded
+
+        def rearm_schedule(c, sql, args, deadline):
+            result = execute(c, sql, args, deadline)
+            if 'SET maintenance_intent=NULL' in sql:
+                c.execute("UPDATE canonical_retirement_source_policy SET maintenance_scheduled_at='1970-01-01' WHERE tenant_id=%s", (self.tenant,))
+            return result
+
+        self.archive.reads.clear()
+        with patch.object(self.store, '_execute_bounded', side_effect=rearm_schedule):
+            report = self.worker(seconds=10).cycle(busy=False)
+        self.assertEqual(report['status'], 'no_ready_parents', report)
+        self.assertEqual(report['attempted_parents'], 0)
+        self.assertEqual(report['cleared_documents'], 0)
+        self.assertEqual(self.source_epochs(), {empty: 1, self.source: 1})
+        self.assertFalse(self.archive.reads)
+
+    def test_expired_remaining_budget_does_not_claim_next_source(self):
+        self.activate()
+        self.ready()
+        empty = self.empty_source_first()
+        clock = [time.monotonic()]
+        start = clock[0]
+        execute = self.store._execute_bounded
+
+        def expire_after_empty(c, sql, args, deadline):
+            result = execute(c, sql, args, deadline)
+            if 'SET maintenance_intent=NULL' in sql:
+                clock[0] = start + 5  # The original10s round reserves2.5s twice.
+            return result
+
+        owner = self.worker(seconds=10)
+        with patch.object(maintenance, 'time', SimpleNamespace(monotonic=lambda: clock[0])), \
+                patch.object(self.store, '_execute_bounded', side_effect=expire_after_empty):
+            report = owner.cycle(busy=False)
+        self.assertEqual(report['status'], 'no_ready_parents', report)
+        self.assertEqual(owner.deadline, start + 10)
+        self.assertEqual(self.source_epochs(), {empty: 1, self.source: 0})
+        self.assertEqual(self.state()['cumulative_cleared_documents'], 0)
+
+    def test_empty_source_claim_refusal_does_not_move_to_live_source(self):
+        self.activate()
+        self.ready()
+        empty = self.empty_source_first()
+        execute = self.store._execute_bounded
+
+        def cancel_claim(c, sql, args, deadline):
+            if sql.startswith('SELECT progress.source_id,progress.native_parent_id,'):
+                return execute(c, 'SELECT pg_sleep(1)', (), time.monotonic()+0.03)
+            return execute(c, sql, args, deadline)
+
+        with patch.object(self.store, '_execute_bounded', side_effect=cancel_claim):
+            report = self.worker(seconds=10).cycle(busy=False)
+        self.assertEqual(report['status'], 'deferred', report)
+        self.assertEqual(report['claim_phase'], 'candidate_select')
+        self.assertEqual(report['sqlstate'], '57014')
+        self.assertEqual(self.source_epochs(), {empty: 1, self.source: 0})
+        self.assertEqual(self.state()['cumulative_cleared_documents'], 0)
+
+    def test_productive_first_source_keeps_original_round_boundary(self):
+        self.activate()
+        self.ready()
+        empty = self.empty_source_first()
+        with self.store.connect() as c:
+            c.execute("UPDATE canonical_retirement_source_policy SET maintenance_scheduled_at='1969-01-01' WHERE tenant_id=%s AND source_id=%s", self.key[:2])
+        report = self.worker(seconds=10).cycle(busy=False)
+        self.assertEqual(report['cleared_documents'], 2, report)
+        self.assertEqual(report['completed_parent_proofs'], 1)
+        self.assertEqual(self.source_epochs(), {empty: 0, self.source: 1})
+
+    def test_later_publication_in_previously_empty_source_is_not_skipped(self):
+        from e2e_logical_evidence_projection import insert_record
+        from recall_server.logical_evidence_projection import mark_logical_evidence_dirty
+        self.activate()
+        self.ready()
+        empty = self.empty_source_first()
+        first = self.worker(seconds=10).cycle(busy=False)
+        self.assertEqual(first['cleared_documents'], 2)
+        with self.store.connect() as c:
+            insert_record(c, tenant=self.tenant, source=empty, parent='later-parent',
+                          native='later-event', text='new native evidence', role='user', byte_start=0)
+            mark_logical_evidence_dirty(c, tenant_id=self.tenant, source_id=empty,
+                                       native_ids=['later-event'], reason='ingest')
+        projected = self.projector.project_pending(tenant_id=self.tenant,
+            batch_size=1, max_batches=1, upload_concurrency=1)
+        self.assertEqual(projected['failed'], 0, projected)
+        with self.store.connect() as c:
+            c.execute("UPDATE canonical_retirement_source_policy SET maintenance_scheduled_at='1970-01-01' WHERE tenant_id=%s AND source_id=%s", (self.tenant, empty))
+            c.execute("UPDATE canonical_chunk_retirement_progress SET updated_at=now()-interval '2 minutes' WHERE tenant_id=%s AND source_id=%s", (self.tenant, empty))
+        second = self.worker(seconds=10).cycle(busy=False)
+        self.assertEqual(second['cleared_documents'], 1, second)
+        self.assertEqual(second['completed_parent_proofs'], 1)
+        self.assertEqual(self.source_epochs(), {empty: 2, self.source: 1})
+
+    def test_next_source_rechecks_revoked_authority_before_retirement(self):
+        self.activate()
+        self.ready()
+        empty = self.empty_source_first()
+        execute = self.store._execute_bounded
+
+        def revoke_after_empty(c, sql, args, deadline):
+            result = execute(c, sql, args, deadline)
+            if 'SET maintenance_intent=NULL' in sql and args[1] == empty:
+                c.execute('DELETE FROM canonical_source_grants WHERE tenant_id=%s AND source_id=%s', self.key[:2])
+            return result
+
+        with patch.object(self.store, '_execute_bounded', side_effect=revoke_after_empty):
+            report = self.worker(seconds=10).cycle(busy=False)
+        self.assertEqual(report['status'], 'owner_refused', report)
+        self.assertEqual(self.source_epochs(), {empty: 1, self.source: 1})
+        self.assertEqual(self.state()['cumulative_cleared_documents'], 0)
+        self.assertFalse(report['commit_outcome_unknown'])
+
+    def test_source_claim_refusal_does_not_attempt_any_parent(self):
+        self.activate()
+        self.ready()
+        empty = self.empty_source_first()
+        execute = self.store._execute_bounded
+
+        def cancel_source(c, sql, args, deadline):
+            if sql.startswith('SELECT * FROM canonical_retirement_source_policy'):
+                return execute(c, 'SELECT pg_sleep(1)', (), time.monotonic()+0.03)
+            return execute(c, sql, args, deadline)
+
+        with patch.object(self.store, '_execute_bounded', side_effect=cancel_source):
+            report = self.worker(seconds=10).cycle(busy=False)
+        self.assertEqual(report['status'], 'deferred', report)
+        self.assertEqual(report['maintenance_phase'], 'source_claim')
+        self.assertEqual(report['sqlstate'], '57014')
+        self.assertEqual(self.source_epochs(), {empty: 0, self.source: 0})
+        self.assertEqual(self.state()['cumulative_cleared_documents'], 0)
+
     def test_first_parent_claim_sql_timeout_retains_safe_stage(self):
         self.activate()
         self.ready()
