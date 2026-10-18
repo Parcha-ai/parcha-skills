@@ -412,11 +412,61 @@ def run_projection_worker(
                     phase_elapsed["logical_elapsed_ms"] = 0
                 active_phase, phase_started = previous_phase, previous_started
 
+            scanned = {
+                "status": "deferred" if scan is not None else "complete",
+                "shards": 0,
+                "rows": 0,
+                "stale": 0,
+                "contended": 0,
+                "requeued": 0,
+                "fragments_rewritten": 0,
+                "fragments_total": 0,
+                "documents_dirty": 0,
+            }
+            parquet_elapsed_ms = 0
+            parquet_serviced = False
+
+            def service_parquet(freshness_busy):
+                nonlocal cycles_since_parquet, last_parquet_started, parquet_serviced
+                nonlocal active_phase, phase_started, parquet_elapsed_ms
+                previous_phase, previous_started = active_phase, phase_started
+                if previous_phase == "logical":
+                    phase_elapsed["logical_elapsed_ms"] = elapsed_ms(previous_started)
+                active_phase, phase_started = "parquet", clock()
+                cycles_since_parquet = 0
+                last_parquet_started = phase_started
+                parquet_serviced = True
+                tick = _parquet_with_publication(
+                    scan,
+                    publish_search if search_plane is not None else None,
+                    tenant_id=tenant_id,
+                    batch_size=1 if freshness_busy else min(4, logical_batch_size),
+                    max_batches=1 if freshness_busy else max_batches_per_cycle,
+                    compaction_budget=0 if freshness_busy else 1,
+                )
+                parquet_elapsed_ms += elapsed_ms(phase_started)
+                phase_elapsed["parquet_elapsed_ms"] = parquet_elapsed_ms
+                accumulate(scanned, tick)
+                if "fragments_total" in tick:
+                    scanned["fragments_total"] = tick["fragments_total"]
+                if previous_phase == "logical":
+                    previous_started += clock() - phase_started
+                    phase_elapsed["logical_elapsed_ms"] = 0
+                active_phase, phase_started = previous_phase, previous_started
+
+            def service_due_parquet():
+                # Admission stops at its original deadline; active logical owners
+                # can still take much longer. Service the same bounded scan on
+                # this coordinator without renewing admission or nesting callbacks.
+                if scan is not None and clock() - last_parquet_started >= parquet_max_wait_seconds:
+                    service_parquet(True)
+
             def heartbeat():
                 if search_plane is not None:
                     publish_search()
                 maintain_retirement(True)
                 maintain_thinning(True)
+                service_due_parquet()
 
             def publish_ready():
                 nonlocal active_phase, phase_started, passage_elapsed_ms
@@ -463,6 +513,7 @@ def run_projection_worker(
                 # Frequent completions can prevent the idle heartbeat entirely.
                 maintain_retirement(True)
                 publish_ready()
+                service_due_parquet()
 
             # Drain existing work first, then publish completed parents while
             # unrelated preparation continues in the bounded logical executor.
@@ -478,7 +529,7 @@ def run_projection_worker(
                 max_wait_seconds=max_wait_seconds,
                 cleanup_concurrency=cleanup_concurrency,
                 on_progress=publish_progress,
-                on_heartbeat=heartbeat if search_plane is not None or retirement_maintainer is not None or background_thinner is not None else None,
+                on_heartbeat=heartbeat if search_plane is not None or retirement_maintainer is not None or background_thinner is not None or scan is not None else None,
                 # Stop admitting at the existing scan cadence, then settle
                 # active owners. Translate the worker clock's remaining time
                 # into the projector's monotonic clock; callbacks are not killed.
@@ -491,8 +542,6 @@ def run_projection_worker(
             )
             logical_elapsed_ms = elapsed_ms(phase_started)
             phase_elapsed["logical_elapsed_ms"] = logical_elapsed_ms
-            active_phase = "parquet"
-            phase_started = clock()
             # Parquet shards are source/month materializations of the authoritative
             # logical documents. Prefer to run them once the upstream queues have
             # drained so a dirty month is rebuilt once, but never starve them: with
@@ -500,7 +549,8 @@ def run_projection_worker(
             # the scan plane went 4 days without a rebuild in production. Every
             # `parquet_every_cycles` cycles the (now fragment-level) rebuild runs
             # regardless of the backlog.
-            cycles_since_parquet += 1
+            if not parquet_serviced:
+                cycles_since_parquet += 1
             parquet_due = (
                 int(documents.get("pending", 0)) == 0
                 and projected["status"] == "complete"
@@ -509,9 +559,6 @@ def run_projection_worker(
                 cycles_since_parquet >= parquet_every_cycles
                 or clock() - last_parquet_started >= parquet_max_wait_seconds
             )
-            if scan is not None and parquet_due:
-                cycles_since_parquet = 0
-                last_parquet_started = clock()
             # The extra maintenance sweep can rebuild a whole month after the
             # queued batch. Yield it while freshness work remains or just ran;
             # logical work can enqueue passages after their pending count above.
@@ -523,32 +570,8 @@ def run_projection_worker(
                 or int(projected.get("pending", 0)) > 0
                 or int(projected.get("documents", 0)) > 0
             )
-            scanned = (
-                _parquet_with_publication(
-                    scan,
-                    publish_search if search_plane is not None else None,
-                    tenant_id=tenant_id,
-                    batch_size=1 if freshness_busy else min(4, logical_batch_size),
-                    # Return to fresh admission after one complete source-month
-                    # while busy; each build retains its existing lease and CAS.
-                    max_batches=1 if freshness_busy else max_batches_per_cycle,
-                    compaction_budget=0 if freshness_busy else 1,
-                )
-                if scan is not None and parquet_due
-                else {
-                    "status": "deferred" if scan is not None else "complete",
-                    "shards": 0,
-                    "rows": 0,
-                    "stale": 0,
-                    "contended": 0,
-                    "requeued": 0,
-                    "fragments_rewritten": 0,
-                    "fragments_total": 0,
-                    "documents_dirty": 0,
-                }
-            )
-            parquet_elapsed_ms = elapsed_ms(phase_started)
-            phase_elapsed["parquet_elapsed_ms"] = parquet_elapsed_ms
+            if scan is not None and parquet_due and not parquet_serviced:
+                service_parquet(freshness_busy)
             active_phase = "thin"
             phase_started = clock()
             # Synchronous callers preserve the prior cadence. The background
@@ -839,7 +862,7 @@ def run_projection_worker(
             phase_elapsed["cycle_elapsed_ms"] = elapsed_ms(cycle_started)
             if active_phase + "_elapsed_ms" in phase_elapsed:
                 key = active_phase + "_elapsed_ms"
-                previous_ticks = phase_elapsed[key] if active_phase in {"passage", "search_plane"} else 0
+                previous_ticks = phase_elapsed[key] if active_phase in {"passage", "search_plane", "parquet"} else 0
                 phase_elapsed[key] = previous_ticks + elapsed_ms(phase_started)
             LOG.exception(
                 "projection cycle failed type=%s failed_phase=%s phase_elapsed_ms=%s "
