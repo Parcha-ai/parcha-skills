@@ -151,6 +151,10 @@ _MIGRATION_FIELDS = ('revision', 'source_document_sha256', 'policy_fingerprint',
 
 def _legacy_result_intervals(old, messages, passages, groups, current_receipts):
     """Prove the narrow old-visible-text to single typed result-leaf migration."""
+    tool_receipts = {r for group in groups if group.evidence_kind == 'tool_result'
+                     for message in group.messages for r in message.receipts}
+    if not any(tool_receipts.intersection(row['receipts']) for row in old):
+        return None
     normal = {(m.record_ordinal, m.record_count): m for m in messages}
     # Use the native emitted unit: an oversized complete final can be split
     # into ordinary windows instead of carrying its complete-message marker.
@@ -168,9 +172,6 @@ def _legacy_result_intervals(old, messages, passages, groups, current_receipts):
             leaves.setdefault(key, []).append(message)
             historical[key] = replace(message, text=visible_message_text(group.full_event_text),
                                       source_unit=None, origin=None)
-    tool_receipts = {r for values in leaves.values() for m in values for r in m.receipts}
-    if not any(tool_receipts.intersection(row['receipts']) for row in old):
-        return None
     obligations = []
     lost_tool = unsupported = False
 
