@@ -527,7 +527,7 @@ class ParquetScanContractTest(unittest.TestCase):
                 stream.add("records", row, member=member("big"))
             for row in rows("small-b", 2):
                 stream.add("records", row, member=member("small-b"))
-            stream._flush("records")
+            stream.finish(first=None, last=None, ensure_datasets=())
 
         owners = {
             identity: sorted(m.logical_document_id for m in members)
