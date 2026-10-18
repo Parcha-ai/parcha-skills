@@ -6,9 +6,11 @@ import hashlib
 import time
 import json
 import math
+import pickle
+import tempfile
 import threading
 from collections import Counter
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, replace
 from datetime import datetime
@@ -48,6 +50,19 @@ from .search_outbox import (
     outbox_months,
     write_search_tombstones,
 )
+
+
+class _PassageRecordReplay:
+    """Replay only this attempt's validated records from its private file."""
+
+    def __init__(self, stream):
+        self.stream = stream
+        self.end = stream.tell()
+
+    def __iter__(self):
+        self.stream.seek(0)
+        while self.stream.tell() < self.end:
+            yield pickle.load(self.stream)
 
 
 class CertificationBudget:
@@ -1135,107 +1150,115 @@ class CanonicalPassageProjector:
                         verify_canonical=False,
                     )
 
-        try:
-            # Enrolled documents currently rebuild fully. Read verified archive
-            # parts once; the two views keep visible-message coordinates intact.
-            migration_check = ((incremental or _migrate_legacy) and not grouped_tools and not resume
-                and candidate.source_id.startswith('claude:')
-                and state and state.get('projected')
-                and state['projected'].get('requested_extraction_version') == 'legacy'
-                and state['projected'].get('applied_extraction_version') == 'legacy')
-            source_records = tuple(records()) if grouped_tools or migration_check else records()
-            messages = visible_messages(source_records, first_record_ordinal=first_record)
-        except LogicalEvidenceError:
-            if resume:
-                return full_fallback()
-            raise
-        passages = (
-            build_passages(
-                tenant_id=candidate.tenant_id,
-                source_id=candidate.source_id,
-                logical_document_id=candidate.logical_document_id,
-                revision=candidate.revision,
-                messages=messages,
-                policy=policy,
-            )
-            if messages and not resume
-            else ()
-        )
-        if resume:
-            if not messages or messages[0].record_ordinal != resume['record_ordinal']:
-                return full_fallback()
-            arguments = dict(tenant_id=candidate.tenant_id, source_id=candidate.source_id,
-                logical_document_id=candidate.logical_document_id, revision=candidate.revision, policy=policy)
+        with ExitStack() as resources:
             try:
-                if resume['source_byte_start'] >= len(messages[0].text.encode()):
-                    raise ValueError("invalid passage restart offset")
-                passages = prefix + passage_append.resume_passages(messages, resume, arguments)
-            except (ValueError, IndexError, UnicodeDecodeError):
-                return full_fallback()
-        coverage = None
-        groups = None
-        migration = None
-        obligations = None
-        if migration_check:
-            with self.store.connect() as connection:
-                old = connection.execute(_LEGACY_PASSAGES, (candidate.tenant_id, candidate.source_id,
-                    candidate.logical_document_id)).fetchall()
-            groups, coverage = extract_tool_event_groups(source_records)
-            obligations = _legacy_result_intervals(old, messages, passages, groups,
-                {r for record in source_records for r in record.receipts})
+                # Enrolled documents currently rebuild fully. Read verified archive
+                # parts once; the two views keep visible-message coordinates intact.
+                migration_check = ((incremental or _migrate_legacy) and not grouped_tools and not resume
+                    and candidate.source_id.startswith('claude:')
+                    and state and state.get('projected')
+                    and state['projected'].get('requested_extraction_version') == 'legacy'
+                    and state['projected'].get('applied_extraction_version') == 'legacy')
+                source_records = records()
+                if grouped_tools or migration_check:
+                    # Never unpickle external input: this anonymous file contains
+                    # only records decoded and validated above in this attempt.
+                    spool = resources.enter_context(tempfile.TemporaryFile(mode="w+b"))
+                    for record in source_records:
+                        pickle.dump(record, spool, protocol=5)
+                    source_records = _PassageRecordReplay(spool)
+                messages = visible_messages(source_records, first_record_ordinal=first_record)
+            except LogicalEvidenceError:
+                if resume:
+                    return full_fallback()
+                raise
+            passages = (
+                build_passages(
+                    tenant_id=candidate.tenant_id,
+                    source_id=candidate.source_id,
+                    logical_document_id=candidate.logical_document_id,
+                    revision=candidate.revision,
+                    messages=messages,
+                    policy=policy,
+                )
+                if messages and not resume
+                else ()
+            )
+            if resume:
+                if not messages or messages[0].record_ordinal != resume['record_ordinal']:
+                    return full_fallback()
+                arguments = dict(tenant_id=candidate.tenant_id, source_id=candidate.source_id,
+                    logical_document_id=candidate.logical_document_id, revision=candidate.revision, policy=policy)
+                try:
+                    if resume['source_byte_start'] >= len(messages[0].text.encode()):
+                        raise ValueError("invalid passage restart offset")
+                    passages = prefix + passage_append.resume_passages(messages, resume, arguments)
+                except (ValueError, IndexError, UnicodeDecodeError):
+                    return full_fallback()
+            coverage = None
+            groups = None
+            migration = None
+            obligations = None
+            if migration_check:
+                with self.store.connect() as connection:
+                    old = connection.execute(_LEGACY_PASSAGES, (candidate.tenant_id, candidate.source_id,
+                        candidate.logical_document_id)).fetchall()
+                groups, coverage = extract_tool_event_groups(source_records)
+                obligations = _legacy_result_intervals(old, messages, passages, groups,
+                    {r for record in source_records for r in record.receipts})
+                if obligations is not None:
+                    migration = dict(projected={k: state['projected'][k] for k in _MIGRATION_FIELDS},
+                                     passages_sha256=passage_append.digest(old))
+                    candidate = replace(candidate, extraction_version='tool_groups_v1')
+                    grouped_tools = True
+                else:
+                    coverage = None
+            tool_messages = ()
+            if grouped_tools:
+                extractor = (extract_codex_tool_event_groups
+                             if candidate.extraction_version == "codex_tool_groups_v1" else extract_tool_event_groups)
+                if groups is None:
+                    groups, coverage = extractor(source_records)
+                tool_messages = tuple(message for group in groups for message in group.messages)
+                # Build each provider block independently. Its message indexes are
+                # group-local, so later visible arrivals cannot rekey old tool spans.
+                combined = list(passages)
+                for group in groups:
+                    for passage in build_passages(tenant_id=candidate.tenant_id,
+                        source_id=candidate.source_id, logical_document_id=candidate.logical_document_id,
+                        revision=candidate.revision, messages=group.messages, policy=policy):
+                        combined.append(replace(passage, ordinal=len(combined)))
+                passages = tuple(combined)
             if obligations is not None:
-                migration = dict(projected={k: state['projected'][k] for k in _MIGRATION_FIELDS},
-                                 passages_sha256=passage_append.digest(old))
-                candidate = replace(candidate, extraction_version='tool_groups_v1')
-                grouped_tools = True
-            else:
-                coverage = None
-        tool_messages = ()
-        if grouped_tools:
-            extractor = (extract_codex_tool_event_groups
-                         if candidate.extraction_version == "codex_tool_groups_v1" else extract_tool_event_groups)
-            if groups is None:
-                groups, coverage = extractor(source_records)
-            tool_messages = tuple(message for group in groups for message in group.messages)
-            # Build each provider block independently. Its message indexes are
-            # group-local, so later visible arrivals cannot rekey old tool spans.
-            combined = list(passages)
-            for group in groups:
-                for passage in build_passages(tenant_id=candidate.tenant_id,
-                    source_id=candidate.source_id, logical_document_id=candidate.logical_document_id,
-                    revision=candidate.revision, messages=group.messages, policy=policy):
-                    combined.append(replace(passage, ordinal=len(combined)))
-            passages = tuple(combined)
-        if obligations is not None:
-            intervals = {}
-            for passage in passages:
-                for span in passage.spans:
-                    intervals.setdefault((span.record_ordinal, span.record_count, span.source_unit), []).append(
-                        (span.source_byte_start, span.source_byte_end))
-            for ordinal, count, unit, start, end in obligations:
-                for left, right in sorted(intervals.get((ordinal, count, unit), ())):
-                    if left > start:
-                        break
-                    start = max(start, right)
-                    if start >= end:
-                        break
-                if start < end:
-                    raise LogicalEvidenceError('legacy_tool_migration_required')
-        checkpoint = (passage_append.make_checkpoint(candidate, manifest, messages, passages,
-            policy, previous=resume) if not grouped_tools and state and state['available'] else None)
-        return PreparedPassageDocument(
-            candidate=candidate,
-            dense_message_count=len(messages) + len(tool_messages) + (resume["message_index"] if resume else 0),
-            dense_message_bytes=sum(len(message.text.encode()) for message in (*messages, *tool_messages)) + (resume["prefix_message_bytes"] if resume else 0),
-            passages=passages,
-            append_checkpoint=checkpoint,
-            previous_checkpoint=resume,
-            append_checkpoint_available=bool(state and state["available"]),
-            archive_bytes_read=archive_bytes_read,
-            archive_parts_read=archive_parts_read,
-            extraction_coverage=coverage,
-            legacy_migration=migration,
-        )
+                intervals = {}
+                for passage in passages:
+                    for span in passage.spans:
+                        intervals.setdefault((span.record_ordinal, span.record_count, span.source_unit), []).append(
+                            (span.source_byte_start, span.source_byte_end))
+                for ordinal, count, unit, start, end in obligations:
+                    for left, right in sorted(intervals.get((ordinal, count, unit), ())):
+                        if left > start:
+                            break
+                        start = max(start, right)
+                        if start >= end:
+                            break
+                    if start < end:
+                        raise LogicalEvidenceError('legacy_tool_migration_required')
+            checkpoint = (passage_append.make_checkpoint(candidate, manifest, messages, passages,
+                policy, previous=resume) if not grouped_tools and state and state['available'] else None)
+            return PreparedPassageDocument(
+                candidate=candidate,
+                dense_message_count=len(messages) + len(tool_messages) + (resume["message_index"] if resume else 0),
+                dense_message_bytes=sum(len(message.text.encode()) for message in (*messages, *tool_messages)) + (resume["prefix_message_bytes"] if resume else 0),
+                passages=passages,
+                append_checkpoint=checkpoint,
+                previous_checkpoint=resume,
+                append_checkpoint_available=bool(state and state["available"]),
+                archive_bytes_read=archive_bytes_read,
+                archive_parts_read=archive_parts_read,
+                extraction_coverage=coverage,
+                legacy_migration=migration,
+            )
 
     def _commit(self, prepared: PreparedPassageDocument) -> dict[str, Any]:
         candidate = prepared.candidate
