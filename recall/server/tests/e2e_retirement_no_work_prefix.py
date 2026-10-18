@@ -82,6 +82,37 @@ class NoWorkPrefix(SingletonMetadataAdmission):
         self.assertEqual(self.run_parent(2)['retired_metadata_chunks'], 2)
         return self.ledger()
 
+    def test_noop_maintenance_completion_retains_its_source_round(self):
+        from e2e_retirement_maintenance import MaintenanceTests
+        from recall_server import retirement_policy as policy
+        from recall_server.retirement_maintenance import RetirementMaintenance
+        self.drain()
+        self.scope = runner.RetirementScope(self.tenant, self.principal, (self.source,))
+        self.key = self.tenant, self.source, 'session'
+        policy.start_policy(self.store, scope=self.scope)
+        self.assertTrue(policy.capture_baseline(self.store, scope=self.scope)['complete'])
+        policy.set_policy_enabled(self.store, scope=self.scope,
+            reviewed_plan=policy.policy_plan(self.store, scope=self.scope), enabled=True)
+        empty = MaintenanceTests.empty_source_first(self)
+        with self.store.connect() as c:
+            c.execute("UPDATE canonical_retirement_source_policy SET maintenance_scheduled_at='1969-01-01' WHERE tenant_id=%s AND source_id=%s", self.key[:2])
+            c.execute("UPDATE canonical_chunk_retirement_progress SET updated_at=now()-interval '2 minutes' WHERE tenant_id=%s", (self.tenant,))
+        owner = RetirementMaintenance(self.store, self.archive, tenant_id=self.tenant,
+            enabled=True, seconds=10, metadata_mode='singleton')
+        # Exercise the existing window path with two records rather than the
+        # production256-record threshold; all proof and completion owners run.
+        limits = retirement.ParentRetirementLimits
+        with patch.object(self.archive, 'read_raw', side_effect=AssertionError('drained archive reopened')), \
+                patch('recall_server.retirement_maintenance.ParentRetirementLimits',
+                      side_effect=lambda **kwargs: replace(limits(**kwargs), batch_documents=1)):
+            result = owner.cycle(busy=False)
+        self.assertEqual(result['completed_noop_parents'], 1, result)
+        self.assertEqual(result['completed_parent_proofs'], 0)
+        self.assertEqual(result['cleared_documents'], 0)
+        self.assertEqual(result['cleared_utf8_bytes'], 0)
+        self.assertFalse(result['commit_outcome_unknown'])
+        self.assertEqual(MaintenanceTests.source_epochs(self), {self.source: 1, empty: 0})
+
     def test_eof_is_scheduling_only_without_archive_or_repeated_attempt(self):
         before = self.drain()
         with patch.object(self.archive, 'read_raw', side_effect=AssertionError('drained archive reopened')) as reads, \
