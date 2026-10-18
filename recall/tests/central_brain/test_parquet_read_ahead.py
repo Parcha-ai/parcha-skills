@@ -24,6 +24,7 @@ class ReadAheadTests(unittest.TestCase):
         second_started = threading.Event()
         witnessed = []
         owner = threading.get_ident()
+        upload_threads = set()
 
         class Archive(_DocumentArchive):
             def read_raw(self, reference):
@@ -35,8 +36,9 @@ class ReadAheadTests(unittest.TestCase):
                 return super().read_raw(reference)
 
             def put_raw(self, **kwargs):
-                self_owner = threading.get_ident()
-                assert self_owner == owner, "output publication escaped owner thread"
+                # Immutable object IO uses one upload worker. Catalog commit and
+                # reference bookkeeping still belong to the build owner.
+                upload_threads.add(threading.get_ident())
                 return super().put_raw(**kwargs)
 
         archive = Archive({f"document:{i}": 1 for i in range(12)})
@@ -55,6 +57,8 @@ class ReadAheadTests(unittest.TestCase):
             witnessed, [True], "second tiny document GET did not overlap first"
         )
         self.assertEqual(len(archive.reads), 12)
+        self.assertEqual(len(upload_threads), 1)
+        self.assertNotIn(owner, upload_threads)
         self.assertEqual(
             sum(
                 n

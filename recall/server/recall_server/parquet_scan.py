@@ -693,6 +693,8 @@ class _StreamingUpload:
         }
         self.flushes = 0
         self.upload_ms = 0
+        self.upload_executor: ThreadPoolExecutor | None = None
+        self.pending_upload = None
         self.maximum_buffer_bytes = 0
         # Where the open document's rows start in the buffer, and whether
         # that document already spilled into an earlier part.
@@ -784,13 +786,20 @@ class _StreamingUpload:
         members: tuple[FragmentMember, ...],
         bounds: tuple[datetime | None, datetime | None],
     ) -> None:
+        # Join before encoding another flush: only one immutable object can be
+        # in flight alongside the existing bounded row/encoder buffers.
+        self._join_upload()
         for payload, row_count in _parquet_parts(rows, self.schemas[dataset]):
+            self._join_upload()
             shard_index = self.part_indexes[dataset]
             if shard_index > MAX_SHARD_INDEX:
                 raise ParquetScanError("parquet_scan_shard_index_exhausted")
             identity = (dataset, shard_index)
-            uploaded_at = time.perf_counter()
-            self.references[identity] = self.projector.archive.put_raw(
+            if self.upload_executor is None:
+                self.upload_executor = ThreadPoolExecutor(
+                    max_workers=1, thread_name_prefix="recall-scan-upload"
+                )
+            future = self.upload_executor.submit(self._put,
                 tenant_id=self.candidate.tenant_id,
                 source_id=self.candidate.source_id,
                 native_id=(
@@ -801,15 +810,37 @@ class _StreamingUpload:
                 media_type=PARQUET_MEDIA_TYPE,
                 created_at=self.created_at.isoformat().replace("+00:00", "Z"),
             )
-            self.upload_ms += round((time.perf_counter() - uploaded_at) * 1_000)
-            self.row_counts[identity] = row_count
             # A flush split by the object ceiling maps every document of the
             # flush to every resulting part: a superset is safe for the delta
             # planner (it over-selects victims) and never loses ownership.
-            self.members[identity] = members
-            self.bounds[identity] = bounds if row_count else (None, None)
+            self.pending_upload = (future, identity, row_count, members, bounds)
             self.part_indexes[dataset] += 1
         self.flushes += 1
+
+    def _put(self, **kwargs):
+        started = time.perf_counter()
+        reference = self.projector.archive.put_raw(**kwargs)
+        return reference, round((time.perf_counter() - started) * 1_000)
+
+    def _join_upload(self) -> None:
+        if self.pending_upload is None:
+            return
+        future, identity, row_count, members, bounds = self.pending_upload
+        reference, elapsed_ms = future.result()
+        # An interrupted wait retains the future so abort can collect its
+        # eventual successful reference before cleanup.
+        # Only the owner thread updates catalog inputs and cleanup references.
+        self.references[identity] = reference
+        self.upload_ms += elapsed_ms
+        self.row_counts[identity] = row_count
+        self.members[identity] = members
+        self.bounds[identity] = bounds if row_count else (None, None)
+        self.pending_upload = None
+
+    def _close_uploads(self) -> None:
+        if self.upload_executor is not None:
+            self.upload_executor.shutdown(wait=True)
+            self.upload_executor = None
 
     def finish(
         self,
@@ -825,11 +856,15 @@ class _StreamingUpload:
         ensure = set(ensure_datasets)
         if not ensure <= set(SCAN_DATASETS):
             raise ParquetScanError("parquet_scan_dataset_invalid")
-        for dataset in SCAN_DATASETS:
-            self._flush(
-                dataset,
-                allow_empty=dataset in ensure and self.rows_seen[dataset] == 0,
-            )
+        try:
+            for dataset in SCAN_DATASETS:
+                self._flush(
+                    dataset,
+                    allow_empty=dataset in ensure and self.rows_seen[dataset] == 0,
+                )
+            self._join_upload()
+        finally:
+            self._close_uploads()
         LOG.info(
             "parquet stream documents=%s passages=%s records=%s actors=%s parts=%s "
             "flushes=%s max_buffer_bytes=%s upload_ms=%s mode=%s",
@@ -859,6 +894,17 @@ class _StreamingUpload:
         )
 
     def abort(self) -> None:
+        # Shutdown settles even a future whose worker raised BaseException.
+        # Collect its successful reference before scheduling original cleanup.
+        self._close_uploads()
+        try:
+            self._join_upload()
+        except BaseException:
+            # A failed PUT returned no reference, exactly as in the synchronous
+            # path. Never replay it; retain all known successful cleanup inputs.
+            pass
+        finally:
+            self.pending_upload = None
         self.projector._schedule_cleanup(self.references.values())
 
 
@@ -2139,7 +2185,7 @@ class CanonicalParquetScanProjector:
                 documents_dirty=len(dirty),
                 documents_rewritten=len(rewrite_documents),
             )
-        except Exception as error:
+        except BaseException as error:
             timing.failed = True
             try:
                 upload.abort()
