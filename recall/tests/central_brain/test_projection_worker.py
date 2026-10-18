@@ -1897,3 +1897,82 @@ class BackgroundThinningTests(unittest.TestCase):
                 background_thinner=thinner,
             )
         self.assertEqual(prepared, [False])
+
+
+class ParquetDuringLogicalTests(unittest.TestCase):
+    def kwargs(self):
+        return dict(tenant_id='tenant:cadence', logical_batch_size=4,
+                    passage_batch_size=2, embedding_batch_size=2,
+                    max_batches_per_cycle=2, upload_concurrency=2,
+                    passage_concurrency=1, interval_seconds=1, once=True,
+                    skip_embedding=True, parquet_every_cycles=50,
+                    parquet_max_wait_seconds=300)
+
+    def test_progress_and_scan_only_heartbeat_share_cadence_and_keep_admission_deadline(self):
+        clock = _FakeClock()
+        calls, bounds = [], []
+        check = self
+
+        class Scan(_Scan):
+            def project_pending(self, **kwargs):
+                bounds.append(kwargs)
+                clock.advance(2)
+                return {**super().project_pending(**kwargs),
+                        'fragments_total': 12 if len(bounds) == 1 else 9}
+
+        class Logical(_Logical):
+            def project_pending(self, **kwargs):
+                deadline = kwargs['admission_deadline_at']
+                clock.advance(301)
+                kwargs['on_progress']()
+                check.assertEqual(calls[-2:], ['passages', 'scan'])
+                check.assertEqual(len(bounds), 1)
+                kwargs['on_heartbeat']()
+                check.assertEqual(len(bounds), 1)
+                clock.advance(301)
+                kwargs['on_heartbeat']()
+                check.assertEqual(len(bounds), 2)
+                check.assertEqual(kwargs['admission_deadline_at'], deadline)
+                return super().project_pending(**kwargs)
+
+        result = run_projection_worker(Logical(calls, work=0), _Passages(calls, work=0),
+                                       Scan(calls), clock=clock, **self.kwargs())
+        self.assertEqual(len(bounds), 2, 'post-logical phase repeated an already serviced scan')
+        self.assertEqual(result['parquet_shards'], 2)
+        self.assertEqual(result['parquet_rows'], 20)
+        self.assertEqual(result['parquet_fragments_total'], 9)
+        self.assertEqual(result['parquet_elapsed_ms'], 4000)
+        self.assertEqual(result['logical_elapsed_ms'], 602000)
+        self.assertTrue(all(b == dict(tenant_id='tenant:cadence', batch_size=1,
+                                     max_batches=1, compaction_budget=0) for b in bounds))
+
+    def test_later_scan_failure_preserves_earlier_scan_elapsed(self):
+        clock = _FakeClock()
+        calls = []
+        failure = RuntimeError('synthetic later scan failure')
+
+        class Scan(_Scan):
+            attempts = 0
+            def project_pending(self, **kwargs):
+                self.attempts += 1
+                clock.advance(2)
+                if self.attempts == 2:
+                    raise failure
+                return super().project_pending(**kwargs)
+
+        class Logical(_Logical):
+            def project_pending(self, **kwargs):
+                clock.advance(301)
+                kwargs['on_heartbeat']()
+                clock.advance(301)
+                kwargs['on_heartbeat']()
+                raise AssertionError('callback error was swallowed')
+
+        with self.assertLogs('recall_server.projection_worker', level='ERROR') as logs:
+            with self.assertRaises(RuntimeError) as caught:
+                run_projection_worker(Logical(calls), _Passages(calls, work=0), Scan(calls),
+                                      clock=clock, **self.kwargs())
+        self.assertIs(caught.exception, failure)
+        self.assertIn('failed_phase=parquet', logs.output[-1])
+        self.assertIn('parquet_elapsed_ms=4000', logs.output[-1])
+        self.assertEqual(calls.count('scan'), 1)
