@@ -15,6 +15,8 @@ class RetirementCliTests(unittest.TestCase):
                 'CanonicalParquetScanProjector', 'CanonicalBodyThinner',
                 'build_evidence_archive_store', 'build_archive_store', 'RetirementMaintenance', 'RetirementSupervisor')
             mocked = {name: stack.enter_context(patch.object(cli, name)) for name in names}
+            mocked['BrainStore'].return_value.pool_max_size = 4
+            mocked['BrainStore'].return_value.reserved_read_connections = 0
             run = stack.enter_context(patch.object(cli, 'run_projection_worker', return_value={'status': 'pending'}))
             if inspect_worker is not None:
                 run.side_effect = lambda *args, **kwargs: inspect_worker(mocked, kwargs)

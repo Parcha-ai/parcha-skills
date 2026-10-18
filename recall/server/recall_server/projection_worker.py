@@ -571,6 +571,8 @@ def run_projection_worker(
                 or int(projected.get("documents", 0)) > 0
             )
             if scan is not None and parquet_due and not parquet_serviced:
+                # Logical work has finished; retain its completed duration.
+                active_phase, phase_started = "parquet", clock()
                 service_parquet(freshness_busy)
             active_phase = "thin"
             phase_started = clock()
