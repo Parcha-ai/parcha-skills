@@ -86,27 +86,30 @@ class StreamCapture(unittest.TestCase):
                 self.assertEqual(len(list(proof["spool"].verified())), 12)
         self.assertEqual(calls, {"stream": 1, "fetch": 0})
         self.assertEqual(metrics["metadata_fetches"], 1)
-        self.assertEqual(metrics["metadata_membership_calls"], 1)
+        self.assertEqual(metrics["metadata_membership_calls"], 0)
 
     def test_same_snapshot_survives_physical_update_before_native_membership(self):
         before = self.capture()
-        verify = receipt_membership.verified_document_chunks
+        original_stream = psycopg.Cursor.stream
         changed = False
 
-        def change_then_verify(*args, **kwargs):
+        def change_after_snapshot(cursor, query, *args, **kwargs):
             nonlocal changed
-            if not changed:
-                with self.store.connect() as connection:
-                    connection.execute(
-                        "UPDATE canonical_chunks SET text_sha256=repeat('0',64) WHERE tenant_id=%s",
-                        (self.tenant,),
-                    )
-                changed = True
-            return verify(*args, **kwargs)
+            stream = original_stream(cursor, query, *args, **kwargs)
+            try:
+                for row in stream:
+                    if not changed and "SELECT selected.*,items.chunks FROM (" in query:
+                        with self.store.connect() as connection:
+                            connection.execute(
+                                "UPDATE canonical_chunks SET text_sha256=repeat('0',64) WHERE tenant_id=%s",
+                                (self.tenant,),
+                            )
+                        changed = True
+                    yield row
+            finally:
+                stream.close()
 
-        with patch.object(
-            receipt_membership, "verified_document_chunks", change_then_verify
-        ):
+        with patch.object(psycopg.Cursor, "stream", change_after_snapshot):
             self.assertEqual(self.capture(), before)
         self.assertTrue(changed)
 
@@ -129,15 +132,16 @@ class StreamCapture(unittest.TestCase):
         self.assertFalse(Path(directory).exists())
         self.assertEqual(self.store.active_connections, 0)
 
-    def test_physical_chunk_cap_refuses_before_membership(self):
+    def test_physical_chunk_cap_refuses_over_budget_row_before_validation(self):
         with patch.object(
             receipt_membership,
-            "verified_document_chunks",
-            wraps=receipt_membership.verified_document_chunks,
+            "receipt_metadata_from_rows",
+            wraps=receipt_membership.receipt_metadata_from_rows,
         ) as verify:
             with self.assertRaisesRegex(Exception, "metadata_budget"):
                 self.capture(replace(self.limits, max_chunks=2))
-        verify.assert_not_called()
+        self.assertEqual(verify.call_count, 2)
+        self.assertEqual(self.store.active_connections, 0)
 
     def test_document_row_and_total_spool_caps_remain_fail_closed(self):
         with self.assertRaisesRegex(Exception, "metadata_budget"):

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 from io import BytesIO
+import re
 import time
 
 from .canonical import _identity_sha256
@@ -16,7 +17,8 @@ from .chunk_bodies import (
     chunk_catalog_snapshot, read_archived_chunks,
 )
 from .evidence_projection import CanonicalEvidenceProjector
-from .logical_evidence import LogicalEvidenceProjectionStore, MAX_PART_BYTES
+from .logical_evidence import LogicalEvidenceError, LogicalEvidenceProjectionStore, MAX_PART_BYTES
+from .logical_body_proof import LogicalBodyProofError
 from .parent_chunk_proof import _attempt_phase, manifest_identity, parent_retirement_plan, read_parent_catalog
 from .passage_projection import decode_logical_record
 
@@ -541,8 +543,13 @@ def retire_parent_windows(store, archive, *, tenant_id, source_id, native_parent
         else:
             failure = ChunkRetirementError('parent_retirement_unavailable')
         if not hasattr(failure,'cause_details'):
+            from .chunk_retirement import _PASSAGE_CAUSE_CODES
+            cause_code = error.args[0] if isinstance(error, (LogicalEvidenceError, LogicalBodyProofError)) and error.args else None
+            if (not isinstance(cause_code, str) or (cause_code not in _PASSAGE_CAUSE_CODES
+                    and not re.fullmatch(r'logical_(?:evidence|body)_[a-z0-9_]{1,64}', cause_code))):
+                cause_code = None
             label = type(error).__name__
             failure.cause_details = dict(error_class=label if len(label)<=80 and label.isidentifier() else 'UnknownError',
-                cause_error_code=None,phase='maintenance')
+                cause_error_code=cause_code,phase='maintenance')
         failure.committed = totals
         raise failure from None
