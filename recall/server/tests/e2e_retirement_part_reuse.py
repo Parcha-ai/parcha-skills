@@ -170,5 +170,44 @@ class RunnerPartReuse(unittest.TestCase):
         self.assertEqual(self.state(), before)
 
 
+class MultiplePartReuse(unittest.TestCase):
+    setUp = original.SelectiveExperiment.setUp
+    state = original.SelectiveExperiment.state
+
+    def test_two_part_window_fetches_once_each_with_exact_native_commit(self):
+        import hashlib
+        import json
+        from e2e_retirement_window_runner import RunnerWindows
+        before = self.state()
+        selected = {row['document_id'] for row in self.docs[:2]}
+        expected = [dict(row, text_redacted='' if row['document_id'] in selected else row['text_redacted'])
+                    for row in before]
+        expected_bytes = sum(len(row['text_redacted'].encode()) for row in before if row['document_id'] in selected)
+        fetched = []
+        read = self.archive.read_raw
+        def measured(reference):
+            fetched.append(reference['artifact_id'])
+            return read(reference)
+        with patch.object(self.archive, 'read_raw', measured):
+            result = RunnerWindows.run_parent(self, max_batches=1)
+        self.assertEqual(self.state(), expected)
+        self.assertEqual(result['cleared_utf8_bytes'], expected_bytes)
+        self.assertEqual(result['cleared_documents'], 2)
+        self.assertEqual(result['batches'], 1)
+        self.assertEqual(result['archive_gets'], 4)
+        self.assertFalse(result['commit_outcome_unknown'])
+        with self.store.connect() as connection:
+            progress = owner._parent_progress(self.store, connection, self.scope, time.monotonic()+5)
+        self.assertEqual(progress['last_record_ordinal'], 1)
+        natives = {row['document_id']: row['native_id'] for row in self.docs}
+        normalized = sorted((natives[row['document_id']], row['ordinal'], row['text_redacted']) for row in expected)
+        print(json.dumps(dict(physical_gets=len(fetched), reused_gets=result['archive_reused_gets'],
+            charged_gets=result['archive_gets'], cleared_bytes=expected_bytes,
+            normalized_state_sha256=hashlib.sha256(json.dumps(normalized).encode()).hexdigest())))
+        self.assertEqual(len(set(fetched)), 2)
+        self.assertEqual(len(fetched), 2)
+        self.assertEqual(result['archive_reused_gets'], 2)
+
+
 if __name__ == '__main__':
     unittest.main()

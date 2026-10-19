@@ -34,6 +34,7 @@ from .logical_evidence import (
 from .passage_projection import (
     MAX_PASSAGE_HEADER_BYTES,
     COMPLETE_SOURCE_UNITS,
+    COMPLETE_REPORT_UNIT,
     LOGICAL_DOCUMENT_ID_RE,
     PASSAGE_EMBEDDING_SEPARATOR,
     LosslessPassage,
@@ -132,6 +133,30 @@ class _DiskView(Sequence):
         return self.source[self.indexes[index]]
 
 
+def _handback_owned_by_visible_message(group, records):
+    """Check whether the complete native report already owns this exact field."""
+    if group.evidence_kind != 'tool_input' or len(group.messages) != 1:
+        return False
+    message = group.messages[0]
+    if message.source_unit != 'claude.tool-input.string.v1#' + group.enclosing_pointer + '/input/message':
+        return False
+    # The group and pointer were resolved by the unchanged typed extractor.
+    event = json.loads(group.full_event_text)
+    block = event['message']['content'][int(group.enclosing_pointer.rsplit('/', 1)[1])]
+    arguments = block.get('input')
+    if (block.get('name') != 'SubagentHandback' or not isinstance(arguments, dict)
+        or set(arguments) != {'message'} or arguments['message'] != message.text):
+        return False
+    visible = tuple(iter_visible_messages(records, first_record_ordinal=records[0].ordinal))
+    return len(visible) == 1 and (
+        visible[0].source_unit == COMPLETE_REPORT_UNIT
+        and visible[0].record_ordinal == message.record_ordinal
+        and visible[0].record_count == message.record_count
+        and visible[0].receipts == message.receipts
+        and visible[0].text == message.text
+    )
+
+
 def _spool_tool_groups(records, extractor, output):
     # Call the unchanged extractor on each complete validated event. Both native
     # adapters' coverage counters are additive; no provider block is split.
@@ -139,7 +164,15 @@ def _spool_tool_groups(records, extractor, output):
     dispositions = Counter()
     for records_group in _logical_record_groups(records):
         groups, counts = extractor(records_group, first_record_ordinal=records_group[0].ordinal)
-        output.extend(groups)
+        retained = []
+        for group in groups:
+            if _handback_owned_by_visible_message(group, records_group):
+                counts['groups'] -= 1
+                counts['included_string_leaves'] -= 1
+                dispositions['already_projected_handback'] += 1
+            else:
+                retained.append(group)
+        output.extend(retained)
         for key in ('events', 'tool_blocks', 'groups', 'string_leaves', 'included_string_leaves'):
             coverage[key] += counts[key]
         dispositions.update(counts['dispositions'])
