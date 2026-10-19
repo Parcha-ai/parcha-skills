@@ -118,7 +118,8 @@ class LegacyToolMigration(unittest.TestCase):
         self.assertTrue(any(p['text_redacted'] == 'Ordinary new human request.' for p in current))
         self.assertEqual(self.document()['requested_extraction_version'], 'tool_groups_v1')
         self.assertEqual(self.document()['applied_extraction_version'], 'tool_groups_v1')
-        self.assertIsNone(self.document()['append_checkpoint'])
+        self.assertEqual(self.document()['append_checkpoint']['tool_groups']['extraction_version'],
+                         'tool_groups_v1')
         self.assertEqual(self.pending(), 0)
         opened = BoundCanonicalRetrieval(self.store, tenant_id=self.tenant, principal_id=self.principal, authorized_sources=(self.source,)).show(old['receipts'][0])
         self.assertIn(raw, [c['text'] for c in opened['chunks']])
