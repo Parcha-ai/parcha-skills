@@ -416,7 +416,7 @@ class TurbopufferHintRetrieval(PassageHintRetrieval):
             stage_started = time.monotonic()
             read_certificates = self.parent_membership_read.enabled and not self.parent_membership_shadow.enabled
             catalog_sql = _CERTIFICATE_PRESENCE_SQL if read_certificates else _SELECTED_AUTHORITY_SQL
-            selected = self.store._execute_bounded(connection, catalog_sql,
+            selected = self.store._execute_bounded_pipeline(connection, catalog_sql,
                 (self.tenant_id, self.sources, self.policy_fingerprint,
                  [source for source, _ in requested], [passage for _, passage in requested]),
                 deadline_at).fetchall()
