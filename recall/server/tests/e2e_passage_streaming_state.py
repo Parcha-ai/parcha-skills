@@ -3,10 +3,10 @@
 import unittest
 import weakref
 import tempfile
-from recall_server import passage_index
 from unittest.mock import patch
 
 from e2e_passage_append_tail import PassageAppendTail
+from recall_server import passage_index
 
 
 class PassageStreamingState(PassageAppendTail):
