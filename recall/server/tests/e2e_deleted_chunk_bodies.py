@@ -654,10 +654,12 @@ class DeletedChunkBodyTests(unittest.TestCase):
             c.execute(
                 """INSERT INTO canonical_chunks(tenant_id,source_id,chunk_id,document_id,
                 ordinal,receipt,text_redacted,text_sha256,deleted_at)
-                SELECT %s,%s,'chk_'||lpad(to_hex(n),32,'0'),%s,10000+n,
-                    'recall://plan/test?rev=1#item='||n,'x',%s,now()
-                FROM generate_series(1,5000) n""",
-                (self.tenant, self.source, document, hashlib.sha256(b"x").hexdigest()),
+                SELECT tenant_id,source_id,'chk_'||lpad(to_hex(n),32,'0'),document_id,10000+n,
+                    'recall://'||source_id||'/'||native_id||'?rev='||revision::text||
+                    '#item='||(10000+n)::text,'x',%s,now()
+                FROM canonical_documents CROSS JOIN generate_series(1,5000) n
+                WHERE tenant_id=%s AND source_id=%s AND document_id=%s""",
+                (hashlib.sha256(b"x").hexdigest(), self.tenant, self.source, document),
             )
             c.execute("ANALYZE canonical_chunks")
             c.execute("ANALYZE canonical_documents")

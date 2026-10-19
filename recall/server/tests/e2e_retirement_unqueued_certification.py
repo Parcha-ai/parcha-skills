@@ -258,9 +258,20 @@ class UnqueuedRetirementCertificationTests(RetirementMembershipTests):
         self.assertEqual(len(queued), 1)
         outcome = membership_remainder.resume(self.store, queued[0],
             settings=self.settings(), deadline_at=time.monotonic() + 3)
-        self.assertEqual(outcome['status'], 'busy')
-        self.assertEqual(outcome['certified_passages'], 0)
-        self.assertEqual(len(self.pending_certificates()), 1)
+        if self.additive_membership_generation:
+            # Pending retirement is scheduling state, not active ownership.
+            # On092 the native proof can finish before metadata retirement.
+            self.assertEqual(outcome['status'], 'enrolled')
+            self.assertEqual(outcome['certified_passages'], len(self.ids))
+            compared = self.compare()
+            self.assertEqual(compared['certified_passages'], len(self.ids))
+            self.assertEqual(compared['native_allowed_passages'], len(self.ids))
+            self.assertEqual(compared['disagreements'], 0)
+            self.assertEqual(self.pending_certificates(), [])
+        else:
+            self.assertEqual(outcome['status'], 'busy')
+            self.assertEqual(outcome['certified_passages'], 0)
+            self.assertEqual(len(self.pending_certificates()), 1)
         self.assertEqual(self.run_retirement()['completed_parent_proofs'], 1)
         self.publisher().project_pending(tenant_id=self.tenant, batch_size=10,
                                         max_batches=1, concurrency=1)
@@ -360,8 +371,18 @@ class UnqueuedRetirementCertificationTests(RetirementMembershipTests):
             self.assertIsNotNone(row)
             outcome = membership_remainder.resume(self.store, row,
                 settings=self.settings(), deadline_at=time.monotonic()+3)
-            self.assertEqual(outcome['status'], 'busy')
-            self.assertEqual(outcome['certified_passages'], 0)
+            if self.additive_membership_generation:
+                # Admission alone has not acquired a maintenance intent.
+                self.assertEqual(outcome['status'], 'enrolled')
+                self.assertEqual(outcome['certified_passages'], len(self.scope['passage_ids']))
+                compared = self.compare()
+                self.assertEqual(compared['certified_passages'], len(self.scope['passage_ids']))
+                self.assertEqual(compared['native_allowed_passages'], len(self.scope['passage_ids']))
+                self.assertEqual(compared['disagreements'], 0)
+                self.assertEqual(self.pending_certificates(), [])
+            else:
+                self.assertEqual(outcome['status'], 'busy')
+                self.assertEqual(outcome['certified_passages'], 0)
             return row
 
         with (patch.object(membership_remainder, 'retain_retirement',
@@ -370,7 +391,16 @@ class UnqueuedRetirementCertificationTests(RetirementMembershipTests):
                            side_effect=TimeoutError('completion hook interrupted'))):
             retired = self.run_retirement()
         self.assertEqual(retired['completed_parent_proofs'], 1)
-        self.assertEqual(len(self.pending_certificates()), 1)
+        if self.additive_membership_generation:
+            # The already acknowledged proof survives equivalent retirement,
+            # even though the optional completion hook was interrupted.
+            self.assertEqual(self.pending_certificates(), [])
+            compared = self.compare()
+            self.assertEqual(compared['certified_passages'], len(self.scope['passage_ids']))
+            self.assertEqual(compared['native_allowed_passages'], len(self.scope['passage_ids']))
+            self.assertEqual(compared['disagreements'], 0)
+        else:
+            self.assertEqual(len(self.pending_certificates()), 1)
         self.publisher().project_pending(tenant_id=self.tenant, batch_size=10,
                                         max_batches=1, concurrency=1)
         self.assertEqual(self.compare()['certified_passages'], len(self.scope['passage_ids']))

@@ -118,11 +118,40 @@ class QueueInitializationTests(ParentMembershipPublicationTests):
 
     def test_initialized_publication_keeps_original_proof_without_initializer(self):
         self.queue()
+        candidate = self.publisher()._pending(tenant_id=self.tenant, limit=1)[0]
+        # Additive INSERTs need not create an authority epoch. Establish this
+        # test's initialized precondition through the native metadata owner.
+        self.assertEqual(enrollment.initialize_published_parent_generation(
+            self.store, tenant_id=self.tenant, source_id=self.source,
+            logical_document_id=candidate.logical_document_id,
+            deadline_at=time.monotonic() + 3), 'initialized')
+        self.assertGreater(self.generation()['generation'], 0)
+        self.assertEqual(self.compare()['certified_passages'], 0)
         with patch.object(enrollment, 'initialize_published_parent_generation', side_effect=AssertionError('normal path changed')):
             result = self.publisher().project_pending(tenant_id=self.tenant, batch_size=1,
                                                       max_batches=1, concurrency=1)
         self.assertEqual(result['documents'], 1)
         self.assertGreater(result['membership_certified_passages'], 0)
+        self.refresh_scope()
+        compared = self.compare()
+        self.assertEqual(compared['certified_passages'], compared['native_allowed_passages'])
+        self.assertEqual(compared['certified_passages'], len(self.scope['passage_ids']))
+        self.assertEqual(compared['disagreements'], 0)
+
+    def test_normal_publication_initializes_additive_generation_then_proves(self):
+        self.queue()
+        before = self.generation()
+        if self.additive_membership_generation:
+            self.assertIsNone(before)
+        initialize = enrollment.initialize_published_parent_generation
+        with patch.object(enrollment, 'initialize_published_parent_generation', wraps=initialize) as initialized:
+            result = self.publisher().project_pending(tenant_id=self.tenant, batch_size=1,
+                                                      max_batches=1, concurrency=1)
+        self.assertEqual(initialized.call_count, int(before is None))
+        self.assertEqual(result['documents'], 1)
+        self.assertGreater(result['membership_certified_passages'], 0)
+        self.assertEqual(result['membership_failed_documents'], 0)
+        self.assertGreater(self.generation()['generation'], 0)
         self.refresh_scope()
         compared = self.compare()
         self.assertEqual(compared['certified_passages'], compared['native_allowed_passages'])

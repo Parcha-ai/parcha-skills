@@ -16,6 +16,7 @@ from psycopg import sql
 from psycopg.conninfo import conninfo_to_dict, make_conninfo
 
 import e2e_optional_reconcile_index as original
+from recall_server import SCHEMA_VERSION
 from recall_server.capabilities import CapabilityError, probe_database
 from recall_server.canonical_retrieval import BoundCanonicalRetrieval
 from recall_server.db import BrainStore
@@ -123,16 +124,16 @@ def scenario(admin_dsn, root, retired):
             state = connection.execute('SELECT requested_extraction_version,applied_extraction_version FROM canonical_passage_documents WHERE tenant_id=%s', (tenant2,)).fetchone()
             assert state == dict(requested_extraction_version='legacy', applied_extraction_version='legacy')
         store.migrate(retire_postgres_plane=retired)
-        assert probe_database(app_dsn, profile='local-fixture')['schema_version'] == 91
+        assert probe_database(app_dsn, profile='local-fixture')['schema_version'] == SCHEMA_VERSION
         assert reader.show(receipt) == before
         with store.connect() as connection:
-            connection.execute('INSERT INTO schema_migrations(version) VALUES(92)')
+            connection.execute('INSERT INTO schema_migrations(version) VALUES(%s)', (SCHEMA_VERSION + 1,))
         try:
             probe_database(app_dsn, profile='local-fixture')
         except CapabilityError as error:
             assert error.code == 'schema_drift'
         else:
-            raise AssertionError('unknown schema92 accepted')
+            raise AssertionError(f'unknown schema{SCHEMA_VERSION + 1} accepted')
     finally:
         if runtime is not None:
             runtime.close()
@@ -151,7 +152,7 @@ def main():
                             RECALL_TPUF_CLIENT_FACTORY='tests.central_brain.fake_turbopuffer:factory',
                             RECALL_TPUF_FAKE_STATE=str(root / 'vendor-fixture.json')):
                 scenario(os.environ['RECALL_DATABASE_URL'], root, retired)
-    print('PASS schema89/90 native startup, exact reads, legacy publication, strict typed-role/version constraints, both planes, unknown92 refusal')
+    print(f'PASS schema89/90 native startup, exact reads, legacy publication, strict typed-role/version constraints, both planes, unknown{SCHEMA_VERSION + 1} refusal')
 
 
 if __name__ == '__main__':
