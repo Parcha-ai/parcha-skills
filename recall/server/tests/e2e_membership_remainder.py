@@ -193,9 +193,24 @@ class MembershipRemainderTests(ParentMembershipPublicationTests):
         with patch.object(remainder, "change_cursor", side_effect=edited):
             outcome = self.run_cycle()
         self.assertEqual(outcome["membership_certified_passages"], 1)
-        self.assertEqual(self.queued()[0]["checkpoint"]["after"], ids[0])
+        if self.additive_membership_generation:
+            self.assertEqual(self.queued(), [])
+        else:
+            self.assertEqual(self.queued()[0]["checkpoint"]["after"], ids[0])
         self.assertEqual(self.compare()["certified_passages"], 0)
         self.assertEqual(self.compare()["disagreements"], 0)
+        if self.additive_membership_generation:
+            with self.store.connect() as connection:
+                self.assertEqual(connection.execute('SELECT count(*) AS count '
+                    'FROM canonical_evidence_document_queue WHERE tenant_id=%s',
+                    (self.tenant,)).fetchone()['count'],1)
+            projected=self.projector.project_pending(tenant_id=self.tenant,
+                batch_size=10,max_batches=1,upload_concurrency=1)
+            self.assertEqual(projected['failed'],0)
+            self.assertEqual(self.run_cycle()['documents'],1)
+            self.refresh_scope()
+            self.assertEqual(self.compare()['certified_passages'],len(self.scope['passage_ids']))
+            self.assertEqual(self.compare()['disagreements'],0)
 
     def test_forget_between_prefixes_blocks_later_proof(self):
         from recall_server.canonical import CanonicalLifecycleError
@@ -647,6 +662,13 @@ class MembershipRemainderTests(ParentMembershipPublicationTests):
     def test_active_retirement_rotates_without_archive_or_reproof(self):
         self.interrupted_publication()
         with self.store.connect() as c:
+            # Keep the original pending-only fixture on091. On092 pending work
+            # is eligible; a real active intent exercises its exclusion boundary.
+            if self.additive_membership_generation:
+                c.execute("""INSERT INTO canonical_retirement_source_policy(
+                    tenant_id,source_id,principal_id,maintenance_intent)
+                    VALUES(%s,%s,%s,'{"parent":"session"}'::jsonb)""",
+                    (self.tenant,self.source,self.principal))
             c.execute(
                 """INSERT INTO canonical_chunk_retirement_progress(
                 tenant_id,source_id,native_parent_id,logical_document_id,enabled,status)
@@ -682,6 +704,13 @@ class MembershipRemainderTests(ParentMembershipPublicationTests):
         self.interrupted_publication()
         busy = self.queued()[0]
         with self.store.connect() as c:
+            # Keep the original pending-only fixture on091. On092 pending work
+            # is eligible; a real active intent exercises its exclusion boundary.
+            if self.additive_membership_generation:
+                c.execute("""INSERT INTO canonical_retirement_source_policy(
+                    tenant_id,source_id,principal_id,maintenance_intent)
+                    VALUES(%s,%s,%s,'{"parent":"session"}'::jsonb)""",
+                    (self.tenant,self.source,self.principal))
             c.execute("""INSERT INTO canonical_chunk_retirement_progress(
                 tenant_id,source_id,native_parent_id,logical_document_id,enabled,status)
                 SELECT tenant_id,source_id,native_parent_id,logical_document_id,true,'pending'

@@ -145,7 +145,31 @@ class RetirementMembershipTests(ParentMembershipPublicationTests):
             with self.store.connect() as c:c.execute('UPDATE canonical_evidence_documents SET manifest_content_sha256=%s WHERE tenant_id=%s',('a'*64,self.tenant))
             return captured
         with patch.object(membership,'_capture',side_effect=capture):result=self.run_retirement()
-        self.assertEqual(result['membership_certified_passages'],0);self.assertEqual(self.authority(),(len(self.ids),1))
+        self.assertEqual(result['membership_certified_passages'],
+                         len(self.ids) if self.additive_membership_generation else 0)
+        self.assertEqual(self.authority(),
+                         (len(self.ids), 0 if self.additive_membership_generation else 1))
+        def rows():
+            with self.store.connect() as c:
+                return self.retrieval._authorize_singletons(c,
+                    [(self.source, p) for p in self.scope['passage_ids']],
+                    time.monotonic()+3, stages={})
+        fast_rows = rows()
+        self.retrieval.parent_membership_read = ReadSettings()
+        with patch('recall_server.receipt_membership.lookup_current_search_membership',
+                   wraps=lookup_current_search_membership) as proof:
+            native_rows = rows()
+        self.assertEqual(proof.call_count, 1)
+        self.assertEqual(fast_rows, native_rows)
+        self.assertEqual(len(native_rows), len(self.ids))
+        self.assertEqual(self.compare()['disagreements'], 0)
+        self.retrieval.parent_membership_read = ReadSettings(
+            enabled=True, binding_epoch='synthetic-epoch-a')
+        self.edit()
+        fast_denied = rows()
+        self.retrieval.parent_membership_read = ReadSettings()
+        self.assertEqual(fast_denied, [])
+        self.assertEqual(fast_denied, rows())
 
     def test_later_certificate_page_failure_keeps_acknowledged_progress(self):
         self.ingest('turn/long','Synthetic evidence paragraph. '*3000)

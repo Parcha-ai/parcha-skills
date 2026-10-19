@@ -125,7 +125,7 @@ def main():
             connection.execute('ANALYZE canonical_documents')
             connection.execute("""INSERT INTO canonical_chunks(tenant_id,source_id,chunk_id,document_id,ordinal,receipt,text_redacted,text_sha256)
                 SELECT tenant_id,source_id,'chk_'||md5('bulk:'||i||':'||rev),'doc_'||md5('bulk:'||i||':'||rev),ordinal,
-                       'recall://synthetic/'||i||'/'||rev,text_redacted,text_sha256
+                       'recall://'||source_id||'/native:'||i||'?rev='||rev||'#item='||ordinal,text_redacted,text_sha256
                 FROM fallback_chunks CROSS JOIN generate_series(1,384)i CROSS JOIN generate_series(1,3)rev""")
             connection.execute('ANALYZE canonical_chunks')
             # Inspect the on-page datum without detoasting: external pointers

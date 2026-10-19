@@ -32,10 +32,13 @@ from connectors.sdk import (
     ConnectorRunner,
 )
 from privacy.policy import PrivacyPolicy
+from client.mac import canonical_envelope
 
 from .archive_runtime import build_archive_store, build_evidence_archive_store
-from .actor_attribution import ActorIdentityIndex
-from .canonical import CanonicalArchiveGateway, CanonicalPlane
+from .actor_attribution import (
+    ActorIdentityIndex, attribute_canonical_events, derive_slack_actor_identities,
+)
+from .canonical import CanonicalArchiveGateway, CanonicalPlane, _identity_sha256
 from .canonical_retrieval import CanonicalRetrieval
 from .control import ControlError, SecretBox
 from .db import BrainStore
@@ -229,6 +232,22 @@ def _selectors(connector_id: str, selected: Mapping[str, Any]) -> dict[str, Any]
     values = _selector_defaults(connector_id)
     values.update(dict(selected))
     return values
+
+
+class _IdentityEnrollingConnector:
+    """Trusted managed pull seam; SDK privacy, archive and ACK behavior is unchanged."""
+
+    def __init__(self, connector, enroll):
+        self.connector = connector
+        self.enroll = enroll
+
+    def __getattr__(self, name):
+        return getattr(self.connector, name)
+
+    def pull(self, cursor):
+        page = self.connector.pull(cursor)
+        self.enroll(page.records)
+        return page
 
 
 class _DirectCanonicalWriter:
@@ -649,7 +668,163 @@ class ManagedConnectorWorker:
                         (error_code, row["id"], self.worker_id),
                     )
 
+    def _require_slack_page_authority(self, connection, row):
+        tenant, source, principal = row["tenant_id"], row["source_id"], row["principal_id"]
+        authority = connection.execute("""SELECT installation.id
+            FROM connector_installations installation
+            JOIN provider_connections provider ON provider.id=installation.connection_id
+            JOIN brain_access_grants access ON access.tenant_id=installation.tenant_id
+                AND access.principal_id=installation.principal_id
+            WHERE installation.id=%s AND installation.revision=%s
+              AND installation.tenant_id=%s AND installation.source_id=%s
+              AND installation.principal_id=%s AND installation.connector_id='slack.messages'
+              AND installation.execution='remote_worker' AND installation.state='enabled'
+              AND installation.connection_id=%s AND installation.lease_owner=%s
+              AND installation.lease_expires_at>clock_timestamp()
+              AND provider.status='connected' AND provider.revoked_at IS NULL
+              AND access.permission IN ('owner','admin')
+            FOR SHARE OF installation,provider,access""",
+            (row["id"], row["revision"], tenant, source, principal,
+             row["connection_id"], self.worker_id)).fetchone()
+        if authority is None:
+            raise ControlError("connector_authority_revoked")
+
+    def _enroll_slack_contacts(self, row, records, *, expected_events=None):
+        # Typed native directory records only, before scrub and ACK dedup. A
+        # privacy drop must not produce even a blinded identity side effect.
+        privacy = PrivacyPolicy(mode=row["privacy_mode"])
+        contacts = [record for record in records
+            if not record.deleted and record.schema_version == 2
+            and record.content.get("kind") == "contact_identity.v1"
+            and record.content.get("identifier_type") == "email"
+            and privacy.apply({"content": record.content,
+                "provenance": PrivacyPolicy(mode="scrub").apply(record.provenance).value,
+            }).action != "drop"]
+        if not contacts:
+            return
+        tenant, source, principal = row["tenant_id"], row["source_id"], row["principal_id"]
+        with self.store.connect() as connection, connection.transaction():
+            self._require_slack_page_authority(connection, row)
+            # New installations have no source until their first archive write.
+            # Existing sources must never recreate a revoked grant here.
+            exists = connection.execute("""SELECT 1 FROM canonical_sources
+                WHERE tenant_id=%s AND source_id=%s""", (tenant, source)).fetchone()
+            if exists is None:
+                CanonicalPlane.register_source(connection, tenant_id=tenant,
+                    principal_id=principal, source_id=source)
+            self.plane._require_existing_source_owner(connection, tenant_id=tenant,
+                principal_id=principal, source_id=source)
+            admitted = []
+            for record in sorted(contacts, key=lambda item: item.native_id):
+                connection.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s,0))",
+                    (f"v2\x1f{tenant}\x1f{source}\x1f{record.native_id}",))
+                forgotten = connection.execute("""SELECT 1 FROM forget_tombstones
+                    WHERE tenant_id=%s AND source_id=%s AND target_identity_sha256=%s""",
+                    (tenant, source, _identity_sha256(tenant, source, record.native_id))).fetchone()
+                if not forgotten:
+                    if expected_events is not None:
+                        self._require_captured_slack_event(connection, row, record.native_id, expected_events)
+                    admitted.append((None, "slack.messages", {"content": record.content}))
+            derive_slack_actor_identities(connection, tenant_id=tenant,
+                events=admitted, identity_index=self.plane.actor_identity_index)
+
+    def _require_captured_slack_event(self, connection, row, native_id, expected_events, *, captured_document=False):
+        current = connection.execute("""SELECT event.event_id,event.content_sha256,
+                CASE WHEN %s THEN event.canonical_redacted END AS captured_document
+            FROM canonical_documents document JOIN canonical_events event USING(tenant_id,source_id,event_id)
+            WHERE document.tenant_id=%s AND document.source_id=%s AND document.native_id=%s
+              AND document.is_current AND document.deleted_at IS NULL AND NOT event.is_tombstone
+              AND event.canonical_redacted#>>'{provenance,connector_id}'='slack.messages'
+            FOR SHARE OF document,event""", (captured_document, row['tenant_id'], row['source_id'], native_id)).fetchone()
+        if current is None or (current['event_id'], current['content_sha256']) != expected_events.get(native_id):
+            raise ControlError('connector_record_changed')
+        return current['captured_document']
+
+    @staticmethod
+    def _slack_record_event(row, record):
+        decision = PrivacyPolicy(mode=row["privacy_mode"]).apply({"content": record.content,
+            "provenance": PrivacyPolicy(mode="scrub").apply(record.provenance).value})
+        if decision.action == "drop":
+            return None
+        return canonical_envelope(source_id=row["source_id"], native_id=record.native_id,
+            kind="connector_record", content=decision.value["content"],
+            principal_id=row["principal_id"], visibility="private",
+            occurred_at=record.occurred_at, provenance=decision.value["provenance"],
+            parent=record.native_parent_id)
+
+    def _reconcile_slack_page(self, row, records, *, expected_events=None, captured_documents=()):
+        self._enroll_slack_contacts(row, records, expected_events=expected_events)
+        prepared = {}
+        for event in captured_documents:
+            # The captured reader validates this accepted canonical commitment.
+            # Reuse its typed references without double-redacting stored content.
+            if (expected_events is None or event['source_id'] != row['source_id']
+                    or event['content'].get('kind') != 'document.v1'):
+                raise ControlError('connector_record_changed')
+            prepared[(event['native_id'], event['content_sha256'])] = event
+        for record in records:
+            if (record.deleted or record.schema_version != 2
+                    or record.content.get("kind") != "communication_message.v1"
+                    or record.content.get("surface") != "slack"):
+                continue
+            # Shared with captured SDK records: apply privacy to original input,
+            # never to already redacted canonical content.
+            event = self._slack_record_event(row, record)
+            if event is not None:
+                prepared[(record.native_id, event["content_sha256"])] = event
+        if not prepared:
+            return
+        native_ids = sorted({native for native, _ in prepared})
+        tenant, source, principal = row["tenant_id"], row["source_id"], row["principal_id"]
+        with self.store.connect() as connection, connection.transaction():
+            self._require_slack_page_authority(connection, row)
+            if connection.execute("SELECT 1 FROM canonical_sources WHERE tenant_id=%s AND source_id=%s",
+                    (tenant, source)).fetchone() is None:
+                return  # First delivery remains the unchanged SDK/canonical ingest path.
+            self.plane._require_existing_source_owner(connection, tenant_id=tenant,
+                principal_id=principal, source_id=source)
+            connection.execute("""SELECT pg_advisory_xact_lock(hashtextextended(value,0))
+                FROM unnest(%s::text[]) AS lock_key(value) ORDER BY value""",
+                ([f"v2\x1f{tenant}\x1f{source}\x1f{native}" for native in native_ids],)).fetchall()
+            forgotten = {item["target_identity_sha256"] for item in connection.execute(
+                """SELECT target_identity_sha256 FROM forget_tombstones
+                   WHERE tenant_id=%s AND source_id=%s AND target_identity_sha256=ANY(%s)""",
+                (tenant, source, [_identity_sha256(tenant, source, native) for native in native_ids]))}
+            admitted = [native for native in native_ids
+                        if _identity_sha256(tenant, source, native) not in forgotten]
+            if not admitted:
+                return
+            # Only a locked current event with the exact SDK content hash may
+            # use page references; stale historical authors cannot cross revisions.
+            current = connection.execute("""SELECT event.event_id,event.native_id,event.content_sha256
+                FROM canonical_documents document JOIN canonical_events event
+                    USING(tenant_id,source_id,event_id)
+                WHERE document.tenant_id=%s AND document.source_id=%s
+                  AND document.native_id=ANY(%s) AND document.is_current
+                  AND document.deleted_at IS NULL AND NOT event.is_tombstone
+                  AND event.canonical_redacted#>>'{provenance,connector_id}'='slack.messages'
+                ORDER BY event.native_id FOR SHARE OF event,document""",
+                (tenant, source, admitted)).fetchall()
+            current = [item for item in current
+                       if (item["native_id"], item["content_sha256"]) in prepared]
+            if expected_events is not None:
+                if ({item['native_id'] for item in current} != set(admitted)
+                        or any((item['event_id'], item['content_sha256']) != expected_events.get(item['native_id'])
+                               for item in current)):
+                    raise ControlError('connector_record_changed')
+            changed = set()
+            attribute_canonical_events(connection, tenant_id=tenant, source_id=source,
+                events=((item["event_id"], "slack.messages",
+                         prepared[(item["native_id"], item["content_sha256"])]) for item in current),
+                identity_index=self.plane.actor_identity_index, changed_event_ids=changed)
+            if changed:
+                from .logical_evidence_projection import mark_logical_evidence_dirty
+                mark_logical_evidence_dirty(connection, tenant_id=tenant, source_id=source,
+                    native_ids=[item["native_id"] for item in current if item["event_id"] in changed],
+                    reason="ingest")
+
     def run_once(self) -> dict[str, Any]:
+        started = time.monotonic()
         row = self._claim()
         if row is None:
             return {
@@ -675,6 +850,9 @@ class ManagedConnectorWorker:
                     credentials,
                     private_directory,
                 )
+                if row.get("connector_id") == "slack.messages":
+                    connector = _IdentityEnrollingConnector(connector,
+                        lambda records: self._reconcile_slack_page(row, records))
                 runner = ConnectorRunner(
                     connector=connector,
                     brain=_DirectCanonicalWriter(
@@ -693,6 +871,12 @@ class ManagedConnectorWorker:
                     spool_path=spool,
                     privacy=PrivacyPolicy(mode=row["privacy_mode"]),
                 )
+                captured = None
+                if row.get('connector_id') == 'slack.messages':
+                    from .slack_captured_attribution import repair_slice, progress_report
+                    captured = repair_slice(self, row, runner, deadline_at=started + self.lease_seconds)
+                    if captured is not None:
+                        captured = progress_report(row, runner)
                 result = runner.run_once()
             if result.get("status") == "backoff":
                 code = result.get("error_code", "connector_rate_limited")
@@ -741,6 +925,7 @@ class ManagedConnectorWorker:
                 "staged": int(result.get("staged", 0)),
                 "embedded": int(embedding.get("processed", 0)),
                 "has_more": has_more,
+                **({'captured_attribution': captured} if captured is not None else {}),
                 **coverage,
             }
         except Exception as error:
@@ -830,6 +1015,8 @@ def run_managed_worker(
             LOG.error("managed connector cycle failed type=%s", type(error).__name__)
             time.sleep(interval_seconds)
             continue
+        if 'captured_attribution' in result:
+            LOG.info('managed captured attribution %s', json.dumps(result['captured_attribution'], sort_keys=True))
         if "coverage" in result:
             LOG.info("managed connector coverage %s", json.dumps({
                 "installation_sha256": result["installation_sha256"],

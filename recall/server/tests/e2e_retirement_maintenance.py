@@ -263,7 +263,8 @@ class MaintenanceTests(unittest.TestCase):
         self.activate()
         self.ready()
         worker = self.worker(seconds=180)
-        now = [time.monotonic()]
+        # Exact budget arithmetic, while keeping native deadlines near the real clock.
+        now = [float(int(time.monotonic()))]
         start = now[0]
         original_run = maintenance.run_retirement
         original_read = self.archive.read_raw

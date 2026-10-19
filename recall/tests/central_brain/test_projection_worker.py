@@ -2047,3 +2047,52 @@ class ParquetDuringLogicalTests(unittest.TestCase):
         self.assertIn('failed_phase=parquet', logs.output[-1])
         self.assertIn('parquet_elapsed_ms=4000', logs.output[-1])
         self.assertEqual(calls.count('scan'), 1)
+
+    def test_admission_renewal_requires_known_successful_scan(self):
+        import threading
+
+        for outcome in ('complete', 'failed', 'unknown', 'exception'):
+            with self.subTest(outcome=outcome):
+                clock = _FakeClock()
+                calls, threads = [], []
+                check = self
+                coordinator = threading.get_ident()
+                failure = TimeoutError('synthetic unknown scan outcome')
+
+                class Scan(_Scan):
+                    def project_pending(self, **kwargs):
+                        threads.append(threading.get_ident())
+                        if outcome == 'exception':
+                            raise failure
+                        tick = super().project_pending(**kwargs)
+                        if outcome == 'complete':
+                            tick['failed'] = 0
+                        elif outcome == 'failed':
+                            tick.update(status='pending', failed=1)
+                        else:
+                            tick['status'] = 'unknown'
+                        return tick
+
+                class Logical(_Logical):
+                    def project_pending(self, **kwargs):
+                        refresh = kwargs['refresh_admission_deadline']
+                        check.assertIsNone(refresh())
+                        kwargs['on_heartbeat']()
+                        check.assertIsNone(refresh(), 'no scan was due yet')
+                        clock.advance(301)
+                        if outcome == 'exception':
+                            with check.assertRaises(TimeoutError) as caught:
+                                kwargs['on_heartbeat']()
+                            check.assertIs(caught.exception, failure)
+                            check.assertIsNone(refresh())
+                        else:
+                            kwargs['on_heartbeat']()
+                            if outcome == 'complete':
+                                check.assertIsInstance(refresh(), float)
+                            else:
+                                check.assertIsNone(refresh())
+                        return super().project_pending(**kwargs)
+
+                run_projection_worker(Logical(calls, work=0), _Passages(calls, work=0),
+                                      Scan(calls), clock=clock, **self.kwargs())
+                self.assertEqual(threads, [coordinator])

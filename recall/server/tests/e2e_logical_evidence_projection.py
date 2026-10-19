@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import gzip
 import hashlib
 import json
@@ -67,8 +68,12 @@ def insert_record(
     raw_reference: dict[str, object] | None = None,
     canonical_content: dict[str, object] | None = None,
     top_level_type: object | None = None,
+    revision: int = 1,
 ) -> str:
-    identity = digest(f"{tenant}\0{source}\0{native}\0{text}")
+    identity_input = f"{tenant}\0{source}\0{native}\0{text}"
+    if revision != 1:
+        identity_input += f"\0revision:{revision}"
+    identity = digest(identity_input)
     artifact = "art_" + identity[:32]
     job = "job_" + identity[:32]
     event = "evt_" + identity[:32]
@@ -127,7 +132,7 @@ def insert_record(
                artifact_id,job_id,kind,content_sha256,revision,occurred_at,
                observed_at,canonical_redacted
            ) VALUES (
-               %s,%s,%s,%s,%s,%s,%s,'transcript_record',%s,1,
+               %s,%s,%s,%s,%s,%s,%s,'transcript_record',%s,%s,
                '2026-07-27T00:00:00Z','2026-07-27T00:00:01Z',%s
            )""",
         (
@@ -139,6 +144,7 @@ def insert_record(
             raw_reference["artifact_id"],
             job,
             digest(text),
+            revision,
             json.dumps(envelope),
         ),
     )
@@ -146,7 +152,7 @@ def insert_record(
         """INSERT INTO canonical_documents(
                tenant_id,source_id,document_id,event_id,artifact_id,native_id,
                content_sha256,revision,is_current,text_redacted,text_sha256
-           ) VALUES (%s,%s,%s,%s,%s,%s,%s,1,true,%s,%s)""",
+           ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,true,%s,%s)""",
         (
             tenant,
             source,
@@ -155,6 +161,7 @@ def insert_record(
             raw_reference["artifact_id"],
             native,
             digest(text),
+            revision,
             text,
             digest(text),
         ),
@@ -162,7 +169,7 @@ def insert_record(
     receipts = []
     for ordinal, chunk_text in enumerate(canonical_text_chunks(text)):
         chunk_identity = digest(f"{identity}\0{ordinal}")
-        receipt = f"recall://{source}/{native}?rev=1#item={ordinal}"
+        receipt = f"recall://{source}/{native}?rev={revision}#item={ordinal}"
         connection.execute(
             """INSERT INTO canonical_chunks(
                    tenant_id,source_id,chunk_id,document_id,ordinal,receipt,
@@ -181,6 +188,29 @@ def insert_record(
         )
         receipts.append(receipt)
     return receipts[0]
+
+
+
+@contextmanager
+def legacy_canonical_state(connection):
+    """Install historical rows only; restore the exact current writer before proof.
+
+    The replacement and restoration share a transaction/savepoint, so another
+    connection never sees the legacy collector committed. Failure rolls it back.
+    Native receipt/authority verification is never replaced.
+    """
+    query = "SELECT pg_get_functiondef('recall_collect_parent_authority()'::regprocedure) AS body"
+    current = connection.execute(query).fetchone()['body']
+    schema = (SERVER / 'schema/082_parent_authority_generation.sql').read_text()
+    start = schema.index('CREATE OR REPLACE FUNCTION recall_collect_parent_authority()')
+    legacy = schema[start:schema.index('$$;',start)+3]
+    try:
+        with connection.transaction():
+            connection.execute(legacy)
+            yield
+            connection.execute(current)
+    finally:
+        assert connection.execute(query).fetchone()['body'] == current
 
 
 def archive_object_count(root: Path) -> int:

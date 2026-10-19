@@ -19,6 +19,7 @@ FIELDS = (
 _CURRENT = """SELECT evidence.revision,evidence.document_content_sha256 AS source_sha256,
     evidence.manifest_content_sha256 AS manifest_sha256,projected.policy_fingerprint AS policy,
     authority.generation AS authority_generation,
+    EXISTS(SELECT 1 FROM schema_migrations WHERE version=92) AS additive_membership_generation,
     EXISTS(SELECT 1 FROM canonical_evidence_document_queue dirty
       WHERE dirty.tenant_id=evidence.tenant_id AND dirty.source_id=evidence.source_id
         AND dirty.native_parent_id=evidence.native_parent_id) AS logical_pending,
@@ -221,12 +222,10 @@ def resume(store, row, *, settings, deadline_at):
                         for name in FIELDS if name != "authority_generation"
                     )
                 )
-                busy = scope is not None and any(
-                    scope[name]
-                    for name in (
-                        "logical_pending",
-                        "retirement_pending",
-                        "retirement_intent",
+                busy = scope is not None and (
+                    scope["retirement_intent"] or (
+                        not scope["additive_membership_generation"]
+                        and (scope["logical_pending"] or scope["retirement_pending"])
                     )
                 )
                 generation_changed = valid and (
@@ -468,7 +467,8 @@ def seed_history(
                       'manifest_sha256',manifest_sha256,'policy',policy,
                       'authority_generation',authority_generation)
                   FROM scoped WHERE revision IS NOT NULL AND authority_generation IS NOT NULL
-                    AND NOT logical_pending AND NOT retirement_pending AND NOT retirement_intent
+                    AND NOT logical_pending AND (additive_membership_generation OR NOT retirement_pending)
+                    AND NOT retirement_intent
                   ON CONFLICT(tenant_id,source_id,logical_document_id) DO NOTHING
                   RETURNING source_id,logical_document_id
                 )
@@ -503,7 +503,9 @@ def seed_history(
                             "retirement_pending",
                             "retirement_intent",
                         )
-                        if row[name]
+                        if row[name] and not (
+                            name == "retirement_pending" and row["additive_membership_generation"]
+                        )
                     ]
                 )
                 if row["revision"] is not None and row["authority_generation"] is None:

@@ -290,6 +290,7 @@ def collapse_document_candidates(
     source_boost: tuple[tuple[str, ...], float] | None = None,
     passage_budget: int | Literal["admitted"] | None = None,
     dense_nominations: frozenset[tuple[str, str]] | None = None,
+    preserve_arm_passages: bool = False,
 ) -> list[dict[str, Any]]:
     """Fuse mechanical hints while keeping their strongest exact ranges.
 
@@ -312,6 +313,8 @@ def collapse_document_candidates(
     ``passage_budget="admitted"`` reallocates the legacy range count by passage
     RRF while preserving every admitted parent; an integer freezes that capacity
     for an authority rebuild. ``None`` retains the legacy per-parent selector.
+    ``preserve_arm_passages`` protects each arm's first ``nominate_per_arm``
+    distinct passages inside that capacity, after the admitted-parent floor.
     """
 
     documents: dict[str, dict[str, Any]] = {}
@@ -324,6 +327,7 @@ def collapse_document_candidates(
         ))
     ):
         raise ValueError("passage budget requires RRF and admitted or bounded integer capacity")
+    passage_nominations: set[tuple[str, str, str]] = set()
     for leg_name, weight, rows in legs:
         seen_passages: set[tuple[str, str, str]] = set()
         leg_scores, normalized = leg_document_scores(rows, mode=fusion)
@@ -387,6 +391,8 @@ def collapse_document_candidates(
                 if identity not in seen_passages:
                     passage_scores[identity] = passage_scores.get(identity, 0.0) + weight / (60 + rank)
                     seen_passages.add(identity)
+                    if preserve_arm_passages and len(seen_passages) <= nominate_per_arm:
+                        passage_nominations.add(identity)
             prior = value["_ranges"].get(range_key)
             arm_top = value["_arm_tops"].get(leg_name)
             replace_range = prior is None or float(row["score"]) > float(prior["score"])
@@ -495,7 +501,11 @@ def collapse_document_candidates(
                 represented.add(key[:2])
         if len(selected_passages) > budget:
             raise ValueError("admitted parents exceed native passage capacity")
-        for key in ordered_passages:
+        # Keep each admitted parent, then protect strong evidence from individual
+        # arms before agreement-based fill. Reuse the existing nomination breadth;
+        # excluded parents never refill the arm prefix or enlarge this capacity.
+        protected = [key for key in ordered_passages if key in passage_nominations]
+        for key in (*protected, *ordered_passages):
             if len(selected_passages) >= budget:
                 break
             selected_passages.add(key)
@@ -2703,6 +2713,7 @@ class PassageHintRetrieval:
         )
         if balanced_passages:
             collapse_options["passage_budget"] = "admitted"
+            collapse_options["preserve_arm_passages"] = True
             collapse_options["dense_nominations"] = dense_nominations
         results = collapse_document_candidates(legs, **collapse_options)
         if balanced_passages:

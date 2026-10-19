@@ -70,6 +70,33 @@ class ToolUnitContractTest(unittest.TestCase):
         value = envelope(); value['message']['content'][0]['name'] = 'SendMessage'
         self.assertEqual(resolve(json.dumps(value), INPUT), (TEXT,'tool_input'))
 
+    def test_request_replay_blob_preserves_inner_role_and_exact_leaf(self):
+        for kind, ref in [('input', INPUT), ('result', RESULT)]:
+            value = envelope(kind)
+            value['type'] = 'api-request-blob'
+            # The producer hash is replay dedup metadata, not receipt authority.
+            value['hash'] = 'untrusted-replay-hash'
+            self.assertEqual(resolve(json.dumps(value), ref), (TEXT, 'tool_' + kind))
+            for outer in [None, 'unknown', 'api-request', 'api-request-shape',
+                          'user' if kind == 'input' else 'assistant']:
+                bad = copy.deepcopy(value)
+                bad['type'] = outer
+                with self.subTest(kind=kind, outer=outer), self.assertRaises(ValueError):
+                    resolve(json.dumps(bad), ref)
+            bad = copy.deepcopy(value)
+            del bad['type']
+            with self.assertRaises(ValueError):
+                resolve(json.dumps(bad), ref)
+            for target in ['outer', 'inner']:
+                bad = copy.deepcopy(value)
+                (bad if target == 'outer' else bad['message'])['channel'] = 'analysis'
+                with self.subTest(kind=kind, target=target), self.assertRaises(ValueError):
+                    resolve(json.dumps(bad), ref)
+            bad = copy.deepcopy(value)
+            bad['message']['role'] = 'user' if kind == 'input' else 'assistant'
+            with self.assertRaises(ValueError):
+                resolve(json.dumps(bad), ref)
+
     def test_escaped_unicode_empty_keys_and_identical_leaves_keep_identity(self):
         value = envelope(); value['message']['content'][0]['input'] = {'a/b~🙂': [TEXT, TEXT], '': TEXT}
         base = 'claude.tool-input.string.v1#/message/content/0/input/'
@@ -151,6 +178,28 @@ class ToolUnitCaptureTest(unittest.TestCase):
                     for _,args,_ in client.calls:
                         encoded=re.search(r"TOOL_UNIT_RESOLVER = '([^']+)'",args['program']).group(1)
                         self.assertEqual(gzip.decompress(base64.b64decode(encoded)),(inspect.getsource(resolve)+'\n'+inspect.getsource(capture._read_page)+'\n'+inspect.getsource(capture._page_stdout)).encode())
+
+    def test_request_replay_blob_uses_same_embedded_resolver_and_receipts(self):
+        for kind, ref in [('input', INPUT), ('result', RESULT)]:
+            value = envelope(kind)
+            value['type'] = 'api-request-blob'
+            for split in [False, True]:
+                with self.subTest(kind=kind, split=split):
+                    hit = tool_mount(self.mount, kind=kind, content=value, split=split)
+                    before = {p.name: p.read_bytes() for p in self.mount.iterdir()}
+                    row, client = self.run_capture(hit)
+                    self.assertTrue(row['complete_selected_passages'], row)
+                    self.assertEqual(row['text'], TEXT)
+                    span = row['source_evidence'][0]['spans'][0]
+                    self.assertEqual(span['source_unit'], ref)
+                    self.assertEqual(span['source_origin'], 'tool_' + kind)
+                    self.assertEqual(span['receipts'], [RECEIPT])
+                    self.assertEqual(before, {p.name: p.read_bytes() for p in self.mount.iterdir()})
+                    for _, args, _ in client.calls:
+                        encoded = re.search(r"TOOL_UNIT_RESOLVER = '([^']+)'", args['program']).group(1)
+                        self.assertEqual(gzip.decompress(base64.b64decode(encoded)),
+                            (inspect.getsource(resolve) + '\n' + inspect.getsource(capture._read_page)
+                             + '\n' + inspect.getsource(capture._page_stdout)).encode())
 
     def test_two_passages_maximum_supported_spans_preserve_program_bound(self):
         original=''.join(chr(65+i%26)for i in range(256))

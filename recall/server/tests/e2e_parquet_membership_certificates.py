@@ -9,6 +9,7 @@ from unittest.mock import patch
 from psycopg import ServerCursor, sql
 
 from e2e_parent_membership_enrollment import ParentEnrollmentTests
+from recall_server import parent_membership_enrollment as enrollment
 from recall_server import parent_membership_read as reader
 from recall_server.db import SearchDeadlineExceeded
 from recall_server.logical_evidence import LogicalEvidenceProjectionStore
@@ -212,7 +213,7 @@ class ParquetCertificateTests(ParentEnrollmentTests):
         self.assertEqual(native.call_count, 1)
         self.assertEqual(native.call_args.kwargs['receipts'], (self.physical_receipt,))
 
-    def test_changed_exact_binding_fields_always_use_native(self):
+    def test_changed_fields_follow_exact_binding_contract(self):
         changes = (
             ('canonical_passages', 'text_sha256', 'a' * 64),
             ('canonical_passages', 'receipts', ['recall://' + self.source + '/missing?rev=1#item=0']),
@@ -232,7 +233,14 @@ class ParquetCertificateTests(ParentEnrollmentTests):
                 with patch('recall_server.receipt_membership.lookup_current_search_membership',
                            wraps=lookup_current_search_membership) as native:
                     self.assertEqual(self.stream(), baseline)
-                self.assertEqual(native.call_count, 1)
+                stable = column not in enrollment._BINDING_FIELDS
+                self.assertEqual(native.call_count, 0 if stable else 1)
+                if stable:
+                    self.assertTrue(baseline)
+                    compared = self.compare()
+                    self.assertEqual(compared['native_allowed_passages'], len(self.ids))
+                    self.assertEqual(compared['certified_passages'], len(self.ids))
+                    self.assertEqual(compared['disagreements'], 0)
                 with self.store.connect() as c:
                     c.execute(update, (old, self.tenant))
 
@@ -374,14 +382,20 @@ class ParquetCertificateTests(ParentEnrollmentTests):
         with patch('recall_server.receipt_membership.lookup_current_search_membership',
                    wraps=lookup_current_search_membership) as native:
             self.assertEqual(self.stream(), baseline)
-        self.assertEqual(native.call_count, 1)
+        self.assertEqual(native.call_count, 0 if self.additive_membership_generation else 1)
+        self.assertEqual(self.stream(False), baseline)
+        if self.additive_membership_generation:
+            compared = self.compare()
+            self.assertEqual(compared['native_allowed_passages'], len(self.ids))
+            self.assertEqual(compared['certified_passages'], len(self.ids))
+            self.assertEqual(compared['disagreements'], 0)
         self.enroll()
         with patch('recall_server.receipt_membership.lookup_current_search_membership',
                    wraps=lookup_current_search_membership) as native:
             self.assertEqual(self.stream(), baseline)
         native.assert_not_called()
 
-    def test_publication_revision_change_uses_native_without_dropping_passage(self):
+    def test_publication_revision_change_preserves_native_rows_under_binding_contract(self):
         self.enroll()
         with self.store.connect() as c:
             c.execute('UPDATE canonical_passage_documents SET revision=revision+1 WHERE tenant_id=%s',
@@ -391,7 +405,98 @@ class ParquetCertificateTests(ParentEnrollmentTests):
         with patch('recall_server.receipt_membership.lookup_current_search_membership',
                    wraps=lookup_current_search_membership) as native:
             self.assertEqual(self.stream(), baseline)
+        stable = 'projected_revision' not in enrollment._BINDING_FIELDS
+        self.assertEqual(native.call_count, 0 if stable else 1)
+        if stable:
+            compared = self.compare()
+            self.assertEqual(compared['native_allowed_passages'], len(self.ids))
+            self.assertEqual(compared['certified_passages'], len(self.ids))
+            self.assertEqual(compared['disagreements'], 0)
+        self.edit()
+        with patch('recall_server.receipt_membership.lookup_current_search_membership',
+                   wraps=lookup_current_search_membership) as native:
+            self.assertEqual(self.stream(), [])
         self.assertEqual(native.call_count, 1)
+        self.assertEqual(self.stream(False), [])
+
+    def test_stream_orders_before_receipt_filter_and_enrichment(self):
+        self.store.search_deadline_ms = 5000
+        self.enroll()
+        self.clone_passages(2001, self.physical_receipt)
+        connect = self.store.connect
+        plans, batches = [], []
+        class Cursor(ServerCursor):
+            def execute(cursor, statement, parameters=None, **kwargs):
+                declaration = cursor._make_declare_statement(statement).as_string()
+                plans.append(cursor.connection.execute(
+                    'EXPLAIN (FORMAT JSON) ' + declaration, parameters
+                ).fetchone()['QUERY PLAN'][0]['Plan'])
+                return super().execute(statement, parameters, **kwargs)
+            def fetchmany(cursor, size=0):
+                rows = super().fetchmany(size)
+                batches.append(len(rows))
+                return rows
+        class Connection:
+            def __init__(self, connection): self.connection = connection
+            def __getattr__(self, name): return getattr(self.connection, name)
+            def cursor(self, name):
+                return Cursor(self.connection, name, row_factory=self.connection.row_factory)
+        @contextmanager
+        def connected():
+            with connect() as connection:
+                yield Connection(connection)
+        with patch.object(self.store, 'connect', side_effect=connected):
+            actual = self.stream()
+        self.assertEqual(batches, [2000, 2, 0])
+        self.assertEqual(actual, self.stream(False))
+        self.assertEqual(len(actual), 2002)
+        self.assertEqual(actual, sorted(actual, key=lambda row: (
+            row['logical_document_id'], row['first_occurred_at'],
+            row['last_occurred_at'], row['passage_id'])))
+        def nodes(node):
+            yield node
+            for child in node.get('Plans', ()):
+                yield from nodes(child)
+        sorts = [node for node in nodes(plans[0]) if 'Sort' in node['Node Type']]
+        self.assertTrue(sorts, plans)
+        for sort in sorts:
+            for node in nodes(sort):
+                self.assertNotIn('cardinality', str(node.get('Filter', '')))
+                self.assertNotIn(node.get('Relation Name'), (
+                    'canonical_passage_actors', 'brain_actors',
+                    'canonical_evidence_documents', 'canonical_passage_documents',
+                    'canonical_parent_authority'))
+
+    def test_defensive_empty_receipt_filter_keeps_eof_and_metadata(self):
+        self.clone_passages(3, self.physical_receipt)
+        # Historical/corrupt state only: current schema rejects empty receipts.
+        # Restore the exact constraint after deleting the invalid fixture rows.
+        with self.store.connect() as connection:
+            constraint = connection.execute("""SELECT conname,pg_get_constraintdef(oid) AS definition
+                FROM pg_constraint WHERE conrelid='canonical_passages'::regclass
+                  AND contype='c' AND pg_get_constraintdef(oid) LIKE '%%cardinality(receipts)%%'""").fetchone()
+            self.assertIsNotNone(constraint)
+            connection.execute(sql.SQL('ALTER TABLE canonical_passages DROP CONSTRAINT {}').format(
+                sql.Identifier(constraint['conname'])))
+            connection.execute("UPDATE canonical_passages SET receipts=ARRAY[]::text[] "
+                "WHERE tenant_id=%s AND passage_id=ANY(%s)",
+                (self.tenant, ['psg_' + f'{i:032x}' for i in (0, 2)]))
+        try:
+            disabled = self.stream(False)
+            enabled = self.stream()
+            self.assertEqual(enabled, disabled)
+            self.assertEqual(len(enabled), 2)
+            self.assertTrue(all(row['receipts'] for row in enabled))
+        finally:
+            with self.store.connect() as connection:
+                connection.execute('DELETE FROM canonical_passages WHERE tenant_id=%s '
+                    'AND cardinality(receipts)=0', (self.tenant,))
+                connection.execute(sql.SQL('ALTER TABLE canonical_passages ADD CONSTRAINT {} ').format(
+                    sql.Identifier(constraint['conname'])) + sql.SQL(constraint['definition']))
+                restored = connection.execute("SELECT pg_get_constraintdef(oid) AS definition,convalidated "
+                    "FROM pg_constraint WHERE conrelid='canonical_passages'::regclass AND conname=%s",
+                    (constraint['conname'],)).fetchone()
+                self.assertEqual(restored, dict(definition=constraint['definition'], convalidated=True))
 
     def test_no_certificate_overhead_needs_no_second_metadata_query(self):
         original = self.store._execute_bounded

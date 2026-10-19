@@ -20,6 +20,8 @@ def resolve_claude_tool_source_unit(record_text, source_unit):
     Claude input is arbitrary JSON. Claude result content is a literal string
     or an array of provider blocks whose declared text fields can be addressed.
     JSON-looking strings are never parsed a second time.
+    api-request-blob is a replay wrapper carrying the inner provider message;
+    it does not establish a new utterance or tool execution.
     """
     import json
 
@@ -62,7 +64,7 @@ def resolve_claude_tool_source_unit(record_text, source_unit):
         value = json.loads(record_text, object_pairs_hook=unique, parse_constant=lambda _: refuse())
         message = value['message']
         role = 'assistant' if kind == 'input' else 'user'
-        if (value.get('type') != role or message.get('role') != role
+        if (value.get('type') not in (role, 'api-request-blob') or message.get('role') != role
                 or value.get('channel') == 'analysis' or message.get('channel') == 'analysis'
                 or not isinstance(message.get('content'), list)):
             refuse()

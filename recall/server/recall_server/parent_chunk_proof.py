@@ -28,6 +28,12 @@ CAPTURE_DETAIL_FIELDS = (
 )
 
 
+def _attempt_phase(diagnostic, phase):
+    """Content-free attempt timing only; never authority or commit evidence."""
+    if diagnostic is not None:
+        diagnostic.update(phase=phase, started=time.monotonic())
+
+
 @contextmanager
 def _capture_stage(metrics, timer, counter=None):
     if metrics is None:
@@ -183,11 +189,43 @@ def read_parent_catalog(store, connection, scope, deadline_at, *, lock=False):
     return found
 
 
-def _capture(store, spool, scope, limits, deadline_at, *, capture_metrics=None):
+def _verified_stream_chunks(row, membership):
+    """Feed same-snapshot SQL fields to the unchanged native receipt validators."""
+    from .receipt_membership import (
+        ReceiptMembershipError, _identity, document_chunk_requests,
+        receipt_metadata_from_rows, verified_document_chunk_metadata,
+    )
+    physical = row['chunks']
+    row['chunks'] = [{key: chunk[key] for key in
+        ('ordinal', 'receipt', 'text_sha256', 'pg_bytes')} for chunk in physical]
+    requested = document_chunk_requests(row['source_id'], [row])
+    records = []
+    for receipt, chunk in zip(requested[row['document_id']], physical or [None]):
+        source, native, revision, ordinal = _identity(receipt)
+        # The original lookup joins by these parsed keys. A foreign physical
+        # receipt cannot gain the captured document's authority by skipping it.
+        if (source, native, revision, ordinal) != (
+                row['source_id'], row['native_id'], row['revision'],
+                0 if chunk is None else chunk['ordinal']):
+            raise ReceiptMembershipError('receipt_membership_identity_invalid')
+        records.append({**{key: row[key] for key in
+            ('tenant_id', 'source_id', 'document_id', 'native_id', 'revision')},
+            **membership, 'document_text_sha256': row['text_sha256'],
+            'requested_receipt': receipt, 'requested_ordinal': ordinal,
+            **({key: chunk[key] for key in ('chunk_id', 'ordinal', 'receipt', 'text_sha256')}
+               if chunk is not None else dict(chunk_id=None, ordinal=None, receipt=None, text_sha256=None)),
+            'chunk_deleted_at': None})
+    members = receipt_metadata_from_rows(records)
+    return verified_document_chunk_metadata([row], requested, members)[row['document_id']]
+
+
+def _capture(store, spool, scope, limits, deadline_at, *, capture_metrics=None, diagnostic=None):
     if capture_metrics is not None:
         for field in CAPTURE_DETAIL_FIELDS:
             capture_metrics.setdefault(field, 0.0 if field.endswith('_ms') else 0)
+    _attempt_phase(diagnostic, 'capture_connection')
     with store.connect() as connection, connection.transaction():
+        _attempt_phase(diagnostic, 'capture_sql')
         connection.execute('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY')
         catalog = read_parent_catalog(store, connection, scope, deadline_at)
         manifest = catalog['manifest']
@@ -196,13 +234,32 @@ def _capture(store, spool, scope, limits, deadline_at, *, capture_metrics=None):
             ORDER BY part_ordinal LIMIT %s''', (*scope[:2], manifest['logical_document_id'], manifest['revision'], limits.max_parts + 1), deadline_at).fetchall()
         if len(parts) > limits.max_parts:
             raise _error('parent_retirement_metadata_budget')
-        sql = '''SELECT selected.*,items.chunks FROM (''' + _DOCUMENTS_SQL + ''') selected
+        verify_membership = getattr(store, 'verified_singleton_receipts', False)
+        selected_sql, chunk_columns = _DOCUMENTS_SQL, ''
+        if verify_membership:
+            from .receipt_membership import lookup_receipt_metadata
+            # Retain the native scope/type checks without issuing another query.
+            lookup_receipt_metadata(store, tenant_id=scope[0], authorized_sources=(scope[1],),
+                receipts=(), allow_verified_singletons=True, connection=connection, deadline_at=deadline_at)
+            membership_columns = ''', authority.is_current AS membership_current,
+                authority.deleted_at AS membership_deleted,
+                authority.chunk_receipt_profile AS membership_profile,
+                CASE WHEN authority.chunk_receipt_profile IS NOT NULL THEN EXISTS (
+                    SELECT 1 FROM canonical_chunks remaining
+                    WHERE remaining.tenant_id=authority.tenant_id AND remaining.source_id=authority.source_id
+                      AND remaining.document_id=authority.document_id
+                ) ELSE false END AS membership_physical'''
+            membership_join = ''' JOIN canonical_documents authority
+                ON authority.tenant_id=captured.tenant_id AND authority.source_id=captured.source_id
+                  AND authority.document_id=captured.document_id'''
+            selected_sql = 'SELECT captured.*' + membership_columns + ' FROM (' + _DOCUMENTS_SQL + ') captured' + membership_join
+            chunk_columns = ',chunk_id'
+        sql = '''SELECT selected.*,items.chunks FROM (''' + selected_sql + ''') selected
             CROSS JOIN LATERAL (SELECT coalesce(jsonb_agg(to_jsonb(item) ORDER BY item.ordinal),'[]'::jsonb) AS chunks
-                FROM (SELECT ordinal,receipt,text_sha256,octet_length(text_redacted) AS pg_bytes
+                FROM (SELECT ordinal,receipt,text_sha256,octet_length(text_redacted) AS pg_bytes''' + chunk_columns + '''
                       FROM canonical_chunks WHERE tenant_id=selected.tenant_id AND source_id=selected.source_id
                         AND document_id=selected.document_id AND deleted_at IS NULL ORDER BY ordinal LIMIT %s) item) items'''
-        count, chunk_count = 0, 0
-        verify_membership = getattr(store, 'verified_singleton_receipts', False)
+        count, chunk_count, physical_count = 0, 0, 0
         store._set_statement_deadline(connection, deadline_at)
         with connection.cursor() as cursor:
             # Pinned psycopg binary supports bounded libpq result chunks. One
@@ -221,59 +278,48 @@ def _capture(store, spool, scope, limits, deadline_at, *, capture_metrics=None):
                         capture_metrics['metadata_rows'] += 1
                     with _capture_stage(capture_metrics, 'metadata_spool_ms'):
                         count += 1
-                        chunk_count += len(row['chunks'])
-                        if count > limits.max_documents or chunk_count > limits.max_chunks or len(row['chunks']) > limits.batch_chunks:
+                        physical_count += len(row['chunks'])
+                        if count > limits.max_documents or physical_count > limits.max_chunks or len(row['chunks']) > limits.batch_chunks:
                             raise _error('parent_retirement_metadata_budget')
-                        if verify_membership:
-                            # Match the native verifier's serialization order, without
-                            # rewriting unchanged physical rows after verification.
-                            row['chunks'] = [{key: chunk[key] for key in
-                                ('ordinal', 'receipt', 'text_sha256', 'pg_bytes')}
-                                for chunk in row['chunks']]
                         row.update(pending=catalog['queue'] is not None,
                                    pg_body_bytes=sum(chunk['pg_bytes'] for chunk in row['chunks']))
+                    if verify_membership:
+                        membership = dict(is_current=row.pop('membership_current'),
+                            document_deleted_at=row.pop('membership_deleted'),
+                            profile=row.pop('membership_profile'),
+                            physical_chunks_remain=row.pop('membership_physical'))
+                        # Local validation, not another SQL call. Stream chunks,
+                        # per-document chunks and the final spool remain bounded.
+                        with _capture_stage(capture_metrics, 'metadata_membership_ms'):
+                            row['chunks'] = _verified_stream_chunks(row, membership)
+                        membership = None
+                    with _capture_stage(capture_metrics, 'metadata_spool_ms'):
+                        chunk_count += len(row['chunks'])
+                        if chunk_count > limits.max_chunks or len(row['chunks']) > limits.batch_chunks:
+                            raise _error('parent_retirement_metadata_budget')
                         spool.add_document(row)
                         _check_deadline(deadline_at)
                     row = None
             finally:
                 stream.close()
-        if verify_membership:
-            from .receipt_membership import verified_document_chunks
-            # Synchronize the completed stream before native pipelined queries,
-            # preserving the same absolute deadline and repeatable-read snapshot.
-            store._set_statement_deadline(connection, deadline_at)
-            chunk_count = 0
-            for documents in spool.membership_batches():
-                with _capture_stage(capture_metrics, 'metadata_membership_ms', 'metadata_membership_calls'):
-                    proven = verified_document_chunks(store, connection, tenant_id=scope[0], source_id=scope[1],
-                        documents=documents, deadline_at=deadline_at)
-                with _capture_stage(capture_metrics, 'metadata_spool_ms'):
-                    for document in documents:
-                        chunks = proven[document['document_id']]
-                        chunk_count += len(chunks)
-                        if chunk_count > limits.max_chunks or len(chunks) > limits.batch_chunks:
-                            raise _error('parent_retirement_metadata_budget')
-                        if chunks != document['chunks']:
-                            spool.replace_chunks(document['document_id'], chunks)
-                        _check_deadline(deadline_at)
-                documents = proven = document = chunks = None
         spool.index.commit()
     return catalog, parts, count, chunk_count
 
 
 @contextmanager
-def prove_parent_chunks(store, archive, *, scope, limits, deadline_at, purpose="retire", capture_metrics=None):
+def prove_parent_chunks(store, archive, *, scope, limits, deadline_at, purpose="retire", capture_metrics=None, diagnostic=None):
     """Yield a complete sealed metadata proof only after all bytes are verified."""
     if purpose not in {"retire", "locate"}:
         raise _error("parent_proof_purpose_invalid")
     with ParentMetadataSpool(max_bytes=limits.max_spool_bytes) as spool:
         capture_started = time.monotonic() if capture_metrics is not None else None
         try:
-            catalog, parts, count, chunk_count = _capture(store, spool, scope, limits, deadline_at, capture_metrics=capture_metrics)
+            catalog, parts, count, chunk_count = _capture(store, spool, scope, limits, deadline_at, capture_metrics=capture_metrics, diagnostic=diagnostic)
         finally:
             if capture_metrics is not None:
                 # Attempt wall time includes failed reads and local metadata spooling.
                 capture_metrics['metadata_capture_ms'] = (time.monotonic() - capture_started) * 1000
+        _attempt_phase(diagnostic, 'archive_proof')
         manifest = catalog['manifest']
         meter = _MeteredArchive(archive, deadline_at)
         excluded, eligible, eligible_bytes, groups = Counter(), 0, 0, 0
@@ -316,7 +362,9 @@ def prove_parent_chunks(store, archive, *, scope, limits, deadline_at, purpose="
                 raise _error('parent_retirement_archive_proof_required')
         spool.index.commit()
         identity = manifest_identity(manifest)
+        _attempt_phase(diagnostic, 'proof_recheck_connection')
         with store.connect() as connection:
+            _attempt_phase(diagnostic, 'proof_recheck_sql')
             current = read_parent_catalog(store, connection, scope, deadline_at)
             if (manifest_identity(current['manifest']) != identity or purpose == 'locate'
                     and current['manifest']['created_at'] != manifest['created_at']):

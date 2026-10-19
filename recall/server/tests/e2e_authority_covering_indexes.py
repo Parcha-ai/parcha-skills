@@ -271,16 +271,25 @@ class AuthorityIndexOperationTest(unittest.TestCase):
             self.assertGreater(node['Actual Loops'],0,(name,node))
 
     def test_visibility_setup_waits_for_older_transaction_then_keeps_plan_assertions(self):
+        sleep = time.sleep
         with psycopg.connect(self.dsn) as holder:
             holder.execute('SELECT pg_current_xact_id()')
-            def release(_seconds):
-                state = self.conn.execute("""SELECT relpages,relallvisible FROM pg_class
-                    WHERE oid='canonical_chunks'::regclass""").fetchone()
-                self.assertLess(state['relallvisible'], state['relpages'])
-                holder.rollback()
+            released = False
+            def release(seconds):
+                nonlocal released
+                if not released:
+                    state = self.conn.execute("""SELECT relpages,relallvisible FROM pg_class
+                        WHERE oid='canonical_chunks'::regclass""").fetchone()
+                    self.assertLess(state['relallvisible'], state['relpages'])
+                    holder.rollback()
+                    released = True
+                # Other old transactions may delay visibility after this one.
+                # Keep the setup's bounded wait instead of spinning or counting it.
+                sleep(seconds)
             with patch('time.sleep', side_effect=release) as waited:
                 self.test_current_authority_query_uses_covering_indexes_without_heap_fetches()
-            self.assertEqual(waited.call_count, 1)
+            self.assertTrue(released)
+            self.assertGreaterEqual(waited.call_count, 1)
 
     def test_visibility_setup_persistent_transaction_fails_before_plan(self):
         with psycopg.connect(self.dsn) as holder:

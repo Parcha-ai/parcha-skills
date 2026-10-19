@@ -123,18 +123,8 @@ class Thinning(unittest.TestCase):
 
     def test_source_collision_stays_zipped_and_tenant_scoped(self):
         _, first = self.insert('collision:a', source='source:a')
-        _, second = self.insert('collision:b', source='source:b', omit_chunks=True)
-        with self.store.connect() as c:
-            # Build an intentional cross-source document-id collision while
-            # preserving foreign keys; source identities remain distinct.
-            c.execute('UPDATE canonical_documents SET document_id=%s WHERE tenant_id=%s AND source_id=%s AND document_id=%s',
-                      (first, self.tenant, 'source:b', second))
-            c.execute('''INSERT INTO canonical_chunks
-                         (tenant_id,source_id,chunk_id,document_id,ordinal,receipt,text_redacted,text_sha256)
-                         SELECT tenant_id,'source:b',chunk_id,document_id,ordinal,
-                                receipt || '/b',text_redacted,text_sha256
-                           FROM canonical_chunks WHERE tenant_id=%s AND source_id='source:a' ''',
-                      (self.tenant,))
+        # Equal IDs across sources are valid when established at insertion.
+        self.insert('collision:b', source='source:b', document_id=first)
         self.thinner.WINDOW_SIZE = 1
         self.assertEqual(self.thinner.thin(batch_size=10)['documents'], 1)
         self.assertEqual(self.remaining(), 1)
@@ -258,6 +248,146 @@ class Thinning(unittest.TestCase):
         second = thinner.thin(batch_size=1)
         self.assertEqual(second['historical_probe_timeouts'], 0)
         self.assertEqual(second['documents'], 1)
+        self.assertEqual(self.remaining(), 0)
+
+    def test_real_key_timeout_retains_prefix_and_still_thins_committed_hint(self):
+        ids = sorted([self.insert('key-history')[1], self.insert('key-fresh')[1]])
+        owner, windows = self, []
+        class Connection:
+            def __init__(self, connection): self.connection = connection
+            def __getattr__(self, name): return getattr(self.connection, name)
+            def execute(self, query, params):
+                if (query.lstrip().startswith('SELECT source_id,document_id')
+                        and 'ORDER BY source_id DESC' not in query):
+                    windows.append(params)
+                    if len(windows) == 1:
+                        # Keep the actual worker2s statement limit. No fake
+                        # Python cancellation or modified native proof query.
+                        self.connection.execute('SELECT pg_sleep(3)')
+                        raise AssertionError('native key deadline did not fire')
+                return self.connection.execute(query, params)
+        class TimeoutStore:
+            @contextmanager
+            def connect(self):
+                with owner.store.connect() as connection:
+                    yield Connection(connection)
+        thinner = CanonicalBodyThinner(TimeoutStore(), tenant_id=self.tenant)
+        first = thinner.thin(batch_size=1,
+            committed_keys=((self.tenant, self.source, ids[1]),))
+        self.assertEqual(first['historical_probe_timeouts'], 1)
+        self.assertEqual(first['historical_window_size'], 512)
+        self.assertEqual(first['documents'], 1)
+        self.assertEqual(first['scanned_keys'], 0)
+        self.assertFalse(first['pass_complete'])
+        self.assertIsNone(thinner._after)
+        self.assertEqual(thinner._through, (self.source, ids[1]))
+        with self.store.connect() as c:
+            locations = {row['document_id']: row['body_location'] for row in c.execute(
+                'SELECT document_id,body_location FROM canonical_documents WHERE tenant_id=%s',
+                (self.tenant,)).fetchall()}
+        self.assertEqual(locations, {ids[0]: 'inline', ids[1]: 'chunks'})
+        second = thinner.thin(batch_size=1)
+        self.assertEqual(second['historical_probe_timeouts'], 0)
+        self.assertEqual(second['documents'], 1)
+        self.assertEqual(self.remaining(), 0)
+        self.assertEqual([row[-1] for row in windows], [1024, 512])
+        self.assertEqual(windows[0][:-1], windows[1][:-1])
+
+    def test_successful_full_key_window_recovers_capacity_after_transient_cancel(self):
+        documents = sorted(self.insert('capacity:' + str(i))[1] for i in range(3))
+        owner, injected = self, []
+        class Connection:
+            def __init__(self, connection): self.connection = connection
+            def __getattr__(self, name): return getattr(self.connection, name)
+            def execute(self, query, params):
+                if (query.lstrip().startswith('SELECT source_id,document_id')
+                        and 'ORDER BY source_id DESC' not in query and not injected):
+                    injected.append(True)
+                    self.connection.execute("SET LOCAL statement_timeout='10ms'")
+                    self.connection.execute('SELECT pg_sleep(0.05)')
+                    raise AssertionError('native key timeout did not fire')
+                return self.connection.execute(query, params)
+        class TimeoutStore:
+            @contextmanager
+            def connect(self):
+                with owner.store.connect() as connection:
+                    yield Connection(connection)
+        thinner = CanonicalBodyThinner(TimeoutStore(), tenant_id=self.tenant)
+        thinner.WINDOW_SIZE = 2
+        first = thinner.thin(batch_size=10)
+        self.assertEqual(first['historical_probe_timeouts'], 1)
+        self.assertEqual(first['historical_window_size'], 1)
+        self.assertIsNone(thinner._after)
+        self.assertEqual(self.remaining(), 3)
+        second = thinner.thin(batch_size=10)
+        self.assertEqual(second['documents'], 1)
+        self.assertEqual(thinner._after, (self.source, documents[0]))
+        self.assertEqual(second['historical_window_size'], 2)
+        third = thinner.thin(batch_size=10)
+        self.assertEqual(third['documents'], 2)
+        self.assertEqual(third['historical_window_size'], 2)
+        self.assertEqual(self.remaining(), 0)
+
+    def test_upper_key_timeout_aborts_without_hints_or_invented_bound(self):
+        from psycopg.errors import QueryCanceled
+        _, document = self.insert('upper-timeout')
+        owner = self
+        class Connection:
+            def __init__(self, connection): self.connection = connection
+            def __getattr__(self, name): return getattr(self.connection, name)
+            def execute(self, query, params):
+                if 'ORDER BY source_id DESC' in query:
+                    self.connection.execute("SET LOCAL statement_timeout='10ms'")
+                    self.connection.execute('SELECT pg_sleep(0.05)')
+                    raise AssertionError('native bound timeout did not fire')
+                return self.connection.execute(query, params)
+        class TimeoutStore:
+            @contextmanager
+            def connect(self):
+                with owner.store.connect() as connection:
+                    yield Connection(connection)
+        thinner = CanonicalBodyThinner(TimeoutStore(), tenant_id=self.tenant)
+        with self.assertRaises(QueryCanceled):
+            thinner.thin(batch_size=1,
+                committed_keys=((self.tenant, self.source, document),))
+        self.assertEqual(self.remaining(), 1)
+        self.assertIsNone(thinner._through)
+        self.assertIsNone(thinner._after)
+        self.assertEqual(thinner._window_size, 1024)
+        self.assertEqual(list(thinner._committed_keys), [(self.source, document)])
+
+    def test_key_timeout_still_refuses_newly_queued_hint(self):
+        _, document = self.insert('hint-revoked')
+        owner, injected = self, []
+        class Connection:
+            def __init__(self, connection): self.connection = connection
+            def __getattr__(self, name): return getattr(self.connection, name)
+            def execute(self, query, params):
+                if (query.lstrip().startswith('SELECT source_id,document_id')
+                        and 'ORDER BY source_id DESC' not in query and not injected):
+                    injected.append(True)
+                    owner.queue('hint-revoked')
+                    self.connection.execute("SET LOCAL statement_timeout='10ms'")
+                    self.connection.execute('SELECT pg_sleep(0.05)')
+                    raise AssertionError('native key timeout did not fire')
+                return self.connection.execute(query, params)
+        class TimeoutStore:
+            @contextmanager
+            def connect(self):
+                with owner.store.connect() as connection:
+                    yield Connection(connection)
+        thinner = CanonicalBodyThinner(TimeoutStore(), tenant_id=self.tenant)
+        first = thinner.thin(batch_size=1,
+            committed_keys=((self.tenant, self.source, document),))
+        self.assertEqual(first['historical_probe_timeouts'], 1)
+        self.assertEqual(first['documents'], 0)
+        self.assertEqual(first['committed_hints_pending'], 1)
+        self.assertIsNone(thinner._after)
+        self.assertEqual(self.remaining(), 1)
+        with self.store.connect() as c:
+            c.execute('DELETE FROM canonical_evidence_document_queue WHERE tenant_id=%s',
+                (self.tenant,))
+        self.assertEqual(thinner.thin(batch_size=1)['documents'], 1)
         self.assertEqual(self.remaining(), 0)
 
     def test_missing_manifest_raw_authority_and_deleted_document_refuse(self):

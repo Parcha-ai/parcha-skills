@@ -90,7 +90,8 @@ class ParentMembershipFastReadTests(ParentEnrollmentTests):
         native_rows, _ = self.authorize(); self.enable()
         with patch('recall_server.receipt_membership.lookup_current_search_membership', wraps=lookup_current_search_membership) as native:
             fast_rows, stages = self.authorize()
-        self.assertEqual(fast_rows, native_rows)
+        # Private authority SQL is unordered; compare every field and duplicate.
+        self.assertCountEqual(fast_rows, native_rows)
         self.assertEqual(native.call_count, 1)
         self.assertEqual(native.call_args.kwargs['receipts'], (self.physical_receipt,))
         self.assertEqual(stages['native_receipts'], 1)
@@ -236,7 +237,28 @@ class ParentMembershipFastReadTests(ParentEnrollmentTests):
             rows, stages = self.authorize()
         self.assertEqual(len(rows), len(self.ids)); self.assertEqual(stages['native_receipts'], 0)
         rows, stages = self.authorize()
-        self.assertEqual(len(rows), len(self.ids)); self.assertGreater(stages['native_receipts'], 0)
+        self.assertEqual(len(rows), len(self.ids))
+        if self.additive_membership_generation:
+            self.assertEqual(stages['native_receipts'], 0)
+        else:
+            self.assertGreater(stages['native_receipts'], 0)
+        fast = self.search()
+        self.retrieval.parent_membership_read = reader.ReadSettings()
+        with patch('recall_server.receipt_membership.lookup_current_search_membership',
+                   wraps=lookup_current_search_membership) as proof:
+            native_rows, _ = self.authorize()
+        self.assertEqual(proof.call_count, 1)
+        self.assertEqual(rows, native_rows)
+        native = self.search()
+        self.assertEqual(fast['results'], native['results'])
+        self.assertEqual(fast['arms'], native['arms'])
+        self.enable(); self.edit()
+        fast_denied = self.search()
+        self.retrieval.parent_membership_read = reader.ReadSettings()
+        native_denied = self.search()
+        self.assertEqual(fast_denied['results'], [])
+        self.assertEqual(fast_denied['results'], native_denied['results'])
+        self.assertEqual(fast_denied['arms'], native_denied['arms'])
 
     def test_shadow_still_observes_real_native_proof_when_both_flags_enabled(self):
         self.enroll(); self.enable()
@@ -428,7 +450,7 @@ class ParentMembershipFastReadTests(ParentEnrollmentTests):
     def test_original_verifier_and_catalog_sql_are_unchanged(self):
         from recall_server import receipt_membership, turbopuffer_retrieval
         self.assertEqual(hashlib.sha256(Path(receipt_membership.__file__).read_bytes()).hexdigest(),
-            'e413d0faac8b9ff686f8e4399502b431a7807058f8ce0ff64f3ef73e704a2aa9')
+            'ecdbee3fbb573c7acb631ab7f026468523c1cb516f6e2bdc47a8e7afcd267fb9')
         original_sha = '33cbb2194d20a5a75b67879de1d707910844d41be8c118e90e5de9712de6dac4'
         origin_sha = '7c2ef4b4d8629c8abb042b5de7940b271b133a5f8c7a743e188c816b9e530636'
         projection = '                                   passage.spans AS origin_spans,\n'

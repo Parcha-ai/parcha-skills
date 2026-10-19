@@ -57,6 +57,8 @@ jobs:
       - name: Parent fallback buffer proof (isolated PostgreSQL 16)
         run: bash server/tests/run_parent_fallback_fixture.sh
       - name: Fresh-PostgreSQL end-to-end suite
+        env:
+          DIAGNOSIS_OUTPUT: ${{ runner.temp }}
         run: |
           for test in \
             e2e_brainstore.py \
@@ -97,6 +99,7 @@ jobs:
             e2e_passage_dispatch_order.py \
             e2e_passage_set_admission.py \
             e2e_passage_source_fairness.py \
+            e2e_passage_parent_fairness.py \
             e2e_passage_lock_contention.py \
             e2e_logical_streaming_progress.py \
             e2e_logical_stream_order.py \
@@ -134,6 +137,7 @@ jobs:
             e2e_parquet_sparse_planning.py \
             e2e_parquet_compaction_reuse.py \
             e2e_parquet_worker_fairness.py \
+            e2e_logical_cadence_readmission.py \
             e2e_parquet_upload_overlap.py \
             e2e_scan_upstream_completeness.py \
             e2e_search_outbox.py \
@@ -145,6 +149,7 @@ jobs:
             e2e_forgotten_trigger_index.py \
             e2e_parent_authority_generation.py \
             e2e_parent_membership_enrollment.py \
+            e2e_membership_additive_epoch.py \
             e2e_parent_membership_publication.py \
             e2e_membership_remainder.py \
             e2e_membership_queue_initialization.py \
@@ -161,6 +166,8 @@ jobs:
             e2e_publication_parent_lock.py \
             e2e_typed_passage_visibility.py \
             e2e_legacy_tool_migration.py \
+            e2e_legacy_tool_lossless_migration.py \
+            e2e_claude_legacy_envelope.py \
             e2e_typed_document_visibility.py \
             e2e_passage_origin.py \
             e2e_long_copied_evidence.py \
@@ -213,6 +220,9 @@ jobs:
             e2e_webhook_ingest.py \
             e2e_remote_worker.py \
             e2e_managed_connector_worker.py \
+            e2e_managed_slack_identity.py \
+            e2e_managed_slack_history_actors.py \
+            e2e_managed_slack_captured_actors.py \
             e2e_workspace_rail.py \
             e2e_retrieval_eval.py \
             e2e_passage_metadata.py \
@@ -258,11 +268,14 @@ jobs:
             e2e_parent_chunk_retirement.py \
             e2e_selective_retirement_experiment.py \
             e2e_parent_retirement_window.py \
+            e2e_retirement_nowork_budget.py \
             e2e_retirement_window_runner.py \
             e2e_retirement_tail_first.py \
             e2e_retirement_no_work_prefix.py \
             e2e_retirement_stream_capture.py \
+            e2e_retirement_stream_membership.py \
             e2e_retirement_part_reuse.py \
+            e2e_retirement_catalog_dedup.py \
             e2e_optional_reconcile_index.py \
             e2e_context_time_index.py \
             e2e_streaming_locators.py \

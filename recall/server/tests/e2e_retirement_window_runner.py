@@ -117,10 +117,66 @@ class RunnerWindows(unittest.TestCase):
             result=self.run_parent(max_batches=8)
         self.assertEqual(calls,2)
         self.assertTrue(result['commit_outcome_unknown'])
+        self.assertEqual(result['failed_phase_counts'], {'commit_ack': 1})
+        self.assertGreaterEqual(result['failed_phase_ms']['commit_ack'], 0)
         self.assertEqual(result['cleared_documents'],2)
         self.assertEqual(result['batches'],1)
         self.assertEqual(sum(not r['text_redacted']for r in self.state()),4)
         self.assertEqual(result['archive_gets'],8)
+
+    def test_later_discovery_decoder_failure_preserves_safe_code_and_acknowledged_prefix(self):
+        from recall_server import parent_chunk_window as windows
+        commit, decode = owner._retire_parent_batch, windows.decode_logical_record
+        acknowledged = []
+
+        def after_commit(*args, **kwargs):
+            result = commit(*args, **kwargs)
+            acknowledged.append(result)
+            return result
+
+        def decode_after_ack(line, **kwargs):
+            # Valid JSON, but not the original canonical encoding. Exercise the
+            # actual decoder's refusal after one real SQL COMMIT is acknowledged.
+            return decode(line + b' ' if acknowledged else line, **kwargs)
+
+        with patch.object(owner, '_retire_parent_batch', after_commit), \
+                patch.object(windows, 'decode_logical_record', decode_after_ack):
+            result = self.run_parent(max_batches=8)
+        self.assertEqual(len(acknowledged), 1)
+        self.assertTrue(result['commit_outcome_unknown'])
+        self.assertEqual(result['status'], 'commit_outcome_unknown')
+        self.assertEqual(result['errors'], {'parent_retirement_unavailable': 1})
+        self.assertEqual(result['failed_phase_counts'], {'window_discovery': 1})
+        self.assertEqual(result['error_class'], 'LogicalEvidenceError')
+        self.assertEqual(result['cleared_documents'], 2)
+        self.assertEqual(result['cleared_utf8_bytes'], acknowledged[0]['cleared_utf8_bytes'])
+        self.assertEqual(result['batches'], 1)
+        self.assertEqual(sum(not row['text_redacted'] for row in self.state()), 2)
+        with self.store.connect() as c:
+            progress = owner._parent_progress(self.store, c,
+                (self.tenant, self.source, 'session'), time.monotonic() + 5)
+        self.assertEqual(progress['last_record_ordinal'], 1)
+        self.assertEqual(result['cause_error_code'], 'passage_logical_record_not_canonical')
+
+    def test_window_logical_archive_error_preserves_safe_code(self):
+        from recall_server.archive import ArchiveError
+        with patch.object(self.archive, 'read_raw', side_effect=ArchiveError('synthetic transport failure')):
+            result = self.run_parent(max_batches=2)
+        self.assertTrue(result['commit_outcome_unknown'])
+        self.assertEqual(result['cleared_documents'], 0)
+        self.assertEqual(result['error_class'], 'LogicalEvidenceError')
+        self.assertEqual(result['cause_error_code'], 'logical_evidence_unavailable')
+
+    def test_window_diagnostic_never_emits_arbitrary_logical_error_text(self):
+        from recall_server.logical_evidence import LogicalEvidenceError
+        private = 'logical_evidence_unavailable https://invalid.example/private'
+        with patch.object(self.archive, 'read_raw', side_effect=LogicalEvidenceError(private)):
+            result = self.run_parent(max_batches=2)
+        self.assertTrue(result['commit_outcome_unknown'])
+        self.assertEqual(result['cleared_documents'], 0)
+        self.assertEqual(result['error_class'], 'LogicalEvidenceError')
+        self.assertIsNone(result['cause_error_code'])
+        self.assertNotIn(private, str(result))
 
     def test_unusable_clear_residue_is_partial_not_failed_and_avoids_next_window(self):
         with self.store.connect() as c:

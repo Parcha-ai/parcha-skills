@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 from io import BytesIO
+import re
 import time
 
 from .canonical import _identity_sha256
@@ -16,8 +17,9 @@ from .chunk_bodies import (
     chunk_catalog_snapshot, read_archived_chunks,
 )
 from .evidence_projection import CanonicalEvidenceProjector
-from .logical_evidence import LogicalEvidenceProjectionStore, MAX_PART_BYTES
-from .parent_chunk_proof import manifest_identity, parent_retirement_plan, read_parent_catalog
+from .logical_evidence import LogicalEvidenceError, LogicalEvidenceProjectionStore, MAX_PART_BYTES
+from .logical_body_proof import LogicalBodyProofError
+from .parent_chunk_proof import _attempt_phase, manifest_identity, parent_retirement_plan, read_parent_catalog
 from .passage_projection import decode_logical_record
 
 
@@ -161,12 +163,14 @@ def _discover(archive, scope, manifest, parts, start, limits, deadline):
     return events, dict(discovery_archive_bytes=consumed,discovery_archive_gets=gets)
 
 
-def prepare_window(store, archive, *, scope, principal_id, limits, deadline_at, remaining_bytes=None, required_scope_epoch=None):
+def prepare_window(store, archive, *, scope, principal_id, limits, deadline_at, remaining_bytes=None, required_scope_epoch=None, diagnostic=None):
     from .chunk_retirement import ChunkRetirementError, _parent_progress, require_retirement_owner
     remaining_bytes = limits.max_clear_bytes if remaining_bytes is None else remaining_bytes
     if type(remaining_bytes) is not int or not 0 <= remaining_bytes <= limits.max_clear_bytes:
         _fail('clear_budget')
+    _attempt_phase(diagnostic, 'window_connection')
     with store.connect() as c, c.transaction():
+        _attempt_phase(diagnostic, 'window_catalog_sql')
         c.execute('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY')
         require_retirement_owner(store,c,scope[:2],principal_id,deadline_at,lock=False)
         _witnesses(store,c,scope,(),deadline_at)
@@ -184,11 +188,14 @@ def prepare_window(store, archive, *, scope, principal_id, limits, deadline_at, 
     identity = manifest_identity(manifest)
     cursor = progress['last_record_ordinal'] if progress['manifest_artifact_id'] == identity['manifest_artifact_id'] else -1
     plan = parent_retirement_plan(scope,identity)
+    _attempt_phase(diagnostic, 'window_discovery')
     events, cost = _discover(archive,scope,manifest,parts,cursor+1,limits,deadline_at)
     if not events:
         return dict(handoff_full_parent=True,plan=plan,cost=cost,scope_epoch=progress['scope_epoch'])
     natives = tuple(event['native_id'] for event in events)
+    _attempt_phase(diagnostic, 'window_witness_connection')
     with store.connect() as c, c.transaction():
+        _attempt_phase(diagnostic, 'window_witness_sql')
         c.execute('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY')
         require_retirement_owner(store,c,scope[:2],principal_id,deadline_at,lock=False)
         witnesses = _witnesses(store,c,scope,natives,deadline_at)
@@ -258,6 +265,7 @@ def prepare_window(store, archive, *, scope, principal_id, limits, deadline_at, 
     if (sum(len(row['chunks']) for row in rows) > limits.batch_chunks
             or sum(row['pg_body_bytes'] for row in rows) > min(limits.hash_bytes,remaining_bytes)):
         _fail('hash_budget')
+    _attempt_phase(diagnostic, 'selected_proof')
     archived = read_archived_chunks(store,archive,tenant_id=scope[0],source_ids=(scope[1],),
         document_ids=ids,located_only=True,deadline_at=deadline_at) if ids else {}
     if set(archived) != set(selected):
@@ -306,14 +314,16 @@ def recheck_coverage(store, connection, scope, coverage, progress, manifest, dea
 
 
 def _advance_without_physical_work(store, *, scope, principal_id, reviewed_plan,
-                                   required_scope_epoch, limits, deadline_at):
+                                   required_scope_epoch, limits, deadline_at, diagnostic=None):
     """Advance scheduling over current admitted rows; never assert archive proof."""
     from .chunk_retirement import (
         ChunkRetirementError, _parent_progress, _try_parent_native_locks,
         require_retirement_owner,
     )
     started = time.monotonic()
+    _attempt_phase(diagnostic, 'no_work_connection')
     with store.connect() as connection, connection.transaction():
+        _attempt_phase(diagnostic, 'no_work_sql')
         def query(sql, values=()):
             return store._execute_bounded(connection, sql, values, deadline_at)
         require_retirement_owner(store, connection, scope[:2], principal_id, deadline_at)
@@ -405,14 +415,16 @@ def _advance_without_physical_work(store, *, scope, principal_id, reviewed_plan,
         if changed != 1:
             _fail('pending')
         _check_deadline(deadline_at)
+        _attempt_phase(diagnostic, 'no_work_commit_ack')
     return dict(status='complete' if complete else 'partial', complete=complete, batches=1,
         completion_proof='no_remaining_physical_work' if complete else None,
         skipped_records=through-cursor, sql_ms=(time.monotonic()-started)*1000)
 
 
 def retire_window(store, archive, *, scope, principal_id, limits, deadline_at, reviewed_plan,
-                  metadata_mode='keep', remaining_bytes=None, should_stop=None, required_scope_epoch=None):
+                  metadata_mode='keep', remaining_bytes=None, should_stop=None, required_scope_epoch=None, diagnostic=None):
     from .chunk_retirement import _retire_parent_batch, _require_singleton_archive_runtime, retire_parent_chunks
+    from .db import SearchDeadlineExceeded
     if metadata_mode not in ('keep','singleton'):
         _fail('metadata_mode')
     if metadata_mode == 'singleton':
@@ -422,13 +434,22 @@ def retire_window(store, archive, *, scope, principal_id, limits, deadline_at, r
     if should_stop is not None and should_stop():
         return dict(status='stopped',complete=False)
     if metadata_mode == 'singleton':
-        skipped = _advance_without_physical_work(store, scope=scope, principal_id=principal_id,
-            reviewed_plan=reviewed_plan, required_scope_epoch=required_scope_epoch, limits=limits,
-            deadline_at=min(deadline_at,time.monotonic()+5))
+        probe = diagnostic if diagnostic is not None else {}
+        try:
+            skipped = _advance_without_physical_work(store, scope=scope, principal_id=principal_id,
+                reviewed_plan=reviewed_plan, required_scope_epoch=required_scope_epoch, limits=limits,
+                deadline_at=min(deadline_at,time.monotonic()+5), diagnostic=probe)
+        except SearchDeadlineExceeded:
+            # The probe transaction has rolled back. Never retry an uncertain
+            # COMMIT or renew the caller's deadline to obtain archive proof.
+            if probe.get('phase') != 'no_work_sql' or time.monotonic() >= deadline_at:
+                raise
+            skipped = None
         if skipped is not None:
             return skipped
+    _attempt_phase(diagnostic, 'window_proof')
     window = prepare_window(store,archive,scope=scope,principal_id=principal_id,limits=limits,
-        deadline_at=deadline_at,remaining_bytes=remaining_bytes,required_scope_epoch=required_scope_epoch)
+        deadline_at=deadline_at,remaining_bytes=remaining_bytes,required_scope_epoch=required_scope_epoch,diagnostic=diagnostic)
     if window['plan']!=reviewed_plan:
         _fail('plan_changed')
     if window['handoff_full_parent']:
@@ -438,20 +459,20 @@ def retire_window(store, archive, *, scope, principal_id, limits, deadline_at, r
         result = retire_parent_chunks(store,archive,tenant_id=scope[0],source_id=scope[1],native_parent_id=scope[2],
             limits=completion_limits,deadline_at=deadline_at,apply=True,reviewed_plan=reviewed_plan,
             owner_principal_id=principal_id,metadata_mode=metadata_mode,should_stop=should_stop,
-            required_scope_epoch=window['scope_epoch'])
+            required_scope_epoch=window['scope_epoch'], diagnostic=diagnostic)
         return dict(result,completion_proof='original_full_parent')
     if should_stop is not None and should_stop():
         return dict(status='stopped',complete=False,**window['cost'])
     result = _retire_parent_batch(store,proof=window['proof'],rows=window['rows'],scope=scope,limits=limits,
         deadline_at=min(deadline_at,time.monotonic()+5),complete=False,
         remaining_bytes=limits.max_clear_bytes if remaining_bytes is None else remaining_bytes,
-        owner_principal_id=principal_id,coverage=window['coverage'],metadata_mode=metadata_mode)
+        owner_principal_id=principal_id,coverage=window['coverage'],metadata_mode=metadata_mode,diagnostic=diagnostic)
     return dict(result,status='partial',complete=False,batches=1,clear_budget_limited=window['clear_budget_limited'],**window['cost'])
 
 
 def retire_parent_windows(store, archive, *, tenant_id, source_id, native_parent_id,
                           apply, reviewed_plan, limits, deadline_at, required_scope_epoch,
-                          owner_principal_id, should_stop=None, metadata_mode='keep'):
+                          owner_principal_id, should_stop=None, metadata_mode='keep', diagnostic=None):
     """Use one attempt budget; distinguish physical no-work from archive proof."""
     from dataclasses import replace
     import psycopg
@@ -469,13 +490,16 @@ def retire_parent_windows(store, archive, *, tenant_id, source_id, native_parent
         return retire_parent_chunks(store,archive,tenant_id=tenant_id,source_id=source_id,
             native_parent_id=native_parent_id,apply=apply,reviewed_plan=reviewed_plan,
             limits=limits,deadline_at=deadline_at,required_scope_epoch=required_scope_epoch,
-            owner_principal_id=owner_principal_id,should_stop=should_stop,metadata_mode=metadata_mode)
+            owner_principal_id=owner_principal_id,should_stop=should_stop,metadata_mode=metadata_mode,
+            **({"diagnostic": diagnostic} if diagnostic is not None else {}))
     meter = RunArchive(archive,max_bytes=limits.max_archive_bytes)
     totals = dict(retired_metadata_chunks=0,cleared_documents=0,cleared_chunks=0,
         cleared_utf8_bytes=0,hashed_utf8_bytes=0,hash_ms=0.0,sql_ms=0.0,batches=0)
     result = dict(status='partial',complete=False)
+    _attempt_phase(diagnostic, 'parent_connection')
     try:
         with store.connect() as connection:
+            _attempt_phase(diagnostic, 'parent_sql')
             if store._execute_bounded(connection,'SELECT 1 FROM schema_migrations WHERE version=69',(),deadline_at).fetchone() is None:
                 raise ChunkRetirementError('parent_retirement_schema_required')
         while totals['batches'] < limits.max_batches:
@@ -491,7 +515,8 @@ def retire_parent_windows(store, archive, *, tenant_id, source_id, native_parent
                     limits=replace(limits,max_batches=limits.max_batches-totals['batches'],
                         max_clear_bytes=clear_left,max_archive_bytes=archive_left),
                     remaining_bytes=clear_left,deadline_at=deadline_at,reviewed_plan=reviewed_plan,
-                    required_scope_epoch=required_scope_epoch,metadata_mode=metadata_mode,should_stop=should_stop)
+                    required_scope_epoch=required_scope_epoch,metadata_mode=metadata_mode,should_stop=should_stop,
+                    **({"diagnostic": diagnostic} if diagnostic is not None else {}))
             except ChunkRetirementError as error:
                 clear_limited = error.error_code == 'parent_retirement_window_clear_budget_hold'
                 archive_limited = (error.error_code == 'parent_retirement_window_archive_budget' and totals['batches'] > 0)
@@ -518,8 +543,13 @@ def retire_parent_windows(store, archive, *, tenant_id, source_id, native_parent
         else:
             failure = ChunkRetirementError('parent_retirement_unavailable')
         if not hasattr(failure,'cause_details'):
+            from .chunk_retirement import _PASSAGE_CAUSE_CODES
+            cause_code = error.args[0] if isinstance(error, (LogicalEvidenceError, LogicalBodyProofError)) and error.args else None
+            if (not isinstance(cause_code, str) or (cause_code not in _PASSAGE_CAUSE_CODES
+                    and not re.fullmatch(r'logical_(?:evidence|body)_[a-z0-9_]{1,64}', cause_code))):
+                cause_code = None
             label = type(error).__name__
             failure.cause_details = dict(error_class=label if len(label)<=80 and label.isidentifier() else 'UnknownError',
-                cause_error_code=None,phase='maintenance')
+                cause_error_code=cause_code,phase='maintenance')
         failure.committed = totals
         raise failure from None
