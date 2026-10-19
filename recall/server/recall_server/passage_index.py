@@ -9,14 +9,18 @@ import math
 import pickle
 import tempfile
 import threading
+from array import array
 from collections import Counter
+from collections.abc import Sequence
 from contextlib import ExitStack, contextmanager
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from io import BytesIO
+from itertools import islice
 from typing import Any, Callable, ClassVar, Iterable, Iterator
 from types import SimpleNamespace
+from weakref import finalize
 
 import psycopg
 
@@ -36,13 +40,14 @@ from .passage_projection import (
     PassageSpan,
     reconstruct_passage,
     visible_message_text,
-    build_passages,
     canonical_spans_json,
     decode_logical_record,
     passage_embed_sha256,
     passage_embedding_input,
     render_passage_header,
-    visible_messages,
+    iter_visible_messages,
+    iter_passages,
+    _logical_record_groups,
 )
 from .passage_representations import ActorContext, DocumentContext
 from .search_outbox import (
@@ -63,6 +68,78 @@ class _PassageRecordReplay:
         self.stream.seek(0)
         while self.stream.tell() < self.end:
             yield pickle.load(self.stream)
+
+
+class _DiskSequence(Sequence):
+    """Attempt-local payloads with compact offsets, never external pickle input.
+
+    Payloads are replayed one at a time. Offsets and selected-row indexes still
+    scale with row count; a single decoded event/window is not size bounded.
+    """
+
+    def __init__(self):
+        self.stream = tempfile.TemporaryFile(mode="w+b")
+        self._finalizer = finalize(self, self.stream.close)
+        self.offsets = array('Q')
+
+    def extend(self, values):
+        for value in values:
+            self.stream.seek(0, 2)
+            offset = self.stream.tell()
+            pickle.dump(value, self.stream, protocol=5)
+            self.offsets.append(offset)
+
+    def __len__(self):
+        return len(self.offsets)
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            return _DiskView(self, range(len(self))[index])
+        self.stream.seek(self.offsets[index])
+        return pickle.load(self.stream)
+
+    def __eq__(self, other):
+        return isinstance(other, Sequence) and len(self) == len(other) and all(
+            left == right for left, right in zip(self, other))
+
+    def close(self):
+        self._finalizer()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+
+class _DiskView(Sequence):
+    __eq__ = _DiskSequence.__eq__
+
+    def __init__(self, source, indexes):
+        self.source, self.indexes = source, indexes
+
+    def __len__(self):
+        return len(self.indexes)
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            return _DiskView(self.source, self.indexes[index])
+        return self.source[self.indexes[index]]
+
+
+def _spool_tool_groups(records, extractor, output):
+    # Call the unchanged extractor on each complete validated event. Both native
+    # adapters' coverage counters are additive; no provider block is split.
+    _, coverage = extractor(())
+    dispositions = Counter()
+    for records_group in _logical_record_groups(records):
+        groups, counts = extractor(records_group, first_record_ordinal=records_group[0].ordinal)
+        output.extend(groups)
+        for key in ('events', 'tool_blocks', 'groups', 'string_leaves', 'included_string_leaves'):
+            coverage[key] += counts[key]
+        dispositions.update(counts['dispositions'])
+    coverage['dispositions'] = dict(sorted(dispositions.items()))
+    return coverage
 
 
 class CertificationBudget:
@@ -132,7 +209,7 @@ class PreparedPassageDocument:
     candidate: PassageCandidate
     dense_message_count: int
     dense_message_bytes: int
-    passages: tuple[LosslessPassage | passage_append.RetainedPassage, ...]
+    passages: Sequence[LosslessPassage | passage_append.RetainedPassage]
     append_checkpoint: dict[str, Any] | None = None
     previous_checkpoint: dict[str, Any] | None = None
     append_checkpoint_available: bool = False
@@ -140,6 +217,11 @@ class PreparedPassageDocument:
     archive_parts_read: int = 0
     extraction_coverage: dict[str, Any] | None = None
     legacy_migration: dict[str, Any] | None = None
+    _resources: ExitStack | None = field(default=None, repr=False, compare=False)
+
+    def close(self):
+        if self._resources is not None:
+            self._resources.close()
 
 
 _LEGACY_PASSAGES = """SELECT passage_id,ordinal,revision,text_sha256,receipts,spans
@@ -264,7 +346,7 @@ class PassageDiff:
     revision differs from the candidate revision.
     """
 
-    to_insert: tuple[LosslessPassage, ...]
+    to_insert: Sequence[LosslessPassage]
     to_delete: tuple[str, ...]
     retained: tuple[str, ...]
     moved: tuple[tuple[str, int], ...]
@@ -281,7 +363,7 @@ class PassageDiff:
 
 def classify_passages(
     existing: Iterable[dict[str, Any]],
-    passages: tuple[LosslessPassage | passage_append.RetainedPassage, ...],
+    passages: Sequence[LosslessPassage | passage_append.RetainedPassage],
     *,
     revision: int,
 ) -> PassageDiff:
@@ -300,25 +382,30 @@ def classify_passages(
         if passage_id in stored:
             raise LogicalEvidenceError("passage_rows_duplicate")
         stored[passage_id] = row
-    new_ids = {passage.passage_id for passage in passages}
+    new_ids = set()
+    disk_backed = isinstance(passages, _DiskSequence)
+    inserted = array('Q') if disk_backed else []
+    retained = []
+    moved = []
+    missing_prefix = False
+    # Replay each payload once for the diff; keep only identities and indexes.
+    for index, passage in enumerate(passages):
+        new_ids.add(passage.passage_id)
+        prior = stored.get(passage.passage_id)
+        if prior is None:
+            if isinstance(passage, passage_append.RetainedPassage):
+                missing_prefix = True
+            elif isinstance(passage, LosslessPassage):
+                inserted.append(index if disk_backed else passage)
+        else:
+            retained.append(passage.passage_id)
+            if int(prior['ordinal']) != passage.ordinal:
+                moved.append((passage.passage_id, passage.ordinal))
     if len(new_ids) != len(passages):
         raise LogicalEvidenceError("passage_identity_collision")
-    if any(isinstance(passage, passage_append.RetainedPassage)
-           and passage.passage_id not in stored for passage in passages):
+    if missing_prefix:
         raise LogicalEvidenceError("passage_retained_prefix_missing")
-    to_insert = tuple(
-        passage for passage in passages
-        if isinstance(passage, LosslessPassage) and passage.passage_id not in stored
-    )
-    retained = tuple(
-        passage.passage_id for passage in passages if passage.passage_id in stored
-    )
-    moved = tuple(
-        (passage.passage_id, passage.ordinal)
-        for passage in passages
-        if passage.passage_id in stored
-        and int(stored[passage.passage_id]["ordinal"]) != passage.ordinal
-    )
+    to_insert = _DiskView(passages, inserted) if disk_backed else tuple(inserted)
     revision_stale = tuple(
         passage_id
         for passage_id in retained
@@ -330,8 +417,8 @@ def classify_passages(
     return PassageDiff(
         to_insert=to_insert,
         to_delete=to_delete,
-        retained=retained,
-        moved=moved,
+        retained=tuple(retained),
+        moved=tuple(moved),
         revision_stale=revision_stale,
     )
 
@@ -1152,6 +1239,9 @@ class CanonicalPassageProjector:
                     )
 
         with ExitStack() as resources:
+            payload_resources = resources.enter_context(ExitStack())
+            passages = payload_resources.enter_context(_DiskSequence())
+            messages = resources.enter_context(_DiskSequence())
             try:
                 # Enrolled documents currently rebuild fully. Read verified archive
                 # parts once; the two views keep visible-message coordinates intact.
@@ -1168,13 +1258,13 @@ class CanonicalPassageProjector:
                     for record in source_records:
                         pickle.dump(record, spool, protocol=5)
                     source_records = _PassageRecordReplay(spool)
-                messages = visible_messages(source_records, first_record_ordinal=first_record)
+                messages.extend(iter_visible_messages(source_records, first_record_ordinal=first_record))
             except LogicalEvidenceError:
                 if resume:
                     return full_fallback()
                 raise
-            passages = (
-                build_passages(
+            passages.extend(
+                iter_passages(
                     tenant_id=candidate.tenant_id,
                     source_id=candidate.source_id,
                     logical_document_id=candidate.logical_document_id,
@@ -1193,7 +1283,10 @@ class CanonicalPassageProjector:
                 try:
                     if resume['source_byte_start'] >= len(messages[0].text.encode()):
                         raise ValueError("invalid passage restart offset")
-                    passages = prefix + passage_append.resume_passages(messages, resume, arguments)
+                    # Keep the existing append proof and tail geometry unchanged.
+                    # The append helper still materializes its tail, not the full rebuild.
+                    passages.extend(prefix)
+                    passages.extend(passage_append.resume_passages(tuple(messages), resume, arguments))
                 except (ValueError, IndexError, UnicodeDecodeError):
                     return full_fallback()
             coverage = None
@@ -1204,7 +1297,8 @@ class CanonicalPassageProjector:
                 with self.store.connect() as connection:
                     old = connection.execute(_LEGACY_PASSAGES, (candidate.tenant_id, candidate.source_id,
                         candidate.logical_document_id)).fetchall()
-                groups, coverage = extract_tool_event_groups(source_records)
+                groups = resources.enter_context(_DiskSequence())
+                coverage = _spool_tool_groups(source_records, extract_tool_event_groups, groups)
                 obligations = _legacy_result_intervals(old, messages, passages, groups,
                     {r for record in source_records for r in record.receipts})
                 if obligations is not None:
@@ -1214,22 +1308,22 @@ class CanonicalPassageProjector:
                     grouped_tools = True
                 else:
                     coverage = None
-            tool_messages = ()
+            tool_message_count = tool_message_bytes = 0
             if grouped_tools:
                 extractor = (extract_codex_tool_event_groups
                              if candidate.extraction_version == "codex_tool_groups_v1" else extract_tool_event_groups)
                 if groups is None:
-                    groups, coverage = extractor(source_records)
-                tool_messages = tuple(message for group in groups for message in group.messages)
+                    groups = resources.enter_context(_DiskSequence())
+                    coverage = _spool_tool_groups(source_records, extractor, groups)
                 # Build each provider block independently. Its message indexes are
                 # group-local, so later visible arrivals cannot rekey old tool spans.
-                combined = list(passages)
                 for group in groups:
-                    for passage in build_passages(tenant_id=candidate.tenant_id,
+                    tool_message_count += len(group.messages)
+                    tool_message_bytes += sum(len(message.text.encode()) for message in group.messages)
+                    for passage in iter_passages(tenant_id=candidate.tenant_id,
                         source_id=candidate.source_id, logical_document_id=candidate.logical_document_id,
                         revision=candidate.revision, messages=group.messages, policy=policy):
-                        combined.append(replace(passage, ordinal=len(combined)))
-                passages = tuple(combined)
+                        passages.extend((replace(passage, ordinal=len(passages)),))
             if obligations is not None:
                 intervals = {}
                 for passage in passages:
@@ -1249,8 +1343,8 @@ class CanonicalPassageProjector:
                 policy, previous=resume) if not grouped_tools and state and state['available'] else None)
             return PreparedPassageDocument(
                 candidate=candidate,
-                dense_message_count=len(messages) + len(tool_messages) + (resume["message_index"] if resume else 0),
-                dense_message_bytes=sum(len(message.text.encode()) for message in (*messages, *tool_messages)) + (resume["prefix_message_bytes"] if resume else 0),
+                dense_message_count=len(messages) + tool_message_count + (resume["message_index"] if resume else 0),
+                dense_message_bytes=sum(len(message.text.encode()) for message in messages) + tool_message_bytes + (resume["prefix_message_bytes"] if resume else 0),
                 passages=passages,
                 append_checkpoint=checkpoint,
                 previous_checkpoint=resume,
@@ -1259,6 +1353,7 @@ class CanonicalPassageProjector:
                 archive_parts_read=archive_parts_read,
                 extraction_coverage=coverage,
                 legacy_migration=migration,
+                _resources=payload_resources.pop_all(),
             )
 
     def _commit(self, prepared: PreparedPassageDocument) -> dict[str, Any]:
@@ -1546,15 +1641,15 @@ class CanonicalPassageProjector:
                 # Stable IDs cover text and window geometry, not receipts or
                 # optional origin annotations. Refresh full prepared metadata;
                 # immutable append-prefix records carry no replacement spans.
-                retained_receipts = [
+                retained_receipts = (
                     {"passage_id": passage.passage_id,
                      "receipts": list(passage.receipts),
                      "spans": (json.loads(canonical_spans_json(passage.spans))
                                if isinstance(passage, LosslessPassage) else None)}
                     for passage in prepared.passages
                     if passage.passage_id in retained_ids
-                ]
-                if retained_receipts:
+                )
+                while receipt_batch := list(islice(retained_receipts, MAX_PASSAGE_PROJECTION_BATCH)):
                     connection.execute(
                         """UPDATE canonical_passages passage
                               SET revision=%s,receipts=current.receipts,
@@ -1568,7 +1663,7 @@ class CanonicalPassageProjector:
                                    OR passage.receipts IS DISTINCT FROM current.receipts
                                    OR (current.spans IS NOT NULL
                                        AND passage.spans IS DISTINCT FROM current.spans))""",
-                        (candidate.revision,json.dumps(retained_receipts), candidate.tenant_id,
+                        (candidate.revision,json.dumps(receipt_batch), candidate.tenant_id,
                          candidate.source_id, candidate.logical_document_id,candidate.revision),
                     )
                 if retained_unheaded:
@@ -2450,28 +2545,30 @@ class CanonicalPassageProjector:
                     if str(error) not in {"logical_evidence_not_found", "logical_evidence_unavailable", "legacy_tool_migration_required"}:
                         raise
                     return {"status": str(error)}, time.monotonic() - preparation_started, 0.0
-                preparation_elapsed = time.monotonic() - preparation_started
-                commit_started = time.monotonic()
-                with commit_slots:
-                    if stopping.is_set():
-                        return {"status": "cancelled"}, preparation_elapsed, 0.0
-                    try:
-                        status = self._commit(prepared)
-                    except psycopg.errors.LockNotAvailable:
-                        # _commit has rolled back and released its locks. Keep
-                        # the unchanged queue for retry without aborting siblings.
-                        status = {"status": "stale"}
-                commit_elapsed = time.monotonic() - commit_started
-                should_certify = (status['status'] == 'committed'
-                                  and self.membership_certification.enabled
-                                  and status.get('membership_legacy', False))
-                passage_ids = (tuple(passage.passage_id for passage in prepared.passages)
-                               if should_certify else ())
-                status['archive_bytes_read'] = prepared.archive_bytes_read
-                status['archive_parts_read'] = prepared.archive_parts_read
-                status['prepare_reused_documents'] = int(prepared.previous_checkpoint is not None)
-                status['prepare_full_documents'] = int(prepared.previous_checkpoint is None)
-                del prepared
+                try:
+                    preparation_elapsed = time.monotonic() - preparation_started
+                    commit_started = time.monotonic()
+                    with commit_slots:
+                        if stopping.is_set():
+                            return {"status": "cancelled"}, preparation_elapsed, 0.0
+                        try:
+                            status = self._commit(prepared)
+                        except psycopg.errors.LockNotAvailable:
+                            # _commit has rolled back and released its locks. Keep
+                            # the unchanged queue for retry without aborting siblings.
+                            status = {"status": "stale"}
+                    commit_elapsed = time.monotonic() - commit_started
+                    should_certify = (status['status'] == 'committed'
+                                      and self.membership_certification.enabled
+                                      and status.get('membership_legacy', False))
+                    passage_ids = (tuple(passage.passage_id for passage in prepared.passages)
+                                   if should_certify else ())
+                    status['archive_bytes_read'] = prepared.archive_bytes_read
+                    status['archive_parts_read'] = prepared.archive_parts_read
+                    status['prepare_reused_documents'] = int(prepared.previous_checkpoint is not None)
+                    status['prepare_full_documents'] = int(prepared.previous_checkpoint is None)
+                finally:
+                    prepared.close()
                 if should_certify:
                     with certification_budget.lease() as certification_deadline:
                         if certification_deadline is None:

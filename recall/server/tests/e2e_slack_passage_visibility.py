@@ -119,7 +119,7 @@ def main():
             store, logical_store, policy=DEFAULT_PASSAGE_POLICY, bound_tenant_id=tenant
         )
         # Persist exactly the old failure: a valid logical document with no eligible messages.
-        with patch("recall_server.passage_index.visible_messages", return_value=()):
+        with patch("recall_server.passage_index.iter_visible_messages", return_value=()):
             old = passages.project_pending(
                 tenant_id=tenant, batch_size=2, max_batches=1, concurrency=1
             )
