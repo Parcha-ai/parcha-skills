@@ -318,7 +318,7 @@ are supported: versions through 69 are required except optional migration 67,
 which retires the Postgres vector plane and is applied explicitly from the
 turbopuffer plane. Migration 70 adds only a reconciliation performance index;
 serving accepts both schema 69 and 70 and reports the actual recorded version.
-The latest shipped migration is 90; migration 71 remains optional and reserved
+The latest shipped migration is 91; migration 71 remains optional and reserved
 for native-conversation metadata. Migration 72 adds nullable
 `canonical_evidence_document_queue.notification_queued_at`, with no default,
 index, or historical reclassification. Apply it before deploying the notification
@@ -1910,3 +1910,36 @@ and trigger in place; neither provides reader authorization. The native receipt,
 person and Forget verifiers are unchanged. Full initialization can cost an extra
 bounded actor-set query before fallback for parents exceeding 64 distinct links;
 suffix savings depend on the planner and current statistics, not a latency promise.
+
+
+### Durable search publication pages (91)
+
+Migration 91 adds nullable JSONB `search_projection_outbox.page_checkpoint`, with
+no default, and records its marker in the same transaction. Deploy images that
+explicitly accept schema 91 to MCP and managed services while the database is
+still on 90. Their original enqueue and seed SQL remains compatible with 90.
+Keep the previous worker running until the exact 091 migration is accepted;
+activate the new checkpoint publisher only afterwards. Image deployment and
+`projection-worker` startup do not apply migrations.
+
+Use the reviewed atomic migration owner for this exact column and marker, with
+its existing statement, lock and transaction limits. Refresh runtime grants and
+verify the recorded marker, column, catalog and application privileges before
+publisher rollout. An uncertain COMMIT requires the original read-only
+reconciliation; do not repeat the apply or run all migrations to resolve it.
+`/healthz` and `/readyz` do not establish schema compatibility.
+
+The publisher saves a cursor only after every write in the page is acknowledged.
+Resume requires the same queue generation, timestamp and reason, shard catalog,
+publication contract, destination and account binding. It still checks current
+receipt authority and Forget on each page. New work invalidates the old scope;
+unknown writes replay conservatively. Only full EOF completion advances the shard
+watermark. The first deployment cannot recover the previous process's unsaved
+cursor, and durable progress does not make an expensive page fit its deadline.
+
+Rollback preserves the additive column, marker and saved checkpoints. Serving
+images must remain schema-91-compatible. The previous worker990 entrypoint passed
+a native schema91 startup and empty-cycle test and ignores the new column,
+replaying work conservatively; its separate capability-check command still
+rejects 91. That startup witness does not prove active-page completion or latency.
+Use the exact reviewed worker rollback image, not an arbitrary older binary.

@@ -30,6 +30,7 @@ class only.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import threading
@@ -40,6 +41,8 @@ from collections.abc import Callable, Generator, Iterator
 from contextlib import contextmanager, nullcontext
 from datetime import date, datetime, timezone
 from typing import Any
+
+from psycopg.types.json import Jsonb
 
 from .turbopuffer_plane import (
     TurbopufferSettings,
@@ -466,6 +469,77 @@ class TurbopufferProjector:
                       ) AS watermark"""
         ).fetchone()["watermark"]
 
+    def _page_checkpoint_scope(self, connection: Any, claim: dict[str, Any], name: str) -> dict[str, Any]:
+        row = connection.execute("""SELECT to_jsonb(shard) AS catalog
+            FROM search_projection_shards shard
+            WHERE tenant_id=%s AND source_id=%s AND month=%s""",
+            (claim["tenant_id"], claim["source_id"], claim["month"])).fetchone()
+        return {
+            # Bump this contract when passage row rendering/publication semantics change.
+            "version": 1,
+            "verified_singleton_receipts": getattr(self.store, "verified_singleton_receipts", False),
+            "claim": [claim["tenant_id"], claim["source_id"], claim["month"].isoformat(),
+                      claim["generation"], claim["queued_at"].isoformat(), claim["reason"]],
+            "catalog": row["catalog"] if row else None,
+            "destination": [self.settings.region, name, namespace_schema(self.settings)],
+            # Settings expose no account ID. Any key rotation safely replays;
+            # the private checkpoint stores only this one-way identity, never the key.
+            "credential_fingerprint": hashlib.sha256(
+                ("search-publication-account-v1\0" + self.settings.api_key).encode()).hexdigest(),
+        }
+
+    @staticmethod
+    def _restore_page_checkpoint(value: Any, scope: dict[str, Any]) -> tuple[Any, ...] | None:
+        if (not isinstance(value, dict) or value.get("scope") != scope
+                or type(value["scope"].get("version")) is not int):
+            return None
+        try:
+            after = value["after"]
+            cursor = datetime.fromisoformat(after[0])
+            watermark = datetime.fromisoformat(value["watermark"])
+            rows = value["rows"]
+            if (not isinstance(after, list) or len(after) != 2
+                    or not isinstance(after[1], str) or not after[1]
+                    or cursor.tzinfo is None or watermark.tzinfo is None
+                    or _month(cursor).isoformat() != scope["claim"][2]
+                    or type(rows) is not int or rows < 0):
+                return None
+            return (cursor, after[1]), watermark, rows
+        except (KeyError, TypeError, ValueError, IndexError):
+            return None
+
+    def _save_page_checkpoint(self, claim: dict[str, Any], previous: Any, value: dict[str, Any]) -> bool:
+        """CAS only after every vendor batch ACK; unknown SQL outcome is reread on restart.
+
+        A new generation invalidates durable progress but does not stop the old
+        full pass: its original EOF watermark still lets hot months converge.
+        Another publisher/catalog advancing this same claim requires a reload.
+        """
+        deadline = time.monotonic() + self.store.search_deadline_ms / 1000
+        with self.store.connect() as connection:
+            updated = self.store._execute_bounded(connection, """UPDATE search_projection_outbox SET page_checkpoint=%s
+                WHERE tenant_id=%s AND source_id=%s AND month=%s
+                  AND generation=%s AND queued_at=%s AND reason=%s
+                  AND COALESCE(page_checkpoint, 'null'::jsonb) = %s::jsonb
+                  AND COALESCE((SELECT to_jsonb(shard) FROM search_projection_shards shard
+                       WHERE shard.tenant_id=%s AND shard.source_id=%s AND shard.month=%s),
+                       'null'::jsonb) = %s::jsonb""",
+                (Jsonb(value), claim["tenant_id"], claim["source_id"], claim["month"],
+                 claim["generation"], claim["queued_at"], claim["reason"],
+                 Jsonb(previous),
+                 claim["tenant_id"], claim["source_id"], claim["month"],
+                 Jsonb(value["scope"]["catalog"])), deadline).rowcount
+            if updated != 1:
+                current = self.store._execute_bounded(connection, """SELECT 1 FROM search_projection_outbox
+                    WHERE tenant_id=%s AND source_id=%s AND month=%s
+                      AND generation=%s AND queued_at=%s AND reason=%s""",
+                    (claim["tenant_id"], claim["source_id"], claim["month"],
+                     claim["generation"], claim["queued_at"], claim["reason"]), deadline).fetchone()
+                if current:
+                    raise ValueError("publication_checkpoint_scope_changed")
+            connection.commit()
+            return updated == 1
+
     def passage_page(
         self,
         connection: Any,
@@ -814,6 +888,14 @@ class TurbopufferProjector:
                 since = catalog_watermark if claim["reason"] in INCREMENTAL_REASONS else None
                 watermark = self.read_watermark(connection)
                 tombstones = self.capture_tombstones(connection, claim)
+                checkpoint_scope = self._page_checkpoint_scope(connection, claim, name)
+                row = connection.execute("""SELECT page_checkpoint FROM search_projection_outbox
+                    WHERE tenant_id=%s AND source_id=%s AND month=%s
+                      AND generation=%s AND queued_at=%s AND reason=%s""",
+                    (tenant_id, claim["source_id"], claim["month"], claim["generation"],
+                     claim["queued_at"], claim["reason"])).fetchone()
+                checkpoint = row["page_checkpoint"] if row else None
+                restored = self._restore_page_checkpoint(checkpoint, checkpoint_scope)
                 connection.commit()
             rate_reported = 0
             for batch in delete_id_batches([row["passage_id"] for row in tombstones], max_bytes=self.max_batch_bytes):
@@ -833,8 +915,11 @@ class TurbopufferProjector:
                 rate_reported = current_rate
             written = 0
             after: tuple[datetime, str] | None = None
+            if restored is not None:
+                after, watermark, written = restored
+            checkpoint_current = True
             last_rows = 0
-            resume_after_timeout = False
+            resume_after_timeout = restored is not None
             while True:
                 page = []
                 timed_out = False
@@ -890,8 +975,15 @@ class TurbopufferProjector:
                 last_rows = self._write_page(namespace, budget, page, timing)
                 after = next_after  # All parallel writes must acknowledge first.
                 written += last_rows
-                exhausted = examined < self.page_rows
                 page = []
+                if checkpoint_current:
+                    next_checkpoint = {"scope": checkpoint_scope,
+                        "after": [after[0].isoformat(), after[1]],
+                        "watermark": watermark.isoformat(), "rows": written}
+                    with timing.measure("commit"):
+                        checkpoint_current = self._save_page_checkpoint(claim, checkpoint, next_checkpoint)
+                    checkpoint = next_checkpoint
+                exhausted = examined < self.page_rows
                 if exhausted:
                     break
                 current_rate = int(budget["rate_limited"])
@@ -938,7 +1030,8 @@ class TurbopufferProjector:
         """Advance one page then return to the worker's sole coordinator.
 
         The worker owns this projector for one tenant and process lifetime.
-        Restart safely replays unfinished work from the last complete watermark.
+        Restart resumes acknowledged upsert pages when the exact claim, catalog,
+        destination and writer contract still match; tombstones are replayed.
         """
         if isinstance(max_months, bool) or not isinstance(max_months, int) or not 1 <= max_months <= 1000:
             raise ValueError("search plane months per cycle is invalid")
