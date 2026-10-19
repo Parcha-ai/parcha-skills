@@ -208,6 +208,7 @@ jobs:
             e2e_webhook_ingest.py \
             e2e_remote_worker.py \
             e2e_managed_connector_worker.py \
+            e2e_managed_slack_identity.py \
             e2e_workspace_rail.py \
             e2e_retrieval_eval.py \
             e2e_passage_metadata.py \
