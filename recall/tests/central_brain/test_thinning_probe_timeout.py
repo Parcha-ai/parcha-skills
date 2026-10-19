@@ -14,6 +14,7 @@ class Store:
         self,
         *,
         failures=1,
+        fail_key=False,
         fail_hint=False,
         fail_write=False,
         fail_rollback=False,
@@ -23,6 +24,7 @@ class Store:
         fail_release_cancel=False,
     ):
         self.failures = failures
+        self.fail_key = fail_key
         self.fail_hint, self.fail_write = fail_hint, fail_write
         self.fail_rollback, self.fail_commit = fail_rollback, fail_commit
         self.other_error = other_error
@@ -62,6 +64,10 @@ class Store:
         if sql.startswith("SET LOCAL"):
             pass
         elif sql.lstrip().startswith("SELECT source_id,document_id"):
+            if self.fail_key and self.failures:
+                assert self.in_savepoint
+                self.failures -= 1
+                raise QueryCanceled("historical key read cancelled")
             self.rows = [dict(source_id="s", document_id="a")]
         elif "locked_parents AS MATERIALIZED" in sql:
             self.rows = [dict(source_id=source, document_id=document)
@@ -82,7 +88,7 @@ class Store:
             else:
                 if self.other_error:
                     raise ValueError("probe invalid")
-                if self.failures:
+                if self.failures and not self.fail_key:
                     self.failures -= 1
                     raise QueryCanceled("historical cancelled")
                 self.rows = [dict(source_id="s", document_id="a")]
@@ -138,6 +144,66 @@ class ProbeTimeoutTests(unittest.TestCase):
         self.assertEqual(sizes, [512, 256, 128, 64, 32, 16, 8, 4, 2, 1, 1, 1])
         self.assertEqual(thinner._after, ("s", "0"))
         self.assertFalse(any("updated_documents AS" in sql for sql, _ in store.calls))
+
+    def test_key_cancellation_never_skips_and_stops_at_one_key(self):
+        store = Store(fail_key=True, failures=12)
+        thinner = self.thinner(store)
+        for size in (512, 256, 128, 64, 32, 16, 8, 4, 2, 1, 1, 1):
+            result = thinner.thin(batch_size=1)
+            self.assertEqual(result["historical_window_size"], size)
+            self.assertEqual(result["historical_probe_timeouts"], 1)
+            self.assertEqual(thinner._after, ("s", "0"))
+            self.assertEqual(thinner._through, ("s", "z"))
+            self.assertFalse(result["pass_complete"])
+        self.assertEqual(store.rollbacks, 12)
+        self.assertFalse(any("WITH candidates AS MATERIALIZED" in sql
+                             for sql, _ in store.calls))
+        self.assertEqual(thinner.thin(batch_size=1)["documents"], 1)
+        self.assertEqual(thinner._after, ("s", "a"))
+
+    def test_key_cancellation_does_not_hide_rollback_hint_write_or_commit_failure(self):
+        for option, error in (("fail_rollback", RuntimeError),
+                              ("fail_rollback_cancel", QueryCanceled),
+                              ("fail_hint", QueryCanceled),
+                              ("fail_write", QueryCanceled),
+                              ("fail_commit", ConnectionError)):
+            with self.subTest(option=option):
+                thinner = self.thinner(Store(fail_key=True, **{option: True}))
+                with self.assertRaises(error):
+                    thinner.thin(batch_size=1,
+                        committed_keys=(("tenant", "s", "recent"),))
+                self.assertEqual(thinner._after, ("s", "0"))
+                self.assertEqual(thinner._through, ("s", "z"))
+                self.assertEqual(thinner._window_size, 1024)
+                self.assertEqual(list(thinner._committed_keys), [("s", "recent")])
+
+    def test_successful_full_windows_restore_original_capacity_without_new_limit(self):
+        class FullWindow(Store):
+            def execute(self, sql, params):
+                result = super().execute(sql, params)
+                if sql.lstrip().startswith("SELECT source_id,document_id"):
+                    self.rows = [dict(source_id="s", document_id=f"a{i:04}")
+                                 for i in range(params[-1])]
+                return result
+        thinner = self.thinner(FullWindow(failures=0))
+        thinner._window_size = 1
+        for expected in (2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 1024):
+            self.assertEqual(thinner.thin(batch_size=2000)["historical_window_size"],
+                             expected)
+        thinner.WINDOW_SIZE = 3
+        self.assertEqual(thinner.thin(batch_size=2000)["historical_window_size"], 3)
+
+    def test_failed_write_or_commit_cannot_publish_recovered_capacity(self):
+        for option, error in (("fail_write", QueryCanceled),
+                              ("fail_commit", ConnectionError),
+                              ("fail_release_cancel", QueryCanceled)):
+            with self.subTest(option=option):
+                thinner = self.thinner(Store(failures=0, **{option: True}))
+                thinner._window_size = 1
+                with self.assertRaises(error):
+                    thinner.thin(batch_size=1)
+                self.assertEqual(thinner._window_size, 1)
+                self.assertEqual(thinner._after, ("s", "0"))
 
     def test_rollback_commit_hint_and_mutation_failures_never_publish_progress(self):
         for option, error in [

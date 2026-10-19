@@ -417,29 +417,28 @@ class CanonicalBodyThinner:
                 params = ((self._tenant_id,) + through
                           + (after if after is not None else ())
                           + (window_size,))
-                keys = connection.execute(
-                    f"""SELECT source_id,document_id FROM canonical_documents
-                        WHERE tenant_id=%s AND body_location='inline'
-                          AND deleted_at IS NULL
-                          AND (source_id,document_id)<=(%s,%s)
-                          {lower}
-                        ORDER BY source_id,document_id LIMIT %s""", params,
-                ).fetchall()
-            if keys:
-                sources = [key["source_id"] for key in keys]
-                documents = [key["document_id"] for key in keys]
                 cancelled = None
                 try:
-                    # Only this read-only probe can recover from cancellation.
-                    # SET LOCAL above has opened the outer transaction; this is
-                    # a savepoint, whose rollback must succeed before hints run.
+                    # Both historical reads may yield to committed hints only
+                    # after their savepoint has rolled back successfully.
                     with connection.transaction():
                         try:
-                            eligible = connection.execute(
-                                _thinning_statement(bounded=True, probe=True),
-                                (sources, documents, self._tenant_id, self._tenant_id,
-                                 batch_size),
+                            keys = connection.execute(
+                                f"""SELECT source_id,document_id FROM canonical_documents
+                                    WHERE tenant_id=%s AND body_location='inline'
+                                      AND deleted_at IS NULL
+                                      AND (source_id,document_id)<=(%s,%s)
+                                      {lower}
+                                    ORDER BY source_id,document_id LIMIT %s""", params,
                             ).fetchall()
+                            if keys:
+                                sources = [key["source_id"] for key in keys]
+                                documents = [key["document_id"] for key in keys]
+                                eligible = connection.execute(
+                                    _thinning_statement(bounded=True, probe=True),
+                                    (sources, documents, self._tenant_id, self._tenant_id,
+                                     batch_size),
+                                ).fetchall()
                         except QueryCanceled as error:
                             cancelled = error
                             raise
@@ -455,10 +454,15 @@ class CanonicalBodyThinner:
                     # No in-call retry and no skipped keys. Retry the same lower
                     # cursor with a smaller page on the next maintenance cycle.
                 else:
-                    if len(eligible) == batch_size:
-                        after = (eligible[-1]["source_id"], eligible[-1]["document_id"])
-                    else:
-                        after = (keys[-1]["source_id"], keys[-1]["document_id"])
+                    if len(keys) == window_size:
+                        # Recover capacity after transient contention; publish
+                        # this next-window choice only after the outer commit.
+                        window_size = min(self.WINDOW_SIZE, window_size * 2)
+                    if keys:
+                        if len(eligible) == batch_size:
+                            after = (eligible[-1]["source_id"], eligible[-1]["document_id"])
+                        else:
+                            after = (keys[-1]["source_id"], keys[-1]["document_id"])
             # Historical selection owns the cursor and has first claim on the
             # batch. Hints only fill unused slots in the same atomic mutation.
             if len(eligible) < batch_size and self._committed_keys:
