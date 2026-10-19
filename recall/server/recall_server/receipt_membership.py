@@ -187,6 +187,11 @@ def lookup_receipt_metadata(
             rows = read(opened)
     else:
         rows = read(connection)
+    return receipt_metadata_from_rows(rows, include_deleted=include_deleted)
+
+
+def receipt_metadata_from_rows(rows, *, include_deleted=False):
+    """Validate rows from the native SQL authority snapshot; never infer it."""
     result = {}
     for row in rows:
         receipt = row['requested_receipt']
@@ -241,14 +246,25 @@ def verified_document_chunks(store, connection, *, tenant_id, source_id, documen
     membership owner may supply an absent admitted singleton; derived metadata
     contributes zero physical body bytes.
     """
-    requested = {}
-    for row in documents:
-        requested[row['document_id']] = tuple(chunk['receipt'] for chunk in row['chunks']) or (
-            item_receipt(source_id, row['native_id'], row['revision'], 0),)
+    requested = document_chunk_requests(source_id, documents)
     members = lookup_receipt_metadata(store, tenant_id=tenant_id,
         authorized_sources=(source_id,),
         receipts=tuple(dict.fromkeys(receipt for receipts in requested.values() for receipt in receipts)),
         allow_verified_singletons=True, connection=connection, deadline_at=deadline_at)
+    return verified_document_chunk_metadata(documents, requested, members)
+
+
+def document_chunk_requests(source_id, documents):
+    """Retain each document's exact physical receipts or admitted-singleton request."""
+    requested = {}
+    for row in documents:
+        requested[row['document_id']] = tuple(chunk['receipt'] for chunk in row['chunks']) or (
+            item_receipt(source_id, row['native_id'], row['revision'], 0),)
+    return requested
+
+
+def verified_document_chunk_metadata(documents, requested, members):
+    """Compare captured chunks with metadata proved by the native receipt owner."""
     result = {}
     for row in documents:
         physical = {chunk['receipt']: chunk for chunk in row['chunks']}
