@@ -127,3 +127,48 @@ def proves_append(checkpoint, projected, candidate, manifest, read_part):
                 and checkpoint['source_byte_start'] >= 0)
     except (KeyError, TypeError, ValueError):
         return False
+
+
+def grouped_checkpoint_matches(checkpoint, projected, candidate):
+    """Typed groups have a second retained range after the visible overlap."""
+    try:
+        groups = checkpoint['tool_groups']
+        if (type(groups['version']) is not int or groups['version'] != 1
+            or groups['extraction_version'] != candidate.extraction_version
+            or projected['requested_extraction_version'] != candidate.extraction_version
+            or projected['applied_extraction_version'] != candidate.extraction_version
+            or not isinstance(groups['coverage'], dict)
+            or groups['coverage'] != projected['extraction_coverage']):
+            return False
+        for key in ('visible_passages', 'tool_passages', 'record_count', 'messages', 'bytes'):
+            if type(groups[key]) is not int or groups[key] < 0:
+                return False
+        return (checkpoint['passage_ordinal'] < groups['visible_passages']
+            and groups['visible_passages'] + groups['tool_passages'] == projected['passage_count']
+            and groups['record_count'] == checkpoint['last_part']['last_record_ordinal'] + 1
+            and groups['messages'] <= projected['dense_message_count']
+            and groups['bytes'] <= projected['dense_message_bytes']
+            and isinstance(groups['prefix_sha256'], str))
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
+def add_group_coverage(previous, current):
+    from collections import Counter
+    if previous['contract'] != current['contract']:
+        raise ValueError('tool coverage contract changed')
+    result = dict(current)
+    for key in ('events', 'tool_blocks', 'groups', 'string_leaves', 'included_string_leaves'):
+        if any(type(value[key]) is not int or value[key] < 0 for value in (previous, current)):
+            raise ValueError('invalid tool coverage count')
+        result[key] += previous[key]
+    dispositions = Counter()
+    if any(not isinstance(value['dispositions'], dict) for value in (previous, current)):
+        raise ValueError('invalid tool coverage dispositions')
+    for value in (previous, current):
+        for key, count in value['dispositions'].items():
+            if not isinstance(key, str) or type(count) is not int or count < 0:
+                raise ValueError('invalid tool coverage disposition')
+            dispositions[key] += count
+    result['dispositions'] = dict(sorted(dispositions.items()))
+    return result

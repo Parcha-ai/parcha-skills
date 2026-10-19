@@ -100,7 +100,8 @@ class ClaudeFirstProjection(unittest.TestCase):
         self.assertEqual(self.document()['requested_extraction_version'], 'tool_groups_v1')
         self.assertEqual(self.document()['applied_extraction_version'], 'tool_groups_v1')
         self.assertTrue(before <= {p['passage_id'] for p in self.projected()})
-        self.assertIsNone(self.document()['append_checkpoint'])
+        self.assertEqual(self.document()['append_checkpoint']['tool_groups']['extraction_version'],
+                         'tool_groups_v1')
 
     def test_pending_forget_refuses_first_projection(self):
         self.ingest('input')
