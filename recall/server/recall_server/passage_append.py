@@ -31,7 +31,16 @@ class RetainedPassage:
 
 
 def prefix_digest(passages):
-    return digest([(p.passage_id, p.ordinal, list(p.receipts)) for p in passages])
+    # Hash the same canonical JSON array without retaining the whole prefix.
+    result = hashlib.sha256(b'[')
+    separator = b''
+    for passage in passages:
+        result.update(separator)
+        result.update(json.dumps((passage.passage_id, passage.ordinal, list(passage.receipts)),
+            sort_keys=True, separators=(',', ':'), ensure_ascii=False).encode())
+        separator = b','
+    result.update(b']')
+    return result.hexdigest()
 
 
 def resume_passages(messages, checkpoint, arguments):

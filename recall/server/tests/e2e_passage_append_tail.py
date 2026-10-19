@@ -184,7 +184,10 @@ class PassageAppendTail(HandbackPublication):
             body=read(reference,**kwargs);reads.append(len(body));return body
         prepared_values=[];prepare=full._prepare
         def capture(*args,**kwargs):
-            prepared=prepare(*args,**kwargs);prepared_values.append(prepared);return prepared
+            from dataclasses import replace
+            prepared=prepare(*args,**kwargs)
+            prepared_values.append(replace(prepared, passages=tuple(prepared.passages), _resources=None))
+            return prepared
         with patch.object(full.logical_projection,'read_part',side_effect=observed),patch.object(full,'_prepare',side_effect=capture):
             report=full.project_pending(tenant_id=self.tenant,batch_size=1,max_batches=1,concurrency=1)
         self.assertEqual(report['documents'],1);self.assertEqual(len(prepared_values),1);prepared=prepared_values[0]

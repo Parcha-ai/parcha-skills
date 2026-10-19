@@ -112,8 +112,8 @@ class PassageRecordSpoolTests(unittest.TestCase):
                             projector._prepare(candidate, incremental=True)
                     else:
                         self.assertEqual(projector._prepare(candidate, incremental=True).passages, ())
-                self.assertEqual(len(opened), 1)
-                self.assertTrue(opened[0].closed)
+                self.assertEqual(len(opened), 3 if failure == 'archive' else 4)
+                self.assertTrue(all(stream.closed for stream in opened))
                 expected = [0, 1] if failure == 'archive' else [0, 1, 2]
                 self.assertEqual(archive.calls, expected)
 

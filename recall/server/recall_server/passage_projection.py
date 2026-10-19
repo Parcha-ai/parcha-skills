@@ -7,7 +7,7 @@ import json
 import re
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
-from itertools import islice
+from itertools import groupby, islice
 from typing import Iterable, Iterator
 
 import orjson
@@ -638,52 +638,23 @@ def build_passages(
     *, tenant_id: str, source_id: str, logical_document_id: str,
     revision: int, messages: tuple[PassageMessage, ...], policy: PassagePolicy,
 ) -> tuple[LosslessPassage, ...]:
-    """Keep typed report boundaries while retaining ordinary token windows."""
-    arguments = dict(tenant_id=tenant_id, source_id=source_id,
-                     logical_document_id=logical_document_id, revision=revision,
-                     policy=policy)
-    if not isinstance(messages, tuple) or not all(isinstance(m, PassageMessage) for m in messages):
-        return _build_passages(messages=messages, **arguments)
-    reports = [i for i, message in enumerate(messages) if message.source_unit in COMPLETE_SOURCE_UNITS]
-    if not reports:
-        return _build_passages(messages=messages, **arguments)
-    if not _ordered_messages(messages):
-        raise ValueError("lossless passage records must be unique and ordered")
-    groups = []
-    start = 0
-    for index in reports:
-        if start < index:
-            groups.append((start, index, False))
-        groups.append((index, index + 1, True))
-        start = index + 1
-    if start < len(messages):
-        groups.append((start, len(messages), False))
-    output = []
-    for start, end, report in groups:
-        built = _build_passages(messages=messages[start:end], **arguments)
-        for passage in built:
-            complete = (report and len(built) == 1
-                        and passage.token_count <= DEFAULT_PASSAGE_POLICY.target_tokens
-                        and passage.text == messages[start].text)
-            spans = tuple(replace(span, message_index=span.message_index + start,
-                                  source_unit=messages[start].source_unit if complete else span.source_unit)
-                          for span in passage.spans)
-            identity = passage_identity(tenant_id=tenant_id, source_id=source_id,
-                logical_document_id=logical_document_id, policy_fingerprint=policy.fingerprint,
-                text_sha256=passage.text_sha256, spans=spans)
-            output.append(replace(passage, passage_id=identity, ordinal=len(output), spans=spans))
-    return tuple(output)
+    """Compatibility materialization of the native streaming window builder."""
+    if not isinstance(messages, tuple) or not messages:
+        raise ValueError("lossless passage document identity is invalid")
+    return tuple(iter_passages(tenant_id=tenant_id, source_id=source_id,
+        logical_document_id=logical_document_id, revision=revision,
+        messages=messages, policy=policy))
 
 
-def _build_passages(
-    *,
-    tenant_id: str,
-    source_id: str,
-    logical_document_id: str,
-    revision: int,
-    messages: tuple[PassageMessage, ...],
-    policy: PassagePolicy,
-) -> tuple[LosslessPassage, ...]:
+def iter_passages(
+    *, tenant_id: str, source_id: str, logical_document_id: str,
+    revision: int, messages: Iterable[PassageMessage], policy: PassagePolicy,
+) -> Iterator[LosslessPassage]:
+    """Emit exact native windows; consumers must exhaust before atomic publication.
+
+    Retention follows the active token window and largest message/tool leaf group,
+    not the parent length. This does not bound complete-event reassembly upstream.
+    """
     if (
         not isinstance(tenant_id, str)
         or not IDENTITY_RE.fullmatch(tenant_id)
@@ -694,36 +665,77 @@ def _build_passages(
         or isinstance(revision, bool)
         or not isinstance(revision, int)
         or revision < 1
-        or not isinstance(messages, tuple)
-        or not messages
         or not isinstance(policy, PassagePolicy)
     ):
         raise ValueError("lossless passage document identity is invalid")
-    for message in messages:
-        if not isinstance(message, PassageMessage):
-            raise ValueError("lossless passage message is invalid")
-        message.validate()
-        if codex_tool_source_unit_role(message.source_unit) is not None and (
-            not source_id.startswith("codex:")
-            or any(not receipt.startswith("recall://" + source_id + "/") for receipt in message.receipts)
-        ):
-            raise ValueError("typed Codex passage source does not match its receipts")
-    if not _ordered_messages(messages):
-        raise ValueError("lossless passage records must be unique and ordered")
 
-    encoded_messages = tuple(message.text.encode() for message in messages)
-    tokens = (
-        token
-        for index, (message, encoded) in enumerate(
-            zip(messages, encoded_messages, strict=True)
-        )
-        for token in _message_tokens(message.text, encoded, index)
-    )
-    passages: list[LosslessPassage] = []
+    def validated():
+        prior = None
+        units = set()
+        for index, message in enumerate(messages):
+            if not isinstance(message, PassageMessage):
+                raise ValueError("lossless passage message is invalid")
+            message.validate()
+            if codex_tool_source_unit_role(message.source_unit) is not None and (
+                not source_id.startswith("codex:")
+                or any(not receipt.startswith("recall://" + source_id + "/") for receipt in message.receipts)
+            ):
+                raise ValueError("typed Codex passage source does not match its receipts")
+            if prior is not None and not _ordered_messages((prior, message)):
+                raise ValueError("lossless passage records must be unique and ordered")
+            if prior is None or prior.record_ordinal != message.record_ordinal:
+                units.clear()
+            if message.source_unit in units:
+                raise ValueError("lossless passage records must be unique and ordered")
+            units.add(message.source_unit)
+            prior = message
+            yield index, message
+
+    ordinal = 0
+    # Each complete report is its own segment; ordinary messages share windows.
+    for report_index, segment in groupby(validated(), key=lambda item:
+            item[0] if item[1].source_unit in COMPLETE_SOURCE_UNITS else None):
+        for passage in _iter_passage_windows(tenant_id=tenant_id, source_id=source_id,
+                logical_document_id=logical_document_id, revision=revision,
+                indexed_messages=segment, policy=policy, ordinal=ordinal,
+                complete=report_index is not None):
+            yield passage
+            ordinal += 1
+
+
+def _iter_passage_windows(*, tenant_id, source_id, logical_document_id, revision,
+                          indexed_messages, policy, ordinal, complete):
+    messages = {}
+    encoded_messages = {}
+    complete_unit = None
+
+    def message_tokens():
+        nonlocal complete_unit
+        for index, message in indexed_messages:
+            encoded = message.text.encode()
+            if not encoded:
+                continue
+            messages[index] = message
+            encoded_messages[index] = encoded
+            if complete:
+                complete_unit = message.source_unit
+            yield from _message_tokens(message.text, encoded, index)
+
+    tokens = message_tokens()
     window = list(islice(tokens, policy.target_tokens))
     while window:
+        active = {token.message_index for token in window}
+        for index in list(messages):
+            if index not in active:
+                del messages[index], encoded_messages[index]
         for reader_window in _reader_span_windows(window, messages):
             spans = _spans(reader_window, messages)
+            if complete_unit is not None:
+                if (len(window) <= DEFAULT_PASSAGE_POLICY.target_tokens
+                    and len(window) == len(reader_window)
+                    and reader_window[0].byte_start == 0
+                    and reader_window[-1].byte_end == len(encoded_messages[reader_window[0].message_index])):
+                    spans = tuple(replace(span, source_unit=complete_unit) for span in spans)
             text = PASSAGE_SEPARATOR.join(
                 encoded_messages[span.message_index][
                     span.source_byte_start:span.source_byte_end
@@ -742,8 +754,7 @@ def _build_passages(
                     value.replace("Z", "+00:00")
                 )
             )
-            passages.append(
-                LosslessPassage(
+            yield LosslessPassage(
                     tenant_id=tenant_id,
                     source_id=source_id,
                     logical_document_id=logical_document_id,
@@ -756,7 +767,7 @@ def _build_passages(
                         text_sha256=text_sha256,
                         spans=spans,
                     ),
-                    ordinal=len(passages),
+                    ordinal=ordinal,
                     policy_fingerprint=policy.fingerprint,
                     token_count=len(reader_window),
                     first_occurred_at=occurred[0],
@@ -780,7 +791,7 @@ def _build_passages(
                     text_sha256=text_sha256,
                     spans=spans,
                 )
-            )
+            ordinal += 1
         if len(window) < policy.target_tokens:
             break
         retained = (
@@ -795,7 +806,6 @@ def _build_passages(
         if not added:
             break
         window = retained + added
-    return tuple(passages)
 
 
 def decode_logical_record(
@@ -946,8 +956,14 @@ def _logical_record_groups(
 def visible_messages(
     records: Iterable[LogicalEvidenceRecord], *, first_record_ordinal: int = 0,
 ) -> tuple[PassageMessage, ...]:
-    """Combine physical segments into exact visible source messages."""
-    messages: list[PassageMessage] = []
+    """Compatibility materialization of exact visible source messages."""
+    return tuple(iter_visible_messages(records, first_record_ordinal=first_record_ordinal))
+
+
+def iter_visible_messages(
+    records: Iterable[LogicalEvidenceRecord], *, first_record_ordinal: int = 0,
+) -> Iterator[PassageMessage]:
+    """Yield visible messages; a complete segmented event is still reassembled."""
     for group in _logical_record_groups(records, first_record_ordinal=first_record_ordinal):
         first = group[0]
         source_text = "".join(record.text for record in group)
@@ -984,5 +1000,4 @@ def visible_messages(
             origin=_message_origin(source_text, text),
         )
         message.validate()
-        messages.append(message)
-    return tuple(messages)
+        yield message
