@@ -237,7 +237,28 @@ class ParentMembershipFastReadTests(ParentEnrollmentTests):
             rows, stages = self.authorize()
         self.assertEqual(len(rows), len(self.ids)); self.assertEqual(stages['native_receipts'], 0)
         rows, stages = self.authorize()
-        self.assertEqual(len(rows), len(self.ids)); self.assertGreater(stages['native_receipts'], 0)
+        self.assertEqual(len(rows), len(self.ids))
+        if self.additive_membership_generation:
+            self.assertEqual(stages['native_receipts'], 0)
+        else:
+            self.assertGreater(stages['native_receipts'], 0)
+        fast = self.search()
+        self.retrieval.parent_membership_read = reader.ReadSettings()
+        with patch('recall_server.receipt_membership.lookup_current_search_membership',
+                   wraps=lookup_current_search_membership) as proof:
+            native_rows, _ = self.authorize()
+        self.assertEqual(proof.call_count, 1)
+        self.assertEqual(rows, native_rows)
+        native = self.search()
+        self.assertEqual(fast['results'], native['results'])
+        self.assertEqual(fast['arms'], native['arms'])
+        self.enable(); self.edit()
+        fast_denied = self.search()
+        self.retrieval.parent_membership_read = reader.ReadSettings()
+        native_denied = self.search()
+        self.assertEqual(fast_denied['results'], [])
+        self.assertEqual(fast_denied['results'], native_denied['results'])
+        self.assertEqual(fast_denied['arms'], native_denied['arms'])
 
     def test_shadow_still_observes_real_native_proof_when_both_flags_enabled(self):
         self.enroll(); self.enable()

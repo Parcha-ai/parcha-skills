@@ -96,6 +96,9 @@ class ParentAuthorityGenerationTests(SingletonSearchTests):
         print(json.dumps(dict(test=self._testMethodName,shared_blocks=blocks,parents=16,documents=64,chunks=chunks)),flush=True)
 
     def test_runtime_role_grants_and_reused_backend_flush_each_transaction(self):
+        # This fixture wraps ingest in a transaction, so its native transaction
+        # is a subtransaction. Both collectors conservatively invalidate once.
+        initial_generation = 1
         role='runtime_generation_'+self.tenant.rsplit(':',1)[-1]
         with self.store.connect() as admin:
             admin.execute(psycopg.sql.SQL('CREATE ROLE {} NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS').format(psycopg.sql.Identifier(role)))
@@ -115,16 +118,16 @@ class ParentAuthorityGenerationTests(SingletonSearchTests):
                         yield runtime
                 with patch.object(self.store,'connect',side_effect=role_connection):
                     self.ingest('turn/search','Synthetic runtime original')
-                    self.assertEqual(self.generation(),self.initial_generation)
+                    self.assertEqual(self.generation(),initial_generation)
                     with psycopg.connect(self.store.dsn) as admin:
                         admin.execute(psycopg.sql.SQL('REVOKE UPDATE ON canonical_parent_authority FROM {}').format(psycopg.sql.Identifier(role)))
                     with self.assertRaises(psycopg.errors.InsufficientPrivilege):
                         self.edit()
-                    self.assertEqual(self.generation(),self.initial_generation)
+                    self.assertEqual(self.generation(),initial_generation)
                     with psycopg.connect(self.store.dsn) as admin:
                         admin.execute(psycopg.sql.SQL('GRANT UPDATE ON canonical_parent_authority TO {}').format(psycopg.sql.Identifier(role)))
                     self.edit()
-                    self.assertEqual(self.generation(),self.initial_generation+1)
+                    self.assertEqual(self.generation(),initial_generation+1)
                     with self.store.connect() as c:
                         privileges=c.execute("""SELECT current_user AS role,
                           has_schema_privilege(current_user,'public','CREATE') AS schema_create,
@@ -137,7 +140,7 @@ class ParentAuthorityGenerationTests(SingletonSearchTests):
                     with self.store.connect() as c:
                         c.execute('DROP TABLE pg_temp.recall_parent_authority_pending')
                     self.edit(batch=True,tombstone=True,native='session')
-                    self.assertEqual(self.generation(),self.initial_generation+2)
+                    self.assertEqual(self.generation(),initial_generation+2)
                     with self.store.connect() as c:
                         self.assertEqual(c.execute('SELECT count(*) AS n FROM pg_temp.recall_parent_authority_pending').fetchone()['n'],0)
         finally:
