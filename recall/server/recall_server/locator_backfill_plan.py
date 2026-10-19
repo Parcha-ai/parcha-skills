@@ -63,7 +63,7 @@ _PARENT_SQL = """SELECT to_jsonb(evidence) AS manifest,
            AND queued.native_parent_id=evidence.native_parent_id) AS queue
     FROM canonical_evidence_documents evidence
    WHERE evidence.tenant_id=%s AND evidence.source_id=%s AND evidence.native_parent_id=%s"""
-_DOCUMENTS_SQL = """SELECT document.tenant_id,document.source_id,document.document_id,
+_DOCUMENTS_SELECT_SQL = """SELECT document.tenant_id,document.source_id,document.document_id,
        document.native_id,document.revision,document.text_sha256,
        document.body_record_ordinal,document.body_record_count,event.kind,
        artifact.media_type AS raw_media_type,
@@ -72,7 +72,8 @@ _DOCUMENTS_SQL = """SELECT document.tenant_id,document.source_id,document.docume
              event.canonical_redacted #>> '{content,message,type}',
              event.canonical_redacted #>> '{content,payload,type}',
              event.canonical_redacted #>> '{message,type}',
-             event.canonical_redacted #>> '{payload,type}'] AS structural_types
+             event.canonical_redacted #>> '{payload,type}'] AS structural_types"""
+_DOCUMENTS_FROM_SQL = """
   FROM canonical_documents document
   JOIN canonical_events event USING(tenant_id,source_id,event_id)
   JOIN raw_artifacts artifact
@@ -86,6 +87,7 @@ _DOCUMENTS_SQL = """SELECT document.tenant_id,document.source_id,document.docume
                       AND later.native_id=document.native_id AND later.revision>document.revision
                       AND later.is_tombstone)
  ORDER BY document.document_id LIMIT %s"""
+_DOCUMENTS_SQL = _DOCUMENTS_SELECT_SQL + _DOCUMENTS_FROM_SQL
 
 
 def _snapshot_on_connection(store, connection, tenant, source, parent, limits, deadline_at):
