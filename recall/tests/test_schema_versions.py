@@ -74,7 +74,7 @@ class ExpectedSchemaVersionsTests(unittest.TestCase):
                     self.versions(latest, native_file)
 
     def test_unknown_latest_is_not_implicitly_allowed(self):
-        for latest in (69, 92):
+        for latest in (69, 93):
             with self.subTest(latest=latest):
                 with self.assertRaisesRegex(AssertionError, "unreviewed latest"):
                     self.versions(latest, False)
@@ -90,3 +90,7 @@ class ExpectedSchemaVersionsTests(unittest.TestCase):
     def test_search_checkpoint_version_is_explicitly_supported(self):
         self.assertEqual(self.versions(91, False), [*range(1, 71), *range(72, 92)])
         self.assertEqual(self.versions(91, True), list(range(1, 92)))
+
+    def test_additive_membership_version_is_explicitly_supported(self):
+        self.assertEqual(self.versions(92, False), [*range(1, 71), *range(72, 93)])
+        self.assertEqual(self.versions(92, True), list(range(1, 93)))

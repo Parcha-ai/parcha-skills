@@ -318,7 +318,7 @@ are supported: versions through 69 are required except optional migration 67,
 which retires the Postgres vector plane and is applied explicitly from the
 turbopuffer plane. Migration 70 adds only a reconciliation performance index;
 serving accepts both schema 69 and 70 and reports the actual recorded version.
-The latest shipped migration is 91; migration 71 remains optional and reserved
+The latest shipped migration is 92; migration 71 remains optional and reserved
 for native-conversation metadata. Migration 72 adds nullable
 `canonical_evidence_document_queue.notification_queued_at`, with no default,
 index, or historical reclassification. Apply it before deploying the notification
@@ -1943,3 +1943,38 @@ a native schema91 startup and empty-cycle test and ignores the new column,
 replaying work conservatively; its separate capability-check command still
 rejects 91. That startup witness does not prove active-page completion or latency.
 Use the exact reviewed worker rollback image, not an arbitrary older binary.
+
+
+### Optional additive membership generation (092)
+
+Migration 092 replaces the existing statement/deferred parent-generation collector
+and records its version. It adds no table, column, index, certificate backfill, or
+new writer flag. The existing singleton profile (080), parent generation (082),
+certificate fields (083), and remainder owner (085) must already be present.
+
+Deploy a runtime that explicitly accepts 091 and 092 to each serving and worker
+role before applying 092 through the reviewed atomic migration owner. Do not
+use a general migrate-all command as an unreviewed production rollout. The v3
+passage binding can run on 091 with conservative generation invalidation; pending
+logical/retirement work continues to block the remainder owner until 092 is
+installed. Active maintenance intent remains blocking on either version.
+
+The new collector rejects NEW noncanonical physical receipt identities and
+in-place changes to receipt-defining document identity. Normal ingestion uses
+canonical receipts and inserts superseding revisions. Historical malformed rows
+may be cleaned or repaired under the reviewed invariant; do not reidentify a
+document in place. Exact singleton conversion preserves membership only under
+the native equivalence checks. Existing-document physical INSERTs invalidate
+unless the transaction owns the current document tuple; subtransaction/XID
+representation mismatches conservatively invalidate.
+
+Mixed v2/v3 readers never treat the other binding domain as a certificate match:
+they use the unchanged native receipt proof. Current grants, source ownership,
+Forget, generation/CAS and full native enrollment proof remain mandatory.
+Rollback requires a binary with explicit 092 capability compatibility; retain
+the migration marker and data. Do not assume an older binary's HTTP health check
+proves schema compatibility or automatically restore an older collector.
+
+This ordering describes the product contract, not evidence of a production
+rollout. Actual roles, CI, migration receipt, rollback target and post-release
+selected-cohort/public-latency acceptance must be bound by the operator.

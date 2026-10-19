@@ -266,13 +266,33 @@ class SingletonMetadataAdmission(ReceiptMembershipTests):
             with self.subTest(assignment=assignment), self.store.connect() as connection, connection.transaction(force_rollback=True):
                 # The exact candidate uses this transaction so corrupted fixture
                 # state is rolled back between independent contradiction cases.
-                connection.execute('UPDATE canonical_chunks SET '+assignment+' WHERE tenant_id=%s AND receipt=%s', (self.tenant, original['receipt']))
+                from contextlib import nullcontext
+                from e2e_logical_evidence_projection import legacy_canonical_state
+                installed = connection.execute('SELECT 1 FROM schema_migrations WHERE version=92').fetchone()
+                # Only this mismatched ordinal needs historical fixture setup.
+                # Restore the installed collector before testing native admission.
+                fixture = legacy_canonical_state(connection) if installed and assignment == 'ordinal=1' else nullcontext()
+                with fixture:
+                    connection.execute('UPDATE canonical_chunks SET '+assignment+' WHERE tenant_id=%s AND receipt=%s', (self.tenant, original['receipt']))
                 from recall_server.chunk_retirement import _singleton_metadata_candidates
                 import time
                 with self.assertRaises(ChunkRetirementError):
                     _singleton_metadata_candidates(self.store, connection, tenant_id=self.tenant,
                         source_id=self.source, document_ids=(original['document_id'],), deadline_at=time.monotonic()+5)
         self.assertEqual(self.baseline(original['receipt']), original)
+
+    def test_admission_current_writer_rejects_mismatched_physical_ordinal(self):
+        import psycopg
+        with self.store.connect() as connection:
+            if not connection.execute('SELECT 1 FROM schema_migrations WHERE version=92').fetchone():
+                self.skipTest('schema091 permits historical contradictory metadata')
+        original = self.prepare()
+        with self.assertRaisesRegex(psycopg.errors.CheckViolation, 'canonical_physical_receipt_identity_invalid'):
+            with self.store.connect() as connection:
+                connection.execute('UPDATE canonical_chunks SET ordinal=1 WHERE tenant_id=%s AND receipt=%s',
+                    (self.tenant, original['receipt']))
+        self.assertEqual(self.baseline(original['receipt']), original)
+        self.assertEqual(self.state(original), {'chunk_receipt_profile': None, 'chunks': 1})
 
     def test_admission_leaves_unrelated_metadata_unchanged(self):
         original = self.prepare()

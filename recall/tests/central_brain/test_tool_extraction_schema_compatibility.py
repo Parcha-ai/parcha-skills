@@ -15,7 +15,7 @@ class ToolExtractionSchemaCompatibility(unittest.TestCase):
                 self.assertEqual(assess_snapshot(snapshot)['schema_version'], latest)
 
     def test_89_does_not_hide_unknown_version_missing_marker_or_privilege_failure(self):
-        for versions in (list(range(1, 93)), [n for n in range(1, 90) if n != 69],
+        for versions in (list(range(1, 94)), [n for n in range(1, 90) if n != 69],
                          list(range(1, 90)) + [89]):
             snapshot = healthy_snapshot()
             snapshot['migration_versions'] = versions

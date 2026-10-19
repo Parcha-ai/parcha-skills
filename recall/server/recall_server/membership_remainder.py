@@ -19,6 +19,7 @@ FIELDS = (
 _CURRENT = """SELECT evidence.revision,evidence.document_content_sha256 AS source_sha256,
     evidence.manifest_content_sha256 AS manifest_sha256,projected.policy_fingerprint AS policy,
     authority.generation AS authority_generation,
+    EXISTS(SELECT 1 FROM schema_migrations WHERE version=92) AS additive_membership_generation,
     EXISTS(SELECT 1 FROM canonical_evidence_document_queue dirty
       WHERE dirty.tenant_id=evidence.tenant_id AND dirty.source_id=evidence.source_id
         AND dirty.native_parent_id=evidence.native_parent_id) AS logical_pending,
@@ -221,12 +222,10 @@ def resume(store, row, *, settings, deadline_at):
                         for name in FIELDS if name != "authority_generation"
                     )
                 )
-                busy = scope is not None and any(
-                    scope[name]
-                    for name in (
-                        "logical_pending",
-                        "retirement_pending",
-                        "retirement_intent",
+                busy = scope is not None and (
+                    scope["retirement_intent"] or (
+                        not scope["additive_membership_generation"]
+                        and (scope["logical_pending"] or scope["retirement_pending"])
                     )
                 )
                 generation_changed = valid and (

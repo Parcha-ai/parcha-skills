@@ -30,6 +30,7 @@ from . import (
     DOCUMENT_EXTRACTION_VERSION,
     CODEX_EXTRACTION_VERSION,
     SEARCH_PUBLICATION_CHECKPOINT_VERSION,
+    ADDITIVE_MEMBERSHIP_GENERATION_VERSION,
 )
 
 
@@ -243,7 +244,9 @@ def assess_snapshot(snapshot: dict[str, Any], profile: str = "production") -> di
                       + ([CODEX_EXTRACTION_VERSION]
                          if CODEX_EXTRACTION_VERSION in versions else [])
                       + ([SEARCH_PUBLICATION_CHECKPOINT_VERSION]
-                         if SEARCH_PUBLICATION_CHECKPOINT_VERSION in versions else []))
+                         if SEARCH_PUBLICATION_CHECKPOINT_VERSION in versions else [])
+                      + ([ADDITIVE_MEMBERSHIP_GENERATION_VERSION]
+                         if ADDITIVE_MEMBERSHIP_GENERATION_VERSION in versions else []))
     if (CODEX_EXTRACTION_VERSION in versions
             and DOCUMENT_EXTRACTION_VERSION not in versions):
         raise CapabilityError("schema_drift")
@@ -267,6 +270,10 @@ def assess_snapshot(snapshot: dict[str, Any], profile: str = "production") -> di
         raise CapabilityError("schema_drift")
     if (LOGICAL_ACTOR_CHECKPOINT_VERSION in versions
             and LOGICAL_APPEND_CAPABILITY_VERSION not in versions):
+        raise CapabilityError("schema_drift")
+    if (ADDITIVE_MEMBERSHIP_GENERATION_VERSION in versions
+            and not {SINGLETON_RECEIPT_PROFILE_VERSION, PARENT_AUTHORITY_GENERATION_VERSION,
+                     PARENT_MEMBERSHIP_CERTIFICATE_VERSION, MEMBERSHIP_REMAINDER_VERSION}.issubset(versions)):
         raise CapabilityError("schema_drift")
     if versions != expected:
         raise CapabilityError("schema_drift")
