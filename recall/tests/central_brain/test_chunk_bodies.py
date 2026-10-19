@@ -36,7 +36,14 @@ class Store:
         return self
 
     def fetchall(self):
-        return copy.deepcopy(self.snapshots[min(len(self.calls) - 1, len(self.snapshots) - 1)])
+        rows = copy.deepcopy(self.snapshots[min(len(self.calls) - 1, len(self.snapshots) - 1)])
+        if '_catalog_first' in self.calls[-1][0]:
+            # Keep every deliberately corrupted catalog intact. Native tests
+            # exercise parent deduplication; this fake supplies complete rows.
+            for row in rows:
+                row['_catalog_parent_id'] = row['native_parent_id'] or row['native_id']
+                row['_catalog_first'] = True
+        return rows
 
 
 class Archive:
