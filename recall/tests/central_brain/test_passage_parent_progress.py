@@ -1,6 +1,7 @@
 """Passage owners keep bodies bounded and preserve commit pool headroom."""
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
+from datetime import datetime, timezone
 import threading
 from types import SimpleNamespace
 import unittest
@@ -78,7 +79,10 @@ class PassageOwnerTests(unittest.TestCase):
         class Projector(CanonicalPassageProjector):
             def _pending(self, **kwargs):
                 calls.append('pending')
-                return [SimpleNamespace(name=name) for name in ('missing', 'unavailable', 'ready')]
+                return [SimpleNamespace(
+                    name=name, tenant_id='tenant:test', source_id='source:test',
+                    logical_document_id=name, changed_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+                ) for name in ('missing', 'unavailable', 'ready')]
             def _prepare(self, candidate, *, incremental=False):
                 assert incremental is True
                 if candidate.name != 'ready':
