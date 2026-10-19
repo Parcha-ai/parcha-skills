@@ -200,6 +200,23 @@ def resume(store, row, *, settings, deadline_at):
         return dict(status="disabled", certified_passages=0)
     try:
         while time.monotonic() < deadline_at:
+            if first_slice:
+                with native._connect(store, deadline_at) as connection:
+                    # Rotate scheduling before metadata can consume the allowance.
+                    # Commit this timestamp before a later read can roll back.
+                    # This acknowledges no proof and never changes its checkpoint.
+                    scheduled = native._query(
+                        store, connection,
+                        """UPDATE canonical_passage_projection_queue
+                        SET changed_at=clock_timestamp()
+                        WHERE tenant_id=%s AND source_id=%s AND logical_document_id=%s
+                          AND generation=%s AND reason='certification'
+                          AND coalesce(certification_checkpoint,'null'::jsonb)=%s::jsonb""",
+                        (*key(row), row["generation"], json.dumps(checkpoint)), deadline_at,
+                    )
+                if scheduled.rowcount != 1:
+                    return dict(status="changed", certified_passages=certified)
+                first_slice = False
             with native._connect(store, deadline_at) as connection:
                 scope = native._query(
                     store, connection, CURRENT, key(row), deadline_at
@@ -236,9 +253,8 @@ def resume(store, row, *, settings, deadline_at):
                 if valid and scope["authority_generation"] is None and not initialize:
                     # A previously positive binding must never be reset.
                     valid = checkpoint["authority_generation"] is None
-                if valid and (first_slice or generation_changed):
-                    # Fair retries use the existing work-order timestamp, never
-                    # a reservation. Release this short queue lock before proof.
+                if valid and generation_changed:
+                    # Reset an invalidated prefix only after current metadata.
                     updated = checkpoint
                     if generation_changed and not busy:
                         # A membership change invalidates the acknowledged prefix.
@@ -262,7 +278,6 @@ def resume(store, row, *, settings, deadline_at):
                     if scheduled.rowcount != 1:
                         return dict(status="changed", certified_passages=certified)
                     checkpoint = updated
-                    first_slice = False
                 rows = (
                     native._query(
                         store,

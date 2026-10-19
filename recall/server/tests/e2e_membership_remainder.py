@@ -759,7 +759,7 @@ class MembershipRemainderTests(ParentMembershipPublicationTests):
                 batch_size=10, max_batches=1, upload_concurrency=1)
 
         def before_rotation(store, connection, statement, parameters, deadline):
-            if "SET changed_at=clock_timestamp(),certification_checkpoint=" in statement and not interleaved:
+            if "SET changed_at=clock_timestamp()" in statement and not interleaved:
                 interleaved.append(True)
                 with ThreadPoolExecutor(max_workers=1) as executor:
                     executor.submit(publish_newer).result(timeout=10)
