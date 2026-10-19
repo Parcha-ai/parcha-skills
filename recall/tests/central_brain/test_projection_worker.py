@@ -91,7 +91,7 @@ class _Scan:
 
 
 class ProjectionWorkerTest(unittest.TestCase):
-    def test_only_new_worker_cycle_renews_optional_certification_allowance(self):
+    def test_new_worker_cycle_does_not_renew_before_wall_cadence(self):
         from unittest.mock import patch
         from types import SimpleNamespace
 
@@ -101,7 +101,7 @@ class ProjectionWorkerTest(unittest.TestCase):
 
         class Passages(_Passages):
             def project_pending(self, **kwargs):
-                now[0] += 10  # Source work before optional proof.
+                now[0] += 1  # Source work before optional proof.
                 with kwargs["certification_budget"].lease() as deadline:
                     deadlines.append(deadline)
                     now[0] += 1  # Charge only actual optional work.
@@ -119,10 +119,81 @@ class ProjectionWorkerTest(unittest.TestCase):
                 logical_batch_size=2, passage_batch_size=1, embedding_batch_size=1,
                 max_batches_per_cycle=1, upload_concurrency=1, passage_concurrency=1,
                 interval_seconds=1, max_cycles=2, skip_embedding=True,
-                sleep=lambda _: None,
+                sleep=lambda _: None, clock=lambda: now[0],
             )
-        self.assertEqual(deadlines, [13, 23, 33, 46, 56, 66])
+        self.assertEqual(deadlines, [4, 5, 6, None, None, None])
         self.assertEqual(result["passage_documents"], 6)
+
+    def test_due_certificate_maintenance_has_one_slice_no_catchup_and_search_first(self):
+        from unittest.mock import patch
+        from types import SimpleNamespace
+
+        now, calls, drains, leases = [0.0], [], [], []
+        empty_search = dict(status="complete", months=0, rows=0, deleted=0,
+                            failed=0, rate_limited=0, pending=0)
+
+        class Passages(_Passages):
+            def project_pending(self, **kwargs):
+                # This callback happens while source futures may still be active.
+                kwargs["on_progress"]()
+                with kwargs["certification_budget"].lease() as deadline:
+                    leases.append(deadline)
+                    now[0] += 3
+                return super().project_pending(**kwargs)
+
+            def certify_pending(self, **kwargs):
+                self_test.assertEqual(calls[-1], "search")
+                self_test.assertEqual(kwargs["batch_size"], 100)
+                with kwargs["certification_budget"].lease() as deadline:
+                    drains.append((now[0], deadline))
+                    now[0] += 3
+                return dict(membership_certified_passages=2, membership_failed_documents=0,
+                            membership_deferred_documents=0, membership_elapsed_ms=3000,
+                            membership_failures=[])
+
+        class Logical(_Logical):
+            def project_pending(self, **kwargs):
+                for at in (29, 30, 33, 1000, 1003, 1029, 1030):
+                    now[0] = at
+                    kwargs["on_heartbeat"]()
+                return super().project_pending(**kwargs)
+
+        def search():
+            calls.append("search")
+            return empty_search
+
+        self_test = self
+        with patch("recall_server.passage_index.time", SimpleNamespace(monotonic=lambda: now[0])):
+            result = run_projection_worker(Logical(calls), Passages(calls),
+                tenant_id="tenant:test", logical_batch_size=2, passage_batch_size=100,
+                embedding_batch_size=1, max_batches_per_cycle=1, upload_concurrency=1,
+                passage_concurrency=1, interval_seconds=30, once=True, skip_embedding=True,
+                clock=lambda: now[0], search_plane=search)
+        self.assertEqual(leases, [3])
+        self.assertEqual(drains, [(30, 33), (1000, 1003), (1030, 1033)])
+        self.assertEqual(result["membership_certified_passages"], 6)
+        self.assertEqual(result["membership_elapsed_ms"], 9000)
+        self.assertEqual(calls.count("search"), 8)
+
+    def test_certificate_allowance_cannot_renew_or_overlap_an_active_proof(self):
+        from unittest.mock import patch
+        from types import SimpleNamespace
+        from recall_server.passage_index import CertificationBudget
+
+        now = [0.0]
+        budget = CertificationBudget()
+        with patch("recall_server.passage_index.time", SimpleNamespace(monotonic=lambda: now[0])):
+            with budget.lease() as deadline:
+                self.assertEqual(deadline, 3)
+                now[0] = 31
+                self.assertFalse(budget.renew())
+                with budget.lease() as competing:
+                    self.assertIsNone(competing)
+            with budget.lease() as expired:
+                self.assertIsNone(expired)
+            self.assertTrue(budget.renew())
+            with budget.lease() as renewed:
+                self.assertEqual(renewed, 34)
 
     def test_logical_admission_deadline_uses_scan_budget_only(self):
         import time

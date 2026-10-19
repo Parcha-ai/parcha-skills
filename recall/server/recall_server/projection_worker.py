@@ -276,6 +276,9 @@ def run_projection_worker(
     last_busy_thin_cycle: int | None = None
     last_busy_thin_started = 0.0
     last_retirement_started = clock() - 30.0
+    certification_enabled = getattr(getattr(passages, "membership_certification", None), "enabled", False)
+    certification_budget = CertificationBudget()
+    last_certification_started = clock()
     # A child can finish before a later publication phase fails. Carry its
     # observed counters until a successful cycle records them exactly once.
     retired = {"status": "disabled" if retirement_maintainer is None else "deferred"}
@@ -294,7 +297,6 @@ def run_projection_worker(
     cycles = 0
     while True:
         cycles += 1
-        certification_budget = CertificationBudget()
         cycle_started = phase_started = clock()
         active_phase = "setup"
         phase_elapsed = {key: 0 for key in PHASE_ELAPSED_KEYS}
@@ -345,6 +347,47 @@ def run_projection_worker(
                         total[key] = value
                     elif isinstance(value, int):
                         total[key] = int(total.get(key, 0)) + value
+
+            def renew_certification():
+                nonlocal last_certification_started
+                now = clock()
+                if now - last_certification_started < 30.0 or not certification_budget.renew():
+                    return False
+                last_certification_started = now
+                return True
+
+            def report_membership_failures(tick):
+                for failure in tick.get("membership_failures", ()):
+                    LOG.warning(
+                        "membership certification failed source_id=%r logical_document_id=%r "
+                        "native_parent_id=%r error_class=%r sqlstate=%r",
+                        failure.get("source_id"), failure.get("logical_document_id"),
+                        failure.get("native_parent_id"), failure.get("error_class"),
+                        failure.get("sqlstate"),
+                    )
+
+            def maintain_certification():
+                nonlocal active_phase, phase_started, passage_elapsed_ms
+                drain = getattr(passages, "certify_pending", None)
+                if active_phase == "passage" or not callable(drain) or not renew_certification():
+                    return
+                previous_phase, previous_started = active_phase, phase_started
+                active_phase, phase_started = "passage", clock()
+                try:
+                    tick = drain(tenant_id=tenant_id, batch_size=passage_batch_size,
+                                 certification_budget=certification_budget)
+                    accumulate(projected, tick)
+                    report_membership_failures(tick)
+                finally:
+                    passage_elapsed_ms += elapsed_ms(phase_started)
+                    phase_elapsed["passage_elapsed_ms"] = passage_elapsed_ms
+                    if previous_phase == "logical":
+                        previous_started += clock() - phase_started
+                    active_phase, phase_started = previous_phase, previous_started
+
+            def publish_background():
+                publish_search()
+                maintain_certification()
 
             def maintain_retirement(busy):
                 nonlocal last_retirement_started, active_phase, phase_started
@@ -440,7 +483,7 @@ def run_projection_worker(
                 parquet_serviced = True
                 tick = _parquet_with_publication(
                     scan,
-                    publish_search if search_plane is not None else None,
+                    publish_background if search_plane is not None or certification_enabled else None,
                     tenant_id=tenant_id,
                     batch_size=1 if freshness_busy else min(4, logical_batch_size),
                     max_batches=1 if freshness_busy else max_batches_per_cycle,
@@ -473,12 +516,14 @@ def run_projection_worker(
                     publish_search()
                 maintain_retirement(True)
                 maintain_thinning(True)
+                maintain_certification()
                 service_due_parquet()
 
             def publish_ready():
                 nonlocal active_phase, phase_started, passage_elapsed_ms
                 previous_phase, previous_started = active_phase, phase_started
                 publication_started = clock()
+                renew_certification()
                 if previous_phase == "logical":
                     phase_elapsed["logical_elapsed_ms"] = elapsed_ms(previous_started)
                 active_phase = "passage"
@@ -493,21 +538,14 @@ def run_projection_worker(
                     concurrency=passage_concurrency,
                     on_progress=publish_search if search_plane is not None else None,
                     certification_budget=certification_budget,
-                    # Sequential metadata proof shares the cycle deadline, not
+                    # Sequential metadata proof shares the coordinator allowance, not
                     # the concurrent body-preparation wave's row limit.
                     certification_batch_size=passage_batch_size,
                 )
                 passage_elapsed_ms += elapsed_ms(phase_started)
                 phase_elapsed["passage_elapsed_ms"] = passage_elapsed_ms
                 accumulate(projected, tick)
-                for failure in tick.get("membership_failures", ()):
-                    LOG.warning(
-                        "membership certification failed source_id=%r logical_document_id=%r "
-                        "native_parent_id=%r error_class=%r sqlstate=%r",
-                        failure.get("source_id"), failure.get("logical_document_id"),
-                        failure.get("native_parent_id"), failure.get("error_class"),
-                        failure.get("sqlstate"),
-                    )
+                report_membership_failures(tick)
                 phase_started = clock()
                 if search_ticks == before_search_ticks:
                     # Drain pre-existing outbox work even when passages were idle.
@@ -536,7 +574,7 @@ def run_projection_worker(
                 max_wait_seconds=max_wait_seconds,
                 cleanup_concurrency=cleanup_concurrency,
                 on_progress=publish_progress,
-                on_heartbeat=heartbeat if search_plane is not None or retirement_maintainer is not None or background_thinner is not None or scan is not None else None,
+                on_heartbeat=heartbeat if search_plane is not None or retirement_maintainer is not None or background_thinner is not None or scan is not None or certification_enabled else None,
                 # Stop admitting at the existing scan cadence, then settle
                 # active owners. Translate the worker clock's remaining time
                 # into the projector's monotonic clock; callbacks are not killed.

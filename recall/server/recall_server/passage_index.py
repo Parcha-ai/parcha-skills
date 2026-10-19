@@ -181,11 +181,21 @@ def _spool_tool_groups(records, extractor, output):
 
 
 class CertificationBudget:
-    """At most three seconds of optional proof work per worker cycle."""
+    """At most three seconds of optional proof work per coordinator allowance."""
 
     def __init__(self):
         self._lock = threading.Lock()
         self._remaining = 3.0
+
+    def renew(self):
+        """The coordinator may renew only after an active proof has settled."""
+        if not self._lock.acquire(blocking=False):
+            return False
+        try:
+            self._remaining = 3.0
+            return True
+        finally:
+            self._lock.release()
 
     @contextmanager
     def lease(self):
@@ -2831,34 +2841,13 @@ class CanonicalPassageProjector:
                 # A transient archive failure must never become a destructive
                 # logical-document rebuild.
                 break
-        # Only optional proof work spends this cycle's shared allowance.
-        # Committed source work and durable certification queues remain intact.
-        if self.membership_certification.enabled:
-            with certification_budget.lease() as certification_deadline:
-                if certification_deadline is not None:
-                    certification_started = time.monotonic()
-                    try:
-                        row = None
-                        certification_rows = membership_remainder.pending(self.store,
-                            tenant_id=tenant_id, limit=certification_batch_size,
-                            deadline_at=certification_deadline)
-                        for row in certification_rows:
-                            if time.monotonic() >= certification_deadline:
-                                break
-                            outcome = membership_remainder.resume(self.store, row,
-                                settings=self.membership_certification, deadline_at=certification_deadline)
-                            membership_certified += outcome['certified_passages']
-                            membership_failed += int(outcome['status'] == 'failed')
-                            if 'failure' in outcome:
-                                membership_failures.append(outcome['failure'])
-                            membership_deferred += int(outcome['status'] not in {'enrolled', 'failed'})
-                    except Exception as error:
-                        membership_failed += 1
-                        membership_failures.append(parent_membership_enrollment.certification_failure(
-                            error, source_id=row["source_id"] if row is not None else None,
-                            logical_document_id=row["logical_document_id"] if row is not None else None))
-                    finally:
-                        membership_elapsed_ms += max(0, round((time.monotonic()-certification_started)*1000))
+        optional = self.certify_pending(tenant_id=tenant_id,
+            batch_size=certification_batch_size, certification_budget=certification_budget)
+        membership_certified += optional['membership_certified_passages']
+        membership_failed += optional['membership_failed_documents']
+        membership_deferred += optional['membership_deferred_documents']
+        membership_elapsed_ms += optional['membership_elapsed_ms']
+        membership_failures.extend(optional['membership_failures'])
         phase_started = time.monotonic()
         with self.store.connect() as connection:
             pending = connection.execute(
@@ -2911,6 +2900,42 @@ class CanonicalPassageProjector:
                 3,
             ),
         }
+
+    def certify_pending(self, *, tenant_id, batch_size, certification_budget):
+        """Drain existing optional work without preparing or publishing sources."""
+        membership_certified = membership_failed = membership_deferred = membership_elapsed_ms = 0
+        membership_failures = []
+        if self.membership_certification.enabled:
+            with certification_budget.lease() as certification_deadline:
+                if certification_deadline is not None:
+                    certification_started = time.monotonic()
+                    try:
+                        row = None
+                        certification_rows = membership_remainder.pending(self.store,
+                            tenant_id=tenant_id, limit=batch_size,
+                            deadline_at=certification_deadline)
+                        for row in certification_rows:
+                            if time.monotonic() >= certification_deadline:
+                                break
+                            outcome = membership_remainder.resume(self.store, row,
+                                settings=self.membership_certification, deadline_at=certification_deadline)
+                            membership_certified += outcome['certified_passages']
+                            membership_failed += int(outcome['status'] == 'failed')
+                            if 'failure' in outcome:
+                                membership_failures.append(outcome['failure'])
+                            membership_deferred += int(outcome['status'] not in {'enrolled', 'failed'})
+                    except Exception as error:
+                        membership_failed += 1
+                        membership_failures.append(parent_membership_enrollment.certification_failure(
+                            error, source_id=row["source_id"] if row is not None else None,
+                            logical_document_id=row["logical_document_id"] if row is not None else None))
+                    finally:
+                        membership_elapsed_ms += max(0, round((time.monotonic()-certification_started)*1000))
+        return dict(membership_certified_passages=membership_certified,
+                    membership_failed_documents=membership_failed,
+                    membership_deferred_documents=membership_deferred,
+                    membership_elapsed_ms=membership_elapsed_ms,
+                    membership_failures=membership_failures)
 
     def embed_pending(
         self,
