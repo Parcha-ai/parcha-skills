@@ -137,12 +137,11 @@ BEGIN
     ELSIF TG_TABLE_NAME='canonical_documents' AND TG_OP='UPDATE' THEN
         -- NULL->1 with an exact live singleton still has physical membership.
         -- Other identity/currentness/profile transitions keep invalidating.
-        changed := 'SELECT changed.* FROM (' || changed || ') changed
-          WHERE NOT EXISTS(SELECT 1 FROM authority_old old_row JOIN authority_new new_row
+        changed := 'WITH equivalent_singletons AS MATERIALIZED (
+          SELECT old_row.tenant_id,old_row.source_id,old_row.document_id
+          FROM authority_old old_row JOIN authority_new new_row
             USING(tenant_id,source_id,document_id)
-            WHERE old_row.tenant_id=changed.tenant_id AND old_row.source_id=changed.source_id
-              AND old_row.document_id=changed.document_id
-              AND ROW(old_row.event_id,old_row.native_id,old_row.revision,old_row.is_current,old_row.deleted_at)
+          WHERE ROW(old_row.event_id,old_row.native_id,old_row.revision,old_row.is_current,old_row.deleted_at)
                   IS NOT DISTINCT FROM
                   ROW(new_row.event_id,new_row.native_id,new_row.revision,new_row.is_current,new_row.deleted_at)
               AND old_row.chunk_receipt_profile IS NULL AND new_row.chunk_receipt_profile=1
@@ -156,7 +155,13 @@ BEGIN
                   AND chunk.document_id=new_row.document_id AND chunk.ordinal=0
                   AND chunk.deleted_at IS NULL AND chunk.text_sha256=new_row.text_sha256
                   AND chunk.receipt=''recall://''||new_row.source_id||''/''||new_row.native_id||
-                    ''?rev=''||new_row.revision::text||''#item=0''))';
+                    ''?rev=''||new_row.revision::text||''#item=0'')
+        )
+        SELECT changed.* FROM (' || changed || ') changed
+          WHERE NOT EXISTS(SELECT 1 FROM equivalent_singletons equivalent
+            WHERE equivalent.tenant_id=changed.tenant_id
+              AND equivalent.source_id=changed.source_id
+              AND equivalent.document_id=changed.document_id)';
     END IF;
 
     IF to_regclass('pg_temp.recall_parent_authority_pending') IS NULL THEN
