@@ -281,7 +281,11 @@ class CrossDatasetDeltaTests(unittest.TestCase):
                 with self.assertLogs('recall_server.parquet_scan', level='WARNING') as logs:
                     with self.assertRaisesRegex(ParquetScanError, '^parquet_scan_state_invalid$'):
                         probe(changed, catalog, archive)._build(_candidate())
-                self.assertEqual(logs.output, ['WARNING:recall_server.parquet_scan:parquet preserve refused dataset=passages reason=revision'])
+                self.assertEqual(logs.output, [
+                    'WARNING:recall_server.parquet_scan:parquet preserve refused dataset=passages reason=revision',
+                    'WARNING:recall_server.parquet_scan:parquet build attempt failed '
+                    "type=ParquetScanError source_id='source:test' bucket=2026-08-01 generation=1",
+                ])
                 self.assertNotIn('document:', str(logs.output))
 
     def test_boolean_passage_revision_refuses_at_decoded_row_boundary(self):
@@ -319,7 +323,9 @@ class CrossDatasetDeltaTests(unittest.TestCase):
                     with self.assertRaisesRegex(ParquetScanError, '^parquet_scan_state_invalid$'):
                         probe(changed, catalog, archive)._build(_candidate())
                 self.assertEqual(logs.output, [
-                    f'WARNING:recall_server.parquet_scan:parquet preserve refused dataset=passages reason={reason}'
+                    f'WARNING:recall_server.parquet_scan:parquet preserve refused dataset=passages reason={reason}',
+                    'WARNING:recall_server.parquet_scan:parquet build attempt failed '
+                    "type=ParquetScanError source_id='source:test' bucket=2026-08-01 generation=1",
                 ])
                 self.assertNotIn('PRIVATE', str(logs.output))
 

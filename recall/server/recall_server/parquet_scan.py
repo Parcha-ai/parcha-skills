@@ -2002,12 +2002,15 @@ class CanonicalParquetScanProjector:
         if mode == "reuse":
             LOG.info(
                 "parquet build documents=%s fragments=%s dirty=%s metadata_ms=%s "
-                "total_ms=%s mode=reuse",
+                "total_ms=%s mode=reuse source_id=%r bucket=%s generation=%s",
                 len(documents),
                 len(catalog.shards),
                 len(dirty),
                 metadata_ms,
                 round((time.perf_counter() - started) * 1_000),
+                candidate.source_id,
+                candidate.bucket_start.isoformat(),
+                candidate.generation,
             )
             return ScanUpload(
                 self._generation(candidate, documents),
@@ -2221,6 +2224,13 @@ class CanonicalParquetScanProjector:
             )
         except BaseException as error:
             timing.failed = True
+            LOG.warning(
+                "parquet build attempt failed type=%s source_id=%r bucket=%s generation=%s",
+                type(error).__name__,
+                candidate.source_id,
+                candidate.bucket_start.isoformat(),
+                candidate.generation,
+            )
             try:
                 upload.abort()
             except Exception:
@@ -2237,7 +2247,8 @@ class CanonicalParquetScanProjector:
         LOG.info(
             "parquet build documents=%s rewritten=%s dirty=%s passages=%s records=%s "
             "fragments_removed=%s fragments_written=%s metadata_ms=%s "
-            "stream_ms=%s upload_ms=%s total_ms=%s mode=%s",
+            "stream_ms=%s upload_ms=%s total_ms=%s mode=%s "
+            "source_id=%r bucket=%s generation=%s",
             len(documents),
             len(rewrite_documents),
             len(dirty),
@@ -2250,6 +2261,9 @@ class CanonicalParquetScanProjector:
             upload.upload_ms,
             round((finished - started) * 1_000),
             mode,
+            candidate.source_id,
+            candidate.bucket_start.isoformat(),
+            candidate.generation,
         )
         return replace(result, dirty_plan_epoch=self.sparse_plan_epoch)
 
@@ -2600,7 +2614,13 @@ class CanonicalParquetScanProjector:
                 # publication was attempted; keep the durable queue for retry.
                 # Commit errors below must still propagate as unknown outcomes.
                 totals["failed"] = totals.get("failed", 0) + 1
-                LOG.warning("parquet build deferred type=SearchDeadlineExceeded")
+                LOG.warning(
+                    "parquet build deferred type=SearchDeadlineExceeded "
+                    "source_id=%r bucket=%s generation=%s",
+                    candidate.source_id,
+                    candidate.bucket_start.isoformat(),
+                    candidate.generation,
+                )
                 return False
             except ParquetScanError as error:
                 if str(error) != "parquet_scan_evidence_requeued":
@@ -2608,12 +2628,13 @@ class CanonicalParquetScanProjector:
                 totals["requeued"] += 1
                 LOG.warning(
                     "parquet evidence requeued tenant=%s source=%s bucket=%s "
-                    "reason=%s generation=%s",
+                    "reason=%s generation=%s source_id=%r",
                     hashlib.sha256(candidate.tenant_id.encode()).hexdigest()[:12],
                     hashlib.sha256(candidate.source_id.encode()).hexdigest()[:12],
                     candidate.bucket_start.isoformat(),
                     candidate.reason,
                     candidate.generation,
+                    candidate.source_id,
                 )
                 return True
             status = self._commit(candidate, upload)
