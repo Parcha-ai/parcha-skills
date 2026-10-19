@@ -28,6 +28,12 @@ CAPTURE_DETAIL_FIELDS = (
 )
 
 
+def _attempt_phase(diagnostic, phase):
+    """Content-free attempt timing only; never authority or commit evidence."""
+    if diagnostic is not None:
+        diagnostic.update(phase=phase, started=time.monotonic())
+
+
 @contextmanager
 def _capture_stage(metrics, timer, counter=None):
     if metrics is None:
@@ -183,11 +189,13 @@ def read_parent_catalog(store, connection, scope, deadline_at, *, lock=False):
     return found
 
 
-def _capture(store, spool, scope, limits, deadline_at, *, capture_metrics=None):
+def _capture(store, spool, scope, limits, deadline_at, *, capture_metrics=None, diagnostic=None):
     if capture_metrics is not None:
         for field in CAPTURE_DETAIL_FIELDS:
             capture_metrics.setdefault(field, 0.0 if field.endswith('_ms') else 0)
+    _attempt_phase(diagnostic, 'capture_connection')
     with store.connect() as connection, connection.transaction():
+        _attempt_phase(diagnostic, 'capture_sql')
         connection.execute('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY')
         catalog = read_parent_catalog(store, connection, scope, deadline_at)
         manifest = catalog['manifest']
@@ -262,18 +270,19 @@ def _capture(store, spool, scope, limits, deadline_at, *, capture_metrics=None):
 
 
 @contextmanager
-def prove_parent_chunks(store, archive, *, scope, limits, deadline_at, purpose="retire", capture_metrics=None):
+def prove_parent_chunks(store, archive, *, scope, limits, deadline_at, purpose="retire", capture_metrics=None, diagnostic=None):
     """Yield a complete sealed metadata proof only after all bytes are verified."""
     if purpose not in {"retire", "locate"}:
         raise _error("parent_proof_purpose_invalid")
     with ParentMetadataSpool(max_bytes=limits.max_spool_bytes) as spool:
         capture_started = time.monotonic() if capture_metrics is not None else None
         try:
-            catalog, parts, count, chunk_count = _capture(store, spool, scope, limits, deadline_at, capture_metrics=capture_metrics)
+            catalog, parts, count, chunk_count = _capture(store, spool, scope, limits, deadline_at, capture_metrics=capture_metrics, diagnostic=diagnostic)
         finally:
             if capture_metrics is not None:
                 # Attempt wall time includes failed reads and local metadata spooling.
                 capture_metrics['metadata_capture_ms'] = (time.monotonic() - capture_started) * 1000
+        _attempt_phase(diagnostic, 'archive_proof')
         manifest = catalog['manifest']
         meter = _MeteredArchive(archive, deadline_at)
         excluded, eligible, eligible_bytes, groups = Counter(), 0, 0, 0
@@ -316,7 +325,9 @@ def prove_parent_chunks(store, archive, *, scope, limits, deadline_at, purpose="
                 raise _error('parent_retirement_archive_proof_required')
         spool.index.commit()
         identity = manifest_identity(manifest)
+        _attempt_phase(diagnostic, 'proof_recheck_connection')
         with store.connect() as connection:
+            _attempt_phase(diagnostic, 'proof_recheck_sql')
             current = read_parent_catalog(store, connection, scope, deadline_at)
             if (manifest_identity(current['manifest']) != identity or purpose == 'locate'
                     and current['manifest']['created_at'] != manifest['created_at']):

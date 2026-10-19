@@ -149,6 +149,8 @@ class ClaimDiagnosticTests(unittest.TestCase):
                 "completed_parent_proofs",
                 "completed_noop_parents",
                 "failed_parents",
+                "failed_phase_counts",
+                "failed_phase_ms",
                 "partial_parents",
                 "batches",
                 "cleared_documents",
@@ -183,6 +185,8 @@ class ClaimDiagnosticTests(unittest.TestCase):
                 "membership_elapsed_ms",
             },
         )
+        self.assertEqual(result["failed_phase_counts"], {})
+        self.assertEqual(result["failed_phase_ms"], {})
         self.assertEqual(result["status"], "claim_refused")
         self.assertEqual(result["retired_metadata_chunks"], 0)
         for field in ("membership_certified_passages", "membership_failed_parents",
