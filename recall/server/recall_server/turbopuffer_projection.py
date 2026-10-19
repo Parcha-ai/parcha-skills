@@ -78,7 +78,7 @@ _LIVE_PASSAGE_PREDICATE = """
     )
 """
 
-_PASSAGE_PAGE_SQL = f"""
+_PASSAGE_SELECT_SQL = """
     SELECT passage.passage_id,passage.source_id,passage.logical_document_id,
            passage.policy_fingerprint,passage.ordinal,
            passage.first_occurred_at,passage.last_occurred_at,
@@ -99,12 +99,16 @@ _PASSAGE_PAGE_SQL = f"""
                    AND actor.passage_id=passage.passage_id),
                '[]'::jsonb
            ) AS actors
-      FROM canonical_passages passage
+"""
+
+_PASSAGE_FROM_SQL = """      FROM canonical_passages passage
       JOIN canonical_passage_documents projected
         USING(tenant_id,source_id,logical_document_id,revision,policy_fingerprint)
       JOIN canonical_evidence_documents evidence
         USING(tenant_id,source_id,logical_document_id)
-     WHERE passage.tenant_id=%s
+"""
+
+_PASSAGE_ELIGIBLE_SQL = f"""     WHERE passage.tenant_id=%s
        AND passage.source_id=%s
        AND passage.first_occurred_at>=%s
        AND passage.first_occurred_at<%s
@@ -115,8 +119,19 @@ _PASSAGE_PAGE_SQL = f"""
      LIMIT %s
 """
 
+# Keep eligibility before LIMIT. Hydrate only those exact keys in this same
+# SQL snapshot, avoiding wide body/origin rows in the keyset sort.
+_PASSAGE_PAGE_SQL = (
+    "WITH eligible_page AS MATERIALIZED (\n"
+    " SELECT passage.tenant_id,passage.source_id,passage.passage_id,passage.first_occurred_at\n"
+    + _PASSAGE_FROM_SQL + _PASSAGE_ELIGIBLE_SQL + ")\n"
+    + _PASSAGE_SELECT_SQL + _PASSAGE_FROM_SQL
+    + " JOIN eligible_page selected ON selected.tenant_id=passage.tenant_id\n"
+    " AND selected.source_id=passage.source_id AND selected.passage_id=passage.passage_id\n"
+    " ORDER BY passage.first_occurred_at,passage.passage_id\n"
+)
 
-_PASSAGE_BY_ID_SQL = _PASSAGE_PAGE_SQL.split("     WHERE passage.tenant_id=%s")[0] + f"""
+_PASSAGE_BY_ID_SQL = _PASSAGE_SELECT_SQL + _PASSAGE_FROM_SQL + f"""
      WHERE passage.tenant_id=%s
        AND passage.passage_id=ANY(%s::text[])
        AND {_LIVE_PASSAGE_PREDICATE}
