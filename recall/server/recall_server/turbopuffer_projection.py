@@ -48,6 +48,7 @@ from .turbopuffer_plane import (
     passage_row,
     EMBED_TEXT_ATTRIBUTE,
 )
+from .db import SearchDeadlineExceeded
 from .search_outbox import _month, record_passage_deletions
 
 LOG = logging.getLogger(__name__)
@@ -776,8 +777,8 @@ class TurbopufferProjector:
             namespace = self.client.namespace(name)
             budget = {"remaining": self.rate_limit_budget_seconds, "rate_limited": 0}
             with timing.measure("catalog"), self.store.connect() as connection:
-                since = (self.shard_watermark(connection, claim)
-                         if claim["reason"] in INCREMENTAL_REASONS else None)
+                catalog_watermark = self.shard_watermark(connection, claim)
+                since = catalog_watermark if claim["reason"] in INCREMENTAL_REASONS else None
                 watermark = self.read_watermark(connection)
                 tombstones = self.capture_tombstones(connection, claim)
                 connection.commit()
@@ -800,25 +801,61 @@ class TurbopufferProjector:
             written = 0
             after: tuple[datetime, str] | None = None
             last_rows = 0
+            resume_after_timeout = False
             while True:
-                with timing.measure("page"), self.store.connect() as connection:
-                    if getattr(self.store, "verified_singleton_receipts", False):
-                        connection.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
-                        deadline = time.monotonic() + self.store.search_deadline_ms / 1000
-                        page = self.passage_page(connection, claim, since=since, after=after,
-                                                 deadline_at=deadline)
-                    else:
-                        page = self.passage_page(connection, claim, since=since, after=after)
-                    examined = len(page)
-                    if page:
-                        after = (page[-1]["first_occurred_at"], page[-1]["passage_id"])
-                    if getattr(self.store, "verified_singleton_receipts", False):
-                        page = self._authorized_publication_rows(connection, tenant_id, page,
-                                                                 deadline_at=deadline)
-                    connection.commit()
+                page = []
+                timed_out = False
+                verified = getattr(self.store, "verified_singleton_receipts", False)
+                try:
+                    with timing.measure("page"), self.store.connect() as connection:
+                        if verified:
+                            connection.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+                            deadline = time.monotonic() + self.store.search_deadline_ms / 1000
+                            if resume_after_timeout:
+                                current = self.store._execute_bounded(connection, """
+                                    SELECT EXISTS (
+                                        SELECT 1 FROM search_projection_outbox
+                                         WHERE tenant_id=%s AND source_id=%s AND month=%s
+                                           AND generation=%s AND queued_at=%s AND reason=%s
+                                    ) AND (
+                                        SELECT built_at FROM search_projection_shards
+                                         WHERE tenant_id=%s AND source_id=%s AND month=%s
+                                    ) IS NOT DISTINCT FROM %s::timestamptz AS current
+                                """, (tenant_id, claim["source_id"], claim["month"],
+                                      claim["generation"], claim["queued_at"], claim["reason"],
+                                      tenant_id, claim["source_id"], claim["month"], catalog_watermark),
+                                    deadline).fetchone()["current"]
+                                if not current:
+                                    raise ValueError("publication_resume_scope_changed")
+                            page = self.passage_page(connection, claim, since=since, after=after,
+                                                     deadline_at=deadline)
+                        else:
+                            page = self.passage_page(connection, claim, since=since, after=after)
+                        examined = len(page)
+                        next_after = ((page[-1]["first_occurred_at"], page[-1]["passage_id"])
+                                      if page else after)
+                        if verified:
+                            page = self._authorized_publication_rows(connection, tenant_id, page,
+                                                                     deadline_at=deadline)
+                        connection.commit()
+                except SearchDeadlineExceeded:
+                    if not cooperative or not verified:
+                        raise
+                    # Keep only acknowledged progress. The next outer quantum
+                    # rechecks this scope and reruns the failed page's authority.
+                    page = []
+                    timed_out = True
+                if timed_out:
+                    LOG.warning("search plane page deferred reason=%s generation=%s type=SearchDeadlineExceeded",
+                        claim["reason"], claim["generation"])
+                    resume_after_timeout = True
+                    yield {"rows": 0, "deleted": 0, "rate_limited": 0, "failed": 1}
+                    continue
+                resume_after_timeout = False
                 if not examined:
                     break
                 last_rows = self._write_page(namespace, budget, page, timing)
+                after = next_after  # All parallel writes must acknowledge first.
                 written += last_rows
                 exhausted = examined < self.page_rows
                 page = []
@@ -907,6 +944,7 @@ class TurbopufferProjector:
             else:
                 for key in ("rows", "deleted", "rate_limited"):
                     result[key] = step[key]
+                result["failed"] = step.get("failed", 0)
                 if "retired" in step:
                     steps.close()
                     result["months"] = 1
