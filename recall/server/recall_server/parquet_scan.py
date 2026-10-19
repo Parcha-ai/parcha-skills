@@ -1235,19 +1235,35 @@ class CanonicalParquetScanProjector:
             parent_membership_read.ReadSettings.from_env()
             if membership_enabled else parent_membership_read.ReadSettings()
         )
+        certificate_inputs = (
+            ",passage.membership_generation,passage.membership_binding_sha256"
+            if read_settings.enabled else ""
+        )
         certificate_columns = """
                           ,passage.tenant_id,passage.source_id,passage.text_sha256,
-                          evidence.manifest_content_sha256,
-                          row_to_json(certificate) AS membership_metadata,
-                          octet_length(row_to_json(certificate)::text) AS membership_metadata_bytes,
-                          (projected.logical_document_id IS NOT NULL
-                           AND evidence.logical_document_id IS NOT NULL)
-                              AS membership_metadata_complete""" if read_settings.enabled else ""
+                          membership.manifest_content_sha256,
+                          membership.membership_metadata,
+                          membership.membership_metadata_bytes,
+                          membership.membership_metadata_complete""" if read_settings.enabled else ""
         certificate_join = """
+                     LEFT JOIN LATERAL (
+                       SELECT evidence.manifest_content_sha256,
+                              row_to_json(certificate) AS membership_metadata,
+                              octet_length(row_to_json(certificate)::text)
+                                  AS membership_metadata_bytes,
+                              (projected.logical_document_id IS NOT NULL
+                               AND evidence.logical_document_id IS NOT NULL)
+                                  AS membership_metadata_complete
+                       FROM (VALUES (1)) AS seed(value)
                      LEFT JOIN canonical_evidence_documents evidence
-                       USING(tenant_id,source_id,logical_document_id)
+                       ON evidence.tenant_id=passage.tenant_id
+                      AND evidence.source_id=passage.source_id
+                      AND evidence.logical_document_id=passage.logical_document_id
                      LEFT JOIN canonical_passage_documents projected
-                       USING(tenant_id,source_id,logical_document_id,policy_fingerprint)
+                       ON projected.tenant_id=passage.tenant_id
+                      AND projected.source_id=passage.source_id
+                      AND projected.logical_document_id=passage.logical_document_id
+                      AND projected.policy_fingerprint=passage.policy_fingerprint
                      LEFT JOIN canonical_parent_authority authority
                        ON authority.tenant_id=evidence.tenant_id
                       AND authority.source_id=evidence.source_id
@@ -1259,7 +1275,9 @@ class CanonicalParquetScanProjector:
                                  evidence.native_parent_id,evidence.revision AS manifest_revision,
                                  projected.revision AS projected_revision,projected.source_document_sha256,
                                  authority.generation
-                     ) certificate""" if read_settings.enabled else ""
+                     ) certificate
+                       OFFSET 0
+                     ) membership ON true""" if read_settings.enabled else ""
         membership_predicate = "true" if membership_enabled else """NOT EXISTS (
                           SELECT 1 FROM unnest(passage.receipts) AS receipt(value)
                           LEFT JOIN canonical_chunks chunk
@@ -1277,6 +1295,9 @@ class CanonicalParquetScanProjector:
         with self.store.connect() as connection:
             if membership_enabled:
                 connection.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            # OFFSET 0 keeps the ordered pointer stream below enrichment and
+            # receipt-array filtering. Otherwise the first FETCH can evaluate
+            # actors, certificates and toasted arrays for a whole parent.
             with connection.cursor(name="parquet_passage_stream") as cursor:
                 cursor.itersize = 2_000
                 cursor.execute(
@@ -1290,7 +1311,24 @@ class CanonicalParquetScanProjector:
                           coalesce(attributed.actor_relations,ARRAY[]::text[])
                               AS actor_relations
                           {certificate_columns}
-                     FROM canonical_passages passage
+                     FROM (
+                          SELECT passage.logical_document_id,passage.revision,
+                                 passage.passage_id,passage.ordinal,
+                                 passage.first_occurred_at,passage.last_occurred_at,
+                                 passage.token_count,passage.roles,passage.receipts,
+                                 passage.text_redacted,passage.tenant_id,passage.source_id,
+                                 passage.text_sha256,passage.policy_fingerprint
+                                 {certificate_inputs}
+                            FROM canonical_passages passage
+                           WHERE passage.tenant_id=%s AND passage.source_id=%s
+                             AND passage.logical_document_id=ANY(%s)
+                             AND passage.last_occurred_at >= %s
+                             AND passage.first_occurred_at < %s
+                           ORDER BY passage.logical_document_id,
+                                    passage.first_occurred_at,
+                                    passage.last_occurred_at,passage.passage_id
+                           OFFSET 0
+                     ) passage
                      {certificate_join}
                      LEFT JOIN LATERAL (
                           SELECT array_agg(link.actor_id ORDER BY link.actor_id,link.relation)
@@ -1307,12 +1345,8 @@ class CanonicalParquetScanProjector:
                              AND link.source_id=passage.source_id
                              AND link.passage_id=passage.passage_id
                      ) attributed ON true
-                    WHERE passage.tenant_id=%s AND passage.source_id=%s
-                      AND passage.logical_document_id=ANY(%s)
-                      AND cardinality(passage.receipts)>0
+                    WHERE cardinality(passage.receipts)>0
                       AND {membership_predicate}
-                      AND passage.last_occurred_at >= %s
-                      AND passage.first_occurred_at < %s
                     ORDER BY passage.logical_document_id,
                              passage.first_occurred_at,
                              passage.last_occurred_at,passage.passage_id""",
