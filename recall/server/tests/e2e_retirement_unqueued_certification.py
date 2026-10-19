@@ -1,5 +1,6 @@
 """A retired publication needs durable proof work even without an earlier queue."""
 import json
+from copy import deepcopy
 from concurrent.futures import ThreadPoolExecutor
 import threading
 import time
@@ -16,6 +17,109 @@ class UnqueuedRetirementCertificationTests(RetirementMembershipTests):
     def pending_certificates(self):
         return membership_remainder.pending(self.store, tenant_id=self.tenant,
             limit=10, deadline_at=time.monotonic() + 3)
+
+    def test_resumed_certificates_preserve_serving_evidence_and_remove_native_proof(self):
+        from recall_server.receipt_membership import lookup_current_search_membership
+        from recall_server.turbopuffer_plane import passage_row
+        from tests.central_brain.test_canonical_retrieval import RerankWiringTests
+
+        self.ingest('turn/serving-tail', 'Synthetic exact deployment phrase paragraph. ' * 3000)
+        self.projector.project_pending(
+            tenant_id=self.tenant, batch_size=10, max_batches=1, upload_concurrency=1)
+        self.publisher(self.settings(enabled=False)).project_pending(
+            tenant_id=self.tenant, batch_size=10, max_batches=1, concurrency=1)
+        self.refresh_scope()
+        fixed_ids = set(self.scope['passage_ids'])
+        self.assertGreater(len(fixed_ids), 1)
+        # Refresh only the existing in-process vendor fixture from the actual
+        # newly published catalog; no authority or hydration method is replaced.
+        with self.store.connect() as connection:
+            rows = connection.execute("""SELECT passage.*,evidence.native_parent_id,
+                evidence.manifest_object_key,evidence.manifest_content_sha256,
+                evidence.first_occurred_at AS doc_first_occurred_at,
+                evidence.last_occurred_at AS doc_last_occurred_at,'[]'::jsonb AS actors
+                FROM canonical_passages passage JOIN canonical_evidence_documents evidence
+                USING(tenant_id,source_id,logical_document_id)
+                WHERE passage.tenant_id=%s AND passage.source_id=%s""",
+                (self.tenant, self.source)).fetchall()
+        self.namespace.rows.clear()
+        self.namespace.write(upsert_rows=[passage_row(row) for row in rows])
+        frozen_vendor = deepcopy(self.namespace.rows)
+        original = membership.enroll_parent_passages
+        pages = []
+
+        def interrupt_second_page(*args, **kwargs):
+            pages.append(tuple(kwargs['passage_ids']))
+            if len(pages) == 2:
+                raise membership.SearchDeadlineExceeded('synthetic certificate deadline')
+            return original(*args, **kwargs)
+
+        with (patch.dict(membership._CERTIFICATION_LIMITS, passages=1),
+              patch.object(membership, 'enroll_parent_passages', side_effect=interrupt_second_page)):
+            retired = self.run_retirement()
+        self.assertEqual(retired['completed_parent_proofs'], 1)
+        self.assertFalse(retired['commit_outcome_unknown'])
+        self.assertEqual(retired['membership_certified_passages'], 1)
+        self.assertTrue(self.pending_certificates())
+
+        def serving_snapshot():
+            reranker = RerankWiringTests._FakeRerank()
+            authorized = []
+            authorize = self.retrieval._authorize_singletons
+
+            def capture_authority(*args, **kwargs):
+                result = authorize(*args, **kwargs)
+                authorized.extend(deepcopy(result))
+                return result
+
+            with (patch.object(self.store, 'rerank_runtime', reranker),
+                  patch.object(self.retrieval, '_authorize_singletons', side_effect=capture_authority),
+                  patch('recall_server.receipt_membership.lookup_current_search_membership',
+                        wraps=lookup_current_search_membership) as native):
+                response = self.retrieval.search(
+                    'exact deployment phrase', lexical_query='deployment phrase',
+                    since=None, until=None, limit=10, include_arms=True,
+                    deadline_at=time.monotonic() + 3)
+            self.assertEqual(response['diagnostics']['authority_status'], 'ok')
+            self.assertEqual(response['diagnostics']['hydrate_status'], 'ok')
+            self.assertEqual(response['diagnostics']['rerank_status'], 'ok')
+            self.assertEqual({row['passage_id'] for row in authorized}, fixed_ids)
+            self.assertEqual(len(reranker.calls), 1)
+            self.assertTrue(reranker.calls[0]['documents'])
+            stages = response['diagnostics']['authority_stages']
+            if native.call_count:
+                self.assertEqual(native.call_count, 1)
+                self.assertEqual(len(native.call_args.kwargs['receipts']), stages['native_receipts'])
+            return response, sorted(authorized, key=lambda row: row['passage_id']), reranker.calls[0], native.call_count
+
+        before, before_authority, before_rerank, before_calls = serving_snapshot()
+        self.assertEqual(before_calls, 1)
+        before_stages = before['diagnostics']['authority_stages']
+        self.assertGreater(before_stages['native_receipts'], 0)
+        self.assertEqual(before_stages['parent_membership_read']['certified_passages'], 1)
+        restarted = self.publisher()
+        with patch.object(restarted.logical_projection, 'read_part',
+                          side_effect=AssertionError('no archive replay for certification')):
+            resumed = restarted.project_pending(
+                tenant_id=self.tenant, batch_size=10, max_batches=1, concurrency=1)
+        self.assertEqual(resumed['documents'], 0)
+        self.assertEqual(self.pending_certificates(), [])
+        after, after_authority, after_rerank, after_calls = serving_snapshot()
+        self.assertEqual(after_calls, 0)
+        after_stages = after['diagnostics']['authority_stages']
+        self.assertEqual(after_stages['native_receipts'], 0)
+        self.assertEqual(after_stages['parent_membership_read']['certified_passages'], len(fixed_ids))
+        self.assertEqual(after_authority, before_authority)
+        self.assertEqual(after['results'], before['results'])
+        self.assertEqual(after['arms'], before['arms'])
+        self.assertEqual(after_rerank['query'], before_rerank['query'])
+        self.assertEqual(after_rerank['documents'], before_rerank['documents'])
+        self.assertEqual(self.namespace.rows, frozen_vendor)
+        print(json.dumps(dict(diagnostic='certificate_completion_serving_parity',
+            authorized_passages=len(fixed_ids), rerank_inputs=len(after_rerank['documents']),
+            certified_before=1, certified_after=len(fixed_ids),
+            native_receipts_before=before_stages['native_receipts'], native_receipts_after=0,
+            native_calls_before=before_calls, native_calls_after=after_calls)), flush=True)
 
     def test_partial_certificate_after_retirement_survives_restart_without_prior_queue(self):
         self.ingest('turn/unqueued-tail', 'Synthetic evidence paragraph. ' * 3000)

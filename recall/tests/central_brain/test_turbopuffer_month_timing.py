@@ -87,9 +87,9 @@ class MonthTimingTest(unittest.TestCase):
         metrics = self.fields(captured)
         self.assertEqual(result['rows'], 1)
         self.assertEqual(metrics, {
-            # Existing phases plus return of the publication lease connection.
-            'month_ms': 2625, 'catalog_ms': 250, 'catalog_calls': 1,
-            'commit_ms': 250, 'commit_calls': 1,
+            # Checkpoint and EOF commits plus return of the publication lease connection.
+            'month_ms': 2875, 'catalog_ms': 250, 'catalog_calls': 1,
+            'commit_ms': 500, 'commit_calls': 2,
             'page_ms': 750, 'page_calls': 1, 'pacer_ms': 250, 'pacer_calls': 1,
             'sdk_ms': 1000, 'sdk_calls': 1, 'backoff_ms': 0, 'backoff_calls': 0,
             'concurrency': 1,
@@ -183,7 +183,7 @@ class MonthTimingTest(unittest.TestCase):
                         projector.project_month(claim)
                 self.assertIs(raised.exception, original)
                 metrics = self.fields(captured)
-                self.assertEqual((metrics[phase + "_ms"], metrics[phase + "_calls"]), (375, 1))
+                self.assertEqual((metrics[phase + "_ms"], metrics[phase + "_calls"]), (375, 2 if phase == "commit" else 1))
                 self.assertEqual(metrics["month_ms"], 375)
                 self.assertIn("succeeded=0", captured.output[0])
                 self.assertNotIn("private", "\n".join(captured.output))

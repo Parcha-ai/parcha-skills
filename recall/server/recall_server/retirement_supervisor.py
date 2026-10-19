@@ -104,6 +104,7 @@ class RetirementSupervisor:
                 "retirement_child status=%s elapsed_ms=%s cpu_seconds=%s peak_rss_kib=%s "
                 "archive_bytes=%s cleared_utf8_bytes=%s unknown=%s error_class=%s phase=%s cause_error_code=%s "
                 "completed_noop_parents=%s completed_parent_proofs=%s "
+                "attempted_parents=%s failed_parents=%s errors=%r "
                 "unknown_source_id=%r unknown_native_parent_id=%r unknown_scope_epoch=%s "
                 "committed_sql_ms=%s committed_hash_ms=%s archive_read_ms=%s "
                 "archive_reused_gets=%s archive_reused_bytes=%s "
@@ -127,6 +128,9 @@ class RetirementSupervisor:
                 result.get("cause_error_code"),
                 result.get("completed_noop_parents"),
                 result.get("completed_parent_proofs"),
+                result.get("attempted_parents"),
+                result.get("failed_parents"),
+                result.get("errors"),
                 result.get("unknown_source_id"),
                 result.get("unknown_native_parent_id"),
                 result.get("unknown_scope_epoch"),

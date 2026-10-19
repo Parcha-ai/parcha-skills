@@ -30,6 +30,7 @@ class only.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import threading
@@ -41,6 +42,8 @@ from contextlib import contextmanager, nullcontext
 from datetime import date, datetime, timezone
 from typing import Any
 
+from psycopg.types.json import Jsonb
+
 from .turbopuffer_plane import (
     TurbopufferSettings,
     build_client,
@@ -48,6 +51,7 @@ from .turbopuffer_plane import (
     passage_row,
     EMBED_TEXT_ATTRIBUTE,
 )
+from .db import SearchDeadlineExceeded
 from .search_outbox import _month, record_passage_deletions
 
 LOG = logging.getLogger(__name__)
@@ -118,6 +122,11 @@ _PASSAGE_BY_ID_SQL = _PASSAGE_PAGE_SQL.split("     WHERE passage.tenant_id=%s")[
        AND {_LIVE_PASSAGE_PREDICATE}
      ORDER BY passage.first_occurred_at,passage.passage_id
 """
+
+_CERTIFICATE_PRESENCE = (
+    "passage.membership_generation AS _membership_generation,"
+    "passage.membership_binding_sha256 AS _membership_binding_sha256,"
+)
 
 
 def _month_bounds(month: date) -> tuple[datetime, datetime]:
@@ -340,6 +349,8 @@ class TurbopufferProjector:
         if isinstance(max_batch_bytes, bool) or not isinstance(max_batch_bytes, int) or not 1024 <= max_batch_bytes <= DEFAULT_MAX_BATCH_BYTES:
             raise ValueError("search plane batch bytes are invalid")
         self.store = store
+        from .parent_membership_read import ReadSettings
+        self.parent_membership_read = ReadSettings.from_env()
         self.settings = settings
         self.batch_rows = batch
         self.max_batch_bytes = max_batch_bytes
@@ -458,6 +469,77 @@ class TurbopufferProjector:
                       ) AS watermark"""
         ).fetchone()["watermark"]
 
+    def _page_checkpoint_scope(self, connection: Any, claim: dict[str, Any], name: str) -> dict[str, Any]:
+        row = connection.execute("""SELECT to_jsonb(shard) AS catalog
+            FROM search_projection_shards shard
+            WHERE tenant_id=%s AND source_id=%s AND month=%s""",
+            (claim["tenant_id"], claim["source_id"], claim["month"])).fetchone()
+        return {
+            # Bump this contract when passage row rendering/publication semantics change.
+            "version": 1,
+            "verified_singleton_receipts": getattr(self.store, "verified_singleton_receipts", False),
+            "claim": [claim["tenant_id"], claim["source_id"], claim["month"].isoformat(),
+                      claim["generation"], claim["queued_at"].isoformat(), claim["reason"]],
+            "catalog": row["catalog"] if row else None,
+            "destination": [self.settings.region, name, namespace_schema(self.settings)],
+            # Settings expose no account ID. Any key rotation safely replays;
+            # the private checkpoint stores only this one-way identity, never the key.
+            "credential_fingerprint": hashlib.sha256(
+                ("search-publication-account-v1\0" + self.settings.api_key).encode()).hexdigest(),
+        }
+
+    @staticmethod
+    def _restore_page_checkpoint(value: Any, scope: dict[str, Any]) -> tuple[Any, ...] | None:
+        if (not isinstance(value, dict) or value.get("scope") != scope
+                or type(value["scope"].get("version")) is not int):
+            return None
+        try:
+            after = value["after"]
+            cursor = datetime.fromisoformat(after[0])
+            watermark = datetime.fromisoformat(value["watermark"])
+            rows = value["rows"]
+            if (not isinstance(after, list) or len(after) != 2
+                    or not isinstance(after[1], str) or not after[1]
+                    or cursor.tzinfo is None or watermark.tzinfo is None
+                    or _month(cursor).isoformat() != scope["claim"][2]
+                    or type(rows) is not int or rows < 0):
+                return None
+            return (cursor, after[1]), watermark, rows
+        except (KeyError, TypeError, ValueError, IndexError):
+            return None
+
+    def _save_page_checkpoint(self, claim: dict[str, Any], previous: Any, value: dict[str, Any]) -> bool:
+        """CAS only after every vendor batch ACK; unknown SQL outcome is reread on restart.
+
+        A new generation invalidates durable progress but does not stop the old
+        full pass: its original EOF watermark still lets hot months converge.
+        Another publisher/catalog advancing this same claim requires a reload.
+        """
+        deadline = time.monotonic() + self.store.search_deadline_ms / 1000
+        with self.store.connect() as connection:
+            updated = self.store._execute_bounded(connection, """UPDATE search_projection_outbox SET page_checkpoint=%s
+                WHERE tenant_id=%s AND source_id=%s AND month=%s
+                  AND generation=%s AND queued_at=%s AND reason=%s
+                  AND COALESCE(page_checkpoint, 'null'::jsonb) = %s::jsonb
+                  AND COALESCE((SELECT to_jsonb(shard) FROM search_projection_shards shard
+                       WHERE shard.tenant_id=%s AND shard.source_id=%s AND shard.month=%s),
+                       'null'::jsonb) = %s::jsonb""",
+                (Jsonb(value), claim["tenant_id"], claim["source_id"], claim["month"],
+                 claim["generation"], claim["queued_at"], claim["reason"],
+                 Jsonb(previous),
+                 claim["tenant_id"], claim["source_id"], claim["month"],
+                 Jsonb(value["scope"]["catalog"])), deadline).rowcount
+            if updated != 1:
+                current = self.store._execute_bounded(connection, """SELECT 1 FROM search_projection_outbox
+                    WHERE tenant_id=%s AND source_id=%s AND month=%s
+                      AND generation=%s AND queued_at=%s AND reason=%s""",
+                    (claim["tenant_id"], claim["source_id"], claim["month"],
+                     claim["generation"], claim["queued_at"], claim["reason"]), deadline).fetchone()
+                if current:
+                    raise ValueError("publication_checkpoint_scope_changed")
+            connection.commit()
+            return updated == 1
+
     def passage_page(
         self,
         connection: Any,
@@ -473,8 +555,12 @@ class TurbopufferProjector:
             # The caller advances over all examined rows, including a page
             # whose receipt proof rejects every row. Filtering cannot hide the
             # cursor or make an intermediate empty page look like exhaustion.
+            sql = _PASSAGE_PAGE_SQL
+            if self.parent_membership_read.enabled:
+                sql = sql.replace("SELECT passage.passage_id,",
+                                  "SELECT " + _CERTIFICATE_PRESENCE + "passage.passage_id,", 1)
             return self.store._execute_bounded(connection,
-                _PASSAGE_PAGE_SQL.replace(_LIVE_PASSAGE_PREDICATE, "true"),
+                sql.replace(_LIVE_PASSAGE_PREDICATE, "true"),
                 (claim["tenant_id"], claim["source_id"], start, end,
                  since, since, cursor_time, cursor_id, self.page_rows),
                 deadline_at,
@@ -492,23 +578,45 @@ class TurbopufferProjector:
 
     def _authorized_publication_rows(self, connection, tenant_id, rows, *, deadline_at):
         """Reuse current receipt authority before writing an examined page."""
+        from .parent_membership_read import partition
         from .receipt_membership import lookup_current_search_membership
 
+        certified = set()
+        if self.parent_membership_read.enabled:
+            # Presence only avoids an optional lookup; partition still checks
+            # the complete current binding in this same RR snapshot.
+            candidates = []
+            for row in rows:
+                generation = row.pop('_membership_generation', None)
+                binding = row.pop('_membership_binding_sha256', None)
+                if generation is not None and binding is not None:
+                    candidates.append(dict(row, tenant_id=tenant_id))
+            certified, _ = partition(
+                self.store, connection,
+                selected=candidates,
+                settings=self.parent_membership_read, deadline_at=deadline_at,
+            )
+        fallback = [row for row in rows if (row['source_id'], row['passage_id']) not in certified]
         members = lookup_current_search_membership(
             self.store, tenant_id=tenant_id,
-            authorized_sources=tuple(sorted({row["source_id"] for row in rows})),
-            receipts=tuple(dict.fromkeys(receipt for row in rows for receipt in row["receipts"])),
+            authorized_sources=tuple(sorted({row["source_id"] for row in fallback})),
+            receipts=tuple(dict.fromkeys(receipt for row in fallback for receipt in row["receipts"])),
             connection=connection, deadline_at=deadline_at,
-        )
-        return [row for row in rows if all((row["source_id"], receipt) in members
+        ) if fallback else set()
+        return [row for row in rows if (row['source_id'], row['passage_id']) in certified
+                or all((row["source_id"], receipt) in members
                                           for receipt in row["receipts"])]
 
     def passages_by_id(self, connection: Any, tenant_id: str, passage_ids: list[str]) -> list[dict[str, Any]]:
         """The live passages among ``passage_ids``, in page order."""
         if getattr(self.store, "verified_singleton_receipts", False):
             deadline = time.monotonic() + self.store.search_deadline_ms / 1000
+            sql = _PASSAGE_BY_ID_SQL
+            if self.parent_membership_read.enabled:
+                sql = sql.replace("SELECT passage.passage_id,",
+                                  "SELECT " + _CERTIFICATE_PRESENCE + "passage.passage_id,", 1)
             rows = self.store._execute_bounded(connection,
-                _PASSAGE_BY_ID_SQL.replace(_LIVE_PASSAGE_PREDICATE, "true"),
+                sql.replace(_LIVE_PASSAGE_PREDICATE, "true"),
                 (tenant_id, list(passage_ids)), deadline,
             ).fetchall()
             return self._authorized_publication_rows(connection, tenant_id, rows, deadline_at=deadline)
@@ -776,10 +884,18 @@ class TurbopufferProjector:
             namespace = self.client.namespace(name)
             budget = {"remaining": self.rate_limit_budget_seconds, "rate_limited": 0}
             with timing.measure("catalog"), self.store.connect() as connection:
-                since = (self.shard_watermark(connection, claim)
-                         if claim["reason"] in INCREMENTAL_REASONS else None)
+                catalog_watermark = self.shard_watermark(connection, claim)
+                since = catalog_watermark if claim["reason"] in INCREMENTAL_REASONS else None
                 watermark = self.read_watermark(connection)
                 tombstones = self.capture_tombstones(connection, claim)
+                checkpoint_scope = self._page_checkpoint_scope(connection, claim, name)
+                row = connection.execute("""SELECT page_checkpoint FROM search_projection_outbox
+                    WHERE tenant_id=%s AND source_id=%s AND month=%s
+                      AND generation=%s AND queued_at=%s AND reason=%s""",
+                    (tenant_id, claim["source_id"], claim["month"], claim["generation"],
+                     claim["queued_at"], claim["reason"])).fetchone()
+                checkpoint = row["page_checkpoint"] if row else None
+                restored = self._restore_page_checkpoint(checkpoint, checkpoint_scope)
                 connection.commit()
             rate_reported = 0
             for batch in delete_id_batches([row["passage_id"] for row in tombstones], max_bytes=self.max_batch_bytes):
@@ -799,29 +915,75 @@ class TurbopufferProjector:
                 rate_reported = current_rate
             written = 0
             after: tuple[datetime, str] | None = None
+            if restored is not None:
+                after, watermark, written = restored
+            checkpoint_current = True
             last_rows = 0
+            resume_after_timeout = restored is not None
             while True:
-                with timing.measure("page"), self.store.connect() as connection:
-                    if getattr(self.store, "verified_singleton_receipts", False):
-                        connection.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
-                        deadline = time.monotonic() + self.store.search_deadline_ms / 1000
-                        page = self.passage_page(connection, claim, since=since, after=after,
-                                                 deadline_at=deadline)
-                    else:
-                        page = self.passage_page(connection, claim, since=since, after=after)
-                    examined = len(page)
-                    if page:
-                        after = (page[-1]["first_occurred_at"], page[-1]["passage_id"])
-                    if getattr(self.store, "verified_singleton_receipts", False):
-                        page = self._authorized_publication_rows(connection, tenant_id, page,
-                                                                 deadline_at=deadline)
-                    connection.commit()
+                page = []
+                timed_out = False
+                verified = getattr(self.store, "verified_singleton_receipts", False)
+                try:
+                    with timing.measure("page"), self.store.connect() as connection:
+                        if verified:
+                            connection.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+                            deadline = time.monotonic() + self.store.search_deadline_ms / 1000
+                            if resume_after_timeout:
+                                current = self.store._execute_bounded(connection, """
+                                    SELECT EXISTS (
+                                        SELECT 1 FROM search_projection_outbox
+                                         WHERE tenant_id=%s AND source_id=%s AND month=%s
+                                           AND generation=%s AND queued_at=%s AND reason=%s
+                                    ) AND (
+                                        SELECT built_at FROM search_projection_shards
+                                         WHERE tenant_id=%s AND source_id=%s AND month=%s
+                                    ) IS NOT DISTINCT FROM %s::timestamptz AS current
+                                """, (tenant_id, claim["source_id"], claim["month"],
+                                      claim["generation"], claim["queued_at"], claim["reason"],
+                                      tenant_id, claim["source_id"], claim["month"], catalog_watermark),
+                                    deadline).fetchone()["current"]
+                                if not current:
+                                    raise ValueError("publication_resume_scope_changed")
+                            page = self.passage_page(connection, claim, since=since, after=after,
+                                                     deadline_at=deadline)
+                        else:
+                            page = self.passage_page(connection, claim, since=since, after=after)
+                        examined = len(page)
+                        next_after = ((page[-1]["first_occurred_at"], page[-1]["passage_id"])
+                                      if page else after)
+                        if verified:
+                            page = self._authorized_publication_rows(connection, tenant_id, page,
+                                                                     deadline_at=deadline)
+                        connection.commit()
+                except SearchDeadlineExceeded:
+                    if not cooperative or not verified:
+                        raise
+                    # Keep only acknowledged progress. The next outer quantum
+                    # rechecks this scope and reruns the failed page's authority.
+                    page = []
+                    timed_out = True
+                if timed_out:
+                    LOG.warning("search plane page deferred reason=%s generation=%s type=SearchDeadlineExceeded",
+                        claim["reason"], claim["generation"])
+                    resume_after_timeout = True
+                    yield {"rows": 0, "deleted": 0, "rate_limited": 0, "failed": 1}
+                    continue
+                resume_after_timeout = False
                 if not examined:
                     break
                 last_rows = self._write_page(namespace, budget, page, timing)
+                after = next_after  # All parallel writes must acknowledge first.
                 written += last_rows
-                exhausted = examined < self.page_rows
                 page = []
+                if checkpoint_current:
+                    next_checkpoint = {"scope": checkpoint_scope,
+                        "after": [after[0].isoformat(), after[1]],
+                        "watermark": watermark.isoformat(), "rows": written}
+                    with timing.measure("commit"):
+                        checkpoint_current = self._save_page_checkpoint(claim, checkpoint, next_checkpoint)
+                    checkpoint = next_checkpoint
+                exhausted = examined < self.page_rows
                 if exhausted:
                     break
                 current_rate = int(budget["rate_limited"])
@@ -868,7 +1030,8 @@ class TurbopufferProjector:
         """Advance one page then return to the worker's sole coordinator.
 
         The worker owns this projector for one tenant and process lifetime.
-        Restart safely replays unfinished work from the last complete watermark.
+        Restart resumes acknowledged upsert pages when the exact claim, catalog,
+        destination and writer contract still match; tombstones are replayed.
         """
         if isinstance(max_months, bool) or not isinstance(max_months, int) or not 1 <= max_months <= 1000:
             raise ValueError("search plane months per cycle is invalid")
@@ -907,6 +1070,7 @@ class TurbopufferProjector:
             else:
                 for key in ("rows", "deleted", "rate_limited"):
                     result[key] = step[key]
+                result["failed"] = step.get("failed", 0)
                 if "retired" in step:
                     steps.close()
                     result["months"] = 1
