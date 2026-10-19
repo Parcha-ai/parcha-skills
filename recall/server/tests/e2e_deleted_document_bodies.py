@@ -147,8 +147,10 @@ class DeletedDocumentBodyTests(chunk_tests.DeletedChunkBodyTests):
             connection.execute(
                 """INSERT INTO canonical_chunks(tenant_id,source_id,chunk_id,document_id,
                     ordinal,receipt,text_redacted,text_sha256,deleted_at)
-                VALUES (%s,%s,'chk_document_duplicate',%s,999,'recall://duplicate#item=999','',%s,now())""",
-                (self.tenant, self.source, row["document_id"], row["text_sha256"]),
+                SELECT tenant_id,source_id,'chk_document_duplicate',document_id,999,
+                    'recall://'||source_id||'/'||native_id||'?rev='||revision::text||'#item=999','',%s,now()
+                FROM canonical_documents WHERE tenant_id=%s AND source_id=%s AND document_id=%s""",
+                (row["text_sha256"], self.tenant, self.source, row["document_id"]),
             )
         scope = dict(
             tenant_id=self.tenant, source_id=self.source, principal_id=self.principal
