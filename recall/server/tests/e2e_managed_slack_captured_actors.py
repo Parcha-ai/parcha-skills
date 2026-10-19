@@ -49,6 +49,185 @@ class CapturedSlackActors(ManagedSlackHistoryActors):
         self.assertEqual(state['unresolved'], 0)
         return reports
 
+    def captured_file(self):
+        import hashlib
+        from connectors.sdk import ConnectorRecordV2
+        worker, _ = self.captured(enroll=False)
+        live_factory = worker.connector_factory
+        payload = b"%PDF-1.4\nSynthetic binary attachment\x00\xff" + b"x" * (2 * 1024 * 1024)
+        record = ConnectorRecordV2(schema_version=2, native_id='slack-file:T123:F123',
+            native_parent_id=self.message.native_id, occurred_at=self.message.occurred_at,
+            content=dict(kind='document.v1', content_fidelity='complete',
+                document_id='slack-file:T123:F123', mime_type='application/pdf',
+                name='Synthetic attachment', parent_id=self.message.native_id,
+                surface='slack', artifact_content_sha256=hashlib.sha256(payload).hexdigest(),
+                text='Synthetic captured attachment', owner_ids=['slack:T123:U123']),
+            provenance=dict(uri='connector://slack/files/slack-file:T123:F123'),
+            archive_payload=payload, archive_media_type='application/pdf')
+        source = self.source
+        class FilePage:
+            source_id = source
+            connector_id = 'slack.messages'
+            def pull(self, cursor):
+                return ConnectorPage((record,), 'captured-file', False)
+        worker.connector_factory = lambda *_: (FilePage(), self.spool)
+        self.assertEqual(self.step(worker)['failed'], 0)
+        worker.connector_factory = live_factory
+        with self.store.connect() as c:
+            event = c.execute("SELECT event_id,artifact_id FROM canonical_events WHERE tenant_id=%s AND source_id=%s AND native_id=%s",
+                (self.tenant, self.source, record.native_id)).fetchone()
+            raw = c.execute('SELECT media_type,size_bytes FROM raw_artifacts WHERE tenant_id=%s AND source_id=%s AND artifact_id=%s',
+                (self.tenant, self.source, event['artifact_id'])).fetchone()
+        self.assertEqual(raw, dict(media_type='application/pdf', size_bytes=len(payload)))
+        with self.store.connect() as c:
+            sdk_bytes = c.execute('SELECT sum(size_bytes) AS size FROM raw_artifacts WHERE tenant_id=%s AND source_id=%s AND artifact_id<>%s',
+                (self.tenant, self.source, event['artifact_id'])).fetchone()['size']
+        self.assertLess(sdk_bytes, len(payload))
+        self.project()
+        self.enroll()
+        return worker, record, event, sdk_bytes
+
+    def test_binary_attachment_repairs_existing_owner_without_reading_file(self):
+        worker, record, event, sdk_bytes = self.captured_file()
+        before = self.immutable()
+        reads = []
+        original = worker.archive.read_raw
+        def observed(reference):
+            reads.append(reference['artifact_id'])
+            return original(reference)
+        with patch.object(worker.archive, 'read_raw', side_effect=observed):
+            self.message_phase(worker)
+            # Only actual SDK reads consume the page byte allowance. The
+            # binary file alone exceeds this allowance but is not downloaded.
+            with patch('recall_server.slack_captured_attribution.MAX_PAGE_BYTES', sdk_bytes):
+                self.assertEqual(self.step(worker)['failed'], 0)
+            with self.store.connect() as c:
+                self.assertTrue(c.execute("SELECT 1 FROM canonical_event_actors WHERE tenant_id=%s AND source_id=%s AND event_id=%s AND relation='owner'",
+                    (self.tenant, self.source, event['event_id'])).fetchone())
+            for _ in range(6):
+                self.assertEqual(self.step(worker)['failed'], 0)
+        with self.store.connect() as c:
+            owners = c.execute("SELECT actor_id FROM canonical_event_actors WHERE tenant_id=%s AND source_id=%s AND event_id=%s AND relation='owner'",
+                (self.tenant, self.source, event['event_id'])).fetchall()
+            queued = c.execute('SELECT 1 FROM canonical_evidence_document_queue WHERE tenant_id=%s AND source_id=%s AND native_parent_id=%s',
+                (self.tenant, self.source, record.native_parent_id)).fetchone()
+        self.assertEqual(owners, [dict(actor_id=self.actor)])
+        self.assertIsNotNone(queued)
+        self.assertNotIn(event['artifact_id'], reads)
+        self.assertEqual(self.immutable(), before)
+        report = self.step(worker)['captured_attribution']
+        self.assertEqual(report['phase'], 'complete')
+        self.assertEqual(report['unresolved'], 0)
+        self.project()
+        with self.store.connect() as c:
+            self.assertTrue(c.execute("SELECT 1 FROM canonical_evidence_document_actors WHERE tenant_id=%s AND source_id=%s AND actor_id=%s AND relation='owner'",
+                (self.tenant, self.source, self.actor)).fetchone())
+
+    def test_captured_file_revocation_and_dirty_failure_cannot_commit_links(self):
+        for boundary in ('revocation', 'dirty_failure'):
+            with self.subTest(boundary=boundary):
+                fixture = type(self)(self._testMethodName)
+                fixture.setUp()
+                try:
+                    worker, record, event, _ = fixture.captured_file()
+                    fixture.message_phase(worker)
+                    original = worker._reconcile_slack_page
+                    def interleave(row, records, **kwargs):
+                        if kwargs.get('captured_documents'):
+                            if boundary == 'revocation':
+                                with fixture.store.connect() as c:
+                                    c.execute('DELETE FROM canonical_source_grants WHERE tenant_id=%s AND source_id=%s AND principal_id=%s',
+                                        (fixture.tenant, fixture.source, fixture.principal))
+                            else:
+                                with patch.object(logical_evidence_projection, 'mark_logical_evidence_dirty',
+                                                  side_effect=RuntimeError('synthetic dirty failure')):
+                                    return original(row, records, **kwargs)
+                        return original(row, records, **kwargs)
+                    with patch.object(worker, '_reconcile_slack_page', side_effect=interleave):
+                        fixture.assertEqual(fixture.step(worker)['failed'], 1)
+                    with fixture.store.connect() as c:
+                        fixture.assertIsNone(c.execute('SELECT 1 FROM canonical_event_actors WHERE tenant_id=%s AND source_id=%s AND event_id=%s',
+                            (fixture.tenant, fixture.source, event['event_id'])).fetchone())
+                    with sqlite3.connect(fixture.spool) as c:
+                        state = json.loads(c.execute("SELECT value FROM meta WHERE key='slack_captured_attribution'").fetchone()[0])
+                    fixture.assertLess(state['after'], record.native_id)
+                    if boundary == 'dirty_failure':
+                        for _ in range(6):
+                            fixture.assertEqual(fixture.step(worker)['failed'], 0)
+                        with fixture.store.connect() as c:
+                            fixture.assertTrue(c.execute("SELECT 1 FROM canonical_event_actors WHERE tenant_id=%s AND source_id=%s AND event_id=%s AND relation='owner'",
+                                (fixture.tenant, fixture.source, event['event_id'])).fetchone())
+                finally:
+                    fixture.doCleanups()
+
+    def test_captured_file_forget_and_current_revision_block_stale_owner(self):
+        import uuid
+        from client.mac import canonical_envelope
+        from recall_server import slack_captured_attribution as captured
+        for boundary in ('forget', 'revision'):
+            with self.subTest(boundary=boundary):
+                fixture = type(self)(self._testMethodName)
+                fixture.setUp()
+                try:
+                    worker, record, event, _ = fixture.captured_file()
+                    fixture.message_phase(worker)
+                    original = captured._record
+                    def interleave(*args, **kwargs):
+                        result = original(*args, **kwargs)
+                        if isinstance(result, dict) and result['native_id'] == record.native_id:
+                            if boundary == 'forget':
+                                with fixture.store.connect() as c:
+                                    receipt = c.execute('SELECT receipt FROM canonical_chunks chunk JOIN canonical_documents document USING(tenant_id,source_id,document_id) WHERE document.tenant_id=%s AND document.source_id=%s AND document.native_id=%s AND document.is_current',
+                                        (fixture.tenant, fixture.source, record.native_id)).fetchone()['receipt']
+                                fixture.plane.forget(dict(contract='recall.forget-request.v1', schema_version=1,
+                                    tenant_id=fixture.tenant, principal_id=fixture.principal, source_id=fixture.source,
+                                    target_receipt=receipt, mode='explicit_forget', reason='owner_requested',
+                                    requested_at='2026-10-19T09:00:00Z', idempotency_key=uuid.uuid4().hex))
+                            else:
+                                changed = canonical_envelope(source_id=fixture.source, native_id=record.native_id,
+                                    kind='connector_record', content={**result['content'], 'owner_ids': ['slack:T123:U999']},
+                                    principal_id=fixture.principal, visibility='private', occurred_at=record.occurred_at,
+                                    provenance=result['provenance'], parent=record.native_parent_id)
+                                fixture.plane.ingest_batch(tenant_id=fixture.tenant, principal_id=fixture.principal, events=[changed])
+                        return result
+                    with patch.object(captured, '_record', side_effect=interleave):
+                        fixture.assertEqual(fixture.step(worker)['failed'], 0)
+                    with fixture.store.connect() as c:
+                        fixture.assertIsNone(c.execute("SELECT 1 FROM canonical_event_actors actor JOIN canonical_events event USING(tenant_id,source_id,event_id) WHERE event.tenant_id=%s AND event.source_id=%s AND event.native_id=%s AND actor.relation='owner'",
+                            (fixture.tenant, fixture.source, record.native_id)).fetchone())
+                        if boundary == 'revision':
+                            fixture.assertEqual(c.execute('SELECT revision FROM canonical_documents WHERE tenant_id=%s AND source_id=%s AND native_id=%s AND is_current',
+                                (fixture.tenant, fixture.source, record.native_id)).fetchone()['revision'], 2)
+                finally:
+                    fixture.doCleanups()
+
+    def test_captured_file_invalid_commitment_becomes_debt_then_recovers(self):
+        from psycopg.types.json import Jsonb
+        worker, record, event, _ = self.captured_file()
+        self.message_phase(worker)
+        with self.store.connect() as c:
+            original = c.execute('SELECT canonical_redacted FROM canonical_events WHERE tenant_id=%s AND source_id=%s AND event_id=%s',
+                (self.tenant, self.source, event['event_id'])).fetchone()['canonical_redacted']
+            c.execute("UPDATE canonical_events SET canonical_redacted=jsonb_set(canonical_redacted,'{content,owner_ids}',%s) WHERE tenant_id=%s AND source_id=%s AND event_id=%s",
+                (Jsonb(['slack:T123:U999']), self.tenant, self.source, event['event_id']))
+        report = self.step(worker)
+        self.assertEqual(report['failed'], 0)
+        self.assertEqual(report['captured_attribution']['phase'], 'complete')
+        self.assertEqual(report['captured_attribution']['unresolved'], 1)
+        # A bad document cannot block the later eligible message or provider lane.
+        self.assertEqual(self.counts(), (1, 1))
+        with self.store.connect() as c:
+            self.assertIsNone(c.execute('SELECT 1 FROM canonical_event_actors WHERE tenant_id=%s AND source_id=%s AND event_id=%s',
+                (self.tenant, self.source, event['event_id'])).fetchone())
+            c.execute('UPDATE canonical_events SET canonical_redacted=%s WHERE tenant_id=%s AND source_id=%s AND event_id=%s',
+                (Jsonb(original), self.tenant, self.source, event['event_id']))
+        report = self.step(worker)
+        self.assertEqual(report['failed'], 0)
+        self.assertEqual(report['captured_attribution']['unresolved'], 0)
+        with self.store.connect() as c:
+            self.assertTrue(c.execute("SELECT 1 FROM canonical_event_actors WHERE tenant_id=%s AND source_id=%s AND event_id=%s AND relation='owner'",
+                (self.tenant, self.source, event['event_id'])).fetchone())
+
     def test_progress_reports_bind_two_actual_installations(self):
         reports = []
         for fixture in (self, type(self)(self._testMethodName)):

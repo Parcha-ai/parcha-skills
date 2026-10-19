@@ -90,10 +90,17 @@ def _record(worker, row, selected, deadline, *, contacts_only=False):
                 AND target_identity_sha256=%s''', (row['tenant_id'], row['source_id'],
                 _identity_sha256(row['tenant_id'], row['source_id'], selected['native_id']))).fetchone():
             return None
-        worker._require_captured_slack_event(c, row, selected['native_id'],
-            {selected['native_id']: (selected['event_id'], selected['content_sha256'])})
-    if contacts_only and selected['content_kind'] == 'communication_message.v1':
-        return None  # Known typed message; the messages phase owns its archive read.
+        document = selected['content_kind'] == 'document.v1' and not contacts_only
+        event = worker._require_captured_slack_event(c, row, selected['native_id'],
+            {selected['native_id']: (selected['event_id'], selected['content_sha256'])},
+            **({'captured_document': True} if document else {}))
+        if document:
+            # Validate accepted typed content before it leaves the read boundary.
+            # Pure malformed-input failures become debt, never write failures.
+            from .projectors import validate_envelope
+            return validate_envelope(event)
+    if contacts_only and selected['content_kind'] in {'communication_message.v1', 'document.v1'}:
+        return None  # The messages phase owns non-contact attribution.
     if (selected['state'] != 'live' or selected['media_type'] != 'application/json'
             or not isinstance(selected['size_bytes'], int)
             or not 0 < selected['size_bytes'] <= MAX_RECORD_BYTES + 100_000):
@@ -187,14 +194,17 @@ def repair_slice(worker, row, runner, *, deadline_at):
         _save(db, state)
     consumed = 0
     for selected in page:
-        charge = min(max(0, selected['size_bytes'] or 0), MAX_RECORD_BYTES + 100_000)
+        contacts_only = state['phase'] == 'contacts' and not retry
+        no_raw_read = (selected['content_kind'] == 'document.v1' or
+            contacts_only and selected['content_kind'] == 'communication_message.v1')
+        charge = 0 if no_raw_read else min(max(0, selected['size_bytes'] or 0), MAX_RECORD_BYTES + 100_000)
         if time.monotonic() >= deadline or consumed + charge > MAX_PAGE_BYTES:
             return state
         consumed += charge
         reason = None
         try:
             record = _record(worker, row, selected, deadline,
-                contacts_only=state['phase'] == 'contacts' and not retry)
+                contacts_only=contacts_only)
         except ControlError:
             raise
         except Exception as error:
@@ -202,16 +212,21 @@ def repair_slice(worker, row, runner, *, deadline_at):
             # message is persisted. Effectful errors below must propagate.
             reason = type(error).__name__ if type(error).__name__ in {
                 'ArchiveError', 'ArchiveNotFound', 'ValueError', 'ConnectorContractError',
-                'JSONDecodeError', 'TimeoutError', 'SearchDeadlineExceeded'} else 'archive_unavailable'
+                'JSONDecodeError', 'TimeoutError', 'SearchDeadlineExceeded',
+                'StructuredEnvelopeValidationError'} else 'archive_unavailable'
             record = None
         debt_key = DEBT + hashlib.sha256(selected['native_id'].encode()).hexdigest()
         existing_debt = db.execute('SELECT 1 FROM meta WHERE key=?', (debt_key,)).fetchone()
+        content = record.get('content') if isinstance(record, dict) else record.content if record is not None else None
         relevant = record is not None and (retry or existing_debt or
-            (record.content.get('kind') == 'contact_identity.v1') == (state['phase'] == 'contacts'))
+            (content.get('kind') == 'contact_identity.v1') == (state['phase'] == 'contacts'))
         if relevant:
             expected = {selected['native_id']: (selected['event_id'], selected['content_sha256'])}
             try:
-                worker._reconcile_slack_page(row, (record,), expected_events=expected)
+                if isinstance(record, dict):
+                    worker._reconcile_slack_page(row, (), expected_events=expected, captured_documents=(record,))
+                else:
+                    worker._reconcile_slack_page(row, (record,), expected_events=expected)
             except ControlError as error:
                 if error.code != 'connector_record_changed':
                     raise
