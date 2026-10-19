@@ -30,6 +30,22 @@ class WindowDispatchTests(unittest.TestCase):
                 subset.assert_not_called()
                 store.connect.assert_not_called()
 
+    def test_supplied_diagnostic_is_forwarded_by_identity_on_both_paths(self):
+        for records in (1, 101):
+            with self.subTest(records=records):
+                diagnostic = {}
+                arguments = self.arguments(records)
+                expected = {"status": "stopped", "complete": False}
+                with patch.object(owner, "retire_parent_chunks", return_value=expected) as full, \
+                     patch.object(window, "retire_window", return_value=expected) as subset:
+                    window.retire_parent_windows(MagicMock(), MagicMock(),
+                        **arguments, diagnostic=diagnostic)
+                selected = full if records == 1 else subset
+                selected.assert_called_once()
+                self.assertIs(selected.call_args.kwargs["diagnostic"], diagnostic)
+                self.assertEqual(selected.call_args.kwargs["deadline_at"], arguments["deadline_at"])
+                self.assertEqual(selected.call_args.kwargs["required_scope_epoch"], 7)
+
     def test_large_and_over_batch_catalogs_keep_window_path(self):
         for records,batch_documents in ((101,256),(50_000,256),(3,2)):
             with self.subTest(records=records,batch_documents=batch_documents):
@@ -40,6 +56,7 @@ class WindowDispatchTests(unittest.TestCase):
                 self.assertEqual(actual["status"],"stopped")
                 full.assert_not_called()
                 subset.assert_called_once()
+                self.assertNotIn("diagnostic", subset.call_args.kwargs)
                 self.assertEqual(subset.call_args.kwargs["deadline_at"],arguments["deadline_at"])
                 self.assertEqual(subset.call_args.kwargs["required_scope_epoch"],7)
                 self.assertEqual(subset.call_args.kwargs["limits"],arguments["limits"])

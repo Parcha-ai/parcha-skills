@@ -129,8 +129,8 @@ class PassageSourceFairness(SetAdmission):
         self.assertEqual(attempted,['healthy-recent','healthy-middle'])
         remaining=self.connection.execute('SELECT logical_document_id FROM canonical_passage_projection_queue').fetchall()
         self.assertEqual([r['logical_document_id'] for r in remaining],['bad-oldest'])
-        # No silent ACK/retry scheduler: under endless fresh arrivals the bad
-        # oldest can still delay middle history within its own source.
+        # Refused metadata stays queued; within-source failure progression is
+        # covered separately by e2e_passage_parent_fairness.
 
     def test_empty_queue_does_not_advance_mode_or_source_cursor(self):
         self.projector.project_pending(tenant_id='a',batch_size=1,max_batches=1,concurrency=1)

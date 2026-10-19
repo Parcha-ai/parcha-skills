@@ -428,8 +428,8 @@ def _try_parent_native_locks(query, scope, rows):
     )
 
 
-def _retire_parent_batch(store, *, proof, rows, scope, limits, deadline_at, complete, remaining_bytes, owner_principal_id=None, metadata_mode="keep", coverage=None):
-    from .parent_chunk_proof import manifest_identity, read_parent_catalog
+def _retire_parent_batch(store, *, proof, rows, scope, limits, deadline_at, complete, remaining_bytes, owner_principal_id=None, metadata_mode="keep", coverage=None, diagnostic=None):
+    from .parent_chunk_proof import _attempt_phase, manifest_identity, read_parent_catalog
     if os.environ.get('RECALL_CHUNK_BODY_READS', 'postgres') != 'archive':
         raise ChunkRetirementError('chunk_retirement_archive_reads_required')
     manifest = proof['manifest']
@@ -447,7 +447,9 @@ def _retire_parent_batch(store, *, proof, rows, scope, limits, deadline_at, comp
     retired_metadata_chunks = 0
     hash_ms = 0.0
     started = time.monotonic()
+    _attempt_phase(diagnostic, 'batch_connection')
     with store.connect() as connection, connection.transaction():
+        _attempt_phase(diagnostic, 'batch_sql')
         def query(sql, values=()):
             return store._execute_bounded(connection, sql, values, deadline_at)
         if owner_principal_id is not None:
@@ -537,6 +539,7 @@ def _retire_parent_batch(store, *, proof, rows, scope, limits, deadline_at, comp
             (manifest['manifest_artifact_id'], cursor, 'complete' if complete else 'partial',
              cleared_documents, cleared_chunks, cleared_bytes, *scope))
         _check(deadline_at)
+        _attempt_phase(diagnostic, 'commit_ack')
     return dict(retired_metadata_chunks=retired_metadata_chunks,
                 cleared_documents=cleared_documents, cleared_chunks=cleared_chunks,
                 cleared_utf8_bytes=cleared_bytes, hashed_utf8_bytes=hashed_bytes,
@@ -545,13 +548,13 @@ def _retire_parent_batch(store, *, proof, rows, scope, limits, deadline_at, comp
 
 def retire_parent_chunks(store, archive, *, tenant_id, source_id, native_parent_id,
                          apply=False, reviewed_plan=None, limits=None, deadline_at=None,
-                         required_scope_epoch=None, owner_principal_id=None, should_stop=None, metadata_mode="keep"):
+                         required_scope_epoch=None, owner_principal_id=None, should_stop=None, metadata_mode="keep", diagnostic=None):
     """Dry-run one exact parent; complete archive proof precedes bounded commits.
 
     Only attempt-local proof authorizes body updates. The persistent cursor is
     scheduling metadata; a restart proves every parent part again exactly once.
     """
-    from .parent_chunk_proof import CAPTURE_DETAIL_FIELDS, prove_parent_chunks
+    from .parent_chunk_proof import CAPTURE_DETAIL_FIELDS, _attempt_phase, prove_parent_chunks
     scope = _parent_scope(tenant_id, source_id, native_parent_id)
     limits = ParentRetirementLimits() if limits is None else limits
     if not isinstance(limits, ParentRetirementLimits) or type(apply) is not bool:
@@ -570,8 +573,10 @@ def retire_parent_chunks(store, archive, *, tenant_id, source_id, native_parent_
     totals = dict(retired_metadata_chunks=0, cleared_documents=0, cleared_chunks=0, cleared_utf8_bytes=0, hashed_utf8_bytes=0,
                   hash_ms=0.0, sql_ms=0.0, batches=0)
     attempt_metrics = dict(metadata_capture_ms=0.0, **{field: 0 for field in CAPTURE_DETAIL_FIELDS})
+    _attempt_phase(diagnostic, 'parent_connection')
     try:
         with store.connect() as connection:
+            _attempt_phase(diagnostic, 'parent_sql')
             schema = store._execute_bounded(connection, 'SELECT 1 FROM schema_migrations WHERE version=69', (), deadline_at).fetchone()
             if schema is None:
                 raise ChunkRetirementError('parent_retirement_schema_required')
@@ -585,7 +590,7 @@ def retire_parent_chunks(store, archive, *, tenant_id, source_id, native_parent_
                     or required_scope_epoch is not None and progress['scope_epoch'] != required_scope_epoch):
                 raise ChunkRetirementError('parent_retirement_disabled')
         with prove_parent_chunks(store, archive, scope=scope, limits=limits, deadline_at=deadline_at,
-                                 capture_metrics=attempt_metrics) as proof:
+                                 capture_metrics=attempt_metrics, diagnostic=diagnostic) as proof:
             report = {key: value for key, value in proof.items() if key not in {'spool','manifest'}}
             report.update(attempt_metrics)
             if not apply:
@@ -599,10 +604,12 @@ def retire_parent_chunks(store, archive, *, tenant_id, source_id, native_parent_
                 result = _retire_parent_batch(store, proof=proof, rows=rows, scope=scope,
                     limits=limits, deadline_at=min(deadline_at, time.monotonic() + 5), complete=complete,
                     remaining_bytes=limits.max_clear_bytes-totals['cleared_utf8_bytes'], owner_principal_id=owner_principal_id,
-                    metadata_mode=metadata_mode)
+                    metadata_mode=metadata_mode, diagnostic=diagnostic)
                 for key, value in result.items():
                     totals[key] += value
                 totals['batches'] += 1
+                _attempt_phase(diagnostic, 'proof_iteration')
+            _attempt_phase(diagnostic, 'proof_iteration')
             for row in proof['spool'].verified():
                 _check(deadline_at)
                 if should_stop is not None and should_stop():
