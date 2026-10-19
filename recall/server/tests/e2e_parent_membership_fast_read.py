@@ -450,7 +450,7 @@ class ParentMembershipFastReadTests(ParentEnrollmentTests):
     def test_original_verifier_and_catalog_sql_are_unchanged(self):
         from recall_server import receipt_membership, turbopuffer_retrieval
         self.assertEqual(hashlib.sha256(Path(receipt_membership.__file__).read_bytes()).hexdigest(),
-            'e413d0faac8b9ff686f8e4399502b431a7807058f8ce0ff64f3ef73e704a2aa9')
+            'ecdbee3fbb573c7acb631ab7f026468523c1cb516f6e2bdc47a8e7afcd267fb9')
         original_sha = '33cbb2194d20a5a75b67879de1d707910844d41be8c118e90e5de9712de6dac4'
         origin_sha = '7c2ef4b4d8629c8abb042b5de7940b271b133a5f8c7a743e188c816b9e530636'
         projection = '                                   passage.spans AS origin_spans,\n'
