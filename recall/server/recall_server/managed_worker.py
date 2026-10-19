@@ -689,7 +689,7 @@ class ManagedConnectorWorker:
         if authority is None:
             raise ControlError("connector_authority_revoked")
 
-    def _enroll_slack_contacts(self, row, records):
+    def _enroll_slack_contacts(self, row, records, *, expected_events=None):
         # Typed native directory records only, before scrub and ACK dedup. A
         # privacy drop must not produce even a blinded identity side effect.
         privacy = PrivacyPolicy(mode=row["privacy_mode"])
@@ -722,31 +722,47 @@ class ManagedConnectorWorker:
                     WHERE tenant_id=%s AND source_id=%s AND target_identity_sha256=%s""",
                     (tenant, source, _identity_sha256(tenant, source, record.native_id))).fetchone()
                 if not forgotten:
+                    if expected_events is not None:
+                        self._require_captured_slack_event(connection, row, record.native_id, expected_events)
                     admitted.append((None, "slack.messages", {"content": record.content}))
             derive_slack_actor_identities(connection, tenant_id=tenant,
                 events=admitted, identity_index=self.plane.actor_identity_index)
 
-    def _reconcile_slack_page(self, row, records):
-        self._enroll_slack_contacts(row, records)
-        privacy = PrivacyPolicy(mode=row["privacy_mode"])
+    def _require_captured_slack_event(self, connection, row, native_id, expected_events):
+        current = connection.execute("""SELECT event.event_id,event.content_sha256
+            FROM canonical_documents document JOIN canonical_events event USING(tenant_id,source_id,event_id)
+            WHERE document.tenant_id=%s AND document.source_id=%s AND document.native_id=%s
+              AND document.is_current AND document.deleted_at IS NULL AND NOT event.is_tombstone
+              AND event.canonical_redacted#>>'{provenance,connector_id}'='slack.messages'
+            FOR SHARE OF document,event""", (row['tenant_id'], row['source_id'], native_id)).fetchone()
+        if current is None or (current['event_id'], current['content_sha256']) != expected_events.get(native_id):
+            raise ControlError('connector_record_changed')
+
+    @staticmethod
+    def _slack_record_event(row, record):
+        decision = PrivacyPolicy(mode=row["privacy_mode"]).apply({"content": record.content,
+            "provenance": PrivacyPolicy(mode="scrub").apply(record.provenance).value})
+        if decision.action == "drop":
+            return None
+        return canonical_envelope(source_id=row["source_id"], native_id=record.native_id,
+            kind="connector_record", content=decision.value["content"],
+            principal_id=row["principal_id"], visibility="private",
+            occurred_at=record.occurred_at, provenance=decision.value["provenance"],
+            parent=record.native_parent_id)
+
+    def _reconcile_slack_page(self, row, records, *, expected_events=None):
+        self._enroll_slack_contacts(row, records, expected_events=expected_events)
         prepared = {}
         for record in records:
             if (record.deleted or record.schema_version != 2
                     or record.content.get("kind") != "communication_message.v1"
                     or record.content.get("surface") != "slack"):
                 continue
-            decision = privacy.apply({"content": record.content,
-                "provenance": PrivacyPolicy(mode="scrub").apply(record.provenance).value})
-            if decision.action == "drop":
-                continue
-            # The SDK's original content commitment also binds typed authors.
-            # A matching current commitment safely covers already-thinned rows.
-            event = canonical_envelope(source_id=row["source_id"], native_id=record.native_id,
-                kind="connector_record", content=decision.value["content"],
-                principal_id=row["principal_id"], visibility="private",
-                occurred_at=record.occurred_at, provenance=decision.value["provenance"],
-                parent=record.native_parent_id)
-            prepared[(record.native_id, event["content_sha256"])] = event
+            # Shared with captured SDK records: apply privacy to original input,
+            # never to already redacted canonical content.
+            event = self._slack_record_event(row, record)
+            if event is not None:
+                prepared[(record.native_id, event["content_sha256"])] = event
         if not prepared:
             return
         native_ids = sorted({native for native, _ in prepared})
@@ -782,6 +798,11 @@ class ManagedConnectorWorker:
                 (tenant, source, admitted)).fetchall()
             current = [item for item in current
                        if (item["native_id"], item["content_sha256"]) in prepared]
+            if expected_events is not None:
+                if ({item['native_id'] for item in current} != set(admitted)
+                        or any((item['event_id'], item['content_sha256']) != expected_events.get(item['native_id'])
+                               for item in current)):
+                    raise ControlError('connector_record_changed')
             changed = set()
             attribute_canonical_events(connection, tenant_id=tenant, source_id=source,
                 events=((item["event_id"], "slack.messages",
@@ -794,6 +815,7 @@ class ManagedConnectorWorker:
                     reason="ingest")
 
     def run_once(self) -> dict[str, Any]:
+        started = time.monotonic()
         row = self._claim()
         if row is None:
             return {
@@ -840,6 +862,12 @@ class ManagedConnectorWorker:
                     spool_path=spool,
                     privacy=PrivacyPolicy(mode=row["privacy_mode"]),
                 )
+                captured = None
+                if row.get('connector_id') == 'slack.messages':
+                    from .slack_captured_attribution import repair_slice, progress_report
+                    captured = repair_slice(self, row, runner, deadline_at=started + self.lease_seconds)
+                    if captured is not None:
+                        captured = progress_report(row, runner)
                 result = runner.run_once()
             if result.get("status") == "backoff":
                 code = result.get("error_code", "connector_rate_limited")
@@ -888,6 +916,7 @@ class ManagedConnectorWorker:
                 "staged": int(result.get("staged", 0)),
                 "embedded": int(embedding.get("processed", 0)),
                 "has_more": has_more,
+                **({'captured_attribution': captured} if captured is not None else {}),
                 **coverage,
             }
         except Exception as error:
@@ -977,6 +1006,8 @@ def run_managed_worker(
             LOG.error("managed connector cycle failed type=%s", type(error).__name__)
             time.sleep(interval_seconds)
             continue
+        if 'captured_attribution' in result:
+            LOG.info('managed captured attribution %s', json.dumps(result['captured_attribution'], sort_keys=True))
         if "coverage" in result:
             LOG.info("managed connector coverage %s", json.dumps({
                 "installation_sha256": result["installation_sha256"],
