@@ -57,6 +57,8 @@ jobs:
       - name: Parent fallback buffer proof (isolated PostgreSQL 16)
         run: bash server/tests/run_parent_fallback_fixture.sh
       - name: Fresh-PostgreSQL end-to-end suite
+        env:
+          DIAGNOSIS_OUTPUT: ${{ runner.temp }}
         run: |
           for test in \
             e2e_brainstore.py \
@@ -146,6 +148,7 @@ jobs:
             e2e_forgotten_trigger_index.py \
             e2e_parent_authority_generation.py \
             e2e_parent_membership_enrollment.py \
+            e2e_membership_additive_epoch.py \
             e2e_parent_membership_publication.py \
             e2e_membership_remainder.py \
             e2e_membership_queue_initialization.py \
