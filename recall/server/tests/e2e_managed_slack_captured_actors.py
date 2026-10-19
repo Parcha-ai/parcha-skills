@@ -123,6 +123,260 @@ class CapturedSlackActors(ManagedSlackHistoryActors):
             self.assertTrue(c.execute("SELECT 1 FROM canonical_evidence_document_actors WHERE tenant_id=%s AND source_id=%s AND actor_id=%s AND relation='owner'",
                 (self.tenant, self.source, self.actor)).fetchone())
 
+    def unfinished_document_debt(self):
+        from connectors.slack_source import normalize_slack_message
+        from recall_server import slack_captured_attribution as captured
+        worker, record, event, _ = self.captured_file()
+        live_factory = worker.connector_factory
+        source = self.source
+        # Real SDK intake supplies a finite forward frontier; none of these
+        # unrelated records can attribute the attachment's enrolled owner.
+        tails = tuple(normalize_slack_message(workspace_id='T123', channel_id='C999',
+            value={'ts': f'1789981300.{index:06d}', 'user': 'U999', 'text': 'Synthetic later record'})
+            for index in range(24))
+        contacts = self.contacts
+        class TailPage:
+            source_id = source
+            connector_id = 'slack.messages'
+            def pull(self, cursor):
+                return ConnectorPage((*contacts, *tails), 'finite-retry-fixture', False)
+        worker.connector_factory = lambda *_: (TailPage(), self.spool)
+        # Establish the ordinary email→Slack identity before freezing a scan
+        # epoch. This is real forward intake, not a hand-written actor mapping.
+        with patch.object(captured, 'repair_slice', return_value=None):
+            self.assertEqual(self.step(worker)['failed'], 0)
+        worker.connector_factory = live_factory
+        # Populate normal body metadata for every tail before taking the
+        # immutable snapshot; later projection should change attribution only.
+        self.project()
+        self.project()
+        before = self.immutable()
+        original = captured._record
+        def old_binary_refusal(worker, row, selected, deadline, **kwargs):
+            if selected['native_id'] == record.native_id:
+                # The pre-1020 SDK-JSON-only boundary refused this real PDF.
+                self.assertEqual(selected['media_type'], 'application/pdf')
+                raise ValueError('captured_archive_unavailable')
+            return original(worker, row, selected, deadline, **kwargs)
+        def checkpoint():
+            with sqlite3.connect(self.spool) as c:
+                return json.loads(c.execute('SELECT value FROM meta WHERE key=?', (captured.KEY,)).fetchone()[0])
+        with patch.object(captured, 'MAX_PAGE_RECORDS', 2):
+            with patch.object(captured, '_record', side_effect=old_binary_refusal):
+                self.assertEqual(self.step(worker)['failed'], 0)
+            old = checkpoint()
+            self.assertEqual(old['phase'], 'contacts')
+            self.assertEqual(old['after'], record.native_id)
+            self.assertEqual(old['unresolved'], 1)
+            with self.store.connect() as c:
+                self.assertIsNone(c.execute('SELECT 1 FROM canonical_event_actors WHERE tenant_id=%s AND source_id=%s AND event_id=%s',
+                    (self.tenant, self.source, event['event_id'])).fetchone())
+        return worker, record, event, before, old
+
+    def captured_checkpoint(self):
+        from recall_server import slack_captured_attribution as captured
+        with sqlite3.connect(self.spool) as c:
+            return json.loads(c.execute('SELECT value FROM meta WHERE key=?', (captured.KEY,)).fetchone()[0])
+
+    def captured_scheduling_rows(self):
+        from recall_server import slack_captured_attribution as captured
+        with sqlite3.connect(self.spool) as c:
+            return c.execute('SELECT key,value FROM meta WHERE key IN (?,?) ORDER BY key',
+                (captured.KEY, captured.RETRY_TURN)).fetchall()
+
+    def test_repairable_document_debt_runs_before_full_contact_and_message_scans(self):
+        from recall_server import slack_captured_attribution as captured
+        worker, record, event, before, old = self.unfinished_document_debt()
+        with patch.object(captured, 'MAX_PAGE_RECORDS', 2):
+            # The current native typed-document path is now available. A fair
+            # two-lane schedule must service debt within two bounded turns,
+            # without waiting for either full-source traversal to finish.
+            reports = [self.step(worker) for _ in range(2)]
+            self.assertTrue(all(report['failed'] == 0 for report in reports), reports)
+            current = self.captured_checkpoint()
+            self.assertEqual(current['epoch'], old['epoch'])
+            self.assertEqual(current['upper'], old['upper'])
+            self.assertEqual(current['phase'], 'contacts')
+            self.assertGreater(current['after'], old['after'])
+            self.assertLessEqual(current['examined'] - old['examined'], 4)
+            self.assertEqual(self.immutable(), before)
+            with self.store.connect() as c:
+                owners = c.execute("SELECT actor_id FROM canonical_event_actors WHERE tenant_id=%s AND source_id=%s AND event_id=%s AND relation='owner'",
+                    (self.tenant, self.source, event['event_id'])).fetchall()
+            self.assertEqual(owners, [dict(actor_id=self.actor)])
+            self.assertEqual(current['unresolved'], 0)
+        self.project()
+        from recall_server.canonical_retrieval import BoundCanonicalRetrieval
+        result = BoundCanonicalRetrieval(self.store, tenant_id=self.tenant, principal_id=self.principal,
+            authorized_sources=(self.source,)).scope_documents(
+                filters={'person': 'Synthetic', 'person_relation': 'owner'}, limit=10)
+        self.assertTrue(result['complete'])
+        self.assertTrue(result['documents'])
+        self.assertEqual(self.immutable(), before)
+
+    def test_retry_turn_survives_restart_and_old_checkpoint_without_companion(self):
+        from recall_server import slack_captured_attribution as captured
+        from recall_server.managed_worker import ManagedConnectorWorker
+        worker, record, event, before, old = self.unfinished_document_debt()
+        self.assertEqual(set(old), {'version', 'epoch', 'phase', 'after', 'upper',
+                                   'examined', 'unresolved', 'retry_after'})
+        with sqlite3.connect(self.spool) as c:
+            # A deployed v1 checkpoint has no companion scheduling key.
+            c.execute('DELETE FROM meta WHERE key=?', (captured.RETRY_TURN,))
+        restarted = ManagedConnectorWorker(self.store, self.archive, self.box,
+            state_root=worker.state_root, worker_id='synthetic-restarted-retry',
+            connector_factory=worker.connector_factory)
+        restarted.retrieval.embed_pending = lambda **_: {}
+        with patch.object(captured, 'MAX_PAGE_RECORDS', 2):
+            self.assertEqual(self.step(restarted)['failed'], 0)
+            repaired = self.captured_checkpoint()
+            self.assertEqual(repaired['unresolved'], 0)
+            self.assertEqual(repaired['after'], old['after'])
+            self.assertEqual(repaired['phase'], 'contacts')
+            with sqlite3.connect(self.spool) as c:
+                self.assertEqual(c.execute('SELECT value FROM meta WHERE key=?',
+                    (captured.RETRY_TURN,)).fetchone()[0], '0')
+            self.assertEqual(self.step(restarted)['failed'], 0)
+            self.assertGreater(self.captured_checkpoint()['after'], old['after'])
+        self.assertEqual(self.immutable(), before)
+        with self.store.connect() as c:
+            self.assertTrue(c.execute('SELECT 1 FROM canonical_event_actors WHERE tenant_id=%s AND source_id=%s AND event_id=%s',
+                (self.tenant, self.source, event['event_id'])).fetchone())
+
+    def test_retry_dirty_failure_preserves_checkpoint_turn_and_restarts(self):
+        from recall_server import slack_captured_attribution as captured
+        worker, record, event, before, old = self.unfinished_document_debt()
+        saved = self.captured_scheduling_rows()
+        with patch.object(captured, 'MAX_PAGE_RECORDS', 2):
+            with patch.object(logical_evidence_projection, 'mark_logical_evidence_dirty',
+                              side_effect=RuntimeError('synthetic dirty failure')):
+                self.assertEqual(self.step(worker)['failed'], 1)
+            self.assertEqual(self.captured_scheduling_rows(), saved)
+            self.assertEqual(self.immutable(), before)
+            with self.store.connect() as c:
+                self.assertIsNone(c.execute('SELECT 1 FROM canonical_event_actors WHERE tenant_id=%s AND source_id=%s AND event_id=%s',
+                    (self.tenant, self.source, event['event_id'])).fetchone())
+            self.assertEqual(self.step(worker)['failed'], 0)
+            self.assertEqual(self.captured_checkpoint()['unresolved'], 0)
+            self.assertEqual(self.captured_checkpoint()['after'], old['after'])
+        self.project()
+        with self.store.connect() as c:
+            self.assertTrue(c.execute("SELECT 1 FROM canonical_evidence_document_actors WHERE tenant_id=%s AND source_id=%s AND actor_id=%s AND relation='owner'",
+                (self.tenant, self.source, self.actor)).fetchone())
+
+    def test_persistent_retry_debt_cannot_starve_forward_scan(self):
+        from recall_server import slack_captured_attribution as captured
+        worker, record, event, before, old = self.unfinished_document_debt()
+        original = captured._record
+        retries = []
+        def unavailable(worker, row, selected, deadline, **kwargs):
+            if selected['native_id'] == record.native_id:
+                retries.append(deadline)
+                raise ValueError('still unavailable')
+            return original(worker, row, selected, deadline, **kwargs)
+        states = [old]
+        with patch.object(captured, 'MAX_PAGE_RECORDS', 2), patch.object(captured, '_record', side_effect=unavailable):
+            for _ in range(6):
+                self.assertEqual(self.step(worker)['failed'], 0)
+                states.append(self.captured_checkpoint())
+        self.assertEqual(len(retries), 3)
+        for index, state in enumerate(states[1:], 1):
+            self.assertEqual(state['phase'], 'contacts')
+            self.assertEqual(state['unresolved'], 1)
+            self.assertEqual(state['epoch'], old['epoch'])
+            self.assertLessEqual(state['examined'] - states[index-1]['examined'], 2)
+            if index % 2:
+                self.assertEqual(state['after'], states[index-1]['after'])
+            else:
+                self.assertGreater(state['after'], states[index-1]['after'])
+        self.assertEqual(self.immutable(), before)
+        # Once the record becomes available it is serviced on the next debt turn.
+        with patch.object(captured, 'MAX_PAGE_RECORDS', 2):
+            self.assertEqual(self.step(worker)['failed'], 0)
+        self.assertEqual(self.captured_checkpoint()['unresolved'], 0)
+
+    def test_retry_preserves_original_deadline_and_raw_byte_budget(self):
+        import time
+        from types import SimpleNamespace
+        from recall_server import slack_captured_attribution as captured
+        worker, record, event, before, old = self.unfinished_document_debt()
+        saved = self.captured_scheduling_rows()
+        original_page = captured._page
+        expired = False
+        def page(*args, **kwargs):
+            nonlocal expired
+            result = original_page(*args, **kwargs)
+            expired = True
+            return result
+        clock = SimpleNamespace(monotonic=lambda: time.monotonic() + (1000 if expired else 0))
+        with patch.object(captured, 'MAX_PAGE_RECORDS', 2):
+            with patch.object(captured, '_page', side_effect=page), patch.object(captured, 'time', clock), \
+                    patch.object(captured, '_record', side_effect=AssertionError('deadline must prevent a record attempt')):
+                self.assertEqual(self.step(worker)['failed'], 0)
+            self.assertEqual(self.captured_scheduling_rows(), saved)
+            self.assertEqual(self.step(worker)['failed'], 0)
+            self.assertEqual(self.captured_checkpoint()['unresolved'], 0)
+            # Create SDK-message debt through the ordinary disposition owner.
+            # Unlike typed-document retry, it needs an actual archive read.
+            original_record = captured._record
+            def unavailable_message(worker, row, selected, deadline, **kwargs):
+                if selected['native_id'] == self.message.native_id:
+                    raise ValueError('synthetic prior SDK failure')
+                return original_record(worker, row, selected, deadline, **kwargs)
+            with patch.object(captured, 'MAX_PAGE_RECORDS', 500), \
+                    patch.object(captured, '_record', side_effect=unavailable_message):
+                self.assertEqual(self.step(worker)['failed'], 0)
+            self.assertEqual(self.captured_checkpoint()['unresolved'], 1)
+            saved = self.captured_scheduling_rows()
+            with patch.object(captured, 'MAX_PAGE_BYTES', 0), \
+                    patch.object(worker.archive, 'read_raw', side_effect=AssertionError('zero raw budget')):
+                self.assertEqual(self.step(worker)['failed'], 0)
+            self.assertEqual(self.captured_scheduling_rows(), saved)
+        self.assertEqual(self.immutable(), before)
+
+    def test_retry_revocation_preserves_progress_and_forget_cannot_resurrect(self):
+        import uuid
+        from recall_server import slack_captured_attribution as captured
+        for boundary in ('grant', 'forget'):
+            with self.subTest(boundary=boundary):
+                fixture = type(self)(self._testMethodName)
+                fixture.setUp()
+                try:
+                    worker, record, event, _, old = fixture.unfinished_document_debt()
+                    saved = fixture.captured_scheduling_rows()
+                    if boundary == 'grant':
+                        with fixture.store.connect() as c:
+                            c.execute('DELETE FROM canonical_source_grants WHERE tenant_id=%s AND source_id=%s AND principal_id=%s',
+                                (fixture.tenant, fixture.source, fixture.principal))
+                    else:
+                        with fixture.store.connect() as c:
+                            receipt = c.execute('''SELECT chunk.receipt FROM canonical_chunks chunk
+                                JOIN canonical_documents document USING(tenant_id,source_id,document_id)
+                                WHERE document.tenant_id=%s AND document.source_id=%s AND document.native_id=%s
+                                  AND document.is_current ORDER BY chunk.ordinal LIMIT 1''',
+                                (fixture.tenant, fixture.source, record.native_id)).fetchone()['receipt']
+                        fixture.plane.forget(dict(contract='recall.forget-request.v1', schema_version=1,
+                            tenant_id=fixture.tenant, principal_id=fixture.principal, source_id=fixture.source,
+                            target_receipt=receipt, mode='explicit_forget', reason='owner_requested',
+                            requested_at='2026-10-19T09:00:00Z', idempotency_key=uuid.uuid4().hex))
+                    before = fixture.immutable()
+                    with patch.object(captured, 'MAX_PAGE_RECORDS', 2):
+                        report = fixture.step(worker)
+                    fixture.assertEqual(report['failed'], int(boundary == 'grant'))
+                    if boundary == 'grant':
+                        fixture.assertEqual(fixture.captured_scheduling_rows(), saved)
+                    else:
+                        state = fixture.captured_checkpoint()
+                        fixture.assertEqual(state['after'], old['after'])
+                        fixture.assertEqual(state['phase'], 'contacts')
+                        fixture.assertEqual(state['unresolved'], 0)
+                    fixture.assertEqual(fixture.immutable(), before)
+                    with fixture.store.connect() as c:
+                        fixture.assertIsNone(c.execute('SELECT 1 FROM canonical_event_actors WHERE tenant_id=%s AND source_id=%s AND event_id=%s',
+                            (fixture.tenant, fixture.source, event['event_id'])).fetchone())
+                finally:
+                    fixture.doCleanups()
+
     def test_captured_file_revocation_and_dirty_failure_cannot_commit_links(self):
         for boundary in ('revocation', 'dirty_failure'):
             with self.subTest(boundary=boundary):

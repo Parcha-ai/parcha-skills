@@ -14,6 +14,7 @@ from .archive import FilesystemArchiveStore
 KEY = 'slack_captured_attribution'
 DEBT = KEY + ':unresolved:'
 DEBT_END = DEBT + '~'
+RETRY_TURN = KEY + ':retry_turn'
 
 
 def _epoch(worker, row):
@@ -29,8 +30,13 @@ def _epoch(worker, row):
         sorted(row['granted_scopes']), row['selectors'], identities], sort_keys=True).encode()).hexdigest()
 
 
-def _save(db, state):
+def _save(db, state, *, retry_next=None):
     db.execute('INSERT OR REPLACE INTO meta(key,value) VALUES (?,?)', (KEY, json.dumps(state)))
+    if retry_next is not None:
+        # Keep the v1 checkpoint readable by the prior runtime. The scheduling
+        # bit commits with acknowledged progress, never as a separate cursor.
+        db.execute('INSERT OR REPLACE INTO meta(key,value) VALUES (?,?)',
+            (RETRY_TURN, '1' if retry_next else '0'))
     db.commit()
 
 
@@ -156,14 +162,17 @@ def repair_slice(worker, row, runner, *, deadline_at):
             examined=0, unresolved=0, retry_after='')
         # Re-examine the full source under the new epoch, including prior debt.
         db.execute('DELETE FROM meta WHERE key>=? AND key<?', (DEBT, DEBT_END))
-        _save(db, state)
+        _save(db, state, retry_next=True)
     if state['phase'] == 'complete' and not state['unresolved']:
         if db.execute('SELECT 1 FROM meta WHERE key>=? AND key<? LIMIT 1', (DEBT, DEBT_END)).fetchone():
             raise ValueError('captured_progress_invalid')
         return state
     now = time.monotonic()
     deadline = min(now + worker.interval_seconds, now + max(0, deadline_at - now) / 2)
-    retry = state['phase'] == 'complete'
+    turn = db.execute('SELECT value FROM meta WHERE key=?', (RETRY_TURN,)).fetchone()
+    if turn is not None and turn[0] not in ('0', '1'):
+        raise ValueError('captured_progress_invalid')
+    retry = state['phase'] == 'complete' or bool(state['unresolved'] and (turn is None or turn[0] == '1'))
     debts = db.execute('SELECT key,value FROM meta WHERE key>=? AND key<? AND key>? ORDER BY key LIMIT ?',
         (DEBT, DEBT_END, state['retry_after'], MAX_PAGE_RECORDS)).fetchall() if retry else []
     if retry and not debts:
@@ -187,11 +196,13 @@ def repair_slice(worker, row, runner, *, deadline_at):
         present = {item['native_id'] for item in page}
         # The current indexed query also supplies terminal deletion/supersession
         # dispositions; absence is not an archive or author-eligibility claim.
+        removed = 0
         for key, value in debts:
             if json.loads(value)['native_id'] not in present:
-                state['unresolved'] -= db.execute('DELETE FROM meta WHERE key=?', (key,)).rowcount
+                removed += db.execute('DELETE FROM meta WHERE key=?', (key,)).rowcount
+        state['unresolved'] -= removed
         page.sort(key=lambda item: hashlib.sha256(item['native_id'].encode()).hexdigest())
-        _save(db, state)
+        _save(db, state, retry_next=False if removed else None)
     consumed = 0
     for selected in page:
         contacts_only = state['phase'] == 'contacts' and not retry
@@ -247,7 +258,7 @@ def repair_slice(worker, row, runner, *, deadline_at):
             state['retry_after'] = debt_key
         state['examined'] += 1
         state['after'] = selected['native_id'] if not retry else state['after']
-        _save(db, state)
+        _save(db, state, retry_next=not retry)
     if not retry and len(page) < MAX_PAGE_RECORDS:
         if _epoch(worker, row) != state['epoch']:
             # Includes our own contact derivation. One harmless repeated pass
@@ -255,5 +266,5 @@ def repair_slice(worker, row, runner, *, deadline_at):
             return state
         state['phase'] = 'messages' if state['phase'] == 'contacts' else 'complete'
         state['after'] = ''
-        _save(db, state)
+        _save(db, state, retry_next=True)
     return state
