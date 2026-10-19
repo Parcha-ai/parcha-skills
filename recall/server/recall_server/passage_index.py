@@ -157,12 +157,12 @@ def _handback_owned_by_visible_message(group, records):
     )
 
 
-def _spool_tool_groups(records, extractor, output):
+def _spool_tool_groups(records, extractor, output, *, first_record_ordinal=0):
     # Call the unchanged extractor on each complete validated event. Both native
     # adapters' coverage counters are additive; no provider block is split.
     _, coverage = extractor(())
     dispositions = Counter()
-    for records_group in _logical_record_groups(records):
+    for records_group in _logical_record_groups(records, first_record_ordinal=first_record_ordinal):
         groups, counts = extractor(records_group, first_record_ordinal=records_group[0].ordinal)
         retained = []
         for group in groups:
@@ -1278,6 +1278,23 @@ class CanonicalPassageProjector:
         if connection is None:
             with self.store.connect() as current:
                 return self._append_prefix(candidate, checkpoint, current)
+        if 'tool_groups' in checkpoint:
+            visible = self._append_prefix(candidate,
+                {key: value for key, value in checkpoint.items() if key != 'tool_groups'}, connection)
+            if visible is None:
+                return None
+            groups = checkpoint['tool_groups']
+            rows = connection.execute("""SELECT passage_id,ordinal,receipts
+                FROM canonical_passages WHERE tenant_id=%s AND source_id=%s
+                  AND logical_document_id=%s AND ordinal>=%s ORDER BY ordinal""",
+                (candidate.tenant_id, candidate.source_id, candidate.logical_document_id,
+                 groups['visible_passages'])).fetchall()
+            tools = tuple(passage_append.RetainedPassage(row['passage_id'], row['ordinal'],
+                tuple(row['receipts'])) for row in rows)
+            if (len(tools) != groups['tool_passages']
+                or passage_append.prefix_digest(tools) != groups['prefix_sha256']):
+                return None
+            return visible + tools
         rows = connection.execute("""SELECT passage_id,ordinal,receipts
             FROM canonical_passages WHERE tenant_id=%s AND source_id=%s
               AND logical_document_id=%s AND ordinal<%s ORDER BY ordinal""",
@@ -1349,7 +1366,9 @@ class CanonicalPassageProjector:
 
         resume = None
         prefix = ()
-        if not grouped_tools and incremental and self.append_reuse_enabled and state and isinstance(checkpoint, dict) and checkpoint.get('policy_fingerprint') == policy.fingerprint:
+        compatible_groups = (grouped_tools and state and isinstance(checkpoint, dict)
+            and passage_append.grouped_checkpoint_matches(checkpoint, state['projected'], candidate))
+        if ((not grouped_tools and isinstance(checkpoint, dict) and 'tool_groups' not in checkpoint) or compatible_groups) and incremental and self.append_reuse_enabled and state and isinstance(checkpoint, dict) and checkpoint.get('policy_fingerprint') == policy.fingerprint:
             try:
                 if passage_append.proves_append(checkpoint, state['projected'], candidate, manifest, lambda ordinal: read_part(ordinal, remember=True)):
                     prefix = self._append_prefix(candidate, checkpoint)
@@ -1405,8 +1424,7 @@ class CanonicalPassageProjector:
             passages = payload_resources.enter_context(_DiskSequence())
             messages = resources.enter_context(_DiskSequence())
             try:
-                # Enrolled documents currently rebuild fully. Read verified archive
-                # parts once; the two views keep visible-message coordinates intact.
+                # Both views share verified records, preserving visible coordinates.
                 migration_check = ((incremental or _migrate_legacy) and not grouped_tools and not resume
                     and candidate.source_id.startswith('claude:')
                     and state and state.get('projected')
@@ -1447,7 +1465,7 @@ class CanonicalPassageProjector:
                         raise ValueError("invalid passage restart offset")
                     # Keep the existing append proof and tail geometry unchanged.
                     # The append helper still materializes its tail, not the full rebuild.
-                    passages.extend(prefix)
+                    passages.extend(prefix[:resume['passage_ordinal']])
                     passages.extend(passage_append.resume_passages(tuple(messages), resume, arguments))
                 except (ValueError, IndexError, UnicodeDecodeError):
                     return full_fallback()
@@ -1471,12 +1489,28 @@ class CanonicalPassageProjector:
                 else:
                     coverage = None
             tool_message_count = tool_message_bytes = 0
+            visible_passages = len(passages)
+            visible_checkpoint = (passage_append.make_checkpoint(candidate, manifest, messages, passages,
+                policy, previous=resume) if grouped_tools and state and state['available'] else None)
             if grouped_tools:
+                previous_groups = resume['tool_groups'] if resume else None
                 extractor = (extract_codex_tool_event_groups
                              if candidate.extraction_version == "codex_tool_groups_v1" else extract_tool_event_groups)
                 if groups is None:
                     groups = resources.enter_context(_DiskSequence())
-                    coverage = _spool_tool_groups(source_records, extractor, groups)
+                    start = previous_groups['record_count'] if previous_groups else 0
+                    coverage = _spool_tool_groups(
+                        (record for record in source_records if record.ordinal >= start),
+                        extractor, groups, first_record_ordinal=start)
+                if previous_groups:
+                    try:
+                        coverage = passage_append.add_group_coverage(previous_groups['coverage'], coverage)
+                    except (KeyError, TypeError, ValueError):
+                        return full_fallback()
+                    tool_message_count = previous_groups['messages']
+                    tool_message_bytes = previous_groups['bytes']
+                    passages.extend(replace(passage, ordinal=visible_passages + index)
+                        for index, passage in enumerate(prefix[resume['passage_ordinal']:]))
                 # Build each provider block independently. Its message indexes are
                 # group-local, so later visible arrivals cannot rekey old tool spans.
                 for group in groups:
@@ -1503,6 +1537,13 @@ class CanonicalPassageProjector:
                         raise LogicalEvidenceError('legacy_tool_migration_required')
             checkpoint = (passage_append.make_checkpoint(candidate, manifest, messages, passages,
                 policy, previous=resume) if not grouped_tools and state and state['available'] else None)
+            if grouped_tools and visible_checkpoint is not None:
+                checkpoint = dict(visible_checkpoint, tool_groups=dict(
+                    version=1, extraction_version=candidate.extraction_version,
+                    visible_passages=visible_passages, tool_passages=len(passages)-visible_passages,
+                    record_count=manifest['record_count'], messages=tool_message_count,
+                    bytes=tool_message_bytes, coverage=coverage,
+                    prefix_sha256=passage_append.prefix_digest(passages[visible_passages:])))
             return PreparedPassageDocument(
                 candidate=candidate,
                 dense_message_count=len(messages) + tool_message_count + (resume["message_index"] if resume else 0),
