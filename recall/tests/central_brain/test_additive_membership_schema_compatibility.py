@@ -1,8 +1,13 @@
 """Explicit 092 compatibility preserves the previous schema and refusal fences."""
+import sys
 import unittest
-from recall_server import SCHEMA_VERSION
-from recall_server.capabilities import assess_snapshot, CapabilityError
-from tests.central_brain.test_core_deployment import healthy_snapshot
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'server'))
+
+from recall_server import SCHEMA_VERSION  # noqa: E402
+from recall_server.capabilities import assess_snapshot, CapabilityError  # noqa: E402
+from tests.central_brain.test_core_deployment import healthy_snapshot  # noqa: E402
 
 
 class AdditiveMembershipSchemaCompatibility(unittest.TestCase):
