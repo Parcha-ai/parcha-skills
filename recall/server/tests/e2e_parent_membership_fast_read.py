@@ -90,7 +90,8 @@ class ParentMembershipFastReadTests(ParentEnrollmentTests):
         native_rows, _ = self.authorize(); self.enable()
         with patch('recall_server.receipt_membership.lookup_current_search_membership', wraps=lookup_current_search_membership) as native:
             fast_rows, stages = self.authorize()
-        self.assertEqual(fast_rows, native_rows)
+        # Private authority SQL is unordered; compare every field and duplicate.
+        self.assertCountEqual(fast_rows, native_rows)
         self.assertEqual(native.call_count, 1)
         self.assertEqual(native.call_args.kwargs['receipts'], (self.physical_receipt,))
         self.assertEqual(stages['native_receipts'], 1)
