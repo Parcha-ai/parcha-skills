@@ -266,6 +266,7 @@ jobs:
             e2e_retirement_tail_first.py \
             e2e_retirement_no_work_prefix.py \
             e2e_retirement_stream_capture.py \
+            e2e_retirement_stream_membership.py \
             e2e_retirement_part_reuse.py \
             e2e_optional_reconcile_index.py \
             e2e_context_time_index.py \
