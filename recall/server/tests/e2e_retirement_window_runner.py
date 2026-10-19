@@ -117,6 +117,8 @@ class RunnerWindows(unittest.TestCase):
             result=self.run_parent(max_batches=8)
         self.assertEqual(calls,2)
         self.assertTrue(result['commit_outcome_unknown'])
+        self.assertEqual(result['failed_phase_counts'], {'commit_ack': 1})
+        self.assertGreaterEqual(result['failed_phase_ms']['commit_ack'], 0)
         self.assertEqual(result['cleared_documents'],2)
         self.assertEqual(result['batches'],1)
         self.assertEqual(sum(not r['text_redacted']for r in self.state()),4)
