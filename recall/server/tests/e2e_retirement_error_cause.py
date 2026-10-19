@@ -55,6 +55,70 @@ class ErrorCause(unittest.TestCase):
         self.assertNotIn(private, str(result))
 
 
+
+class DeadlinePhase(unittest.TestCase):
+    setUp = fixtures.CaptureTiming.setUp
+    run_owner = fixtures.CaptureTiming.run_owner
+
+    def cancel_phase(self, query_fragment, expected_phase):
+        import time
+        original = self.store._execute_bounded
+        cancelled = []
+
+        def execute(connection, sql, values, deadline):
+            if query_fragment in sql:
+                cancelled.append(True)
+                return original(connection, 'SELECT pg_sleep(%s)', (.1,), time.monotonic() + .02)
+            return original(connection, sql, values, deadline)
+
+        with patch.object(self.store, '_execute_bounded', execute):
+            result = self.run_owner()
+        self.assertEqual(cancelled, [True])
+        self.assertEqual(result['errors'], {'parent_retirement_deadline_exceeded': 1})
+        self.assertFalse(result['commit_outcome_unknown'])
+        self.assertEqual(result['cleared_documents'], 0)
+        self.assertEqual(result['failed_phase_counts'], {expected_phase: 1})
+        self.assertGreaterEqual(result['failed_phase_ms'][expected_phase], 10)
+        self.assertLessEqual(result['failed_phase_ms'][expected_phase], result['parent_wall_ms'])
+        self.assertNotIn('pg_sleep', str(result))
+        with self.store.connect() as c:
+            state = c.execute("SELECT last_record_ordinal FROM canonical_chunk_retirement_progress WHERE tenant_id=%s", (self.tenant,)).fetchone()
+            self.assertEqual(state['last_record_ordinal'], -1)
+            self.assertEqual(c.execute("SELECT count(*) AS n FROM canonical_chunks WHERE tenant_id=%s AND text_redacted<>''", (self.tenant,)).fetchone()['n'], 3)
+
+    def test_actual_pool_checkout_timeout_retains_unknown_and_elapsed(self):
+        import os
+        from psycopg_pool import ConnectionPool
+        from recall_server import retirement_runner as runner
+        original = self.store.connect
+        claimed = False
+
+        def before_parent(_candidate):
+            nonlocal claimed
+            claimed = True
+
+        with ConnectionPool(os.environ['RECALL_DATABASE_URL'], min_size=1, max_size=1) as pool:
+            with pool.connection():
+                def connect(*, timeout=None):
+                    if claimed:
+                        return pool.connection(timeout=.02)
+                    return original(timeout=timeout)
+                with patch.object(self.store, 'connect', connect):
+                    result = runner.run_retirement(self.store, self.archive, scope=self.scope,
+                        apply=True, before_parent=before_parent)
+        self.assertTrue(result['commit_outcome_unknown'])
+        self.assertEqual(result['error_class'], 'PoolTimeout')
+        self.assertEqual(result['cleared_documents'], 0)
+        self.assertEqual(result['failed_phase_counts'], {'parent_connection': 1})
+        self.assertGreaterEqual(result['failed_phase_ms']['parent_connection'], 10)
+        self.assertFalse(self.archive.reads)
+
+    def test_failed_capture_sql_has_attempt_phase_and_elapsed(self):
+        self.cancel_phase('SELECT * FROM canonical_evidence_document_parts', 'capture_sql')
+
+    def test_failed_batch_sql_has_attempt_phase_and_elapsed(self):
+        self.cancel_phase('SELECT document.tenant_id,document.source_id,document.document_id,document.native_id,', 'batch_sql')
+
 def diagnostic_case(code, expected):
     def test(self):
         with patch.object(self.archive, 'read_raw', side_effect=LogicalEvidenceError(code)):

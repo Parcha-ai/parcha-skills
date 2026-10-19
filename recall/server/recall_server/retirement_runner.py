@@ -23,6 +23,7 @@ from .parent_chunk_window import retire_parent_windows
 from .logical_evidence import IDENTITY_RE, MAX_PART_BYTES, PART_MEDIA_TYPE
 from .parent_chunk_proof import (
     CAPTURE_DETAIL_FIELDS,
+    _attempt_phase,
     manifest_identity,
     parent_retirement_plan,
     read_parent_catalog,
@@ -562,6 +563,7 @@ def run_retirement(
         membership_elapsed_ms=0,
     )
     errors, excluded, attempted = Counter(), Counter(), []
+    failed_phase_counts, failed_phase_ms = Counter(), Counter()
     for _ in range(limits.max_parents):
         if time.monotonic() >= deadline_at or should_stop is not None and should_stop():
             report["status"] = "stopped"
@@ -609,6 +611,8 @@ def run_retirement(
             # any archive read or clearing. A failed observer stops this call.
             before_parent(candidate)
         parent_started = time.monotonic()
+        diagnostic = {}
+        _attempt_phase(diagnostic, 'certification_admission')
         try:
             certification_request = None
             if (metadata_mode == "singleton" and membership_certification is not None
@@ -648,6 +652,7 @@ def run_retirement(
                     owner_principal_id=scope.principal_id,
                     should_stop=should_stop,
                     metadata_mode=metadata_mode,
+                    diagnostic=diagnostic,
                 )
             for field in ("metadata_capture_ms", *CAPTURE_DETAIL_FIELDS):
                 report[field] += result.get(field, 0)
@@ -686,6 +691,8 @@ def run_retirement(
                     report["membership_elapsed_ms"] += round(
                         (time.monotonic() - certification_started) * 1000)
         except ChunkRetirementError as error:
+            failed_phase_counts[diagnostic['phase']] += 1
+            failed_phase_ms[diagnostic['phase']] += (time.monotonic() - diagnostic['started']) * 1000
             report["failed_parents"] += 1
             errors[error.error_code] += 1
             result = getattr(error, "committed", {})
@@ -733,6 +740,8 @@ def run_retirement(
     return dict(
         report,
         errors=dict(errors),
+        failed_phase_counts=dict(failed_phase_counts),
+        failed_phase_ms=dict(failed_phase_ms),
         excluded=dict(excluded),
         archive_gets=meter.gets,
         archive_reused_gets=meter.reused_gets,
