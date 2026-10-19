@@ -479,7 +479,8 @@ def retire_parent_windows(store, archive, *, tenant_id, source_id, native_parent
         return retire_parent_chunks(store,archive,tenant_id=tenant_id,source_id=source_id,
             native_parent_id=native_parent_id,apply=apply,reviewed_plan=reviewed_plan,
             limits=limits,deadline_at=deadline_at,required_scope_epoch=required_scope_epoch,
-            owner_principal_id=owner_principal_id,should_stop=should_stop,metadata_mode=metadata_mode,diagnostic=diagnostic)
+            owner_principal_id=owner_principal_id,should_stop=should_stop,metadata_mode=metadata_mode,
+            **({"diagnostic": diagnostic} if diagnostic is not None else {}))
     meter = RunArchive(archive,max_bytes=limits.max_archive_bytes)
     totals = dict(retired_metadata_chunks=0,cleared_documents=0,cleared_chunks=0,
         cleared_utf8_bytes=0,hashed_utf8_bytes=0,hash_ms=0.0,sql_ms=0.0,batches=0)
@@ -503,7 +504,8 @@ def retire_parent_windows(store, archive, *, tenant_id, source_id, native_parent
                     limits=replace(limits,max_batches=limits.max_batches-totals['batches'],
                         max_clear_bytes=clear_left,max_archive_bytes=archive_left),
                     remaining_bytes=clear_left,deadline_at=deadline_at,reviewed_plan=reviewed_plan,
-                    required_scope_epoch=required_scope_epoch,metadata_mode=metadata_mode,should_stop=should_stop,diagnostic=diagnostic)
+                    required_scope_epoch=required_scope_epoch,metadata_mode=metadata_mode,should_stop=should_stop,
+                    **({"diagnostic": diagnostic} if diagnostic is not None else {}))
             except ChunkRetirementError as error:
                 clear_limited = error.error_code == 'parent_retirement_window_clear_budget_hold'
                 archive_limited = (error.error_code == 'parent_retirement_window_archive_budget' and totals['batches'] > 0)
