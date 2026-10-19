@@ -51,9 +51,9 @@ def main():
             pg = BoundCanonicalRetrieval(store, **args)
             archived = BoundCanonicalRetrieval(store, chunk_body_archive=archive, **args)
 
-            def insert(connection, native, text, ordinal):
+            def insert(connection, native, text, ordinal, *, revision=1):
                 return insert_record(connection, tenant=tenant, source=source, parent=parent,
-                                     native=native, text=text, role="assistant", byte_start=ordinal * 10)
+                                     native=native, text=text, role="assistant", byte_start=ordinal * 10, revision=revision)
 
             def dirty(connection, native):
                 mark_logical_evidence_dirty(connection, tenant_id=tenant, source_id=source,
@@ -95,11 +95,7 @@ def main():
             # A2 has new content and receipts; the old shared part still contains A1.
             with store.connect() as connection:
                 connection.execute("UPDATE canonical_documents SET is_current=false WHERE tenant_id=%s AND source_id=%s AND native_id='a'", (tenant, source))
-                temporary_receipt = insert(connection, "a-v2", "A second revision", 3)
-                connection.execute("UPDATE canonical_events SET native_id='a',revision=2 WHERE tenant_id=%s AND source_id=%s AND native_id='a-v2'", (tenant, source))
-                connection.execute("UPDATE canonical_documents SET native_id='a',revision=2 WHERE tenant_id=%s AND source_id=%s AND native_id='a-v2'", (tenant, source))
-                a2 = f"recall://{source}/a?rev=2#item=0"
-                connection.execute("UPDATE canonical_chunks SET receipt=%s WHERE receipt=%s", (a2, temporary_receipt))
+                a2 = insert(connection, "a", "A second revision", 3, revision=2)
                 dirty(connection, "a")
             assert archived.show(a) is None
             assert archived.show(a2) == pg.show(a2)

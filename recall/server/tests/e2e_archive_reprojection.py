@@ -110,8 +110,9 @@ def revision_tombstone_actor_backfill(store, root):
     with store.connect() as connection:
         scope = (tenant, source)
         connection.execute("UPDATE canonical_chunks SET text_redacted='' WHERE tenant_id=%s AND source_id=%s", scope)
-        connection.execute("UPDATE canonical_documents SET revision=2,text_sha256=%s WHERE tenant_id=%s AND source_id=%s AND native_id='event-0001'", (hashlib.sha256(revised.encode()).hexdigest(), *scope))
-        connection.execute("UPDATE canonical_chunks SET text_redacted=%s,text_sha256=%s,receipt=replace(receipt,'?rev=1#','?rev=2#') WHERE tenant_id=%s AND source_id=%s AND receipt LIKE '%%/event-0001?%%'", (revised, hashlib.sha256(revised.encode()).hexdigest(), *scope))
+        connection.execute("UPDATE canonical_documents SET is_current=false WHERE tenant_id=%s AND source_id=%s AND native_id='event-0001'", scope)
+        insert_record(connection, tenant=tenant, source=source, parent='session', native='event-0001',
+                      text=revised, role='assistant', byte_start=10, revision=2)
         connection.execute("UPDATE canonical_documents SET is_current=false,deleted_at=now() WHERE tenant_id=%s AND source_id=%s AND native_id='event-0002'", scope)
         connection.execute("UPDATE canonical_events SET source_ordinal=CASE WHEN native_id='event-0000' THEN 999 ELSE 0 END WHERE tenant_id=%s AND source_id=%s", scope)
         connection.execute("INSERT INTO brain_actors(tenant_id,actor_id,actor_kind,display_name) VALUES(%s,%s,'human','Current actor')", (tenant, actor))

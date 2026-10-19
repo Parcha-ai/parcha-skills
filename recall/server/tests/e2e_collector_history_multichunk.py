@@ -1,6 +1,7 @@
 """Recover bounded original canonical chunks without changing body authority."""
 import hashlib
 import json
+from contextlib import nullcontext
 import unittest
 from unittest.mock import patch
 
@@ -102,11 +103,15 @@ class MultichunkRecovery(unittest.TestCase):
         self.assertEqual(len(self.prepare_chunks('x', generation=9, total_bytes=48000)), 2)
         self.assertEqual(len(self.assert_recovered()), 3)
 
-    def alter_chunk(self, assignment, params=(), *, ordinal=1):
+    def alter_chunk(self, assignment, params=(), *, ordinal=1, historical=False):
+        from e2e_logical_evidence_projection import legacy_canonical_state
         with self.store.connect() as connection:
-            connection.execute(f'''UPDATE canonical_chunks SET {assignment}
-                WHERE tenant_id=%s AND source_id=%s AND document_id=%s AND ordinal=%s''',
-                (*params, self.tenant, self.source, self.expected['document_id'], ordinal))
+            # Only explicit pre-invariant corruption fixtures use the legacy
+            # writer; the exact installed collector is restored before recovery.
+            with legacy_canonical_state(connection) if historical else nullcontext():
+                connection.execute(f'''UPDATE canonical_chunks SET {assignment}
+                    WHERE tenant_id=%s AND source_id=%s AND document_id=%s AND ordinal=%s''',
+                    (*params, self.tenant, self.source, self.expected['document_id'], ordinal))
 
     def test_later_chunk_corruption_cannot_reach_raw_or_write(self):
         self.prepare_chunks('x' * 30000)
@@ -119,7 +124,7 @@ class MultichunkRecovery(unittest.TestCase):
 
     def test_wrong_later_receipt_refuses_before_raw(self):
         self.prepare_chunks('x' * 30000)
-        self.alter_chunk('receipt=%s', ('recall://wrong/identity?rev=1#item=1',))
+        self.alter_chunk('receipt=%s', ('recall://wrong/identity?rev=1#item=1',), historical=True)
         with patch.object(self.archive, 'verify_raw_bounded') as head:
             with self.assertRaisesRegex(CollectorHistoryRecoveryError, 'chunk_changed'):
                 self.recover()
@@ -137,7 +142,7 @@ class MultichunkRecovery(unittest.TestCase):
 
     def test_ordinal_gap_refuses(self):
         self.prepare_chunks('x' * 30000)
-        self.alter_chunk('ordinal=2')
+        self.alter_chunk('ordinal=2', historical=True)
         with self.assertRaisesRegex(CollectorHistoryRecoveryError, 'chunk_changed'):
             self.recover()
         self.assert_no_correction()
