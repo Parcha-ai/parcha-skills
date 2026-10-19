@@ -59,6 +59,89 @@ class ToolGroupPublication(unittest.TestCase):
             source_document_sha256=row['source_document_sha256'],
             extraction_version='tool_groups_v1', principal_id=self.principal, **extra)
 
+    def test_enrollment_keeps_one_complete_handback_owner(self):
+        report = 'The checked schema permission caused the deploy failure.'
+        value = {'type': 'assistant', 'message': {'role': 'assistant', 'content': [
+            {'type': 'tool_use', 'name': 'SubagentHandback', 'input': {'message': report}}]}}
+        original = self.ingest('handback', value=value)
+        self.project()
+        before = self.projected()
+        self.assertEqual(len(before), 1)
+        self.assertEqual(before[0]['spans'][0]['source_unit'], 'subagent_handback.complete.v1')
+        self.assertEqual(self.enroll()['status'], 'queued')
+        self.project()
+        after = self.projected()
+        self.assertEqual(len(after), 1)
+        for field in ('passage_id', 'text_sha256', 'receipts', 'spans'):
+            self.assertEqual(after[0][field], before[0][field])
+        self.assertIn(original, [chunk['text'] for chunk in self.grant_and_open(after[0])['chunks']])
+
+    def test_long_handback_keeps_every_original_window_and_byte(self):
+        report = 'Verified café finding and remaining action. ' * 600
+        self.ingest('long-handback', value={'type': 'assistant', 'message': {
+            'role': 'assistant', 'content': [{'type': 'tool_use', 'name': 'SubagentHandback',
+                'input': {'message': report}}]}})
+        self.project()
+        before = self.projected()
+        self.assertGreater(len(before), 1)
+        self.enroll()
+        self.project()
+        after = self.projected()
+        self.assertEqual(len(after), len(before))
+        for old, current in zip(before, after):
+            for field in ('passage_id', 'text_sha256', 'receipts', 'spans', 'text_redacted'):
+                self.assertEqual(current[field], old[field])
+        covered = set()
+        for row in after:
+            for span in row['spans']:
+                self.assertEqual(report.encode()[span['source_byte_start']:span['source_byte_end']],
+                    row['text_redacted'].encode()[span['passage_byte_start']:span['passage_byte_end']])
+                covered.update(range(span['source_byte_start'], span['source_byte_end']))
+        self.assertEqual(len(covered), len(report.encode()))
+        self.assertEqual(self.document()['extraction_coverage']['dispositions']['already_projected_handback'], 1)
+
+    def test_handback_with_preamble_keeps_generic_fallback(self):
+        report = 'The tool report is not present in the visible preamble.'
+        raw = self.ingest('preamble', value={'type': 'assistant', 'message': {
+            'role': 'assistant', 'content': [{'type': 'text', 'text': 'Separate visible context.'},
+                {'type': 'tool_use', 'name': 'SubagentHandback', 'input': {'message': report}}]}})
+        self.project()
+        before = self.projected()
+        self.enroll()
+        self.project()
+        after = self.projected()
+        self.assertTrue({row['passage_id'] for row in before} <= {row['passage_id'] for row in after})
+        tool = next(row for row in after if 'claude.tool-input' in json.dumps(row['spans']))
+        self.assertIn(report, tool['text_redacted'])
+        self.assertIn(raw, [chunk['text'] for chunk in self.grant_and_open(tool)['chunks']])
+        self.assertNotIn('already_projected_handback', self.document()['extraction_coverage']['dispositions'])
+
+    def test_extra_input_and_unrelated_equal_text_are_not_owned(self):
+        report = 'Exact equal text does not establish a shared semantic owner.'
+        raw = self.ingest('mixed', value={'type': 'assistant', 'message': {
+            'role': 'assistant', 'content': [
+                {'type': 'tool_use', 'name': 'SubagentHandback', 'input': {'message': report}},
+                {'type': 'tool_use', 'name': 'SubagentHandback', 'input': {'message': report, 'attempt': 2}},
+                {'type': 'tool_use', 'name': 'SubagentHandback', 'input': {'message': report, 'detail': 'Preserve the other leaf.'}},
+                {'type': 'tool_use', 'name': 'SendMessage', 'input': {'message': report}}]}})
+        self.project()
+        before = self.projected()
+        self.enroll()
+        self.project()
+        after = self.projected()
+        self.assertTrue({row['passage_id'] for row in before} <= {row['passage_id'] for row in after})
+        units = {span.get('source_unit') for row in after for span in row['spans']}
+        self.assertNotIn('claude.tool-input.string.v1#/message/content/0/input/message', units)
+        for index in (1, 2, 3):
+            self.assertIn(f'claude.tool-input.string.v1#/message/content/{index}/input/message', units)
+        self.assertIn('claude.tool-input.string.v1#/message/content/2/input/detail', units)
+        for row in after:
+            self.assertIn(raw, [chunk['text'] for chunk in self.grant_and_open(row)['chunks']])
+        coverage = self.document()['extraction_coverage']
+        self.assertEqual(coverage['groups'], 3)
+        self.assertEqual(coverage['included_string_leaves'], 4)
+        self.assertEqual(coverage['dispositions']['already_projected_handback'], 1)
+
     def test_explicit_enrollment_recovers_inputs_results_and_keeps_legacy_identity(self):
         self.store.search_plane = 'turbopuffer'
         original = [self.ingest('input'), self.ingest('result', result=True, second=1)]
