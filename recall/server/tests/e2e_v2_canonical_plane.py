@@ -136,7 +136,7 @@ def main() -> None:
                        ) VALUES (%s,%s,%s,%s,0,%s,'synthetic canonical text',%s)""",
                     (
                         tenant, source, chunk, document,
-                        f"recall://{source}/native-synthetic?rev=1#item=0",
+                        f"recall://{source}/native:synthetic?rev=1#item=0",
                         text_sha256,
                     ),
                 )
@@ -156,7 +156,7 @@ def main() -> None:
                         tenant,
                         source,
                         f"recall://{source}/legacy?rev=1",
-                        f"recall://{source}/native-synthetic?rev=1",
+                        f"recall://{source}/native:synthetic?rev=1",
                     ),
                 )
                 connection.execute(
