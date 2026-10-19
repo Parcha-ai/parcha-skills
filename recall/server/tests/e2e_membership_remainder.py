@@ -13,6 +13,54 @@ from e2e_passage_receipt_repair import Repair
 
 
 class MembershipRemainderTests(ParentMembershipPublicationTests):
+    def test_certification_pairs_each_metadata_deadline_without_changing_native_proof(self):
+        import json
+        import psycopg
+        from psycopg.pq import PipelineStatus
+
+        self.interrupted_publication()
+        before = self.compare()
+        self.assertEqual(before['certified_passages'], 0)
+        query = enrollment._query
+        execute = psycopg.Connection.execute
+        active = []
+        observed = dict(owner_queries=0, owner_settings=0, pipelined_queries=0,
+                        pipelined_settings=0, other_settings=0)
+        def owner(store, connection, statement, parameters, deadline):
+            active.append(statement)
+            try:
+                return query(store, connection, statement, parameters, deadline)
+            finally:
+                active.pop()
+        def traced(connection, statement, params=None, **kwargs):
+            setting = str(statement).startswith("SELECT set_config('statement_timeout'")
+            pipelined = connection.info.pipeline_status != PipelineStatus.OFF
+            if active and setting:
+                observed['owner_settings'] += 1
+                observed['pipelined_settings'] += int(pipelined)
+            elif active and statement == active[-1]:
+                observed['owner_queries'] += 1
+                observed['pipelined_queries'] += int(pipelined)
+            elif setting:
+                observed['other_settings'] += 1
+            return execute(connection, statement, params, **kwargs)
+        started = time.monotonic()
+        with patch.object(enrollment, '_query', owner), patch.object(psycopg.Connection, 'execute', traced):
+            result = self.run_cycle()
+        observed['elapsed_ms'] = round((time.monotonic() - started) * 1000, 3)
+        self.assertEqual(result['membership_failed_documents'], 0)
+        self.assertEqual(result['membership_certified_passages'], before['selected_passages'])
+        self.assertEqual(self.queued(), [])
+        after = self.compare()
+        self.assertEqual(after['native_allowed_passages'], before['native_allowed_passages'])
+        self.assertEqual(after['certified_passages'], before['native_allowed_passages'])
+        self.assertEqual(after['disagreements'], 0)
+        print(json.dumps(observed), flush=True)
+        self.assertGreater(observed['owner_queries'], 5)
+        self.assertEqual(observed['owner_queries'], observed['owner_settings'])
+        self.assertEqual(observed['pipelined_queries'], observed['owner_queries'])
+        self.assertEqual(observed['pipelined_settings'], observed['owner_settings'])
+
     def receipt_weighted_parent(self, counts=(400, 400, 100)):
         # Synthetic fanout on native current rows: exercise actual membership,
         # ownership, certificate commits and durable queue CAS, not archive I/O.
@@ -46,7 +94,7 @@ class MembershipRemainderTests(ParentMembershipPublicationTests):
 
     def test_receipt_prefix_survives_later_native_query_cancel(self):
         ids = self.receipt_weighted_parent()
-        original = self.store._execute_bounded
+        original = self.store._execute_bounded_pipeline
         ownership_calls = []
 
         def cancel_second(connection, statement, parameters, deadline):
@@ -57,7 +105,7 @@ class MembershipRemainderTests(ParentMembershipPublicationTests):
                                     min(deadline, time.monotonic() + .01))
             return original(connection, statement, parameters, deadline)
 
-        with patch.object(self.store, "_execute_bounded", side_effect=cancel_second):
+        with patch.object(self.store, "_execute_bounded_pipeline", side_effect=cancel_second):
             first = self.run_cycle()
         self.assertEqual(first["membership_failed_documents"], 1)
         self.assertEqual(first["membership_failures"][0]["sqlstate"], "57014")
@@ -127,7 +175,7 @@ class MembershipRemainderTests(ParentMembershipPublicationTests):
     def test_first_prefix_cancellation_makes_no_durable_progress(self):
         self.receipt_weighted_parent()
         before = self.queued()
-        original = self.store._execute_bounded
+        original = self.store._execute_bounded_pipeline
 
         def cancel(connection, statement, parameters, deadline):
             if statement == enrollment._OWNERS:
@@ -135,7 +183,7 @@ class MembershipRemainderTests(ParentMembershipPublicationTests):
                                 min(deadline, time.monotonic() + .01))
             return original(connection, statement, parameters, deadline)
 
-        with patch.object(self.store, "_execute_bounded", side_effect=cancel):
+        with patch.object(self.store, "_execute_bounded_pipeline", side_effect=cancel):
             outcome = self.run_cycle()
         self.assertEqual(outcome["membership_certified_passages"], 0)
         self.assertEqual(outcome["membership_failures"][0]["sqlstate"], "57014")
