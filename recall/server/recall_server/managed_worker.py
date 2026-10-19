@@ -745,7 +745,7 @@ class ManagedConnectorWorker:
                     credentials,
                     private_directory,
                 )
-                if row["connector_id"] == "slack.messages":
+                if row.get("connector_id") == "slack.messages":
                     connector = _IdentityEnrollingConnector(connector,
                         lambda records: self._enroll_slack_contacts(row, records))
                 runner = ConnectorRunner(
