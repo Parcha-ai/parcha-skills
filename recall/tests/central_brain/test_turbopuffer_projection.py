@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import json
 import sys
 import unittest
 from contextlib import contextmanager
@@ -121,6 +122,24 @@ class _Catalog:
         if folded.startswith("SELECT passage_id FROM canonical_passages"):
             return _Result([{"passage_id": row["passage_id"]} for row in self.passages
                             if row["passage_id"] in params[1]])
+        if folded.startswith("SELECT to_jsonb(shard)"):
+            shard = self.shards.get((params[1], params[2]))
+            return _Result([{"catalog": json.loads(json.dumps(shard, default=lambda d: d.isoformat()))}] if shard else [])
+        if folded.startswith("SELECT page_checkpoint") or folded.startswith("SELECT 1 FROM search_projection_outbox"):
+            _tenant, source, month, generation, queued_at, reason = params
+            row = self.outbox.get((source, month))
+            matched = row and (row["generation"],row["queued_at"],row["reason"]) == (generation,queued_at,reason)
+            return _Result([{"page_checkpoint": row.get("page_checkpoint")}] if matched else [])
+        if folded.startswith("UPDATE search_projection_outbox SET page_checkpoint="):
+            value, _tenant, source, month, generation, queued_at, reason, previous, *_scope = params
+            row = self.outbox.get((source,month))
+            catalog = self.shards.get((source,month))
+            catalog = json.loads(json.dumps(catalog,default=lambda d: d.isoformat()))
+            matched = row and (row["generation"],row["queued_at"],row["reason"]) == (generation,queued_at,reason)
+            if matched and row.get("page_checkpoint") == (previous.obj if previous else None) and catalog == value.obj["scope"]["catalog"]:
+                row["page_checkpoint"] = value.obj
+                return _Result(rowcount=1)
+            return _Result(rowcount=0)
         if "FROM search_projection_outbox" in folded and "count(*)" in folded:
             return _Result([{"count": len(self.outbox)}])
         if "FROM search_projection_outbox" in folded and folded.startswith("SELECT"):
@@ -220,6 +239,12 @@ class _Connection:
 
 
 class _Store:
+    search_deadline_ms = 5000
+
+    @staticmethod
+    def _execute_bounded(connection, sql, params, deadline):
+        return connection.execute(sql, params)
+
     def __init__(self, catalog: _Catalog):
         self.catalog = catalog
 

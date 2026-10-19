@@ -95,6 +95,7 @@ def enqueue_search_outbox(
            ON CONFLICT(tenant_id,source_id,month)
            DO UPDATE SET
                generation=search_projection_outbox.generation+1,
+               page_checkpoint=NULL,
                reason=CASE
                    WHEN search_projection_outbox.reason='backfill'
                    THEN 'backfill' ELSE excluded.reason END,
@@ -202,6 +203,7 @@ def seed_search_outbox(
            ON CONFLICT(tenant_id,source_id,month)
            DO UPDATE SET
                generation=search_projection_outbox.generation+1,
+               page_checkpoint=NULL,
                reason='backfill',
                queued_at=clock_timestamp()
             WHERE search_projection_outbox.reason<>'backfill'""",
