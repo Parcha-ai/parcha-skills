@@ -374,7 +374,13 @@ class ParquetCertificateTests(ParentEnrollmentTests):
         with patch('recall_server.receipt_membership.lookup_current_search_membership',
                    wraps=lookup_current_search_membership) as native:
             self.assertEqual(self.stream(), baseline)
-        self.assertEqual(native.call_count, 1)
+        self.assertEqual(native.call_count, 0 if self.additive_membership_generation else 1)
+        self.assertEqual(self.stream(False), baseline)
+        if self.additive_membership_generation:
+            compared = self.compare()
+            self.assertEqual(compared['native_allowed_passages'], len(self.ids))
+            self.assertEqual(compared['certified_passages'], len(self.ids))
+            self.assertEqual(compared['disagreements'], 0)
         self.enroll()
         with patch('recall_server.receipt_membership.lookup_current_search_membership',
                    wraps=lookup_current_search_membership) as native:
