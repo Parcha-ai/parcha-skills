@@ -1286,6 +1286,50 @@ def fit_search_result(value: Any) -> Any:
             break
     trimmed_ranges = False
     if _encoded_result_size(fitted) > SEARCH_RESULT_BUDGET_BYTES:
+        # Adding text_clipped can cost more than a tiny original snippet.
+        # Use the cheaper text/flag projection so trial size is monotone and
+        # width zero really is the smallest representation without pointer loss.
+        projections = {}
+        clipped_sizes = {}
+        for ranges in ranges_by_document:
+            for item in ranges:
+                if isinstance(item.get("text"), str):
+                    projection = {key: item[key] for key in ("text", "text_clipped") if key in item}
+                    projections[id(item)] = (projection, _encoded_result_size(projection))
+
+        def text_trial(width: int) -> dict:
+            trial = clip_search_snippets(fitted, width)
+            largest = 0
+            for original_ranges, document in zip(ranges_by_document, trial["results"], strict=True):
+                for original, item in zip(original_ranges, document["matching_ranges"], strict=True):
+                    if id(original) not in projections:
+                        continue
+                    projection, original_size = projections[id(original)]
+                    if item["text"] != original["text"]:
+                        text = item["text"]
+                        if text not in clipped_sizes:
+                            clipped_sizes[text] = _encoded_result_size({"text": text, "text_clipped": True})
+                        if original_size <= clipped_sizes[text]:
+                            item.update(projection)
+                            if "text_clipped" not in projection:
+                                item.pop("text_clipped", None)
+                    largest = max(largest, len(item["text"]))
+            trial["diagnostics"]["snippet_chars"] = largest
+            return trial
+
+        # Trial copies leave the ordinary fallback intact if metadata cannot fit.
+        best = text_trial(0)
+        if _encoded_result_size(best) <= SEARCH_RESULT_BUDGET_BYTES:
+            low, high = 1, min(snippet_chars, MIN_SEARCH_SNIPPET_CHARS)
+            while low <= high:
+                width = (low + high) // 2
+                trial = text_trial(width)
+                if _encoded_result_size(trial) <= SEARCH_RESULT_BUDGET_BYTES:
+                    best = trial
+                    low = width + 1
+                else:
+                    high = width - 1
+            return best
         # Long passages carry dozens of receipts and hundreds of span
         # offsets each (the turbopuffer plane's BM25 arm favours them): a
         # limit-50 result was 1.25 MB with 0.6 MB of spans and receipts.

@@ -52,6 +52,22 @@ def full_response():
     return dict(results=documents,diagnostics=dict(engine='lossless-passages-v1'))
 
 
+
+def receipt_heavy_response(sibling_ranges):
+    documents = []
+    for parent in range(5):
+        ranges = []
+        for passage in range(1 if parent == 0 else sibling_ranges):
+            ranges.append(dict(
+                passage_id=f'psg_{parent:02}_{passage:04}', text='x' * 256,
+                receipts=[f'recall://synthetic:source/parent-{parent}-record-{i:04}?rev=1#item=0'
+                          for i in range(14 if parent == 0 else 24)],
+                spans=[], spans_omitted=True))
+        documents.append(dict(source_id='synthetic:source',
+            logical_document_id=f'ldoc_{parent}', rerank_score=1-parent/10,
+            matching_ranges=ranges))
+    return dict(results=documents, diagnostics={})
+
 def search(value, **arguments):
     store = SimpleNamespace(search=lambda *_: value)
     return mcp._call_tool(store, {}, 'recall_search', dict(query='Synthetic evidence',limit=5,**arguments))
@@ -110,6 +126,95 @@ class SearchSpanDisclosureTest(unittest.TestCase):
                 for key in ('passage_id','text','receipts','copied_evidence'):
                     self.assertEqual(full.get(key),hint.get(key))
         self.assertLess(set(result_receipts(old)),set(result_receipts(compact)))
+
+    def test_emergency_text_reduction_keeps_full_receipts_with_exact_wire_bound(self):
+        for text in ('x' * 256, ('漢🙂"\\\n' * 52)[:256]):
+            with self.subTest(text=text[:5]):
+                value = receipt_heavy_response(65)
+                for document in value['results']:
+                    for item in document['matching_ranges']:
+                        item['text'] = text
+                value['results'][0]['matching_ranges'][0]['copied_evidence'] = [dict(
+                    source_id='synthetic:copy', logical_document_id='copy-parent',
+                    passage_id='copy-passage', receipts=['recall://synthetic:copy/a?rev=1#item=0'])]
+                original = copy.deepcopy(value)
+                self.assertGreater(mcp._encoded_result_size(value), mcp.SEARCH_RESULT_BUDGET_BYTES)
+                fitted = search(value, snippet_chars=256)
+                self.assertEqual(len(fitted['results'][0]['matching_ranges'][0]['receipts']), 14)
+                self.assertEqual(result_receipts(fitted), result_receipts(value))
+                self.assertEqual(value, original)
+                width = fitted['diagnostics']['snippet_chars']
+                self.assertLess(width, 256)
+                self.assertGreater(width, 0)
+                self.assertNotIn('ranges_trimmed', fitted['diagnostics'])
+                for before, after in zip(value['results'], fitted['results'], strict=True):
+                    self.assertEqual(before['logical_document_id'], after['logical_document_id'])
+                    for full, compact in zip(before['matching_ranges'], after['matching_ranges'], strict=True):
+                        self.assertEqual(full['receipts'], compact['receipts'])
+                        self.assertEqual(full.get('copied_evidence'), compact.get('copied_evidence'))
+                        self.assertEqual(compact['text'], text[:width])
+                        self.assertTrue(compact['text_clipped'])
+                self.assertLessEqual(mcp._encoded_result_size(fitted), mcp.SEARCH_RESULT_BUDGET_BYTES)
+                self.assertGreater(mcp._encoded_result_size(mcp.clip_search_snippets(value, width + 1)),
+                                   mcp.SEARCH_RESULT_BUDGET_BYTES)
+                envelope = mcp._tool_result(fitted)
+                self.assertEqual(json.loads(envelope['content'][0]['text']), envelope['structuredContent'])
+
+    def test_short_original_text_is_kept_when_clipping_flags_cost_more(self):
+        value = receipt_heavy_response(65)
+        for document in value['results']:
+            for item in document['matching_ranges']:
+                item['text'] = 'a'
+        value['results'][0]['matching_ranges'][0]['text'] = 'x' * 256
+        # Keep one already-clipped Unicode range as a separate flag case.
+        value['results'][1]['matching_ranges'][0].update(text='🙂', text_clipped=True)
+        one = mcp.clip_search_snippets(value, 1)
+        slack = mcp.SEARCH_RESULT_BUDGET_BYTES - mcp._encoded_result_size(one) - 128
+        value['diagnostics']['fixture_padding'] = 'p' * (slack // 2)
+        self.assertGreater(mcp._encoded_result_size(value), mcp.SEARCH_RESULT_BUDGET_BYTES)
+        self.assertLess(mcp._encoded_result_size(mcp.clip_search_snippets(value, 1)),
+                        mcp.SEARCH_RESULT_BUDGET_BYTES)
+        self.assertGreater(mcp._encoded_result_size(mcp.clip_search_snippets(value, 0)),
+                           mcp.SEARCH_RESULT_BUDGET_BYTES)
+        original = copy.deepcopy(value)
+        fitted = search(value, snippet_chars=256)
+        self.assertEqual(len(fitted['results'][0]['matching_ranges'][0]['receipts']), 14)
+        self.assertEqual(result_receipts(fitted), result_receipts(value))
+        self.assertEqual(value, original)
+        self.assertEqual(fitted['results'][1]['matching_ranges'][1],
+                         value['results'][1]['matching_ranges'][1])
+        self.assertTrue(fitted['results'][1]['matching_ranges'][0]['text_clipped'])
+        self.assertEqual(fitted['diagnostics']['snippet_chars'], max(
+            len(item['text']) for row in fitted['results'] for item in row['matching_ranges']))
+        self.assertLessEqual(mcp._encoded_result_size(fitted), mcp.SEARCH_RESULT_BUDGET_BYTES)
+
+    def test_sibling_receipt_growth_triggers_target_receipt_loss_after_span_omission(self):
+        # The target and its rank never change. Each sibling range carries
+        # authorized pointers, already without source-coordinate payload.
+
+        small, large = receipt_heavy_response(60), receipt_heavy_response(80)
+        target = copy.deepcopy(small['results'][0])
+        self.assertEqual(target, large['results'][0])
+        self.assertLess(mcp._encoded_result_size(small), mcp.SEARCH_RESULT_BUDGET_BYTES)
+        self.assertGreater(mcp._encoded_result_size(large), mcp.SEARCH_RESULT_BUDGET_BYTES)
+        ordinary = search(small, snippet_chars=256)
+        fitted = search(large, snippet_chars=256)
+        self.assertEqual(ordinary['results'][0], target)
+        self.assertEqual(fitted['results'][0]['logical_document_id'], target['logical_document_id'])
+        item = fitted['results'][0]['matching_ranges'][0]
+        self.assertEqual(len(item['receipts']), 8)
+        self.assertEqual(item['receipts_truncated'], 6)
+        self.assertEqual(item['text'], 'x' * 256)
+        self.assertNotIn(target['matching_ranges'][0]['receipts'][-1], item['receipts'])
+        self.assertEqual(large['results'][0], target)
+        self.assertLessEqual(mcp._encoded_result_size(fitted), mcp.SEARCH_RESULT_BUDGET_BYTES)
+        # Even eliminating all snippet text cannot fit these full pointers.
+        # Raising the receipt prefix alone is not a complete byte-safe repair.
+        empty = copy.deepcopy(large)
+        for document in empty['results']:
+            for item in document['matching_ranges']:
+                item['text'] = ''
+        self.assertGreater(mcp._encoded_result_size(empty), mcp.SEARCH_RESULT_BUDGET_BYTES)
 
     def test_exact_metadata_and_existing_capture_recover_source_bytes(self):
         with tempfile.TemporaryDirectory() as directory:
