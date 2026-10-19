@@ -123,18 +123,8 @@ class Thinning(unittest.TestCase):
 
     def test_source_collision_stays_zipped_and_tenant_scoped(self):
         _, first = self.insert('collision:a', source='source:a')
-        _, second = self.insert('collision:b', source='source:b', omit_chunks=True)
-        with self.store.connect() as c:
-            # Build an intentional cross-source document-id collision while
-            # preserving foreign keys; source identities remain distinct.
-            c.execute('UPDATE canonical_documents SET document_id=%s WHERE tenant_id=%s AND source_id=%s AND document_id=%s',
-                      (first, self.tenant, 'source:b', second))
-            c.execute('''INSERT INTO canonical_chunks
-                         (tenant_id,source_id,chunk_id,document_id,ordinal,receipt,text_redacted,text_sha256)
-                         SELECT tenant_id,'source:b',chunk_id,document_id,ordinal,
-                                receipt || '/b',text_redacted,text_sha256
-                           FROM canonical_chunks WHERE tenant_id=%s AND source_id='source:a' ''',
-                      (self.tenant,))
+        # Equal IDs across sources are valid when established at insertion.
+        self.insert('collision:b', source='source:b', document_id=first)
         self.thinner.WINDOW_SIZE = 1
         self.assertEqual(self.thinner.thin(batch_size=10)['documents'], 1)
         self.assertEqual(self.remaining(), 1)

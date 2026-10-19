@@ -134,8 +134,10 @@ def run_case(store, root, *, position, corruption):
         if corruption == "cleared_body":
             # A new revision has no matching archive proof. Cleared old
             # revisions are now explicitly recoverable in the reprojection E2E.
-            connection.execute("UPDATE canonical_documents SET revision=2 " + where, scope)
-            connection.execute("UPDATE canonical_chunks SET text_redacted='', receipt=replace(receipt,'?rev=1#','?rev=2#') " + where, scope)
+            from e2e_logical_evidence_projection import legacy_canonical_state
+            with legacy_canonical_state(connection):
+                connection.execute("UPDATE canonical_documents SET revision=2 " + where, scope)
+                connection.execute("UPDATE canonical_chunks SET text_redacted='', receipt=replace(receipt,'?rev=1#','?rev=2#') " + where, scope)
         elif corruption == "document_hash":
             connection.execute("UPDATE canonical_documents SET text_sha256=%s " + where, ("0" * 64, *scope))
         elif corruption == "chunk_hash":

@@ -21,6 +21,10 @@ class ParentEnrollmentTests(SingletonSearchTests):
             c.execute("INSERT INTO brain_access_grants(tenant_id,principal_id,permission) VALUES(%s,%s,'owner') ON CONFLICT DO NOTHING",(self.tenant,self.principal))
         with self.store.connect() as c:
             self.ids=tuple(row['passage_id'] for row in c.execute('SELECT passage_id FROM canonical_passages WHERE tenant_id=%s ORDER BY passage_id',(self.tenant,)).fetchall())
+        with self.store.connect() as c:
+            self.additive_membership_generation = c.execute(
+                'SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=92) AS enabled'
+            ).fetchone()['enabled']
         self.scope=dict(tenant_id=self.tenant,principal_id=self.principal,source_id=self.source,
                         native_parent_id='session',passage_ids=self.ids,binding_epoch='synthetic-epoch-a',
                         limits=dict(passages=32,receipt_references=1000,metadata_bytes=1024*1024))
@@ -109,8 +113,20 @@ class ParentEnrollmentTests(SingletonSearchTests):
         with self.store.connect() as c:
             c.execute("UPDATE canonical_evidence_documents SET manifest_content_sha256=%s WHERE tenant_id=%s",('a'*64,self.tenant))
         result=self.compare()
-        self.assertEqual(result['certified_passages'],0)
+        self.assertEqual(result['certified_passages'], len(self.ids) if self.additive_membership_generation else 0)
         self.assertEqual(result['native_allowed_passages'],len(self.ids))
+        self.assertEqual(result['disagreements'],0)
+        from e2e_parent_membership_fast_read import ParentMembershipFastReadTests
+        from recall_server.parent_membership_read import ReadSettings
+        with patch.object(self.store, 'verified_singleton_receipts', True):
+            self.retrieval.parent_membership_read = ReadSettings(enabled=False)
+            native = ParentMembershipFastReadTests.search(self)
+            self.retrieval.parent_membership_read = ReadSettings(enabled=True,
+                binding_epoch=self.scope['binding_epoch'])
+            certified = ParentMembershipFastReadTests.search(self)
+        self.assertTrue(native['results'])
+        self.assertEqual(certified['results'],native['results'])
+        self.assertEqual(certified['arms'],native['arms'])
 
     def test_live_grant_revoked_between_proof_and_publication(self):
         original=enrollment._capture
@@ -171,6 +187,7 @@ class ParentEnrollmentTests(SingletonSearchTests):
         self.assertEqual(self.compare()['certified_passages'],0)
 
     def test_enrollment_publication_does_not_wait_for_authority_row_lock(self):
+        self.assertEqual(self.enroll()['status'], 'enrolled')
         with ThreadPoolExecutor(1) as pool:
             with self.store.connect() as c:
                 c.execute('UPDATE canonical_parent_authority SET generation=generation+1 WHERE tenant_id=%s',(self.tenant,))
@@ -178,7 +195,10 @@ class ParentEnrollmentTests(SingletonSearchTests):
                 self.assertEqual(pending.result(2)['status'],'enrolled')
         # The writer commits afterward. The saved generation is the earlier
         # capture, so the just-published certificate is now a fallback.
-        self.assertEqual(self.compare()['certified_passages'],0)
+        result=self.compare()
+        self.assertEqual(result['certified_passages'],0)
+        self.assertEqual(result['native_allowed_passages'],len(self.ids))
+        self.assertEqual(result['disagreements'],0)
 
     def test_shadow_always_runs_original_verifier_even_when_certified(self):
         self.enroll()
@@ -227,7 +247,10 @@ class ParentEnrollmentTests(SingletonSearchTests):
         with self.store.connect() as c:
             current=c.execute('SELECT generation FROM canonical_parent_authority WHERE tenant_id=%s AND source_id=%s',
                               (self.tenant,self.source)).fetchone()['generation']
-        self.assertGreater(current,retained)
+        if self.additive_membership_generation:
+            self.assertEqual(current,retained)
+        else:
+            self.assertGreater(current,retained)
         self.assertEqual(self.compare()['status'],'incomplete')
         self.assertEqual(self.search()['results'],[])
 
