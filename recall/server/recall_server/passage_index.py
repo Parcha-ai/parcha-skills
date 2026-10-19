@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import time
 import json
 import math
@@ -55,6 +56,9 @@ from .search_outbox import (
     outbox_months,
     write_search_tombstones,
 )
+
+
+LOG = logging.getLogger(__name__)
 
 
 class _PassageRecordReplay:
@@ -732,6 +736,12 @@ class CanonicalPassageProjector:
         self._ordinary_source_cursor: dict[bool, tuple[str, str] | None] = {
             False: None, True: None,
         }
+        # Known refusals yield to siblings without changing authoritative queue
+        # age or generation. At most one position per encountered source/mode;
+        # restart resets these admission hints, never publication state.
+        self._ordinary_parent_cursor: dict[
+            bool, dict[tuple[str, str], tuple[datetime, str]]
+        ] = {False: {}, True: {}}
         runtime = getattr(store, "semantic_runtime", None)
         bind = getattr(runtime, "bind_passage_coverage_probe", None)
         if callable(bind) and not getattr(
@@ -909,6 +919,30 @@ class CanonicalPassageProjector:
             )
         return max(0, result.rowcount)
 
+    def _yield_unavailable_parents(self, keys, *, recent: bool, previous=None) -> None:
+        grouped = {}
+        for tenant, source, changed_at, document in keys:
+            grouped.setdefault((tenant, source), []).append((changed_at, document))
+        cursors = self._ordinary_parent_cursor[recent]
+        for source, positions in grouped.items():
+            cursor = (cursors if previous is None else previous).get(source)
+            if previous is not None and source in cursors and cursors[source] != cursor:
+                # Metadata refusals were already recorded by _pending. Combine
+                # both failure phases against the original admission position.
+                positions.append(cursors[source])
+            def order(position):
+                stamp, document = position
+                if cursor is None:
+                    after = True
+                elif recent:
+                    after = stamp < cursor[0] or (stamp == cursor[0] and document > cursor[1])
+                else:
+                    after = position > cursor
+                return (not after, -stamp.timestamp() if recent else stamp.timestamp(), document)
+            # Use admission order, not future completion order, when one source
+            # supplied several failed siblings in the same bounded batch.
+            cursors[source] = max(positions, key=order)
+
     def _pending(
         self,
         *,
@@ -918,22 +952,41 @@ class CanonicalPassageProjector:
         recent = self._prefer_notification_admission
         cursor = self._ordinary_source_cursor[recent]
         after_tenant, after_source = cursor if cursor is not None else (None, None)
+        parent_cursors = json.dumps([
+            dict(tenant_id=tenant, source_id=source, changed_at=position[0].isoformat(),
+                 logical_document_id=position[1])
+            for (tenant, source), position in self._ordinary_parent_cursor[recent].items()
+        ])
         with self.store.connect() as connection:
             rows = connection.execute(
-                """WITH eligible AS MATERIALIZED (
+                """WITH parent_cursors AS (
+                       SELECT * FROM jsonb_to_recordset(%s::jsonb) AS cursor(
+                           tenant_id text, source_id text, changed_at timestamptz,
+                           logical_document_id text)
+                   ), eligible AS MATERIALIZED (
                        SELECT candidate_queue.*,
                               CASE WHEN %s AND notification_queued_at IS NOT NULL
                                    THEN 0 ELSE 1 END AS admission_priority,
-                              CASE WHEN %s::text IS NULL OR (tenant_id,source_id)>
-                                        (%s::text,%s::text) THEN 0 ELSE 1 END AS source_wrap
+                              CASE WHEN %s::text IS NULL OR (candidate_queue.tenant_id,candidate_queue.source_id)>
+                                        (%s::text,%s::text) THEN 0 ELSE 1 END AS source_wrap,
+                              CASE WHEN cursor.source_id IS NULL OR
+                                   (CASE WHEN %s THEN
+                                       candidate_queue.changed_at<cursor.changed_at OR
+                                       (candidate_queue.changed_at=cursor.changed_at AND
+                                        candidate_queue.logical_document_id>cursor.logical_document_id)
+                                    ELSE (candidate_queue.changed_at,candidate_queue.logical_document_id)>
+                                         (cursor.changed_at,cursor.logical_document_id) END)
+                                   THEN 0 ELSE 1 END AS parent_wrap
                          FROM canonical_passage_projection_queue candidate_queue
-                        WHERE (%s::text IS NULL OR tenant_id=%s)
+                         LEFT JOIN parent_cursors cursor USING (tenant_id,source_id)
+                        WHERE (%s::text IS NULL OR candidate_queue.tenant_id=%s)
                           AND reason<>'certification'
                    ), ranked AS (
                        SELECT eligible.*,
                               row_number() OVER (
                                   PARTITION BY tenant_id,source_id,admission_priority
-                                  ORDER BY CASE WHEN %s THEN changed_at END DESC,
+                                  ORDER BY CASE WHEN admission_priority=1 THEN parent_wrap ELSE 0 END,
+                                           CASE WHEN %s THEN changed_at END DESC,
                                            changed_at,logical_document_id
                               ) AS source_position,
                               count(*) OVER (
@@ -1011,8 +1064,8 @@ class CanonicalPassageProjector:
                              queue.changed_at,queue.tenant_id,
                              queue.source_id,queue.logical_document_id,
                              part.part_ordinal""",
-                (recent, after_tenant, after_tenant, after_source,
-                 tenant_id, tenant_id, recent, limit),
+                (parent_cursors, recent, after_tenant, after_tenant, after_source,
+                 recent, tenant_id, tenant_id, recent, limit),
             ).fetchall()
         # The turn belongs to admission, not successful metadata hydration.
         # A truly empty queue spends no turn; an invalid head must not suppress
@@ -1025,6 +1078,10 @@ class CanonicalPassageProjector:
         if ordinary:
             last = max(ordinary, key=lambda row: row["source_turn"])
             self._ordinary_source_cursor[recent] = (last["tenant_id"], last["source_id"])
+        self._yield_unavailable_parents(
+            ((row["tenant_id"], row["source_id"], row["changed_at"], row["logical_document_id"])
+             for row in rows if row["admission_priority"] == 1 and
+             (row["manifest_artifact_id"] is None or row["part_ordinal"] is None)), recent=recent)
         grouped: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
         for row in rows:
             if row["manifest_artifact_id"] is None or row["part_ordinal"] is None:
@@ -2522,6 +2579,8 @@ class CanonicalPassageProjector:
         preparation_counts = Counter()
         while batches < max_batches:
             phase_started = time.monotonic()
+            recent = self._prefer_notification_admission
+            previous_parent_cursors = self._ordinary_parent_cursor[recent].copy()
             candidates = self._pending(
                 tenant_id=tenant_id,
                 limit=batch_size,
@@ -2599,6 +2658,7 @@ class CanonicalPassageProjector:
                 return status, preparation_elapsed, commit_elapsed
 
             requeued_in_batch = unavailable_in_batch = 0
+            yielded_parents = []
             with ThreadPoolExecutor(
                 max_workers=min(concurrency, len(candidates)),
                 thread_name_prefix="recall-passage-projector",
@@ -2622,6 +2682,18 @@ class CanonicalPassageProjector:
                                 preparation_counts[key] += int(status.get(key, 0))
                             prepare_seconds += preparation_elapsed
                             commit_seconds += commit_elapsed
+                            if status["status"] in {
+                                "logical_evidence_not_found", "logical_evidence_unavailable",
+                                "legacy_tool_migration_required", "stale",
+                            }:
+                                yielded_parents.append((candidate.tenant_id, candidate.source_id,
+                                                        candidate.changed_at, candidate.logical_document_id))
+                            if status["status"] in {
+                                "logical_evidence_not_found", "logical_evidence_unavailable",
+                                "legacy_tool_migration_required",
+                            }:
+                                LOG.warning("passage preparation refused source_id=%r logical_document_id=%r status=%s",
+                                            candidate.source_id, candidate.logical_document_id, status["status"])
                             if status["status"] == "logical_evidence_not_found":
                                 # Keep logical requeue on the coordinator's
                                 # reserved pool connection, outside commit owners.
@@ -2654,6 +2726,7 @@ class CanonicalPassageProjector:
                     for future in futures:
                         future.cancel()
                     raise
+            self._yield_unavailable_parents(yielded_parents, recent=recent, previous=previous_parent_cursors)
             requeued += requeued_in_batch
             unavailable += unavailable_in_batch
             batches += 1
