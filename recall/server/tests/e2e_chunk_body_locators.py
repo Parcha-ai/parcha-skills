@@ -88,12 +88,8 @@ def small_cases(store, root):
     # New canonical revision has NULL positions until its own publication.
     with store.connect() as connection:
         connection.execute("UPDATE canonical_documents SET is_current=false WHERE document_id=%s", (old[0]['document_id'],))
-        temporary = insert_record(connection, tenant=tenant, source=source, parent='session', native='temporary',
-                                  text='replacement body', role='assistant', byte_start=0)
-        connection.execute("UPDATE canonical_events SET native_id='event-0000',revision=2 WHERE tenant_id=%s AND source_id=%s AND native_id='temporary'", (tenant, source))
-        connection.execute("UPDATE canonical_documents SET native_id='event-0000',revision=2 WHERE tenant_id=%s AND source_id=%s AND native_id='temporary'", (tenant, source))
-        receipt = f'recall://{source}/event-0000?rev=2#item=0'
-        connection.execute('UPDATE canonical_chunks SET receipt=%s WHERE receipt=%s', (receipt, temporary))
+        receipt = insert_record(connection, tenant=tenant, source=source, parent='session', native='event-0000',
+                                text='replacement body', role='assistant', byte_start=0, revision=2)
         connection.execute("UPDATE canonical_documents SET is_current=false,deleted_at=now() WHERE document_id=%s", (old[1]['document_id'],))
     mark_dirty(store, tenant, source)
     reader = BoundCanonicalRetrieval(store, tenant_id=tenant, principal_id='principal:reprojection',

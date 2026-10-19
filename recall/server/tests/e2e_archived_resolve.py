@@ -40,12 +40,8 @@ def main():
                                             native='native', text='historical α' if owner == tenant else 'other tenant secret',
                                             role='assistant', byte_start=0)
                 conn.execute('UPDATE canonical_documents SET is_current=false WHERE tenant_id=%s', (tenant,))
-                new_receipt = insert_record(conn, tenant=tenant, source=source, parent='session', native='new',
-                                            text='current β 🧠\n' * 5000, role='assistant', byte_start=10)
-                conn.execute("UPDATE canonical_events SET native_id='native',revision=2 WHERE tenant_id=%s AND native_id='new'", (tenant,))
-                conn.execute("UPDATE canonical_documents SET native_id='native',revision=2 WHERE tenant_id=%s AND native_id='new'", (tenant,))
-                conn.execute("UPDATE canonical_chunks SET receipt=replace(receipt,'/new?rev=1','/native?rev=2') WHERE tenant_id=%s AND receipt LIKE %s", (tenant, '%/new?rev=1%'))
-                new_receipt = new_receipt.replace('/new?rev=1', '/native?rev=2')
+                new_receipt = insert_record(conn, tenant=tenant, source=source, parent='session', native='native',
+                                            text='current β 🧠\n' * 5000, role='assistant', byte_start=10, revision=2)
             scope = dict(tenant_id=tenant, authorized_sources=(source,))
             historical = store.resolve(receipt, **scope)
             current = store.resolve(new_receipt, **scope)

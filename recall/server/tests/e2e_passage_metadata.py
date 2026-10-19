@@ -139,7 +139,9 @@ def main():
             connection.execute('DELETE FROM canonical_chunks WHERE tenant_id=%s AND source_id=%s AND ordinal=1',(tenant,source))
 
         with store.connect() as connection:
-            connection.execute('UPDATE canonical_chunks SET receipt=%s WHERE tenant_id=%s AND source_id=%s',('recall://missing',tenant,source))
+            from e2e_logical_evidence_projection import legacy_canonical_state
+            with legacy_canonical_state(connection):
+                connection.execute('UPDATE canonical_chunks SET receipt=%s WHERE tenant_id=%s AND source_id=%s',('recall://missing',tenant,source))
         open_unavailable()
         with store.connect() as connection:
             connection.execute('UPDATE canonical_chunks SET receipt=%s WHERE tenant_id=%s AND source_id=%s',(rows[0]['receipts'][0],tenant,source))

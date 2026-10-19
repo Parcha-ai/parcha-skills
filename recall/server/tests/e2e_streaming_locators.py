@@ -502,6 +502,7 @@ def failures(store, root):
     )
     publish = locators._publish_batch
     for mutation in ("revoke", "recreate", "revision", "enabled"):
+        revision_rows = []
 
         def change(*args, **kwargs):
             with store.connect() as connection:
@@ -516,10 +517,19 @@ def failures(store, root):
                         (scope["tenant_id"], scope["source_id"]),
                     )
                 elif mutation == "revision":
-                    connection.execute(
-                        "UPDATE canonical_documents SET revision=revision+1 WHERE document_id=%s",
-                        (kwargs["rows"][0]["document_id"],),
-                    )
+                    old_id = kwargs["rows"][0]["document_id"]
+                    current = connection.execute(
+                        'UPDATE canonical_documents SET is_current=false WHERE document_id=%s '
+                        'RETURNING native_id,revision', (old_id,)).fetchone()
+                    receipt = insert_record(connection, tenant=scope['tenant_id'],
+                        source=scope['source_id'], parent=scope['native_parent_id'],
+                        native=current['native_id'], revision=current['revision']+1,
+                        text='Valid superseding revision before locator CAS', role='assistant', byte_start=0)
+                    replacement = connection.execute('SELECT document.document_id,document.event_id '
+                        'FROM canonical_chunks chunk JOIN canonical_documents document '
+                        'USING(tenant_id,source_id,document_id) WHERE chunk.tenant_id=%s AND chunk.receipt=%s',
+                        (scope['tenant_id'],receipt)).fetchone()
+                    revision_rows.append((old_id,replacement))
                 else:
                     connection.execute(
                         "UPDATE canonical_chunk_retirement_progress SET enabled=true,status='pending' WHERE tenant_id=%s AND source_id=%s",
@@ -540,10 +550,15 @@ def failures(store, root):
                     (scope["tenant_id"], scope["source_id"]),
                 )
             elif mutation == "revision":
-                connection.execute(
-                    "UPDATE canonical_documents SET revision=1 WHERE tenant_id=%s AND source_id=%s",
-                    (scope["tenant_id"], scope["source_id"]),
-                )
+                for old_id, replacement in revision_rows:
+                    connection.execute('DELETE FROM canonical_chunks WHERE tenant_id=%s AND document_id=%s',
+                        (scope['tenant_id'],replacement['document_id']))
+                    connection.execute('DELETE FROM canonical_documents WHERE tenant_id=%s AND document_id=%s',
+                        (scope['tenant_id'],replacement['document_id']))
+                    connection.execute('DELETE FROM canonical_events WHERE tenant_id=%s AND event_id=%s',
+                        (scope['tenant_id'],replacement['event_id']))
+                    connection.execute('UPDATE canonical_documents SET is_current=true WHERE document_id=%s',
+                        (old_id,))
             elif mutation == "enabled":
                 connection.execute(
                     "UPDATE canonical_chunk_retirement_progress SET enabled=false,status='disabled' WHERE tenant_id=%s AND source_id=%s",

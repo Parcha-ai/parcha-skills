@@ -111,7 +111,8 @@ class StreamCapture(unittest.TestCase):
         self.assertTrue(changed)
 
     def test_native_membership_refusal_discards_all_staged_metadata(self):
-        with self.store.connect() as connection:
+        from e2e_logical_evidence_projection import legacy_canonical_state
+        with self.store.connect() as connection, legacy_canonical_state(connection):
             connection.execute(
                 "UPDATE canonical_chunks SET receipt=receipt||'invalid' WHERE tenant_id=%s",
                 (self.tenant,),

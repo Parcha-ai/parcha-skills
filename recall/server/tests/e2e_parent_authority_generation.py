@@ -14,10 +14,26 @@ from unittest.mock import patch
 
 from e2e_singleton_search_authority import SingletonSearchTests
 from recall_server.chunk_retirement import retire_current_chunks, ChunkRetirementError
-from recall_server.receipt_membership import lookup_current_search_membership
+from recall_server.receipt_membership import ReceiptMembershipError, lookup_current_search_membership
 
 
 class ParentAuthorityGenerationTests(SingletonSearchTests):
+    def setUp(self):
+        super().setUp()
+        with self.store.connect() as connection:
+            self.additive_generation = connection.execute(
+                'SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=92) AS installed'
+            ).fetchone()['installed']
+        self.initial_generation = 0 if self.additive_generation else 1
+
+    def assert_members(self, receipts, allowed):
+        with self.store.connect() as connection:
+            members = lookup_current_search_membership(self.store,
+                tenant_id=self.tenant, authorized_sources=(self.source,),
+                receipts=tuple(receipts), connection=connection,
+                deadline_at=time.monotonic()+3)
+        self.assertEqual(members, {(self.source, receipt) for receipt in allowed})
+
     def generation(self, parent='session', connection=None):
         sql='''SELECT generation FROM canonical_parent_authority
                WHERE tenant_id=%s AND source_id=%s AND native_parent_id=%s'''
@@ -42,8 +58,7 @@ class ParentAuthorityGenerationTests(SingletonSearchTests):
         # trigger. The outer INSERT plan excludes AFTER-statement trigger I/O.
         with self.store.connect() as connection:
             original = connection.execute("SELECT pg_get_functiondef('recall_collect_parent_authority()'::regprocedure) AS body").fetchone()['body']
-            instrumented = original.replace('DECLARE fields text; changed text; parents text;',
-                                            'DECLARE fields text; changed text; parents text; measured json;')
+            instrumented = original.replace('DECLARE ', 'DECLARE measured json; ', 1)
             instrumented = instrumented.replace("EXECUTE 'WITH changed AS ('",
                                                 "EXECUTE 'EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) WITH changed AS ('")
             instrumented = instrumented.replace("|| parents || ' ON CONFLICT DO NOTHING';",
@@ -68,8 +83,12 @@ class ParentAuthorityGenerationTests(SingletonSearchTests):
             chunks = connection.execute('SELECT count(*) AS n FROM canonical_chunks WHERE tenant_id=%s',
                                         (self.tenant,)).fetchone()['n']
         self.assertEqual(chunks, 256)
+        with self.store.connect() as connection:
+            receipts = [row['receipt'] for row in connection.execute(
+                'SELECT receipt FROM canonical_chunks WHERE tenant_id=%s', (self.tenant,))]
+        self.assert_members(receipts, receipts)
         for parent in range(16):
-            self.assertEqual(self.generation(f'parent/{parent}'), 1)
+            self.assertEqual(self.generation(f'parent/{parent}'), self.initial_generation)
         # The original join performs 16,384 document probes for256 chunks,
         # exceeding300k shared-buffer hits. Bound work rather than wall time.
         blocks = plans[0]['Plan']['Shared Hit Blocks'] + plans[0]['Plan']['Shared Read Blocks']
@@ -96,16 +115,16 @@ class ParentAuthorityGenerationTests(SingletonSearchTests):
                         yield runtime
                 with patch.object(self.store,'connect',side_effect=role_connection):
                     self.ingest('turn/search','Synthetic runtime original')
-                    self.assertEqual(self.generation(),1)
+                    self.assertEqual(self.generation(),self.initial_generation)
                     with psycopg.connect(self.store.dsn) as admin:
                         admin.execute(psycopg.sql.SQL('REVOKE UPDATE ON canonical_parent_authority FROM {}').format(psycopg.sql.Identifier(role)))
                     with self.assertRaises(psycopg.errors.InsufficientPrivilege):
                         self.edit()
-                    self.assertEqual(self.generation(),1)
+                    self.assertEqual(self.generation(),self.initial_generation)
                     with psycopg.connect(self.store.dsn) as admin:
                         admin.execute(psycopg.sql.SQL('GRANT UPDATE ON canonical_parent_authority TO {}').format(psycopg.sql.Identifier(role)))
                     self.edit()
-                    self.assertEqual(self.generation(),2)
+                    self.assertEqual(self.generation(),self.initial_generation+1)
                     with self.store.connect() as c:
                         privileges=c.execute("""SELECT current_user AS role,
                           has_schema_privilege(current_user,'public','CREATE') AS schema_create,
@@ -118,7 +137,7 @@ class ParentAuthorityGenerationTests(SingletonSearchTests):
                     with self.store.connect() as c:
                         c.execute('DROP TABLE pg_temp.recall_parent_authority_pending')
                     self.edit(batch=True,tombstone=True,native='session')
-                    self.assertEqual(self.generation(),3)
+                    self.assertEqual(self.generation(),self.initial_generation+2)
                     with self.store.connect() as c:
                         self.assertEqual(c.execute('SELECT count(*) AS n FROM pg_temp.recall_parent_authority_pending').fetchone()['n'],0)
         finally:
@@ -128,13 +147,13 @@ class ParentAuthorityGenerationTests(SingletonSearchTests):
 
     def test_ingest_replay_edit_and_batch_advance_once(self):
         self.receipt=self.ingest('turn/search','Synthetic original')['receipt']
-        self.assertEqual(self.generation(),1)
+        self.assertEqual(self.generation(),self.initial_generation)
         self.assertTrue(self.ingest('turn/search','Synthetic original')['replay'])
-        self.assertEqual(self.generation(),1)
+        self.assertEqual(self.generation(),self.initial_generation)
         self.edit()
-        self.assertEqual(self.generation(),2)
+        self.assertEqual(self.generation(),self.initial_generation+1)
         self.edit(batch=True,tombstone=True,native='session')
-        self.assertEqual(self.generation(),3)
+        self.assertEqual(self.generation(),self.initial_generation+2)
         with self.store.connect() as c:
             members=lookup_current_search_membership(self.store,tenant_id=self.tenant,
                 authorized_sources=(self.source,),receipts=(self.receipt,),connection=c,
@@ -147,7 +166,7 @@ class ParentAuthorityGenerationTests(SingletonSearchTests):
             c.execute("UPDATE canonical_chunks SET text_redacted='' WHERE tenant_id=%s",(self.tenant,))
             c.execute("UPDATE canonical_documents SET text_redacted='',body_record_ordinal=0,body_record_count=1 WHERE tenant_id=%s",(self.tenant,))
             c.execute('UPDATE canonical_documents SET is_current=is_current WHERE tenant_id=%s',(self.tenant,))
-        self.assertEqual(self.generation(),1)
+        self.assertEqual(self.generation(),self.initial_generation)
         with self.store.connect() as c:
             members=lookup_current_search_membership(self.store,tenant_id=self.tenant,
                 authorized_sources=(self.source,),receipts=(receipt,),connection=c,
@@ -155,57 +174,68 @@ class ParentAuthorityGenerationTests(SingletonSearchTests):
         self.assertEqual(members,{(self.source,receipt)})
 
     def test_profile_and_chunk_membership_changes_invalidate(self):
-        self.ingest('turn/profile','Synthetic profile')
+        receipt=self.ingest('turn/profile','Synthetic profile')['receipt']
         with self.store.connect() as c:
             c.execute('UPDATE canonical_documents SET chunk_receipt_profile=1 WHERE tenant_id=%s',(self.tenant,))
             c.execute('DELETE FROM canonical_chunks WHERE tenant_id=%s',(self.tenant,))
-        self.assertEqual(self.generation(),2)
+        self.assertEqual(self.generation(),self.initial_generation+1)
+        with patch.object(self.store, 'verified_singleton_receipts', True):
+            self.assert_members((receipt,), (receipt,))
         with self.store.connect() as c:
             c.execute('UPDATE canonical_documents SET chunk_receipt_profile=2 WHERE tenant_id=%s',(self.tenant,))
-        self.assertEqual(self.generation(),3)
+        self.assertEqual(self.generation(),self.initial_generation+2)
+        with patch.object(self.store, 'verified_singleton_receipts', True):
+            with self.assertRaisesRegex(ReceiptMembershipError, 'receipt_membership_profile_invalid'):
+                self.assert_members((receipt,), ())
 
     def test_parent_move_invalidates_old_and_new_keys(self):
-        self.ingest('turn/move','Synthetic move')
+        receipt=self.ingest('turn/move','Synthetic move')['receipt']
         with self.store.connect() as c:
             c.execute("UPDATE canonical_events SET native_parent_id='moved-parent' WHERE tenant_id=%s",(self.tenant,))
-        self.assertEqual(self.generation(),2)
+        self.assertEqual(self.generation(),self.initial_generation+1)
         self.assertEqual(self.generation('moved-parent'),1)
+        self.assert_members((receipt,), (receipt,))
 
     def test_chunk_receipt_and_document_currentness_changes_invalidate(self):
-        self.ingest('turn/receipt','Synthetic receipt')
+        receipt=self.ingest('turn/receipt','Synthetic receipt')['receipt']
+        changed=receipt.replace('#item=0', '#item=1')
         with self.store.connect() as c:
             c.execute("UPDATE canonical_chunks SET ordinal=1,receipt=replace(receipt,'#item=0','#item=1') WHERE tenant_id=%s",(self.tenant,))
-        self.assertEqual(self.generation(),2)
+        self.assertEqual(self.generation(),self.initial_generation+1)
+        self.assert_members((receipt, changed), (changed,))
         with self.store.connect() as c:
             c.execute('UPDATE canonical_documents SET is_current=false,deleted_at=now() WHERE tenant_id=%s',(self.tenant,))
-        self.assertEqual(self.generation(),3)
+        self.assertEqual(self.generation(),self.initial_generation+2)
+        self.assert_members((receipt, changed), ())
 
     def test_ordered_hard_deletion_retains_parent_version(self):
-        self.ingest('turn/cascade','Synthetic cascade')
+        receipt=self.ingest('turn/cascade','Synthetic cascade')['receipt']
         with self.store.connect() as c:
             c.execute('DELETE FROM canonical_chunks WHERE tenant_id=%s',(self.tenant,))
             c.execute('DELETE FROM canonical_documents WHERE tenant_id=%s',(self.tenant,))
             c.execute('DELETE FROM canonical_events WHERE tenant_id=%s',(self.tenant,))
-        self.assertEqual(self.generation(),2)
+        self.assertEqual(self.generation(),self.initial_generation+1)
+        self.assert_members((receipt,), ())
 
     def test_rollback_after_early_flush_reverts_generation_and_data(self):
-        self.ingest('turn/rollback','Synthetic rollback')
+        receipt=self.ingest('turn/rollback','Synthetic rollback')['receipt']
         with self.store.connect() as c, c.transaction(force_rollback=True):
             c.execute('UPDATE canonical_documents SET is_current=false WHERE tenant_id=%s',(self.tenant,))
             c.execute('SET CONSTRAINTS ALL IMMEDIATE')
-            self.assertEqual(self.generation(connection=c),2)
-        self.assertEqual(self.generation(),1)
+            self.assertEqual(self.generation(connection=c),self.initial_generation+1)
+        self.assertEqual(self.generation(),self.initial_generation)
         with self.store.connect() as c:
             self.assertTrue(c.execute('SELECT is_current FROM canonical_documents WHERE tenant_id=%s',(self.tenant,)).fetchone()['is_current'])
+        self.assert_members((receipt,), (receipt,))
 
     def test_publication_and_catalog_deletion_do_not_reset_generation(self):
         self.prepare_search()
-        self.assertEqual(self.generation(),1)
+        self.assertEqual(self.generation(),self.initial_generation)
         with self.store.connect() as c:
             c.execute('DELETE FROM canonical_evidence_documents WHERE tenant_id=%s',(self.tenant,))
-        self.assertEqual(self.generation(),1)
+        self.assertEqual(self.generation(),self.initial_generation)
         self.edit()
-        self.assertEqual(self.generation(),2)
+        self.assertEqual(self.generation(),self.initial_generation+1)
 
     def test_forget_revokes_before_archive_cleanup_and_preserves_native_proof(self):
         from recall_server.canonical import CanonicalLifecycleError
@@ -234,13 +264,24 @@ class ParentAuthorityGenerationTests(SingletonSearchTests):
                         c.execute(migration)
 
     def test_migration_replay_preserves_existing_generation(self):
-        self.ingest('turn/migration','Synthetic migration replay')
         migration=(Path(__file__).resolve().parents[1]/'schema'/'082_parent_authority_generation.sql').read_text()
         with self.store.connect() as c:
-            c.execute(migration)
-        self.assertEqual(self.generation(),1)
-        self.edit(native='turn/migration')
-        self.assertEqual(self.generation(),2)
+            original=c.execute("SELECT pg_get_functiondef('recall_collect_parent_authority()'::regprocedure) AS body").fetchone()['body']
+        try:
+            # This method tests installing/replaying082 itself. Other methods
+            # retain the installed collector, including its current-schema rules.
+            with self.store.connect() as c:
+                c.execute(migration)
+            self.ingest('turn/migration','Synthetic migration replay')
+            with self.store.connect() as c:
+                c.execute(migration)
+            self.assertEqual(self.generation(),1)
+            self.edit(native='turn/migration')
+            self.assertEqual(self.generation(),2)
+        finally:
+            with self.store.connect() as c:
+                c.execute(original)
+                self.assertEqual(c.execute("SELECT pg_get_functiondef('recall_collect_parent_authority()'::regprocedure) AS body").fetchone()['body'], original)
 
     def test_native_concurrent_ingest_commits_without_added_retries(self):
         self.ingest('warmup','Synthetic warmup')
@@ -254,7 +295,12 @@ class ParentAuthorityGenerationTests(SingletonSearchTests):
         with ThreadPoolExecutor(4) as pool:
             completed=sum(pool.map(writer,range(4)))
         self.assertEqual(completed,40)
-        self.assertEqual(self.generation(),initial+40)
+        self.assertEqual(self.generation(),initial+(0 if self.additive_generation else 40))
+        with self.store.connect() as c:
+            receipts=[row['receipt'] for row in c.execute(
+                'SELECT receipt FROM canonical_chunks WHERE tenant_id=%s', (self.tenant,))]
+        self.assertEqual(len(receipts), 41)
+        self.assert_members(receipts, receipts)
 
     def test_sorted_multi_parent_flush_creates_missing_versions_concurrently(self):
         for native in ('one','two','three','four'):
@@ -364,7 +410,7 @@ class ParentAuthorityGenerationTests(SingletonSearchTests):
         # A native retirement proof race may defer, but cannot silently clear
         # changed input. Its independent verifier remains unchanged.
         self.assertIn(outcomes['retire'],('applied','ChunkRetirementError'))
-        self.assertGreaterEqual(self.generation(),initial+3)
+        self.assertGreaterEqual(self.generation(),initial+(1 if self.additive_generation else 3))
         self.assertIn('entered',publication_attempts)
         before_publication=self.generation()
         with patch.object(self.projector,'_commit',side_effect=observe_commit):
@@ -372,6 +418,9 @@ class ParentAuthorityGenerationTests(SingletonSearchTests):
         self.assertEqual(completed['failed'],0)
         self.assertIn('committed',publication_attempts)
         self.assertEqual(self.generation(),before_publication)
+        with self.store.connect() as c:
+            new_receipt=c.execute("SELECT receipt FROM canonical_chunks JOIN canonical_documents USING(tenant_id,source_id,document_id) WHERE tenant_id=%s AND native_id='turn/new'", (self.tenant,)).fetchone()['receipt']
+        self.assert_members((self.physical_receipt,new_receipt), (new_receipt,))
         print(json.dumps(dict(test=self._testMethodName,synthetic=True,native_write_owners=True,outcomes=outcomes,publication_attempts=publication_attempts,elapsed_ms=round((time.monotonic()-started)*1000,3))),flush=True)
 
 

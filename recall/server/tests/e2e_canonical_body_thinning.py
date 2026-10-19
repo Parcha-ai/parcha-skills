@@ -42,6 +42,7 @@ def insert_document(
     suffix: str,
     text: str,
     omit_chunks: bool = False,
+    document_id: str | None = None,
 ) -> tuple[str, str]:
     native = f"native:{suffix}"
     parent = f"session:{suffix}"
@@ -49,7 +50,7 @@ def insert_document(
     artifact = "art_" + digest(f"artifact:{suffix}")[:32]
     job = "job_" + digest(f"job:{suffix}")[:32]
     event = "evt_" + digest(f"event:{suffix}")[:32]
-    document = "doc_" + digest(f"document:{suffix}")[:32]
+    document = document_id or "doc_" + digest(f"document:{suffix}")[:32]
     object_hash = digest(f"object:{suffix}")
     connection.execute(
         "INSERT INTO brain_tenants(tenant_id) VALUES (%s) ON CONFLICT DO NOTHING",

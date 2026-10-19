@@ -105,11 +105,8 @@ def append_race(store, root, *, after_fence):
 
 def revision(connection, tenant, source):
     connection.execute("UPDATE canonical_documents SET is_current=false WHERE tenant_id=%s AND source_id=%s AND native_id='event-0000' AND is_current", (tenant, source))
-    receipt = insert_record(connection, tenant=tenant, source=source, parent='session', native='replacement',
-                            text='revision two', role='assistant', byte_start=0)
-    connection.execute("UPDATE canonical_events SET native_id='event-0000',revision=2 WHERE tenant_id=%s AND source_id=%s AND native_id='replacement'", (tenant, source))
-    connection.execute("UPDATE canonical_documents SET native_id='event-0000',revision=2 WHERE tenant_id=%s AND source_id=%s AND native_id='replacement'", (tenant, source))
-    connection.execute('UPDATE canonical_chunks SET receipt=%s WHERE receipt=%s', (f'recall://{source}/event-0000?rev=2#item=0', receipt))
+    insert_record(connection, tenant=tenant, source=source, parent='session', native='event-0000',
+                  text='revision two', role='assistant', byte_start=0, revision=2)
 
 
 def ingest_owns_document_first(store, root):
