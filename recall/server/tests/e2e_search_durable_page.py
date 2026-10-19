@@ -193,7 +193,12 @@ class DurablePublication(CooperativePublication):
                 native_ids=['late-behind-cursor'],reason='ingest')
         self.logical.project_pending(batch_size=10,max_batches=1,upload_concurrency=2)
         self.passages.project_pending(batch_size=10,max_batches=1,concurrency=2)
-        self.assertIsNone(self.checkpoint(),'real producer must invalidate the old generation checkpoint')
+        checkpoint=self.checkpoint()
+        self.assertIsNotNone(checkpoint,'enqueue preserves opaque progress until the publisher revalidates it')
+        with self.store.connect() as connection:
+            generation=connection.execute('SELECT generation FROM search_projection_outbox WHERE tenant_id=%s AND source_id=%s',
+                (self.tenant,self.sources['large'])).fetchone()['generation']
+        self.assertNotEqual(checkpoint['scope']['claim'][3],generation,'real producer must invalidate checkpoint scope')
         self.restart()
         for _ in range(16):
             result=self.writer.drain_quantum(tenant_id=self.tenant,max_months=1)
@@ -346,6 +351,36 @@ class DurablePublication(CooperativePublication):
             self.assertEqual(result['failed'],0)
             self.assertIn(first,namespace.rows,'a different account must not skip the old account ACKed page')
             self.assertNotIn(self.settings.api_key,json.dumps(self.checkpoint()))
+
+    def test_pre091_schema_native_enqueue_and_seed_remain_compatible(self):
+        from recall_server.search_outbox import enqueue_search_outbox, seed_search_outbox
+        with self.store.connect() as connection:
+            connection.execute('ALTER TABLE search_projection_outbox DROP COLUMN page_checkpoint')
+            connection.execute('DELETE FROM schema_migrations WHERE version=91')
+        try:
+            with self.store.connect() as connection:
+                month=connection.execute('SELECT month FROM search_projection_outbox WHERE tenant_id=%s LIMIT 1',
+                    (self.tenant,)).fetchone()['month']
+                count=enqueue_search_outbox(connection,tenant_id=self.tenant,source_id=self.sources['large'],
+                    months=[month],reason='logical-update')
+                self.assertEqual(count,1)
+                # SQL resolves the full conflict UPDATE even when the fixture has no shards.
+                self.assertGreaterEqual(seed_search_outbox(connection,tenant_id=self.tenant),0)
+        finally:
+            self.store.migrate()
+        with self.store.connect() as connection:
+            self.assertEqual(connection.execute('SELECT count(*) AS n FROM schema_migrations WHERE version=91').fetchone()['n'],1)
+
+    def test_migration_records_version_once_and_preserves_checkpoint(self):
+        self.writer.drain_quantum(tenant_id=self.tenant,max_months=1)
+        before=self.checkpoint()
+        self.assertIsNotNone(before)
+        for _ in range(2):
+            self.store.migrate()
+            with self.store.connect() as connection:
+                count=connection.execute('SELECT count(*) AS n FROM schema_migrations WHERE version=91').fetchone()['n']
+            self.assertEqual(count,1,'migration must durably record version91')
+            self.assertEqual(self.checkpoint(),before)
 
 
 if __name__ == '__main__':

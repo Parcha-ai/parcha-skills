@@ -1,6 +1,6 @@
 """Recall central BrainStore service."""
 
-SCHEMA_VERSION = 90
+SCHEMA_VERSION = 91
 # H3-e': migration 067 drops the Postgres vector/tsvector plane (passage
 # embeddings, the embedding ledger, canonical_passages.search_vector). It is
 # destructive, so ``migrate`` applies it only when asked to retire the plane
@@ -46,6 +46,8 @@ PARQUET_DIRTY_PLAN_VERSION = 88
 DOCUMENT_EXTRACTION_VERSION = 89
 # Compatibility precedes the separate Codex publisher and its typed-role DDL.
 CODEX_EXTRACTION_VERSION = 90
+# Optional acknowledged page continuation; publisher requires the column.
+SEARCH_PUBLICATION_CHECKPOINT_VERSION = 91
 # Optional until a delayed Slack body needs a terminal-identity ACK.
 SUPPRESSED_ARTIFACT_SCHEMA_VERSION = 77
 MANDATORY_SCHEMA_VERSION = 69
