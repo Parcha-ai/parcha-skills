@@ -50,6 +50,7 @@ from .passage_projection import (
     iter_visible_messages,
     iter_passages,
     _logical_record_groups,
+    _text_blocks,
 )
 from .passage_representations import ActorContext, DocumentContext
 from .search_outbox import (
@@ -268,8 +269,62 @@ _MIGRATION_FIELDS = ('revision', 'source_document_sha256', 'policy_fingerprint',
                      'requested_extraction_version', 'applied_extraction_version')
 
 
+def _legacy_block_intervals(message, span, normal, normal_units, leaves, raw):
+    """Translate an exact historical concatenation into native emitted byte domains.
+
+    Only the newline separators inserted by the historical visible-message join
+    have no source-field interval. Every intersected field byte must be covered
+    by the unchanged final typed/normal passage coverage check.
+    """
+    key = (message.record_ordinal, message.record_count)
+    content = json.loads(raw)['message']['content']
+    if not isinstance(content, list):
+        raise ValueError('historical_domain_unsupported')
+    historical = tuple(dict.fromkeys(_text_blocks(content)))
+    if '\n'.join(historical) != message.text:
+        raise ValueError('historical_commitment_mismatch')
+    visible = tuple(dict.fromkeys(_text_blocks(content, include_tool_results=False)))
+    offsets = {}
+    position = 0
+    for text in visible:
+        offsets[text] = position
+        position += len(text.encode()) + 1
+    if visible and (key not in normal or normal[key].text != '\n'.join(visible)
+                    or normal[key].receipts != message.receipts
+                    or len(normal_units.get(key, ())) != 1):
+        raise ValueError('historical_domain_unsupported')
+    seen = set()
+    position = 0
+    obligations = []
+    for index, block in enumerate(content):
+        for text in _text_blocks(block):
+            if text in seen:
+                continue
+            seen.add(text)
+            end = position + len(text.encode())
+            left, right = max(position, span.source_byte_start), min(end, span.source_byte_end)
+            if left < right:
+                if isinstance(block, dict) and block.get('type') == 'tool_result':
+                    matching = [leaf for leaf in leaves
+                                if leaf.source_unit.startswith(
+                                    f'claude.tool-result.string.v1#/message/content/{index}/')
+                                and leaf.text == text and leaf.receipts == message.receipts]
+                    if not matching:
+                        raise ValueError('historical_domain_unsupported')
+                    obligations.extend((*key, leaf.source_unit, left-position, right-position)
+                                       for leaf in matching)
+                else:
+                    unit = next(iter(normal_units[key]))
+                    obligations.append((*key, unit, offsets[text]+left-position,
+                                        offsets[text]+right-position))
+            position = end + 1
+    if not obligations:
+        raise ValueError('historical_domain_unsupported')
+    return obligations
+
+
 def _legacy_result_intervals(old, messages, passages, groups, current_receipts):
-    """Prove the narrow old-visible-text to single typed result-leaf migration."""
+    """Prove old visible bytes are covered by native normal and typed result domains."""
     tool_receipts = {r for group in groups if group.evidence_kind == 'tool_result'
                      for message in group.messages for r in message.receipts}
     if not any(tool_receipts.intersection(row['receipts']) for row in old):
@@ -283,12 +338,14 @@ def _legacy_result_intervals(old, messages, passages, groups, current_receipts):
             normal_units.setdefault((span.record_ordinal, span.record_count), set()).add(span.source_unit)
     historical = dict(normal)
     leaves = {}
-    for group in groups:
+    historical_group_indexes = {}
+    for group_index, group in enumerate(groups):
         if group.evidence_kind != 'tool_result':
             continue
         for message in group.messages:
             key = (message.record_ordinal, message.record_count)
             leaves.setdefault(key, []).append(message)
+            historical_group_indexes.setdefault(key, group_index)
             historical[key] = replace(message, text=visible_message_text(group.full_event_text),
                                       source_unit=None, origin=None)
     obligations = []
@@ -354,7 +411,12 @@ def _legacy_result_intervals(old, messages, passages, groups, current_receipts):
                 lost_tool = True
                 candidates = leaves.get(key, ())
                 if len(candidates) != 1 or candidates[0].text != message.text or candidates[0].receipts != message.receipts:
-                    unsupported = True
+                    try:
+                        obligations.extend(_legacy_block_intervals(
+                            message, span, normal, normal_units, candidates,
+                            groups[historical_group_indexes[key]].full_event_text))
+                    except (KeyError, TypeError, ValueError, AttributeError):
+                        unsupported = True
                     continue
                 unit = candidates[0].source_unit
             else:
