@@ -47,6 +47,8 @@ class PublicationPageKeys(PublicationCertificates):
             captured.append((sql,args));return execute(c,sql,args,deadline)
         with patch.object(self.store,'verified_singleton_receipts',True),self.store.connect()as c,c.transaction():
             c.execute('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY')
+            if getattr(self,'fixed_join_order',False):
+                c.execute('SET LOCAL join_collapse_limit=1')
             cases=[]
             for sql in (original,candidate):
                 with patch.object(publication,'_PASSAGE_PAGE_SQL',sql),patch.object(self.store,'_execute_bounded',side_effect=record):
@@ -65,6 +67,12 @@ class PublicationPageKeys(PublicationCertificates):
             print(json.dumps(dict(original_ms=cases[0]['ms'],candidate_ms=cases[1]['ms'],original_wide_rows=cases[0]['work'],candidate_wide_rows=cases[1]['work'],full_rows_equal=True),sort_keys=True))
             self.assertLessEqual(cases[1]['work'],128,'candidate hydrates wide rows beyond the examined page')
             self.assertGreater(cases[0]['work'],128,'fixture must exercise the original pre-limit hydration')
+
+    def test_tied_time_limit_bounds_hydration_with_fixed_join_order(self):
+        # A legal alternate plan must not turn the selected-key lookup into a
+        # whole-source hydration join. CI exposed this without forcing a plan.
+        self.fixed_join_order=True
+        self.test_tied_time_limit_bounds_full_row_hydration()
 
     def test_current_revision_watermark_keyset_and_native_authority_equal(self):
         owner,claim=self.tied_fixture()

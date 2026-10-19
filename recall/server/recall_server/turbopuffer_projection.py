@@ -121,14 +121,19 @@ _PASSAGE_ELIGIBLE_SQL = f"""     WHERE passage.tenant_id=%s
 
 # Keep eligibility before LIMIT. Hydrate only those exact keys in this same
 # SQL snapshot, avoiding wide body/origin rows in the keyset sort.
+# OFFSET 0 prevents flattening the per-key lookup into a whole-source join.
 _PASSAGE_PAGE_SQL = (
     "WITH eligible_page AS MATERIALIZED (\n"
     " SELECT passage.tenant_id,passage.source_id,passage.passage_id,passage.first_occurred_at\n"
     + _PASSAGE_FROM_SQL + _PASSAGE_ELIGIBLE_SQL + ")\n"
+    + " SELECT hydrated.* FROM eligible_page selected\n"
+    " CROSS JOIN LATERAL (\n"
     + _PASSAGE_SELECT_SQL + _PASSAGE_FROM_SQL
-    + " JOIN eligible_page selected ON selected.tenant_id=passage.tenant_id\n"
-    " AND selected.source_id=passage.source_id AND selected.passage_id=passage.passage_id\n"
-    " ORDER BY passage.first_occurred_at,passage.passage_id\n"
+    + " WHERE passage.tenant_id=selected.tenant_id AND passage.source_id=selected.source_id\n"
+    "   AND passage.passage_id=selected.passage_id\n"
+    " OFFSET 0\n"
+    " ) hydrated\n"
+    " ORDER BY hydrated.first_occurred_at,hydrated.passage_id\n"
 )
 
 _PASSAGE_BY_ID_SQL = _PASSAGE_SELECT_SQL + _PASSAGE_FROM_SQL + f"""
