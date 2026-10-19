@@ -157,25 +157,20 @@ class CaptureBatching(unittest.TestCase):
         from recall_server import receipt_membership
         class Members(dict):
             pass
-        class Rows(list):
-            pass
         references = []
-        original_batches = proof.ParentMetadataSpool.membership_batches
-        original_member = receipt_membership.verified_document_chunks
+        original_member = receipt_membership.receipt_metadata_from_rows
+        calls = 0
         def member(*args, **kwargs):
+            nonlocal calls
+            self.assertTrue(all(ref() is None for ref in references),
+                            'previous decoded membership survives into the next streamed document')
             result = Members(original_member(*args, **kwargs))
             references.append(weakref.ref(result))
+            calls += 1
             return result
-        def batches(spool):
-            for documents in original_batches(spool):
-                self.assertTrue(all(ref() is None for ref in references),
-                                'previous decoded batch survives into the next membership batch')
-                rows = Rows(documents)
-                references.append(weakref.ref(rows))
-                yield rows
-                rows = documents = None
-        with patch.object(proof.ParentMetadataSpool, 'membership_batches', batches), patch.object(self.store, 'verified_singleton_receipts', True), patch.object(receipt_membership, 'verified_document_chunks', member):
+        with patch.object(self.store, 'verified_singleton_receipts', True), patch.object(receipt_membership, 'receipt_metadata_from_rows', member):
             self.assertEqual(self.capture()['rows'], (257, 257))
+        self.assertEqual(calls, 257)
         self.assertTrue(all(ref() is None for ref in references))
 
     def test_document_budget_still_refuses_without_archive_reads(self):
