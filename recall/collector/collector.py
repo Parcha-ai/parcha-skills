@@ -436,6 +436,18 @@ class Collector:
     def _clear_running(self) -> None:
         self.db.execute("DELETE FROM meta WHERE key='running_started_epoch'")
 
+    @staticmethod
+    def _claude_workflow_journal(path: Path) -> bool:
+        # Claude LocalFileJournal caches Workflow returns beside agent transcripts.
+        # Match its owned layout even when the selected root is the run directory.
+        return (
+            path.name == "journal.jsonl"
+            and path.parent.name.startswith("wf_")
+            and len(path.parent.name) > 3
+            and path.parent.parent.name == "workflows"
+            and path.parent.parent.parent.name == "subagents"
+        )
+
     def discover(self) -> list[Path]:
         roots = [(self.root, "source_unavailable")]
         if self.harness == "codex" and self.archive_root is not None:
@@ -457,7 +469,8 @@ class Collector:
                             if entry.is_dir(follow_symlinks=False):
                                 pending.append(Path(entry.path))
                             elif entry.name.endswith(".jsonl") and (
-                                self.harness != "codex" or entry.name.startswith("rollout-")
+                                (entry.name.startswith("rollout-") if self.harness == "codex"
+                                 else not self._claude_workflow_journal(Path(entry.path)))
                             ):
                                 metadata = entry.stat()
                                 if stat.S_ISREG(metadata.st_mode):

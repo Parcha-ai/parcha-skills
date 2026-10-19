@@ -1,7 +1,13 @@
 # Portable collectors
 
 The collector discovers only Claude Code `*.jsonl` or Codex `rollout-*.jsonl` files under one
-explicit root. Complete JSONL records enter a mode-0600 SQLite outbox before network I/O. The
+explicit root. Claude's `subagents/workflows/wf_<run-id>/journal.jsonl` replay journals
+are excluded from future discovery: they cache workflow return values rather than
+transcript messages. Agent transcripts beside them, moved transcripts, and custom
+paths remain discoverable. Previously captured journal records and pending outbox
+entries are retained; this exclusion does not authorize Forget.
+
+Complete JSONL records enter a mode-0600 SQLite outbox before network I/O. The
 scan offset may move once the spool transaction is durable; the separate committed offset moves
 only after BrainStore returns a commit acknowledgement. A lost acknowledgement retries the same
 idempotency key.
