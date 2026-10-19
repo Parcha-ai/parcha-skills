@@ -120,6 +120,11 @@ _PASSAGE_BY_ID_SQL = _PASSAGE_PAGE_SQL.split("     WHERE passage.tenant_id=%s")[
      ORDER BY passage.first_occurred_at,passage.passage_id
 """
 
+_CERTIFICATE_PRESENCE = (
+    "passage.membership_generation AS _membership_generation,"
+    "passage.membership_binding_sha256 AS _membership_binding_sha256,"
+)
+
 
 def _month_bounds(month: date) -> tuple[datetime, datetime]:
     start = datetime(month.year, month.month, 1, tzinfo=timezone.utc)
@@ -341,6 +346,8 @@ class TurbopufferProjector:
         if isinstance(max_batch_bytes, bool) or not isinstance(max_batch_bytes, int) or not 1024 <= max_batch_bytes <= DEFAULT_MAX_BATCH_BYTES:
             raise ValueError("search plane batch bytes are invalid")
         self.store = store
+        from .parent_membership_read import ReadSettings
+        self.parent_membership_read = ReadSettings.from_env()
         self.settings = settings
         self.batch_rows = batch
         self.max_batch_bytes = max_batch_bytes
@@ -474,8 +481,12 @@ class TurbopufferProjector:
             # The caller advances over all examined rows, including a page
             # whose receipt proof rejects every row. Filtering cannot hide the
             # cursor or make an intermediate empty page look like exhaustion.
+            sql = _PASSAGE_PAGE_SQL
+            if self.parent_membership_read.enabled:
+                sql = sql.replace("SELECT passage.passage_id,",
+                                  "SELECT " + _CERTIFICATE_PRESENCE + "passage.passage_id,", 1)
             return self.store._execute_bounded(connection,
-                _PASSAGE_PAGE_SQL.replace(_LIVE_PASSAGE_PREDICATE, "true"),
+                sql.replace(_LIVE_PASSAGE_PREDICATE, "true"),
                 (claim["tenant_id"], claim["source_id"], start, end,
                  since, since, cursor_time, cursor_id, self.page_rows),
                 deadline_at,
@@ -493,23 +504,45 @@ class TurbopufferProjector:
 
     def _authorized_publication_rows(self, connection, tenant_id, rows, *, deadline_at):
         """Reuse current receipt authority before writing an examined page."""
+        from .parent_membership_read import partition
         from .receipt_membership import lookup_current_search_membership
 
+        certified = set()
+        if self.parent_membership_read.enabled:
+            # Presence only avoids an optional lookup; partition still checks
+            # the complete current binding in this same RR snapshot.
+            candidates = []
+            for row in rows:
+                generation = row.pop('_membership_generation', None)
+                binding = row.pop('_membership_binding_sha256', None)
+                if generation is not None and binding is not None:
+                    candidates.append(dict(row, tenant_id=tenant_id))
+            certified, _ = partition(
+                self.store, connection,
+                selected=candidates,
+                settings=self.parent_membership_read, deadline_at=deadline_at,
+            )
+        fallback = [row for row in rows if (row['source_id'], row['passage_id']) not in certified]
         members = lookup_current_search_membership(
             self.store, tenant_id=tenant_id,
-            authorized_sources=tuple(sorted({row["source_id"] for row in rows})),
-            receipts=tuple(dict.fromkeys(receipt for row in rows for receipt in row["receipts"])),
+            authorized_sources=tuple(sorted({row["source_id"] for row in fallback})),
+            receipts=tuple(dict.fromkeys(receipt for row in fallback for receipt in row["receipts"])),
             connection=connection, deadline_at=deadline_at,
-        )
-        return [row for row in rows if all((row["source_id"], receipt) in members
+        ) if fallback else set()
+        return [row for row in rows if (row['source_id'], row['passage_id']) in certified
+                or all((row["source_id"], receipt) in members
                                           for receipt in row["receipts"])]
 
     def passages_by_id(self, connection: Any, tenant_id: str, passage_ids: list[str]) -> list[dict[str, Any]]:
         """The live passages among ``passage_ids``, in page order."""
         if getattr(self.store, "verified_singleton_receipts", False):
             deadline = time.monotonic() + self.store.search_deadline_ms / 1000
+            sql = _PASSAGE_BY_ID_SQL
+            if self.parent_membership_read.enabled:
+                sql = sql.replace("SELECT passage.passage_id,",
+                                  "SELECT " + _CERTIFICATE_PRESENCE + "passage.passage_id,", 1)
             rows = self.store._execute_bounded(connection,
-                _PASSAGE_BY_ID_SQL.replace(_LIVE_PASSAGE_PREDICATE, "true"),
+                sql.replace(_LIVE_PASSAGE_PREDICATE, "true"),
                 (tenant_id, list(passage_ids)), deadline,
             ).fetchall()
             return self._authorized_publication_rows(connection, tenant_id, rows, deadline_at=deadline)
