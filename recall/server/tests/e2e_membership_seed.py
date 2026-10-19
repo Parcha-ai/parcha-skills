@@ -3,6 +3,7 @@
 
 from concurrent.futures import ThreadPoolExecutor
 import threading
+import hashlib
 import time
 import io
 import json
@@ -178,6 +179,122 @@ class HistoricalMembershipSeedTests(ParentMembershipPublicationTests):
             self.assertIsNone(c.execute('SELECT generation FROM canonical_parent_authority WHERE tenant_id=%s',
                                        (self.tenant,)).fetchone())
 
+    def passive_retirement(self):
+        with self.store.connect() as c:
+            c.execute("""INSERT INTO canonical_chunk_retirement_progress(
+                tenant_id,source_id,native_parent_id,logical_document_id,enabled,status)
+                SELECT tenant_id,source_id,native_parent_id,logical_document_id,true,'pending'
+                FROM canonical_evidence_documents WHERE tenant_id=%s""", (self.tenant,))
+
+    def active_retirement(self):
+        with self.store.connect() as c:
+            c.execute("""INSERT INTO canonical_retirement_source_policy(
+                tenant_id,source_id,principal_id,maintenance_intent)
+                VALUES(%s,%s,%s,'{"parent":"session"}'::jsonb)""",
+                (self.tenant,self.source,self.principal))
+
+    def test_passive_retirement_seed_reaches_native_proof_on092(self):
+        if not self.additive_membership_generation:
+            self.skipTest('schema092-specific admission')
+        self.passive_retirement()
+        result = self.seed()
+        self.assertEqual(result['queued'],1)
+        self.assertEqual(result['deferred'],[])
+        publisher = self.publisher()
+        with patch.object(publisher,'_prepare',side_effect=AssertionError('no archive republication')):
+            outcome = publisher.project_pending(tenant_id=self.tenant,batch_size=10,max_batches=1)
+        self.assertEqual(outcome['documents'],0)
+        self.assertEqual(outcome['membership_certified_passages'],len(self.ids))
+        compared = self.compare()
+        self.assertEqual(compared['certified_passages'],len(self.ids))
+        self.assertEqual(compared['native_allowed_passages'],len(self.ids))
+        self.assertEqual(compared['disagreements'],0)
+        with self.store.connect() as c:
+            self.assertEqual(c.execute('SELECT status FROM canonical_chunk_retirement_progress WHERE tenant_id=%s',(self.tenant,)).fetchone()['status'],'pending')
+
+    def test_seed_recertifies_nonnull_v2_binding_with_matching_generation(self):
+        legacy_fields = (
+            'tenant_id', 'source_id', 'native_parent_id', 'logical_document_id',
+            'passage_id', 'policy_fingerprint', 'text_sha256', 'receipts',
+            'manifest_content_sha256', 'manifest_revision', 'projected_revision',
+            'passage_revision', 'source_document_sha256',
+        )
+        def legacy(row, scope):
+            payload = ['recall.passage-membership-binding.v2', scope['binding_epoch'],
+                       *[row[field] for field in legacy_fields]]
+            return hashlib.sha256(json.dumps(payload, ensure_ascii=False,
+                separators=(',', ':'), allow_nan=False).encode()).hexdigest()
+        with patch.object(enrollment, '_binding', legacy):
+            self.assertEqual(self.enroll()['status'], 'enrolled')
+            self.assertEqual(self.compare()['certified_passages'], len(self.ids))
+        self.assertEqual(self.compare()['certified_passages'],0)
+        self.assertEqual(self.compare()['native_allowed_passages'],len(self.ids))
+        self.assertEqual(self.queued(),[])
+        with self.store.connect() as c:
+            before = c.execute('SELECT passage_id,membership_generation,membership_binding_sha256 '
+                               'FROM canonical_passages WHERE tenant_id=%s ORDER BY passage_id',(self.tenant,)).fetchall()
+        self.assertTrue(all(r['membership_generation'] is not None and r['membership_binding_sha256'] for r in before))
+        self.assertEqual(self.seed()['queued'],1)
+        publisher = self.publisher()
+        with patch.object(publisher,'_prepare',side_effect=AssertionError('no source re-publication')):
+            result = publisher.project_pending(tenant_id=self.tenant,batch_size=10,max_batches=1)
+        self.assertEqual(result['documents'],0)
+        self.assertEqual(result['membership_certified_passages'],len(self.ids))
+        compared = self.compare()
+        self.assertEqual(compared['certified_passages'],len(self.ids))
+        self.assertEqual(compared['native_allowed_passages'],len(self.ids))
+        self.assertEqual(compared['disagreements'],0)
+        with self.store.connect() as c:
+            after = c.execute('SELECT passage_id,membership_generation,membership_binding_sha256 '
+                              'FROM canonical_passages WHERE tenant_id=%s ORDER BY passage_id',(self.tenant,)).fetchall()
+        self.assertEqual([(r['passage_id'],r['membership_generation']) for r in before],
+                         [(r['passage_id'],r['membership_generation']) for r in after])
+        self.assertTrue(all(a['membership_binding_sha256'] != b['membership_binding_sha256']
+                            for a,b in zip(before,after,strict=True)))
+
+    def test_active_retirement_still_defers_seed(self):
+        self.passive_retirement()
+        self.active_retirement()
+        result = self.seed()
+        self.assertEqual(result['queued'],0)
+        self.assertIn('retirement_intent',result['deferred'][0]['reasons'])
+        self.assertEqual(self.queued(),[])
+        self.assertEqual(self.compare()['certified_passages'],0)
+
+    def test_active_intent_after_passive_admission_is_rechecked(self):
+        if not self.additive_membership_generation:
+            self.skipTest('schema092-specific admission')
+        self.passive_retirement()
+        self.assertEqual(self.seed()['queued'],1)
+        self.active_retirement()
+        publisher = self.publisher()
+        result = publisher.project_pending(tenant_id=self.tenant,batch_size=10,max_batches=1)
+        self.assertEqual(result['membership_certified_passages'],0)
+        self.assertEqual(len(self.queued()),1)
+        self.assertEqual(self.compare()['certified_passages'],0)
+        with self.store.connect() as c:
+            c.execute('UPDATE canonical_retirement_source_policy SET maintenance_intent=NULL WHERE tenant_id=%s',(self.tenant,))
+        result = publisher.project_pending(tenant_id=self.tenant,batch_size=10,max_batches=1)
+        self.assertEqual(result['membership_certified_passages'],len(self.ids))
+        self.assertEqual(self.compare()['disagreements'],0)
+
+    def test_edit_during_passive_retirement_proof_refuses_stale_stamp(self):
+        if not self.additive_membership_generation:
+            self.skipTest('schema092-specific admission')
+        self.passive_retirement()
+        self.assertEqual(self.seed()['queued'],1)
+        original = enrollment._capture
+        def edited(*args,**kwargs):
+            captured = original(*args,**kwargs)
+            self.edit()
+            return captured
+        with patch.object(enrollment,'_capture',side_effect=edited):
+            result = self.publisher().project_pending(tenant_id=self.tenant,batch_size=10,max_batches=1)
+        self.assertEqual(result['membership_certified_passages'],0)
+        compared=self.compare()
+        self.assertEqual(compared['certified_passages'],0)
+        self.assertEqual(compared['disagreements'],0)
+
     def queued(self):
         return remainder.pending(
             self.store,
@@ -337,6 +454,11 @@ class HistoricalMembershipSeedTests(ParentMembershipPublicationTests):
             )
         result = self.seed()
         self.assertEqual(result["scanned"], 1)
+        if self.additive_membership_generation:
+            self.assertEqual(result["queued"], 1)
+            self.assertEqual(result["deferred"], [])
+            self.assertEqual(len(self.queued()), 1)
+            return
         self.assertEqual(result["queued"], 0)
         self.assertEqual(
             result["deferred"],
