@@ -34,8 +34,8 @@ from connectors.sdk import (
 from privacy.policy import PrivacyPolicy
 
 from .archive_runtime import build_archive_store, build_evidence_archive_store
-from .actor_attribution import ActorIdentityIndex
-from .canonical import CanonicalArchiveGateway, CanonicalPlane
+from .actor_attribution import ActorIdentityIndex, derive_slack_actor_identities
+from .canonical import CanonicalArchiveGateway, CanonicalPlane, _identity_sha256
 from .canonical_retrieval import CanonicalRetrieval
 from .control import ControlError, SecretBox
 from .db import BrainStore
@@ -229,6 +229,22 @@ def _selectors(connector_id: str, selected: Mapping[str, Any]) -> dict[str, Any]
     values = _selector_defaults(connector_id)
     values.update(dict(selected))
     return values
+
+
+class _IdentityEnrollingConnector:
+    """Trusted managed pull seam; SDK privacy, archive and ACK behavior is unchanged."""
+
+    def __init__(self, connector, enroll):
+        self.connector = connector
+        self.enroll = enroll
+
+    def __getattr__(self, name):
+        return getattr(self.connector, name)
+
+    def pull(self, cursor):
+        page = self.connector.pull(cursor)
+        self.enroll(page.records)
+        return page
 
 
 class _DirectCanonicalWriter:
@@ -649,6 +665,60 @@ class ManagedConnectorWorker:
                         (error_code, row["id"], self.worker_id),
                     )
 
+    def _enroll_slack_contacts(self, row, records):
+        # Typed native directory records only, before scrub and ACK dedup. A
+        # privacy drop must not produce even a blinded identity side effect.
+        privacy = PrivacyPolicy(mode=row["privacy_mode"])
+        contacts = [record for record in records
+            if not record.deleted and record.schema_version == 2
+            and record.content.get("kind") == "contact_identity.v1"
+            and record.content.get("identifier_type") == "email"
+            and privacy.apply({"content": record.content,
+                "provenance": PrivacyPolicy(mode="scrub").apply(record.provenance).value,
+            }).action != "drop"]
+        if not contacts:
+            return
+        tenant, source, principal = row["tenant_id"], row["source_id"], row["principal_id"]
+        with self.store.connect() as connection, connection.transaction():
+            authority = connection.execute("""SELECT installation.id
+                FROM connector_installations installation
+                JOIN provider_connections provider ON provider.id=installation.connection_id
+                JOIN brain_access_grants access ON access.tenant_id=installation.tenant_id
+                    AND access.principal_id=installation.principal_id
+                WHERE installation.id=%s AND installation.revision=%s
+                  AND installation.tenant_id=%s AND installation.source_id=%s
+                  AND installation.principal_id=%s AND installation.connector_id='slack.messages'
+                  AND installation.execution='remote_worker' AND installation.state='enabled'
+                  AND installation.connection_id=%s AND installation.lease_owner=%s
+                  AND installation.lease_expires_at>clock_timestamp()
+                  AND provider.status='connected' AND provider.revoked_at IS NULL
+                  AND access.permission IN ('owner','admin')
+                FOR SHARE OF installation,provider,access""",
+                (row["id"], row["revision"], tenant, source, principal,
+                 row["connection_id"], self.worker_id)).fetchone()
+            if authority is None:
+                raise ControlError("connector_authority_revoked")
+            # New installations have no source until their first archive write.
+            # Existing sources must never recreate a revoked grant here.
+            exists = connection.execute("""SELECT 1 FROM canonical_sources
+                WHERE tenant_id=%s AND source_id=%s""", (tenant, source)).fetchone()
+            if exists is None:
+                CanonicalPlane.register_source(connection, tenant_id=tenant,
+                    principal_id=principal, source_id=source)
+            self.plane._require_existing_source_owner(connection, tenant_id=tenant,
+                principal_id=principal, source_id=source)
+            admitted = []
+            for record in sorted(contacts, key=lambda item: item.native_id):
+                connection.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s,0))",
+                    (f"v2\x1f{tenant}\x1f{source}\x1f{record.native_id}",))
+                forgotten = connection.execute("""SELECT 1 FROM forget_tombstones
+                    WHERE tenant_id=%s AND source_id=%s AND target_identity_sha256=%s""",
+                    (tenant, source, _identity_sha256(tenant, source, record.native_id))).fetchone()
+                if not forgotten:
+                    admitted.append((None, "slack.messages", {"content": record.content}))
+            derive_slack_actor_identities(connection, tenant_id=tenant,
+                events=admitted, identity_index=self.plane.actor_identity_index)
+
     def run_once(self) -> dict[str, Any]:
         row = self._claim()
         if row is None:
@@ -675,6 +745,9 @@ class ManagedConnectorWorker:
                     credentials,
                     private_directory,
                 )
+                if row.get("connector_id") == "slack.messages":
+                    connector = _IdentityEnrollingConnector(connector,
+                        lambda records: self._enroll_slack_contacts(row, records))
                 runner = ConnectorRunner(
                     connector=connector,
                     brain=_DirectCanonicalWriter(

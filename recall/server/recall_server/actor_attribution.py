@@ -212,45 +212,16 @@ def is_local_user_authored(event: dict[str, Any], connector_id: str) -> bool:
     return False
 
 
-def attribute_canonical_events(
-    connection: Any,
-    *,
-    tenant_id: str,
-    source_id: str,
-    events: Iterable[tuple[str, str, dict[str, Any]]],
-    identity_index: ActorIdentityIndex | None = None,
-    changed_event_ids: set[str] | None = None,
-) -> int:
-    """Persist actors, optionally collecting only events with newly inserted links."""
+def derive_slack_actor_identities(connection, *, tenant_id, events, identity_index):
+    """Bind native Slack subjects only to already enrolled email identities.
 
-    prepared = list(events)
-    inserted = 0
-    authored_event_ids = sorted({
-        event_id
-        for event_id, connector_id, event in prepared
-        if is_local_user_authored(event, connector_id)
-    })
-    if authored_event_ids:
-        result = connection.execute(
-            """INSERT INTO canonical_event_actors(
-                   tenant_id,source_id,event_id,actor_id,relation
-               )
-               SELECT %s,%s,event_id,binding.actor_id,'author'
-                 FROM unnest(%s::text[]) AS selected(event_id)
-                 JOIN canonical_source_actor_bindings binding
-                   ON binding.tenant_id=%s AND binding.source_id=%s
-                  AND binding.relation IN ('contributor','owner')
-               ON CONFLICT DO NOTHING"""
-            + (" RETURNING event_id" if changed_event_ids is not None else ""),
-            (tenant_id, source_id, authored_event_ids, tenant_id, source_id),
-        )
-        inserted += max(0, result.rowcount)
-        if changed_event_ids is not None:
-            changed_event_ids.update(row["event_id"] for row in result.fetchall())
+    Caller owns current source authority and Forget checks. Plaintext inputs
+    remain in memory; only purpose-bound HMACs enter the database.
+    """
     if identity_index is None:
-        return inserted
+        return
     derived_identities: list[dict[str, str]] = []
-    for _event_id, connector_id, event in prepared:
+    for _event_id, connector_id, event in events:
         content = event.get("content") if isinstance(event, dict) else None
         if (
             connector_id not in {"slack.messages", "portable.slack"}
@@ -301,6 +272,47 @@ def attribute_canonical_events(
                ON CONFLICT DO NOTHING""",
             (tenant_id, json.dumps(derived_identities), tenant_id),
         )
+
+
+def attribute_canonical_events(
+    connection: Any,
+    *,
+    tenant_id: str,
+    source_id: str,
+    events: Iterable[tuple[str, str, dict[str, Any]]],
+    identity_index: ActorIdentityIndex | None = None,
+    changed_event_ids: set[str] | None = None,
+) -> int:
+    """Persist actors, optionally collecting only events with newly inserted links."""
+
+    prepared = list(events)
+    inserted = 0
+    authored_event_ids = sorted({
+        event_id
+        for event_id, connector_id, event in prepared
+        if is_local_user_authored(event, connector_id)
+    })
+    if authored_event_ids:
+        result = connection.execute(
+            """INSERT INTO canonical_event_actors(
+                   tenant_id,source_id,event_id,actor_id,relation
+               )
+               SELECT %s,%s,event_id,binding.actor_id,'author'
+                 FROM unnest(%s::text[]) AS selected(event_id)
+                 JOIN canonical_source_actor_bindings binding
+                   ON binding.tenant_id=%s AND binding.source_id=%s
+                  AND binding.relation IN ('contributor','owner')
+               ON CONFLICT DO NOTHING"""
+            + (" RETURNING event_id" if changed_event_ids is not None else ""),
+            (tenant_id, source_id, authored_event_ids, tenant_id, source_id),
+        )
+        inserted += max(0, result.rowcount)
+        if changed_event_ids is not None:
+            changed_event_ids.update(row["event_id"] for row in result.fetchall())
+    if identity_index is None:
+        return inserted
+    derive_slack_actor_identities(connection, tenant_id=tenant_id,
+        events=prepared, identity_index=identity_index)
     references: list[dict[str, str]] = []
     for event_id, connector_id, event in prepared:
         for reference in native_actor_references(event):
