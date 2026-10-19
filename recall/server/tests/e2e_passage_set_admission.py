@@ -101,6 +101,7 @@ class SetAdmission(unittest.TestCase):
     def assert_selection(self, *, tenant, limit, notified):
         self.projector._prefer_notification_admission = notified
         self.projector._ordinary_source_cursor[notified] = None
+        self.projector._ordinary_parent_cursor[notified].clear()
         got = self.projector._pending(tenant_id=tenant, limit=limit)
         expected = self.oracle(tenant, limit, notified)
         self.assertEqual([(r.tenant_id,r.source_id,r.logical_document_id) for r in got],
@@ -139,6 +140,7 @@ class SetAdmission(unittest.TestCase):
                 self.assert_selection(tenant='a',limit=limit,notified=notified)
         self.projector._prefer_notification_admission=False
         self.projector._ordinary_source_cursor[False]=None
+        self.projector._ordinary_parent_cursor[False].clear()
         self.assertEqual(self.projector._pending(tenant_id='a',limit=3), ())
 
     def test_70000_queue_scoring_avoids_per_parent_subplans(self):
@@ -164,7 +166,7 @@ class SetAdmission(unittest.TestCase):
                      if isinstance(v,str) and 'SELECT queue.tenant_id' in v)
         repetitions = []
         for notified in (False,True):
-            params=(notified,None,None,None,'scale','scale',notified,10)
+            params=('[]',notified,None,None,None,notified,'scale','scale',notified,10)
             # Warm reads, then retain actual plan attribution without a fragile time threshold.
             self.connection.execute(query,params).fetchall()
             result=self.connection.execute('EXPLAIN(ANALYZE,BUFFERS,FORMAT JSON) '+query,params).fetchone()['QUERY PLAN'][0]
