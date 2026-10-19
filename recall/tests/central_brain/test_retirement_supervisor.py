@@ -100,7 +100,9 @@ print(json.dumps({'status':'complete','cleared_documents':3,'cleared_utf8_bytes'
             claim_wall_ms=2., parent_wall_ms=31., metadata_capture_ms=5., error_class="LogicalEvidenceError",
             cause_error_code="logical_evidence_record_invalid", phase="maintenance",
             metadata_rows=3, metadata_fetches=2, metadata_fetch_ms=2.,
-            metadata_membership_calls=1, metadata_membership_ms=1., metadata_spool_ms=.5)
+            metadata_membership_calls=1, metadata_membership_ms=1., metadata_spool_ms=.5,
+            attempted_parents=2, failed_parents=2,
+            errors={"parent_retirement_deadline_exceeded": 2})
         self.worker.child = Mock(returncode=0, stdout=BytesIO(json.dumps(result).encode()))
         self.worker.child.poll.return_value = 0
         with self.assertLogs('recall_server.retirement_supervisor', level='INFO') as logs:
@@ -110,7 +112,8 @@ print(json.dumps({'status':'complete','cleared_documents':3,'cleared_utf8_bytes'
                       'archive_reused_gets','archive_reused_bytes',
                       'claim_wall_ms','parent_wall_ms','metadata_capture_ms','cause_error_code',
                       'metadata_rows','metadata_fetches','metadata_fetch_ms',
-                      'metadata_membership_calls','metadata_membership_ms','metadata_spool_ms'):
+                      'metadata_membership_calls','metadata_membership_ms','metadata_spool_ms',
+                      'attempted_parents','failed_parents','errors'):
             self.assertIn(f'{field}={result[field]}', logs.output[0])
 
     def test_scheduling_completion_is_logged_separately_from_archive_proofs(self):
