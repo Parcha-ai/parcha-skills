@@ -34,6 +34,25 @@ def _save(db, state):
     db.commit()
 
 
+def progress_report(row, runner):
+    """Report persisted progress and debt presence from one SQLite snapshot."""
+    saved = runner.db.execute("""SELECT value, EXISTS(
+        SELECT 1 FROM meta WHERE key>=? AND key<?) AS has_debt
+        FROM meta WHERE key=?""", (DEBT, DEBT_END, KEY)).fetchone()
+    if saved is None:
+        raise ValueError('captured_progress_invalid')
+    state = json.loads(saved[0])
+    has_debt = bool(saved[1])
+    if (state['unresolved'] > 0) != has_debt:
+        raise ValueError('captured_progress_invalid')
+    return dict(installation_id=str(row['id']), source_id=row['source_id'],
+        checkpoint_version=state['version'], authority_epoch=state['epoch'],
+        frontier_sha256=hashlib.sha256(json.dumps(state['upper']).encode()).hexdigest(),
+        phase=state['phase'], examined=state['examined'], unresolved=state['unresolved'],
+        unresolved_entries_present=has_debt,
+        status='unresolved' if has_debt else 'complete' if state['phase'] == 'complete' else 'in_progress')
+
+
 def _page(worker, row, after, upper, limit, native_ids=None):
     with worker.store.connect() as c, c.transaction():
         c.execute("SELECT set_config('statement_timeout',%s,true)", (str(worker.store.search_deadline_ms),))

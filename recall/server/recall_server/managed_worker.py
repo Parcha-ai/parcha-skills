@@ -864,8 +864,10 @@ class ManagedConnectorWorker:
                 )
                 captured = None
                 if row.get('connector_id') == 'slack.messages':
-                    from .slack_captured_attribution import repair_slice
+                    from .slack_captured_attribution import repair_slice, progress_report
                     captured = repair_slice(self, row, runner, deadline_at=started + self.lease_seconds)
+                    if captured is not None:
+                        captured = progress_report(row, runner)
                 result = runner.run_once()
             if result.get("status") == "backoff":
                 code = result.get("error_code", "connector_rate_limited")
@@ -914,8 +916,7 @@ class ManagedConnectorWorker:
                 "staged": int(result.get("staged", 0)),
                 "embedded": int(embedding.get("processed", 0)),
                 "has_more": has_more,
-                **({'captured_attribution': {key: captured[key] for key in
-                    ('phase', 'examined', 'unresolved')}} if captured is not None else {}),
+                **({'captured_attribution': captured} if captured is not None else {}),
                 **coverage,
             }
         except Exception as error:

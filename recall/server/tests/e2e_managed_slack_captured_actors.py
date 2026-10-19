@@ -49,6 +49,68 @@ class CapturedSlackActors(ManagedSlackHistoryActors):
         self.assertEqual(state['unresolved'], 0)
         return reports
 
+    def test_progress_reports_bind_two_actual_installations(self):
+        reports = []
+        for fixture in (self, type(self)(self._testMethodName)):
+            if fixture is not self:
+                fixture.setUp()
+                self.addCleanup(fixture.doCleanups)
+            worker, _ = fixture.captured()
+            fixture.converge(worker)
+            report = fixture.step(worker)['captured_attribution']
+            reports.append((fixture, report))
+            with fixture.store.connect() as c:
+                c.execute("UPDATE connector_installations SET state='paused' WHERE id=%s", (fixture.installation,))
+        for fixture, report in reports:
+            self.assertEqual(report['installation_id'], fixture.installation)
+            self.assertEqual(report['source_id'], fixture.source)
+            self.assertEqual(report['status'], 'complete')
+            self.assertEqual(report['phase'], 'complete')
+            self.assertEqual(report['unresolved'], 0)
+            self.assertFalse(report['unresolved_entries_present'])
+            self.assertEqual(len(report['authority_epoch']), 64)
+            self.assertEqual(len(report['frontier_sha256']), 64)
+            encoded = json.dumps(report)
+            self.assertNotIn(fixture.message.native_id, encoded)
+            self.assertNotIn(fixture.email, encoded)
+        self.assertNotEqual(reports[0][1]['installation_id'], reports[1][1]['installation_id'])
+        self.assertNotEqual(reports[0][1]['source_id'], reports[1][1]['source_id'])
+
+    def test_progress_distinguishes_unresolved_from_failed_mutation(self):
+        from recall_server.archive import ArchiveNotFound
+        worker, _ = self.captured(thin=True)
+        self.message_phase(worker)
+        with patch.object(worker.archive, 'read_raw', side_effect=ArchiveNotFound('synthetic')):
+            result = self.step(worker)
+        self.assertEqual(result['failed'], 0)
+        report = result['captured_attribution']
+        self.assertEqual(report['status'], 'unresolved')
+        self.assertTrue(report['unresolved_entries_present'])
+        self.assertGreater(report['unresolved'], 0)
+        with patch.object(logical_evidence_projection, 'mark_logical_evidence_dirty',
+                          side_effect=RuntimeError('synthetic queue failure')):
+            result = self.step(worker)
+        self.assertEqual(result['failed'], 1)
+        self.assertNotIn('captured_attribution', result)
+        self.assertEqual(self.counts(), (1, 0))
+
+    def test_progress_rejects_zero_counter_with_persisted_debt(self):
+        from recall_server import slack_captured_attribution as captured
+        worker, _ = self.captured()
+        self.converge(worker)
+        original = captured.repair_slice
+        def corrupt(*args, **kwargs):
+            result = original(*args, **kwargs)
+            db = args[2].db
+            db.execute('INSERT INTO meta(key,value) VALUES (?,?)',
+                (captured.DEBT + 'synthetic', json.dumps(dict(native_id='synthetic', reason='ArchiveNotFound'))))
+            db.commit()
+            return result
+        with patch.object(captured, 'repair_slice', side_effect=corrupt):
+            result = self.step(worker)
+        self.assertEqual(result['failed'], 1)
+        self.assertNotIn('captured_attribution', result)
+
     def test_contacts_skip_intact_message_archive(self):
         worker, _ = self.captured()
         with self.store.connect() as c:
