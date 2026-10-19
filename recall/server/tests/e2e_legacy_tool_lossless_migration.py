@@ -4,10 +4,9 @@ import unittest
 from dataclasses import replace
 from unittest.mock import patch
 
+from e2e_legacy_tool_migration import LegacyToolMigration
 from recall_server import passage_append, passage_index, passage_projection
 from recall_server.logical_evidence import LogicalEvidenceError
-
-from e2e_legacy_tool_migration import LegacyToolMigration
 
 
 class LosslessLegacyMigration(LegacyToolMigration):
