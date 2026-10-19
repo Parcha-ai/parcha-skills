@@ -2514,12 +2514,15 @@ class CanonicalLogicalEvidenceProjector:
         on_progress: Callable[[], None] | None = None,
         on_heartbeat: Callable[[], None] | None = None,
         admission_deadline_at: float | None = None,
+        refresh_admission_deadline: Callable[[], float | None] | None = None,
     ) -> dict[str, int | str]:
         if admission_deadline_at is not None and (
             isinstance(admission_deadline_at, bool)
             or not isinstance(admission_deadline_at, (int, float))
             or not math.isfinite(admission_deadline_at)
         ):
+            raise LogicalEvidenceError("logical_evidence_budget_invalid")
+        if refresh_admission_deadline is not None and not callable(refresh_admission_deadline):
             raise LogicalEvidenceError("logical_evidence_budget_invalid")
         if cleanup_concurrency is None:
             cleanup_concurrency = upload_concurrency
@@ -2758,6 +2761,7 @@ class CanonicalLogicalEvidenceProjector:
                     pending[future] = candidate, batch
 
         def publish_with_refill(executor, callback):
+            nonlocal admission_deadline_at
             # Hand admission to one temporary feeder while this coordinator
             # runs the sole downstream callback. Only the feeder touches pending
             # until it is joined; accounting and body hints stay on this thread.
@@ -2801,6 +2805,16 @@ class CanonicalLogicalEvidenceProjector:
                 pending.update(ready)
             if errors:
                 raise errors[0]
+            # Only the coordinator can renew admission, after its callback and
+            # feeder have settled successfully. A failed/unknown callback cannot
+            # open more work; the original finite admission count still applies.
+            if refresh_admission_deadline is not None:
+                refreshed = refresh_admission_deadline()
+                if refreshed is not None:
+                    if (isinstance(refreshed, bool) or not isinstance(refreshed, (int, float))
+                            or not math.isfinite(refreshed)):
+                        raise LogicalEvidenceError("logical_evidence_budget_invalid")
+                    admission_deadline_at = refreshed
 
         try:
             with ThreadPoolExecutor(

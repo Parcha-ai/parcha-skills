@@ -425,10 +425,12 @@ def run_projection_worker(
             }
             parquet_elapsed_ms = 0
             parquet_serviced = False
+            completed_scan_admission_deadline = None
 
             def service_parquet(freshness_busy):
                 nonlocal cycles_since_parquet, last_parquet_started, parquet_serviced
                 nonlocal active_phase, phase_started, parquet_elapsed_ms
+                nonlocal completed_scan_admission_deadline
                 previous_phase, previous_started = active_phase, phase_started
                 if previous_phase == "logical":
                     phase_elapsed["logical_elapsed_ms"] = elapsed_ms(previous_started)
@@ -453,11 +455,16 @@ def run_projection_worker(
                     previous_started += clock() - phase_started
                     phase_elapsed["logical_elapsed_ms"] = 0
                 active_phase, phase_started = previous_phase, previous_started
+                # Renew only after the native scan settles. Merely starting a
+                # due scan (or losing its outcome) must not reopen admission.
+                if tick.get("status") == "complete" and tick.get("failed") == 0:
+                    completed_scan_admission_deadline = time.monotonic() + max(
+                        0.0, last_parquet_started + parquet_max_wait_seconds - clock()
+                    )
 
             def service_due_parquet():
-                # Admission stops at its original deadline; active logical owners
-                # can still take much longer. Service the same bounded scan on
-                # this coordinator without renewing admission or nesting callbacks.
+                # Service the same bounded scan while active owners settle.
+                # Successful completion allows the next finite admission window.
                 if scan is not None and clock() - last_parquet_started >= parquet_max_wait_seconds:
                     service_parquet(True)
 
@@ -538,6 +545,9 @@ def run_projection_worker(
                         0.0, last_parquet_started + parquet_max_wait_seconds - clock()
                     )
                     if scan is not None else None
+                ),
+                refresh_admission_deadline=(
+                    (lambda: completed_scan_admission_deadline) if scan is not None else None
                 ),
             )
             logical_elapsed_ms = elapsed_ms(phase_started)
