@@ -2649,7 +2649,9 @@ class CanonicalPassageProjector:
         on_progress: Callable[[], None] | None = None,
         certification_budget: CertificationBudget | None = None,
         certification_batch_size: int | None = None,
-    ) -> dict[str, int | str]:
+        defer_count: bool = False,
+    ) -> dict[str, int | str | None]:
+        """Publish bounded waves; deferred depth stays unknown until counted."""
         tenant_id = self._tenant(tenant_id)
         certification_budget = certification_budget or CertificationBudget()
         if certification_batch_size is None:
@@ -2848,18 +2850,13 @@ class CanonicalPassageProjector:
         membership_deferred += optional['membership_deferred_documents']
         membership_elapsed_ms += optional['membership_elapsed_ms']
         membership_failures.extend(optional['membership_failures'])
-        phase_started = time.monotonic()
-        with self.store.connect() as connection:
-            pending = connection.execute(
-                """SELECT count(*) AS count
-                     FROM canonical_passage_projection_queue
-                    WHERE (%s::text IS NULL OR tenant_id=%s) AND reason<>'certification'""",
-                (tenant_id, tenant_id),
-            ).fetchone()["count"]
-        count_seconds = time.monotonic() - phase_started
+        pending_summary = (
+            {"status": "unknown", "pending": None, "count_ms": 0}
+            if defer_count else self.count_pending(tenant_id=tenant_id)
+        )
         elapsed_seconds = max(0.001, time.monotonic() - started)
         return {
-            "status": "complete" if int(pending) == 0 else "pending",
+            **pending_summary,
             "documents": documents,
             "membership_certified_passages": membership_certified,
             "membership_failed_documents": membership_failed,
@@ -2875,7 +2872,6 @@ class CanonicalPassageProjector:
             "requeued": requeued,
             "unavailable": unavailable,
             "batches": batches,
-            "pending": int(pending),
             # Prepare/commit are accumulated owner durations and can overlap;
             # commit includes cap/connection waits. Other phases are coordinator
             # wall time. Failure diagnostics contain identities but no passage text.
@@ -2889,7 +2885,6 @@ class CanonicalPassageProjector:
             "prepare_reused_documents": preparation_counts['prepare_reused_documents'],
             "prepare_full_documents": preparation_counts['prepare_full_documents'],
             "commit_ms": max(0, round(commit_seconds * 1000)),
-            "count_ms": max(0, round(count_seconds * 1000)),
             "elapsed_seconds": round(elapsed_seconds, 3),
             "documents_per_second": round(
                 documents / elapsed_seconds,
@@ -2899,6 +2894,24 @@ class CanonicalPassageProjector:
                 passages / elapsed_seconds,
                 3,
             ),
+        }
+
+    def count_pending(self, *, tenant_id: str | None = None) -> dict[str, int | str]:
+        """Read exact ordinary queue depth at a caller's scheduling boundary."""
+        tenant_id = self._tenant(tenant_id)
+        phase_started = time.monotonic()
+        with self.store.connect() as connection:
+            pending = connection.execute(
+                """SELECT count(*) AS count
+                     FROM canonical_passage_projection_queue
+                    WHERE (%s::text IS NULL OR tenant_id=%s) AND reason<>'certification'""",
+                (tenant_id, tenant_id),
+            ).fetchone()["count"]
+        count_seconds = time.monotonic() - phase_started
+        return {
+            "status": "complete" if int(pending) == 0 else "pending",
+            "pending": int(pending),
+            "count_ms": max(0, round(count_seconds * 1000)),
         }
 
     def certify_pending(self, *, tenant_id, batch_size, certification_budget):

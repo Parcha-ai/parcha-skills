@@ -138,6 +138,7 @@ jobs:
             e2e_parquet_compaction_reuse.py \
             e2e_parquet_worker_fairness.py \
             e2e_passage_parquet_cadence.py \
+            e2e_passage_count_boundary.py \
             e2e_logical_cadence_readmission.py \
             e2e_parquet_upload_overlap.py \
             e2e_scan_upstream_completeness.py \

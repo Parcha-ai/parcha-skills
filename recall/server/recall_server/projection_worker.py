@@ -339,6 +339,7 @@ def run_projection_worker(
             projected: dict[str, Any] = {}
             searched: dict[str, Any] = {}
             passage_elapsed_ms = search_plane_elapsed_ms = 0
+            count_passages = getattr(passages, "count_pending", None)
 
             def accumulate(total, current):
                 # Queue depth/status describe the newest tick; work and elapsed
@@ -565,6 +566,7 @@ def run_projection_worker(
                     # Sequential metadata proof shares the coordinator allowance, not
                     # the concurrent body-preparation wave's row limit.
                     certification_batch_size=passage_batch_size,
+                    **({"defer_count": True} if callable(count_passages) else {}),
                 )
                 passage_elapsed_ms += elapsed_ms(phase_started)
                 phase_elapsed["passage_elapsed_ms"] = passage_elapsed_ms
@@ -576,6 +578,17 @@ def run_projection_worker(
                     publish_search()
                 if previous_phase == "logical":
                     previous_started += clock() - publication_started
+                active_phase, phase_started = previous_phase, previous_started
+
+            def refresh_passage_count():
+                nonlocal active_phase, phase_started, passage_elapsed_ms
+                if not callable(count_passages):
+                    return
+                previous_phase, previous_started = active_phase, phase_started
+                active_phase, phase_started = "passage", clock()
+                accumulate(projected, count_passages(tenant_id=tenant_id))
+                passage_elapsed_ms += elapsed_ms(phase_started)
+                phase_elapsed["passage_elapsed_ms"] = passage_elapsed_ms
                 active_phase, phase_started = previous_phase, previous_started
 
             def publish_progress():
@@ -614,6 +627,8 @@ def run_projection_worker(
             )
             logical_elapsed_ms = elapsed_ms(phase_started)
             phase_elapsed["logical_elapsed_ms"] = logical_elapsed_ms
+            # Logical completion can enqueue work after the final passage wave.
+            refresh_passage_count()
             # Parquet shards are source/month materializations of the authoritative
             # logical documents. Prefer to run them once the upstream queues have
             # drained so a dirty month is rebuilt once, but never starve them: with
@@ -646,6 +661,9 @@ def run_projection_worker(
                 # Logical work has finished; retain its completed duration.
                 active_phase, phase_started = "parquet", clock()
                 service_parquet(freshness_busy)
+            # A background passage wave invalidates the count read before scan.
+            if projected.get("pending") is None:
+                refresh_passage_count()
             active_phase = "thin"
             phase_started = clock()
             # Synchronous callers preserve the prior cadence. The background
