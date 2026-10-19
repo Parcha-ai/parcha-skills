@@ -1,4 +1,4 @@
-"""One immutable part may be reused, never authority or a failed read."""
+"""Bounded immutable parts may be reused, never authority or a failed read."""
 import hashlib
 import time
 import tracemalloc
@@ -33,14 +33,14 @@ class PartReuseTests(unittest.TestCase):
         self.assertEqual((self.meter.gets, self.meter.bytes), (3, 3*len(self.payload)))
         self.assertEqual((self.meter.reused_gets, self.meter.reused_bytes), (1, len(self.payload)))
 
-    def test_different_reference_evicts_even_with_identical_payload(self):
+    def test_different_reference_fetches_independently_even_with_identical_payload(self):
         with self.meter.reuse_part():
             for field, value in [('tenant_id','other'), ('source_id','other'), ('artifact_id','new'),
                                  ('version_id','new'), ('object_key','new')]:
                 self.meter.read_raw(self.reference)
                 self.meter.read_raw(dict(self.reference, **{field:value}))
                 self.meter.read_raw(self.reference)
-        self.assertEqual(self.delegate.read_raw.call_count, 11)
+        self.assertEqual(self.delegate.read_raw.call_count, 6)
 
     def test_changed_content_at_same_key_fetches_new_bytes(self):
         changed = b'new version\n'
@@ -125,6 +125,46 @@ class PartReuseTests(unittest.TestCase):
                 projection.read_part(self.reference, tenant_id='tenant', source_id='source')
                 digest.assert_called_once_with(self.payload)
         self.assertEqual(self.delegate.read_raw.call_count, 1)
+
+    def test_byte_bound_evicts_before_fetch_and_retains_multiple_small_parts(self):
+        size = len(self.payload)
+        references = [dict(self.reference, artifact_id=str(i)) for i in range(3)]
+        def measured(_reference):
+            self.assertLessEqual(self.meter._part_bytes, size)
+            return self.payload
+        self.delegate.read_raw.side_effect = measured
+        with patch('recall_server.retirement_runner.MAX_PART_BYTES', 2*size), self.meter.reuse_part():
+            for reference in references[:2]:
+                self.meter.read_raw(reference)
+            self.assertEqual(self.meter._part_bytes, 2*size)
+            self.meter.read_raw(references[0])  # A is newest; C must evict B.
+            self.meter.read_raw(references[2])
+            self.meter.read_raw(references[0])
+            self.assertEqual(self.delegate.read_raw.call_count, 3)
+            self.assertEqual(self.meter._part_bytes, 2*size)
+            self.meter.read_raw(references[1])
+            self.assertEqual(self.delegate.read_raw.call_count, 4)
+        self.assertEqual(self.meter._part_bytes, 0)
+        self.assertEqual(len(self.meter._parts), 0)
+
+    def test_entry_bound_evicts_only_and_never_rejects_valid_reads(self):
+        with patch('recall_server.retirement_runner._MAX_REUSED_PARTS', 2), self.meter.reuse_part():
+            for index in range(5):
+                self.assertEqual(self.meter.read_raw(dict(self.reference, artifact_id=str(index))), self.payload)
+                self.assertLessEqual(len(self.meter._parts), 2)
+        self.assertEqual(self.delegate.read_raw.call_count, 5)
+        self.assertEqual(self.meter.gets, 5)
+
+    def test_corrupt_second_part_discards_retention_without_accepting_it(self):
+        projection = LogicalEvidenceProjectionStore(self.meter)
+        self.delegate.read_raw.side_effect = [self.payload, b'x'*len(self.payload), self.payload]
+        with self.meter.reuse_part():
+            projection.read_part(self.reference, tenant_id='tenant', source_id='source')
+            with self.assertRaises(LogicalEvidenceError):
+                projection.read_part(dict(self.reference, artifact_id='other'), tenant_id='tenant', source_id='source')
+            projection.read_part(self.reference, tenant_id='tenant', source_id='source')
+        self.assertEqual(self.delegate.read_raw.call_count, 3)
+        self.assertEqual(self.meter.reused_gets, 0)
 
     def test_two_maximum_parts_retain_only_one_payload(self):
         from recall_server.logical_evidence import MAX_PART_BYTES

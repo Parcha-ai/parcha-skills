@@ -5,7 +5,7 @@ Schema075 retains detached intent after catalog deletion. Ordinary runs never
 enroll or rebind replacements; rebind requires a fresh explicit owner review.
 """
 
-from collections import Counter
+from collections import Counter, OrderedDict
 from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, dataclass, replace
 import hashlib
@@ -422,6 +422,8 @@ def _claim(store, *, scope, limits, deadline_at, attempted, diagnostic=None):
         return row
 
 
+_MAX_REUSED_PARTS = 64
+
 class RunArchive:
     """Charge attempted catalog bytes, including failed and reused reads.
 
@@ -435,17 +437,20 @@ class RunArchive:
         self.reused_gets = self.reused_bytes = 0
         self.read_ms = 0.0
         self._reuse = False
-        self._part = None
+        self._parts = OrderedDict()
+        self._part_bytes = 0
 
     @contextmanager
     def reuse_part(self):
-        """Retain at most one immutable part; never retain authority or proof."""
+        """Retain immutable parts within the original byte bound, never proof."""
         self._reuse = True
-        self._part = None
+        self._parts.clear()
+        self._part_bytes = 0
         try:
             yield
         finally:
-            self._part = None
+            self._parts.clear()
+            self._part_bytes = 0
             self._reuse = False
 
     def read_raw(self, reference):
@@ -470,25 +475,41 @@ class RunArchive:
             if self._reuse and reference.get("media_type") == PART_MEDIA_TYPE and 0 < size <= MAX_PART_BYTES:
                 # Full identity includes scope, locator/version, size and hash.
                 key = orjson.dumps(reference, option=orjson.OPT_SORT_KEYS)
-            if key is not None and self._part is not None and self._part[0] == key:
+            if key is not None and key in self._parts:
+                self._parts.move_to_end(key)
                 self.reused_gets += 1
                 self.reused_bytes += size
-                return self._part[1]
-            # Evict before fetching so two retained parts cannot accumulate,
-            # including when a new read fails or is not a logical part.
-            self._part = None
-            bounded = getattr(self.delegate, "read_raw_bounded", None)
-            payload = (
-                bounded(reference, deadline_at=deadline_at)
-                if deadline_at is not None and callable(bounded)
-                else self.delegate.read_raw(reference)
-            )
-            retain = (key is not None and type(payload) is bytes and len(payload) == size
-                      and hashlib.sha256(payload).hexdigest() == reference.get("content_sha256"))
-            if deadline_at is not None:
-                _remaining(deadline_at)
+                return self._parts[key]
+            # Reserve room before fetching: retained payloads plus the incoming
+            # part cannot exceed the original one-maximum-part byte ceiling.
+            if key is None:
+                self._parts.clear()
+                self._part_bytes = 0
+            else:
+                while self._parts and (self._part_bytes + size > MAX_PART_BYTES
+                        or len(self._parts) >= _MAX_REUSED_PARTS):
+                    self._part_bytes -= len(self._parts.popitem(last=False)[1])
+            try:
+                bounded = getattr(self.delegate, "read_raw_bounded", None)
+                payload = (
+                    bounded(reference, deadline_at=deadline_at)
+                    if deadline_at is not None and callable(bounded)
+                    else self.delegate.read_raw(reference)
+                )
+                retain = (key is not None and type(payload) is bytes and len(payload) == size
+                          and hashlib.sha256(payload).hexdigest() == reference.get("content_sha256"))
+                if deadline_at is not None:
+                    _remaining(deadline_at)
+            except BaseException:
+                self._parts.clear()
+                self._part_bytes = 0
+                raise
             if retain:
-                self._part = key, payload
+                self._parts[key] = payload
+                self._part_bytes += len(payload)
+            else:
+                self._parts.clear()
+                self._part_bytes = 0
             return payload
         finally:
             self.read_ms += (time.monotonic() - started) * 1000
