@@ -65,7 +65,9 @@ class ManagedSlackHistoryActors(ManagedSlackIdentity):
             result = original(runner)
             self.sdk_results.append(result)
             return result
-        with patch.object(ConnectorRunner, 'run_once', observed_run), patch(
+        # These controls isolate the original provider-history lane. The new
+        # captured-history entrypoint tests production run_once composition.
+        with patch('recall_server.slack_captured_attribution.repair_slice', return_value=None), patch.object(ConnectorRunner, 'run_once', observed_run), patch(
             'connectors.slack_workspace._now', side_effect=self.rail.timestamp
         ):
             return self.step(self.worker)
