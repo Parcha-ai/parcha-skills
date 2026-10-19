@@ -279,6 +279,7 @@ def run_projection_worker(
     certification_enabled = getattr(getattr(passages, "membership_certification", None), "enabled", False)
     certification_budget = CertificationBudget()
     last_certification_started = clock()
+    quiet_passages_during_parquet = False
     # A child can finish before a later publication phase fails. Carry its
     # observed counters until a successful cycle records them exactly once.
     retired = {"status": "disabled" if retirement_maintainer is None else "deferred"}
@@ -385,8 +386,17 @@ def run_projection_worker(
                         previous_started += clock() - phase_started
                     active_phase, phase_started = previous_phase, previous_started
 
+            passage_attempted_during_scan = False
+
             def publish_background():
-                publish_search()
+                nonlocal passage_attempted_during_scan
+                # One ordinary passage wave shares the coordinator while the
+                # existing scan settles; its progress callback only drains search.
+                if quiet_passages_during_parquet:
+                    publish_search()
+                else:
+                    passage_attempted_during_scan = True
+                    publish_ready()
                 maintain_certification()
 
             def maintain_retirement(busy):
@@ -473,7 +483,8 @@ def run_projection_worker(
             def service_parquet(freshness_busy):
                 nonlocal cycles_since_parquet, last_parquet_started, parquet_serviced
                 nonlocal active_phase, phase_started, parquet_elapsed_ms
-                nonlocal completed_scan_admission_deadline
+                nonlocal completed_scan_admission_deadline, quiet_passages_during_parquet
+                nonlocal passage_attempted_during_scan
                 previous_phase, previous_started = active_phase, phase_started
                 if previous_phase == "logical":
                     phase_elapsed["logical_elapsed_ms"] = elapsed_ms(previous_started)
@@ -481,14 +492,27 @@ def run_projection_worker(
                 cycles_since_parquet = 0
                 last_parquet_started = phase_started
                 parquet_serviced = True
-                tick = _parquet_with_publication(
-                    scan,
-                    publish_background if search_plane is not None or certification_enabled else None,
-                    tenant_id=tenant_id,
-                    batch_size=1 if freshness_busy else min(4, logical_batch_size),
-                    max_batches=1 if freshness_busy else max_batches_per_cycle,
-                    compaction_budget=0 if freshness_busy else 1,
-                )
+                passage_attempted_during_scan = False
+                try:
+                    tick = _parquet_with_publication(
+                        scan,
+                        publish_background if search_plane is not None or certification_enabled else None,
+                        tenant_id=tenant_id,
+                        batch_size=1 if freshness_busy else min(4, logical_batch_size),
+                        max_batches=1 if freshness_busy else max_batches_per_cycle,
+                        compaction_budget=0 if freshness_busy else 1,
+                    )
+                finally:
+                    # If publication raced this scan, reserve its successor a
+                    # quiet window even when the scan's outcome is unknown.
+                    if passage_attempted_during_scan:
+                        quiet_passages_during_parquet = True
+                if (
+                    tick.get("status") == "complete" and tick.get("failed") == 0
+                    and tick.get("stale") == 0 and tick.get("contended") == 0
+                    and tick.get("requeued") == 0
+                ):
+                    quiet_passages_during_parquet = False
                 parquet_elapsed_ms += elapsed_ms(phase_started)
                 phase_elapsed["parquet_elapsed_ms"] = parquet_elapsed_ms
                 accumulate(scanned, tick)
