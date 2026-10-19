@@ -9,6 +9,7 @@ from unittest.mock import patch
 from psycopg import ServerCursor, sql
 
 from e2e_parent_membership_enrollment import ParentEnrollmentTests
+from recall_server import parent_membership_enrollment as enrollment
 from recall_server import parent_membership_read as reader
 from recall_server.db import SearchDeadlineExceeded
 from recall_server.logical_evidence import LogicalEvidenceProjectionStore
@@ -212,7 +213,7 @@ class ParquetCertificateTests(ParentEnrollmentTests):
         self.assertEqual(native.call_count, 1)
         self.assertEqual(native.call_args.kwargs['receipts'], (self.physical_receipt,))
 
-    def test_changed_exact_binding_fields_always_use_native(self):
+    def test_changed_fields_follow_exact_binding_contract(self):
         changes = (
             ('canonical_passages', 'text_sha256', 'a' * 64),
             ('canonical_passages', 'receipts', ['recall://' + self.source + '/missing?rev=1#item=0']),
@@ -232,7 +233,14 @@ class ParquetCertificateTests(ParentEnrollmentTests):
                 with patch('recall_server.receipt_membership.lookup_current_search_membership',
                            wraps=lookup_current_search_membership) as native:
                     self.assertEqual(self.stream(), baseline)
-                self.assertEqual(native.call_count, 1)
+                stable = column not in enrollment._BINDING_FIELDS
+                self.assertEqual(native.call_count, 0 if stable else 1)
+                if stable:
+                    self.assertTrue(baseline)
+                    compared = self.compare()
+                    self.assertEqual(compared['native_allowed_passages'], len(self.ids))
+                    self.assertEqual(compared['certified_passages'], len(self.ids))
+                    self.assertEqual(compared['disagreements'], 0)
                 with self.store.connect() as c:
                     c.execute(update, (old, self.tenant))
 
@@ -374,14 +382,20 @@ class ParquetCertificateTests(ParentEnrollmentTests):
         with patch('recall_server.receipt_membership.lookup_current_search_membership',
                    wraps=lookup_current_search_membership) as native:
             self.assertEqual(self.stream(), baseline)
-        self.assertEqual(native.call_count, 1)
+        self.assertEqual(native.call_count, 0 if self.additive_membership_generation else 1)
+        self.assertEqual(self.stream(False), baseline)
+        if self.additive_membership_generation:
+            compared = self.compare()
+            self.assertEqual(compared['native_allowed_passages'], len(self.ids))
+            self.assertEqual(compared['certified_passages'], len(self.ids))
+            self.assertEqual(compared['disagreements'], 0)
         self.enroll()
         with patch('recall_server.receipt_membership.lookup_current_search_membership',
                    wraps=lookup_current_search_membership) as native:
             self.assertEqual(self.stream(), baseline)
         native.assert_not_called()
 
-    def test_publication_revision_change_uses_native_without_dropping_passage(self):
+    def test_publication_revision_change_preserves_native_rows_under_binding_contract(self):
         self.enroll()
         with self.store.connect() as c:
             c.execute('UPDATE canonical_passage_documents SET revision=revision+1 WHERE tenant_id=%s',
@@ -391,7 +405,19 @@ class ParquetCertificateTests(ParentEnrollmentTests):
         with patch('recall_server.receipt_membership.lookup_current_search_membership',
                    wraps=lookup_current_search_membership) as native:
             self.assertEqual(self.stream(), baseline)
+        stable = 'projected_revision' not in enrollment._BINDING_FIELDS
+        self.assertEqual(native.call_count, 0 if stable else 1)
+        if stable:
+            compared = self.compare()
+            self.assertEqual(compared['native_allowed_passages'], len(self.ids))
+            self.assertEqual(compared['certified_passages'], len(self.ids))
+            self.assertEqual(compared['disagreements'], 0)
+        self.edit()
+        with patch('recall_server.receipt_membership.lookup_current_search_membership',
+                   wraps=lookup_current_search_membership) as native:
+            self.assertEqual(self.stream(), [])
         self.assertEqual(native.call_count, 1)
+        self.assertEqual(self.stream(False), [])
 
     def test_stream_orders_before_receipt_filter_and_enrichment(self):
         self.store.search_deadline_ms = 5000

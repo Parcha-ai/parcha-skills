@@ -111,6 +111,7 @@ class ParquetFairness(SparsePlanning):
                 'ORDER BY first_occurred_at DESC,passage_id DESC LIMIT 1',
                 (self.tenant,)).fetchone()['receipts'][0]
         blocked, release, published = (threading.Event() for _ in range(3))
+        allow_publication = threading.Event()
         calls = []
         native_build, native_verify = self.scan._build, self.archive.verify_raw_bounded
         client = FakeTurbopuffer()
@@ -133,6 +134,10 @@ class ParquetFairness(SparsePlanning):
             return native_verify(reference, deadline_at=time.monotonic() + 1)
 
         def publish():
+            # The worker normally drains existing outbox work before Parquet.
+            # Start this fixture's writer only after the paused-state assertion.
+            if not allow_publication.is_set():
+                return dict(status='complete', rows=0, pending=1)
             result = writer.drain_quantum(tenant_id=self.tenant, max_months=1)
             if blocked.is_set() and any(
                 target_receipt in row.get('receipts', [])
@@ -160,6 +165,7 @@ class ParquetFairness(SparsePlanning):
                     target_receipt in row.get('receipts', [])
                     for namespace in client.namespaces.values() for row in namespace.rows.values()
                 ), 'fixture search work already published before archive pause')
+                allow_publication.set()
                 self.assertTrue(published.wait(3), 'publication waited behind archive admission')
                 self.assertFalse(future.done())
                 self.assertEqual(calls, ['build'])

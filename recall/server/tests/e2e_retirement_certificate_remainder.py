@@ -98,6 +98,22 @@ class RetirementCertificateRemainderTests(RetirementMembershipTests):
         )
         self.assertEqual(rows[0]["checkpoint"]["after"], attempted[0][-1])
         capture = membership._capture
+        resumed_ids = []
+        if self.additive_membership_generation:
+            self.refresh_scope()
+            with self.store.connect() as connection:
+                before = connection.execute(
+                    "SELECT passage_id,text_sha256,receipts,membership_generation,"
+                    "membership_binding_sha256 FROM canonical_passages "
+                    "WHERE tenant_id=%s ORDER BY passage_id", (self.tenant,),
+                ).fetchall()
+            prefix = next(row for row in before if row["passage_id"] == attempted[0][0])
+            self.assertEqual(prefix["membership_generation"], rows[0]["checkpoint"]["authority_generation"])
+            self.assertTrue(prefix["membership_binding_sha256"])
+
+        def track_resume(*args, **kwargs):
+            resumed_ids.extend(kwargs["passage_ids"])
+            return original(*args, **kwargs)
 
         def retire_after_capture(*args, **kwargs):
             captured = capture(*args, **kwargs)
@@ -108,10 +124,52 @@ class RetirementCertificateRemainderTests(RetirementMembershipTests):
             self.assertEqual(self.run_retirement(enabled=False)["completed_parent_proofs"], 1)
             return captured
 
-        with patch.object(membership, "_capture", side_effect=retire_after_capture):
+        with (patch.object(membership, "_capture", side_effect=retire_after_capture),
+              patch.object(membership, "enroll_parent_passages", side_effect=track_resume)):
             outcome = membership_remainder.resume(
                 self.store, rows[0], settings=self.settings(), deadline_at=time.monotonic()+10,
             )
+        if self.additive_membership_generation:
+            # Exact singleton retirement preserves membership on092. Resume the
+            # unproved tail without redoing the already acknowledged prefix.
+            self.assertEqual(outcome["status"], "enrolled")
+            self.assertEqual(resumed_ids, [row["passage_id"] for row in before
+                                          if row["passage_id"] > rows[0]["checkpoint"]["after"]])
+            self.assertEqual(outcome["certified_passages"], len(before) - 1)
+            self.assertEqual(membership_remainder.pending(
+                self.store, tenant_id=self.tenant, limit=10, deadline_at=time.monotonic()+3,
+            ), [])
+            with self.store.connect() as connection:
+                after = connection.execute(
+                    "SELECT passage_id,text_sha256,receipts,membership_generation,"
+                    "membership_binding_sha256 FROM canonical_passages "
+                    "WHERE tenant_id=%s ORDER BY passage_id", (self.tenant,),
+                ).fetchall()
+                generation = connection.execute(
+                    "SELECT generation FROM canonical_parent_authority WHERE tenant_id=%s "
+                    "AND source_id=%s AND native_parent_id='session'",
+                    (self.tenant, self.source),
+                ).fetchone()["generation"]
+            self.assertEqual(generation, rows[0]["checkpoint"]["authority_generation"])
+            self.assertEqual(next(row for row in after if row["passage_id"] == prefix["passage_id"]), prefix)
+            self.assertEqual(
+                [{key: row[key] for key in ("passage_id", "text_sha256", "receipts")} for row in after],
+                [{key: row[key] for key in ("passage_id", "text_sha256", "receipts")} for row in before],
+            )
+            compared = self.compare()
+            self.assertEqual(compared["native_allowed_passages"], len(before))
+            self.assertEqual(compared["certified_passages"], len(before))
+            self.assertEqual(compared["disagreements"], 0)
+            with patch.object(membership, "enroll_parent_passages",
+                              side_effect=AssertionError("completed queue must not reprove")):
+                resumed = self.publisher().project_pending(
+                    tenant_id=self.tenant, batch_size=10, max_batches=1, concurrency=1,
+                )
+            self.assertEqual(resumed["documents"], 0)
+            self.assertEqual(resumed["membership_certified_passages"], 0)
+            return
+        # On091 retirement invalidates the prefix; retain the original failure
+        # outcome, unchanged queue and full reproof assertions below.
         self.assertEqual(outcome["status"], "changed")
         self.assertEqual(outcome["certified_passages"], 0)
         self.assertEqual(membership_remainder.pending(

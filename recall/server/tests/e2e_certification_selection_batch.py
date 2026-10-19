@@ -96,6 +96,17 @@ class CertificationSelectionTests(ParentMembershipPublicationTests):
         for parent in parents[:2]:
             self.source = parent["source_id"]
             self.ingest("turn/unprojected", "Synthetic pending source update")
+            if self.additive_membership_generation:
+                # On092 a pending additive ingest is safe to certify. Hold an
+                # actual parent maintenance intent to exercise busy selection.
+                with self.store.connect() as connection:
+                    connection.execute("""INSERT INTO canonical_retirement_source_policy(
+                        tenant_id,source_id,principal_id,maintenance_intent)
+                        SELECT tenant_id,source_id,%s,
+                               jsonb_build_object('parent',native_parent_id)
+                        FROM canonical_evidence_documents
+                        WHERE tenant_id=%s AND source_id=%s AND logical_document_id=%s""",
+                        (self.principal, *remainder.key(parent)))
         self.source = original_source
         outcome = self.worker_cycle(self.publisher())
         self.assertEqual(outcome["membership_deferred_documents"], 2)

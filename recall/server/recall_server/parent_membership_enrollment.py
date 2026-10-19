@@ -21,8 +21,6 @@ _CERTIFICATION_LIMITS = dict(passages=128,receipt_references=20000,metadata_byte
 _BINDING_FIELDS = (
     'tenant_id', 'source_id', 'native_parent_id', 'logical_document_id',
     'passage_id', 'policy_fingerprint', 'text_sha256', 'receipts',
-    'manifest_content_sha256', 'manifest_revision', 'projected_revision',
-    'passage_revision', 'source_document_sha256',
 )
 _SELECT = """SELECT passage.tenant_id,passage.source_id,passage.passage_id,
     passage.logical_document_id,passage.policy_fingerprint,passage.text_sha256,
@@ -141,7 +139,7 @@ def _rows(store, connection, scope, deadline, *, lock=False):
 
 
 def _binding(row, scope):
-    payload=['recall.passage-membership-binding.v2',scope['binding_epoch'],*[row[field] for field in _BINDING_FIELDS]]
+    payload=['recall.passage-membership-binding.v3',scope['binding_epoch'],*[row[field] for field in _BINDING_FIELDS]]
     return hashlib.sha256(json.dumps(payload,ensure_ascii=False,separators=(',',':'),allow_nan=False).encode()).hexdigest()
 
 
