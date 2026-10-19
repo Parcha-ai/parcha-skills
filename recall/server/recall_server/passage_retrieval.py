@@ -291,6 +291,7 @@ def collapse_document_candidates(
     passage_budget: int | Literal["admitted"] | None = None,
     dense_nominations: frozenset[tuple[str, str]] | None = None,
     preserve_arm_passages: bool = False,
+    share_arm_nominations: bool = False,
 ) -> list[dict[str, Any]]:
     """Fuse mechanical hints while keeping their strongest exact ranges.
 
@@ -319,6 +320,7 @@ def collapse_document_candidates(
 
     documents: dict[str, dict[str, Any]] = {}
     nominated_documents: set[tuple[str, str]] = set()
+    arm_prefixes: list[list[tuple[str, str]]] = []
     passage_scores: dict[tuple[str, str, str], float] = {}
     if passage_budget is not None and (
         fusion != "rrf" or (passage_budget != "admitted" and (
@@ -343,6 +345,8 @@ def collapse_document_candidates(
                 "normalized": normalized,
             }
         seen_documents: set[str] = set()
+        prefix: list[tuple[str, str]] = []
+        arm_prefixes.append(prefix)
         for rank, row in enumerate(rows, start=1):
             document_id = row["logical_document_id"]
             value = documents.setdefault(
@@ -366,6 +370,8 @@ def collapse_document_candidates(
                 },
             )
             if document_id not in seen_documents:
+                if share_arm_nominations and len(prefix) < limit:
+                    prefix.append((row["source_id"], document_id))
                 if (
                     (row["source_id"], document_id) in dense_nominations
                     if leg_name == "dense" and dense_nominations is not None
@@ -467,6 +473,27 @@ def collapse_document_candidates(
     )
     ranked = ordered[:limit]
     if nominate_per_arm > 0:
+        if share_arm_nominations and fusion == "rrf":
+            # Preserve the fused head and original nominees. Share unused
+            # overflow slots among strong arm prefixes already bounded by
+            # the head depth, rather than wasting slots on the same parents.
+            admitted = {(value["source_id"], value["logical_document_id"])
+                        for value in ranked} | nominated_documents
+            remaining = max(0, limit + len(legs) * nominate_per_arm - len(admitted))
+            prefixes = [iter(prefix) for prefix in arm_prefixes]
+            while remaining:
+                added = False
+                for prefix in prefixes:
+                    key = next((key for key in prefix if key not in admitted), None)
+                    if key is not None:
+                        admitted.add(key)
+                        nominated_documents.add(key)
+                        remaining -= 1
+                        added = True
+                        if not remaining:
+                            break
+                if not added:
+                    break
         # Each arm nominates its own top documents past the fused cut so a
         # small-alpha arm's best evidence still reaches the reranker; the
         # first ``limit`` rows are untouched, the nominations follow them in
@@ -2714,6 +2741,7 @@ class PassageHintRetrieval:
         if balanced_passages:
             collapse_options["passage_budget"] = "admitted"
             collapse_options["preserve_arm_passages"] = True
+            collapse_options["share_arm_nominations"] = True
             collapse_options["dense_nominations"] = dense_nominations
         results = collapse_document_candidates(legs, **collapse_options)
         if balanced_passages:
