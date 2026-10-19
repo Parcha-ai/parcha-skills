@@ -154,7 +154,8 @@ class ToolGroupPublication(unittest.TestCase):
         self.assertTrue({p['passage_id'] for p in before} <= {p['passage_id'] for p in after})
         self.assertEqual(self.document()['requested_extraction_version'], 'tool_groups_v1')
         self.assertEqual(self.document()['applied_extraction_version'], 'tool_groups_v1')
-        self.assertIsNone(self.document()['append_checkpoint'])
+        self.assertEqual(self.document()['append_checkpoint']['tool_groups']['extraction_version'],
+                         'tool_groups_v1')
         for prior in before:
             current = next(p for p in after if p['passage_id'] == prior['passage_id'])
             for field in ('text_redacted', 'text_sha256', 'embed_sha256', 'spans'):
@@ -212,7 +213,8 @@ class ToolGroupPublication(unittest.TestCase):
         # The input's group-local coordinates survive a later visible message.
         self.assertTrue(any(p['passage_id'] in ids and 'tool-input' in json.dumps(p['spans'])
                             for p in self.projected()))
-        self.assertIsNone(self.document()['append_checkpoint'])
+        self.assertEqual(self.document()['append_checkpoint']['tool_groups']['extraction_version'],
+                         'tool_groups_v1')
 
     def test_wrong_tenant_stale_manifest_and_unknown_version_do_not_enqueue(self):
         self.ingest('input'); self.project(); before = self.document()
