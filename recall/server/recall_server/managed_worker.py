@@ -728,15 +728,17 @@ class ManagedConnectorWorker:
             derive_slack_actor_identities(connection, tenant_id=tenant,
                 events=admitted, identity_index=self.plane.actor_identity_index)
 
-    def _require_captured_slack_event(self, connection, row, native_id, expected_events):
-        current = connection.execute("""SELECT event.event_id,event.content_sha256
+    def _require_captured_slack_event(self, connection, row, native_id, expected_events, *, captured_document=False):
+        current = connection.execute("""SELECT event.event_id,event.content_sha256,
+                CASE WHEN %s THEN event.canonical_redacted END AS captured_document
             FROM canonical_documents document JOIN canonical_events event USING(tenant_id,source_id,event_id)
             WHERE document.tenant_id=%s AND document.source_id=%s AND document.native_id=%s
               AND document.is_current AND document.deleted_at IS NULL AND NOT event.is_tombstone
               AND event.canonical_redacted#>>'{provenance,connector_id}'='slack.messages'
-            FOR SHARE OF document,event""", (row['tenant_id'], row['source_id'], native_id)).fetchone()
+            FOR SHARE OF document,event""", (captured_document, row['tenant_id'], row['source_id'], native_id)).fetchone()
         if current is None or (current['event_id'], current['content_sha256']) != expected_events.get(native_id):
             raise ControlError('connector_record_changed')
+        return current['captured_document']
 
     @staticmethod
     def _slack_record_event(row, record):
@@ -750,9 +752,16 @@ class ManagedConnectorWorker:
             occurred_at=record.occurred_at, provenance=decision.value["provenance"],
             parent=record.native_parent_id)
 
-    def _reconcile_slack_page(self, row, records, *, expected_events=None):
+    def _reconcile_slack_page(self, row, records, *, expected_events=None, captured_documents=()):
         self._enroll_slack_contacts(row, records, expected_events=expected_events)
         prepared = {}
+        for event in captured_documents:
+            # The captured reader validates this accepted canonical commitment.
+            # Reuse its typed references without double-redacting stored content.
+            if (expected_events is None or event['source_id'] != row['source_id']
+                    or event['content'].get('kind') != 'document.v1'):
+                raise ControlError('connector_record_changed')
+            prepared[(event['native_id'], event['content_sha256'])] = event
         for record in records:
             if (record.deleted or record.schema_version != 2
                     or record.content.get("kind") != "communication_message.v1"
