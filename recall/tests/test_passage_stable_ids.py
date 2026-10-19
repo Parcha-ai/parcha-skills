@@ -254,6 +254,10 @@ class FakeConnection:
         yield
 
     @contextmanager
+    def pipeline(self):
+        yield
+
+    @contextmanager
     def cursor(self):
         yield FakeCursor(self)
 

@@ -44,6 +44,72 @@ class PassageAppendTail(HandbackPublication):
         self.assertTrue({r['passage_id']for r in before[:-1]}<={r['passage_id']for r in after})
         print(dict(full_archive_bytes=full_bytes,actual_archive_bytes=sum(reads),parts_read=len(reads),prepare_metadata_queries=len(metadata_ms),prepare_metadata_ms=metadata_ms))
 
+    def test_commit_catalog_batches_locks_without_changing_publication(self):
+        import json
+        import psycopg
+        from psycopg.pq import PipelineStatus
+        from recall_server.passage_projection import canonical_spans_json
+
+        self.source = 'claude:' + self.source
+        self.seed()
+        candidate = self.append()
+        prepared = self.passages._prepare(candidate, incremental=True)
+        oracle = self.assert_oracle(candidate, prepared)
+        statements = []
+        execute = psycopg.Connection.execute
+
+        def observed(connection, query, *args, **kwargs):
+            statements.append((str(query), connection.info.pipeline_status))
+            return execute(connection, query, *args, **kwargs)
+
+        started = time.monotonic()
+        with patch.object(psycopg.Connection, 'execute', observed):
+            result = self.passages._commit(prepared)
+        elapsed = time.monotonic() - started
+        self.assertEqual(result['status'], 'committed')
+        expected = [(p.passage_id, p.ordinal, p.revision, list(p.receipts), p.text,
+                     json.loads(canonical_spans_json(p.spans)), list(p.roles))
+                    for p in oracle.passages]
+        actual = [(r['passage_id'], r['ordinal'], r['revision'], r['receipts'], r['text_redacted'],
+                   r['spans'], r['roles'])
+                  for r in self.projected()]
+        self.assertEqual(actual, expected)
+        first = next(i for i, (sql, _) in enumerate(statements)
+                     if 'pg_advisory_xact_lock' in sql)
+        catalog = statements[first:first + 6]
+        self.assertEqual(len(catalog), 6)
+        self.assertIn('pg_advisory_xact_lock', catalog[0][0])
+        self.assertIn('pg_advisory_xact_lock', catalog[1][0])
+        self.assertIn('canonical_passage_projection_queue', catalog[2][0])
+        self.assertIn('canonical_evidence_documents', catalog[3][0])
+        self.assertIn('canonical_passage_documents', catalog[4][0])
+        self.assertIn("queued.reason='forget'", catalog[5][0])
+        print(dict(commit_statements=len(statements), catalog_statements=len(catalog),
+                   catalog_pipelined=sum(state == PipelineStatus.ON for _, state in catalog),
+                   commit_ms=round(elapsed * 1000, 3), passages=len(actual)))
+        self.assertTrue(all(state == PipelineStatus.ON for _, state in catalog),
+                        'independent commit catalog statements require serial exchanges')
+
+    def test_commit_catalog_refuses_pending_forget_without_acknowledging_publication(self):
+        self.source = 'claude:' + self.source
+        self.seed()
+        candidate = self.append()
+        prepared = self.passages._prepare(candidate, incremental=True)
+        before = self.projected()
+        with self.store.connect() as connection:
+            connection.execute("""INSERT INTO canonical_evidence_document_queue(
+                tenant_id,source_id,native_parent_id,reason) VALUES (%s,%s,'session-one','forget')
+                ON CONFLICT(tenant_id,source_id,native_parent_id)
+                DO UPDATE SET reason='forget'""", (self.tenant, self.source))
+            queued = connection.execute('SELECT * FROM canonical_passage_projection_queue WHERE tenant_id=%s',
+                                        (self.tenant,)).fetchall()
+        self.assertEqual(self.passages._commit(prepared), {'status': 'stale'})
+        self.assertEqual(self.projected(), before)
+        with self.store.connect() as connection:
+            self.assertEqual(connection.execute(
+                'SELECT * FROM canonical_passage_projection_queue WHERE tenant_id=%s',
+                (self.tenant,)).fetchall(), queued)
+
     def next_candidate(self):
         self.logical.project_pending(tenant_id=self.tenant,batch_size=1,max_batches=1,upload_concurrency=1)
         return self.passages._pending(tenant_id=self.tenant,limit=1)[0]

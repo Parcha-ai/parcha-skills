@@ -1524,49 +1524,56 @@ class CanonicalPassageProjector:
             with connection.transaction():
                 # Logical publication takes the parent catalog before this
                 # queue. Serialize commit before taking the opposite FK order.
-                connection.execute(
-                    "SELECT pg_advisory_xact_lock(hashtextextended(%s,0))",
-                    ("logical-evidence\x1f" + candidate.logical_document_id,),
-                )
-                connection.execute(
-                    "SELECT pg_advisory_xact_lock(hashtextextended(%s,0))",
-                    ("lossless-passages\x1f" + candidate.logical_document_id,),
-                )
-                queued = connection.execute(
-                    """SELECT revision,generation,changed_at
+                # These ordered locks/reads depend only on the candidate.
+                # Synchronize before consuming results or changing publication.
+                with connection.pipeline():
+                    connection.execute(
+                        "SELECT pg_advisory_xact_lock(hashtextextended(%s,0))",
+                        ("logical-evidence\x1f" + candidate.logical_document_id,),
+                    )
+                    connection.execute(
+                        "SELECT pg_advisory_xact_lock(hashtextextended(%s,0))",
+                        ("lossless-passages\x1f" + candidate.logical_document_id,),
+                    )
+                    queued_cursor = connection.execute(
+                        """SELECT revision,generation,changed_at
                          FROM canonical_passage_projection_queue
                         WHERE tenant_id=%s AND source_id=%s
                           AND logical_document_id=%s AND reason<>'certification'
                         FOR UPDATE""",
-                    (
-                        candidate.tenant_id,
-                        candidate.source_id,
-                        candidate.logical_document_id,
-                    ),
-                ).fetchone()
-                current = connection.execute(
-                    """SELECT revision,document_content_sha256,first_occurred_at,last_occurred_at
+                        (
+                            candidate.tenant_id,
+                            candidate.source_id,
+                            candidate.logical_document_id,
+                        ),
+                    )
+                    current_cursor = connection.execute(
+                        """SELECT revision,document_content_sha256,first_occurred_at,last_occurred_at
                          FROM canonical_evidence_documents
                         WHERE tenant_id=%s AND source_id=%s
                           AND logical_document_id=%s""",
-                    (
-                        candidate.tenant_id,
-                        candidate.source_id,
-                        candidate.logical_document_id,
-                    ),
-                ).fetchone()
-                extraction = connection.execute("""SELECT requested_extraction_version,applied_extraction_version,
+                        (
+                            candidate.tenant_id,
+                            candidate.source_id,
+                            candidate.logical_document_id,
+                        ),
+                    )
+                    extraction_cursor = connection.execute("""SELECT requested_extraction_version,applied_extraction_version,
                     revision,source_document_sha256,policy_fingerprint
                     FROM canonical_passage_documents
                     WHERE tenant_id=%s AND source_id=%s AND logical_document_id=%s FOR UPDATE""",
-                    (candidate.tenant_id, candidate.source_id, candidate.logical_document_id)).fetchone()
-                forgetting = (connection.execute("""SELECT 1
+                        (candidate.tenant_id, candidate.source_id, candidate.logical_document_id))
+                    forgetting_cursor = (connection.execute("""SELECT 1
                     FROM canonical_evidence_document_queue queued
                     JOIN canonical_evidence_documents evidence USING(tenant_id,source_id,native_parent_id)
                     WHERE evidence.tenant_id=%s AND evidence.source_id=%s
                       AND evidence.logical_document_id=%s AND queued.reason='forget'""",
-                    (candidate.tenant_id, candidate.source_id, candidate.logical_document_id)).fetchone()
-                    if candidate.extraction_version != 'legacy' else None)
+                        (candidate.tenant_id, candidate.source_id, candidate.logical_document_id))
+                        if candidate.extraction_version != 'legacy' else None)
+                queued = queued_cursor.fetchone()
+                current = current_cursor.fetchone()
+                extraction = extraction_cursor.fetchone()
+                forgetting = forgetting_cursor.fetchone() if forgetting_cursor is not None else None
                 if (
                     queued is None
                     or current is None
