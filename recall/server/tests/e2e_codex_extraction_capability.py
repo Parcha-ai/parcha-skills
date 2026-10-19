@@ -57,7 +57,7 @@ def scenario(admin_dsn, root, retired):
                 connection.execute(sql.SQL("ALTER TABLE canonical_passage_documents DROP CONSTRAINT {}, ADD CONSTRAINT {} CHECK ({} IN ('legacy','tool_groups_v1'))").format(
                     sql.Identifier('canonical_passage_documents_'+field+'_check'),
                     sql.Identifier('canonical_passage_documents_'+field+'_check'),sql.Identifier(field)))
-            connection.execute('DELETE FROM schema_migrations WHERE version=90')
+            connection.execute('DELETE FROM schema_migrations WHERE version>=90')
         tenant, source, _, projection, _, _ = original.fixture(store, root, count=2)
         with store.connect() as connection:
             port = connection.info.port
@@ -122,13 +122,17 @@ def scenario(admin_dsn, root, retired):
         with store.connect() as connection:
             state = connection.execute('SELECT requested_extraction_version,applied_extraction_version FROM canonical_passage_documents WHERE tenant_id=%s', (tenant2,)).fetchone()
             assert state == dict(requested_extraction_version='legacy', applied_extraction_version='legacy')
-            connection.execute('INSERT INTO schema_migrations(version) VALUES(91)')
+        store.migrate(retire_postgres_plane=retired)
+        assert probe_database(app_dsn, profile='local-fixture')['schema_version'] == 91
+        assert reader.show(receipt) == before
+        with store.connect() as connection:
+            connection.execute('INSERT INTO schema_migrations(version) VALUES(92)')
         try:
             probe_database(app_dsn, profile='local-fixture')
         except CapabilityError as error:
             assert error.code == 'schema_drift'
         else:
-            raise AssertionError('unknown schema91 accepted')
+            raise AssertionError('unknown schema92 accepted')
     finally:
         if runtime is not None:
             runtime.close()
@@ -147,7 +151,7 @@ def main():
                             RECALL_TPUF_CLIENT_FACTORY='tests.central_brain.fake_turbopuffer:factory',
                             RECALL_TPUF_FAKE_STATE=str(root / 'vendor-fixture.json')):
                 scenario(os.environ['RECALL_DATABASE_URL'], root, retired)
-    print('PASS schema89/90 native startup, exact reads, legacy publication, strict typed-role/version constraints, both planes, unknown91 refusal')
+    print('PASS schema89/90 native startup, exact reads, legacy publication, strict typed-role/version constraints, both planes, unknown92 refusal')
 
 
 if __name__ == '__main__':

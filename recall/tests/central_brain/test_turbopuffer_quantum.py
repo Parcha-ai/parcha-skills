@@ -68,7 +68,7 @@ class QuantumTests(unittest.TestCase):
         self.assertTrue(all(reference() is None for reference in references))
         self.assertEqual(catalog.shards, {})
 
-    def test_restart_replays_unfinished_month_without_early_watermark(self):
+    def test_restart_resumes_acknowledged_page_without_early_watermark(self):
         catalog, projector, client = self.fixture()
         self.assertEqual(quantum(projector)['months'], 0)
         self.assertEqual(catalog.shards, {})
@@ -79,7 +79,7 @@ class QuantumTests(unittest.TestCase):
             quantum(restarted)
         ns = client.namespace(SETTINGS.namespace(TENANT))
         first_id = catalog.passages[0]['passage_id']
-        self.assertEqual(sum(first_id in _upserts(write) for write in ns.writes), 2)
+        self.assertEqual(sum(first_id in _upserts(write) for write in ns.writes), 1)
         self.assertEqual(len(ns.rows), 5)
         self.assertEqual(catalog.shards[(SOURCE, JULY)]['built_at'], catalog.watermark)
 
