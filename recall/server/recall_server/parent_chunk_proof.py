@@ -14,7 +14,10 @@ import time
 import orjson
 
 from .chunk_bodies import _EXCLUDED_TYPES, _check_deadline, _record_location, _verified_body
-from .locator_backfill_plan import _DOCUMENTS_SQL, _MeteredArchive, _PARENT_SQL
+from .locator_backfill_plan import (
+    _DOCUMENTS_FROM_SQL, _DOCUMENTS_SELECT_SQL, _DOCUMENTS_SQL,
+    _MeteredArchive, _PARENT_SQL,
+)
 from .logical_body_proof import iter_parent_bodies
 
 # Metadata only: bodies remain in PostgreSQL/archive; the per-row and spool
@@ -241,18 +244,17 @@ def _capture(store, spool, scope, limits, deadline_at, *, capture_metrics=None, 
             # Retain the native scope/type checks without issuing another query.
             lookup_receipt_metadata(store, tenant_id=scope[0], authorized_sources=(scope[1],),
                 receipts=(), allow_verified_singletons=True, connection=connection, deadline_at=deadline_at)
-            membership_columns = ''', authority.is_current AS membership_current,
-                authority.deleted_at AS membership_deleted,
-                authority.chunk_receipt_profile AS membership_profile,
-                CASE WHEN authority.chunk_receipt_profile IS NOT NULL THEN EXISTS (
+            membership_columns = ''', document.is_current AS membership_current,
+                document.deleted_at AS membership_deleted,
+                document.chunk_receipt_profile AS membership_profile,
+                CASE WHEN document.chunk_receipt_profile IS NOT NULL THEN EXISTS (
                     SELECT 1 FROM canonical_chunks remaining
-                    WHERE remaining.tenant_id=authority.tenant_id AND remaining.source_id=authority.source_id
-                      AND remaining.document_id=authority.document_id
+                    WHERE remaining.tenant_id=document.tenant_id AND remaining.source_id=document.source_id
+                      AND remaining.document_id=document.document_id
                 ) ELSE false END AS membership_physical'''
-            membership_join = ''' JOIN canonical_documents authority
-                ON authority.tenant_id=captured.tenant_id AND authority.source_id=captured.source_id
-                  AND authority.document_id=captured.document_id'''
-            selected_sql = 'SELECT captured.*' + membership_columns + ' FROM (' + _DOCUMENTS_SQL + ') captured' + membership_join
+            # The selected document is already the exact current tuple in this
+            # statement's RR snapshot; do not fetch it again by primary key.
+            selected_sql = _DOCUMENTS_SELECT_SQL + membership_columns + _DOCUMENTS_FROM_SQL
             chunk_columns = ',chunk_id'
         sql = '''SELECT selected.*,items.chunks FROM (''' + selected_sql + ''') selected
             CROSS JOIN LATERAL (SELECT coalesce(jsonb_agg(to_jsonb(item) ORDER BY item.ordinal),'[]'::jsonb) AS chunks
