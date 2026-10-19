@@ -7,7 +7,9 @@ import os
 from .passage_projection import COMPLETE_SOURCE_UNITS, build_passages, passage_identity
 
 # Change whenever visible extraction, tokenization, or source-unit grouping changes.
-CHECKPOINT_VERSION = 1
+# Version 1 can describe historical visible tool-result concatenations. Rebuild
+# it once before resuming with the current normal/typed extraction domains.
+CHECKPOINT_VERSION = 2
 
 
 def reuse_enabled():
@@ -86,7 +88,12 @@ def make_checkpoint(candidate, manifest, messages, passages, policy, *, previous
 def proves_append(checkpoint, projected, candidate, manifest, read_part):
     """Prove the old record stream is an exact prefix without reading old objects."""
     try:
-        if (not isinstance(checkpoint, dict) or checkpoint['version'] != CHECKPOINT_VERSION
+        # Only Claude's historical visible tool-result extraction changed.
+        # Unchanged source contracts can keep their exact v1 prefix proof.
+        compatible = isinstance(checkpoint, dict) and (
+            checkpoint.get('version') == CHECKPOINT_VERSION
+            or (checkpoint.get('version') == 1 and not candidate.source_id.startswith('claude:')))
+        if (not compatible
             or checkpoint['policy_fingerprint'] != projected['policy_fingerprint']
             or checkpoint['revision'] != projected['revision']
             or checkpoint['source_document_sha256'] != projected['source_document_sha256']
