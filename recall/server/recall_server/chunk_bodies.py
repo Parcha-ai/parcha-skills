@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 import hashlib
 from io import BytesIO
 import math
@@ -28,6 +29,7 @@ class ChunkBodyError(ValueError):
 
 
 _CATALOG_SQL = """
+    WITH selected AS MATERIALIZED (
     SELECT document.tenant_id,document.source_id,document.document_id,
            document.native_id,document.revision,document.text_sha256,
            document.body_record_ordinal,document.body_record_count,
@@ -44,24 +46,16 @@ _CATALOG_SQL = """
                 WHERE queued.tenant_id=event.tenant_id AND queued.source_id=event.source_id
                   AND queued.native_parent_id=COALESCE(event.native_parent_id,event.native_id)
            ) AS pending,
-           to_jsonb(evidence) AS manifest,
-           COALESCE(parts.items,'[]'::jsonb) AS parts,
+           COALESCE(event.native_parent_id,event.native_id) AS _catalog_parent_id,
+           row_number() OVER (PARTITION BY document.tenant_id,document.source_id,
+               COALESCE(event.native_parent_id,event.native_id)
+               ORDER BY document.document_id)=1 AS _catalog_first,
            COALESCE(chunks.items,'[]'::jsonb) AS chunks
       FROM canonical_documents document
       JOIN canonical_events event USING(tenant_id,source_id,event_id)
       JOIN raw_artifacts artifact
         ON artifact.tenant_id=event.tenant_id AND artifact.source_id=event.source_id
        AND artifact.artifact_id=event.artifact_id
-      LEFT JOIN canonical_evidence_documents evidence
-        ON evidence.tenant_id=event.tenant_id AND evidence.source_id=event.source_id
-       AND evidence.native_parent_id=COALESCE(event.native_parent_id,event.native_id)
-      LEFT JOIN LATERAL (
-          SELECT jsonb_agg(to_jsonb(part) ORDER BY part.part_ordinal) AS items
-            FROM canonical_evidence_document_parts part
-           WHERE part.tenant_id=evidence.tenant_id AND part.source_id=evidence.source_id
-             AND part.logical_document_id=evidence.logical_document_id
-             AND part.revision=evidence.revision
-      ) parts ON true
       LEFT JOIN LATERAL (
           SELECT jsonb_agg(jsonb_build_object(
                      'ordinal',chunk.ordinal,'receipt',chunk.receipt,
@@ -83,7 +77,29 @@ _CATALOG_SQL = """
               AND later.native_id=document.native_id AND later.revision>document.revision
               AND later.is_tombstone
        )
-     ORDER BY document.source_id,document.document_id
+
+    ), parent_keys AS (
+        SELECT DISTINCT tenant_id,source_id,_catalog_parent_id FROM selected
+    ), catalogs AS MATERIALIZED (
+        SELECT parent.tenant_id,parent.source_id,parent._catalog_parent_id,
+               to_jsonb(evidence) AS manifest,COALESCE(parts.items,'[]'::jsonb) AS parts
+          FROM parent_keys parent
+          LEFT JOIN canonical_evidence_documents evidence
+            ON evidence.tenant_id=parent.tenant_id AND evidence.source_id=parent.source_id
+           AND evidence.native_parent_id=parent._catalog_parent_id
+          LEFT JOIN LATERAL (
+              SELECT jsonb_agg(to_jsonb(part) ORDER BY part.part_ordinal) AS items
+                FROM canonical_evidence_document_parts part
+               WHERE part.tenant_id=evidence.tenant_id AND part.source_id=evidence.source_id
+                 AND part.logical_document_id=evidence.logical_document_id
+                 AND part.revision=evidence.revision
+          ) parts ON true
+    )
+    SELECT selected.*,
+           CASE WHEN selected._catalog_first THEN catalogs.manifest END AS manifest,
+           CASE WHEN selected._catalog_first THEN catalogs.parts END AS parts
+      FROM selected JOIN catalogs USING(tenant_id,source_id,_catalog_parent_id)
+     ORDER BY selected.source_id,selected.document_id
 """
 
 
@@ -199,6 +215,17 @@ def chunk_catalog_snapshot(
             'document.native_id,document.revision,document.text_sha256,document.chunk_receipt_profile,')
     def read(opened):
         rows = store._execute_bounded(opened, statement, params, deadline_at).fetchall()
+        # One parent catalog crosses the wire per statement. Rebuild the same
+        # independent document rows before the existing receipt and read fences.
+        catalogs = {}
+        for row in rows:
+            parent = row['tenant_id'], row['source_id'], row.pop('_catalog_parent_id')
+            if row.pop('_catalog_first'):
+                catalogs[parent] = row['manifest'], row['parts']
+            else:
+                row['manifest'], row['parts'] = deepcopy(catalogs[parent])
+            # Preserve the legacy column order as well as its values.
+            row['chunks'] = row.pop('chunks')
         if singleton:
             from .receipt_membership import lookup_receipt_metadata
             from .projectors import item_receipt
