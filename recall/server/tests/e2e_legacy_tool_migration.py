@@ -8,10 +8,9 @@ from unittest.mock import patch
 
 import psycopg
 from e2e_typed_passage_visibility import TypedPassageVisibility
-from recall_server import passage_index, passage_projection
+from recall_server import passage_append, passage_index, passage_projection
 from recall_server.canonical import CanonicalLifecycleError
 from recall_server.canonical_retrieval import BoundCanonicalRetrieval
-from recall_server.logical_evidence import LogicalEvidenceError
 from recall_server.projectors import canonical_json
 
 
@@ -33,7 +32,10 @@ class LegacyToolMigration(unittest.TestCase):
         native = passage_projection._visible_message
         with patch.object(passage_index, '_document_extraction_version', return_value='legacy'):
             if historical:
-                with patch.object(passage_projection, '_visible_message', side_effect=lambda text: native(text, include_tool_results=True)):
+                # Build the real predecessor extraction/checkpoint contract.
+                with patch.object(passage_append, 'CHECKPOINT_VERSION', 1), patch.object(
+                    passage_projection, '_visible_message', side_effect=lambda text: native(text, include_tool_results=True)
+                ):
                     self.project()
             else:
                 self.project()
@@ -174,19 +176,32 @@ class LegacyToolMigration(unittest.TestCase):
                     self.grant_and_open(row)
                 self.assertEqual(observed, [{}], 'unused whole-parent migration maps were allocated')
 
-    def test_mixed_old_byte_domain_refuses_without_destructive_commit(self):
-        self.seed(mixed=True)
-        before = self.published_rows()
-        with self.assertRaisesRegex(LogicalEvidenceError, 'legacy_tool_migration_required'):
-            self.append_and_prepare()
-        self.assertEqual(self.published_rows(), before)
-        self.assertEqual(self.document()['applied_extraction_version'], 'legacy')
-        self.assertEqual(self.pending(), 1)
+    def test_mixed_old_byte_domain_migrates_without_losing_history(self):
+        raw = self.seed(mixed=True)
+        old = self.projected()[0]
+        prepared = self.append_and_prepare()
+        try:
+            self.assertEqual(self.passages._commit(prepared)['status'], 'committed')
+        finally:
+            prepared.close()
+        current = self.projected()
+        self.assertTrue(any('Original human request.' in row['text_redacted'] for row in current))
+        result = next(row for row in current if row['text_redacted'] == 'Verified historical result.')
+        self.assertEqual(result['receipts'], old['receipts'])
+        self.assertTrue(all(span['source_unit'].startswith('claude.tool-result.string.v1#')
+                            for span in result['spans']))
+        for row in current:
+            self.grant_and_open(row)
+        history = BoundCanonicalRetrieval(self.store, tenant_id=self.tenant,
+            principal_id=self.principal, authorized_sources=(self.source,)).show(old['receipts'][0])
+        self.assertIn(raw, [chunk['text'] for chunk in history['chunks']])
+        self.assertEqual(self.document()['applied_extraction_version'], 'tool_groups_v1')
+        self.assertEqual(self.pending(), 0)
         self.ingest_blocks('unaffected', [{'type': 'text', 'text': 'Another parent progresses.'}], parent='unaffected')
         report = self.project()
         self.assertEqual(report['documents'], 1)
-        self.assertEqual(report['unavailable'], 1)
-        self.assertEqual(self.pending(), 1)
+        self.assertEqual(report['unavailable'], 0)
+        self.assertEqual(self.pending(), 0)
 
     def test_changed_source_refuses_stale_migration(self):
         self.seed()
@@ -272,6 +287,12 @@ class LegacyToolMigration(unittest.TestCase):
 
     def test_append_full_fallback_keeps_worker_migration_intent(self):
         self.seed()
+        # Exercise geometry fallback after the compatibility gate. Historical
+        # v1 rejection is covered separately; retain this downstream intent check.
+        with self.store.connect() as connection:
+            connection.execute("UPDATE canonical_passage_documents SET append_checkpoint="
+                               "jsonb_set(append_checkpoint,'{version}',%s::jsonb) WHERE tenant_id=%s",
+                               (str(passage_append.CHECKPOINT_VERSION), self.tenant))
         with patch.object(self.passages, '_prepare', wraps=self.passages._prepare) as prepare:
             prepared = self.append_and_prepare(native='zz-arrival')
         self.assertTrue(any(call.kwargs.get('_migrate_legacy') for call in prepare.call_args_list))

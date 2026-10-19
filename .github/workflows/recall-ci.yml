@@ -165,6 +165,8 @@ jobs:
             e2e_publication_parent_lock.py \
             e2e_typed_passage_visibility.py \
             e2e_legacy_tool_migration.py \
+            e2e_legacy_tool_lossless_migration.py \
+            e2e_claude_legacy_envelope.py \
             e2e_typed_document_visibility.py \
             e2e_passage_origin.py \
             e2e_long_copied_evidence.py \
@@ -269,6 +271,7 @@ jobs:
             e2e_retirement_tail_first.py \
             e2e_retirement_no_work_prefix.py \
             e2e_retirement_stream_capture.py \
+            e2e_retirement_stream_membership.py \
             e2e_retirement_part_reuse.py \
             e2e_optional_reconcile_index.py \
             e2e_context_time_index.py \

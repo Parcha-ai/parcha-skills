@@ -105,20 +105,27 @@ class MetadataFetchTests(unittest.TestCase):
         self.assertTrue(connection.closed)
         self.assertFalse(self.spool_path.exists())
 
-    def test_pipeline_refresh_reuses_absolute_deadline_and_bounded_membership(self):
-        connection = Connection([metadata(i) for i in range(257)])
-        batches = []
+    def test_one_stream_reuses_absolute_deadline_and_bounded_native_rows(self):
+        rows = [metadata(i) for i in range(257)]
+        for i, row in enumerate(rows):
+            row.update(membership_current=True, membership_deleted=None,
+                       membership_profile=None, membership_physical=False)
+            row['chunks'][0].update(chunk_id=f'chunk-{i}',
+                                   receipt=f'recall://source/native-{i}?rev=1#item=0')
+        connection = Connection(rows)
         deadline = time.monotonic() + 60
+        sizes = []
+        native = receipt_membership.receipt_metadata_from_rows
 
-        def verified(*args, documents, deadline_at, **kwargs):
-            self.assertEqual(deadline_at, deadline)
-            batches.append(len(documents))
-            return {row['document_id']: row['chunks'] for row in documents}
+        def verified(records, **kwargs):
+            sizes.append(len(records))
+            return native(records, **kwargs)
 
-        with patch.object(receipt_membership, 'verified_document_chunks', verified):
+        with patch.object(receipt_membership, 'receipt_metadata_from_rows', verified):
             self.assertEqual(self.capture(connection, deadline=deadline, verified=True)[2:], (257, 257))
-        self.assertEqual(connection.deadlines, [deadline, deadline])
-        self.assertEqual(batches, [256, 1])
+        self.assertEqual(connection.deadlines, [deadline])
+        self.assertEqual(sizes, [1] * 257)
+        self.assertEqual(len(connection.requests), 1)
 
     def test_midstream_deadline_discards_spool(self):
         connection = Connection([metadata(i) for i in range(3)])
