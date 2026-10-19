@@ -422,6 +422,7 @@ def _advance_without_physical_work(store, *, scope, principal_id, reviewed_plan,
 def retire_window(store, archive, *, scope, principal_id, limits, deadline_at, reviewed_plan,
                   metadata_mode='keep', remaining_bytes=None, should_stop=None, required_scope_epoch=None, diagnostic=None):
     from .chunk_retirement import _retire_parent_batch, _require_singleton_archive_runtime, retire_parent_chunks
+    from .db import SearchDeadlineExceeded
     if metadata_mode not in ('keep','singleton'):
         _fail('metadata_mode')
     if metadata_mode == 'singleton':
@@ -431,9 +432,17 @@ def retire_window(store, archive, *, scope, principal_id, limits, deadline_at, r
     if should_stop is not None and should_stop():
         return dict(status='stopped',complete=False)
     if metadata_mode == 'singleton':
-        skipped = _advance_without_physical_work(store, scope=scope, principal_id=principal_id,
-            reviewed_plan=reviewed_plan, required_scope_epoch=required_scope_epoch, limits=limits,
-            deadline_at=min(deadline_at,time.monotonic()+5), diagnostic=diagnostic)
+        probe = diagnostic if diagnostic is not None else {}
+        try:
+            skipped = _advance_without_physical_work(store, scope=scope, principal_id=principal_id,
+                reviewed_plan=reviewed_plan, required_scope_epoch=required_scope_epoch, limits=limits,
+                deadline_at=min(deadline_at,time.monotonic()+5), diagnostic=probe)
+        except SearchDeadlineExceeded:
+            # The probe transaction has rolled back. Never retry an uncertain
+            # COMMIT or renew the caller's deadline to obtain archive proof.
+            if probe.get('phase') != 'no_work_sql' or time.monotonic() >= deadline_at:
+                raise
+            skipped = None
         if skipped is not None:
             return skipped
     _attempt_phase(diagnostic, 'window_proof')
