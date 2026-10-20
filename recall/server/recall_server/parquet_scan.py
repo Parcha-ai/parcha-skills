@@ -529,6 +529,7 @@ class ScanCatalog:
     members: dict[tuple[str, int], tuple[FragmentMember, ...]]
     dirty: frozenset[str]
     compaction: bool = False
+    forced_documents: frozenset[str] = frozenset()
 
     def document_parts(self) -> dict[str, set[tuple[str, int]]]:
         parts: dict[str, set[tuple[str, int]]] = {}
@@ -601,6 +602,12 @@ class ScanUpload:
     documents_dirty: int = 0
     documents_rewritten: int = 0
     dirty_plan_epoch: str | None = None
+    retained_members: dict[
+        tuple[str, int], tuple[tuple[FragmentMember, FragmentMember], ...]
+    ] = field(default_factory=dict)
+    retained_references: dict[tuple[str, int], dict[str, Any]] = field(
+        default_factory=dict
+    )
 
 
 @dataclass(frozen=True)
@@ -1123,10 +1130,11 @@ class CanonicalParquetScanProjector:
                     or {row["dataset"] for row in shards} != set(SCAN_DATASETS)
                     or any(row.get("dirty_plan_epoch") != self.sparse_plan_epoch for row in shards)):
                 return None
-            dirty = frozenset(row["logical_document_id"] for row in connection.execute(
-                """SELECT logical_document_id FROM canonical_parquet_scan_dirty_documents
+            dirty_rows = connection.execute(
+                """SELECT logical_document_id,reason FROM canonical_parquet_scan_dirty_documents
                     WHERE tenant_id=%s AND source_id=%s AND bucket_start=%s""", scope,
-            ).fetchall())
+            ).fetchall()
+            dirty = frozenset(row["logical_document_id"] for row in dirty_rows)
             if not dirty or SCAN_DIRTY_ALL in dirty:
                 return None
             rows = connection.execute(
@@ -1152,6 +1160,8 @@ class CanonicalParquetScanProjector:
         catalog = ScanCatalog(
             {(row["dataset"], int(row["shard_index"])): row for row in shards},
             {key: tuple(value) for key, value in grouped.items()}, dirty,
+            forced_documents=frozenset(row["logical_document_id"] for row in dirty_rows
+                                       if row["reason"] == "backfill"),
         )
         recorded: dict[str, set[str]] = {}
         for members in catalog.members.values():
@@ -1163,7 +1173,7 @@ class CanonicalParquetScanProjector:
             # A sibling changed without named dirt. Never infer its other victims
             # from this partial membership view; let the full oracle recover.
             return None
-        changed = {key for key in dirty if recorded.get(key, set()) != (
+        changed = {key for key in dirty if key in catalog.forced_documents or recorded.get(key, set()) != (
             {current[key]} if key in current else set())}
         victims = {key for key, members in catalog.members.items()
                    if any(member.logical_document_id in changed for member in members)}
@@ -1446,6 +1456,8 @@ class CanonicalParquetScanProjector:
             shards={(row["dataset"], int(row["shard_index"])): row for row in shards},
             members={identity: tuple(value) for identity, value in grouped.items()},
             dirty=frozenset(str(row["logical_document_id"]) for row in dirty),
+            forced_documents=frozenset(str(row["logical_document_id"]) for row in dirty
+                                       if row["reason"] == "backfill" and row["logical_document_id"] != SCAN_DIRTY_ALL),
             compaction=any(
                 str(row["logical_document_id"]) == SCAN_DIRTY_ALL
                 and str(row.get("reason")) == "compaction"
@@ -1818,7 +1830,7 @@ class CanonicalParquetScanProjector:
             if not all_parts:
                 return "reuse", set(), set(), dirty
             return "full", all_parts, set(), dirty
-        if not stale and not uncovered and datasets_complete and (
+        if not stale and not uncovered and not catalog.forced_documents and datasets_complete and (
             not allow_compaction or not catalog.fragmented(self.compaction_fragments)
         ):
             # Content-identical with no eligible compaction: keep every immutable
@@ -1847,7 +1859,7 @@ class CanonicalParquetScanProjector:
                     for identity, shard in catalog.shards.items())
             and not (SCAN_DIRTY_ALL in catalog.dirty and not catalog.compaction)
         )
-        compact_rewrite = ((stale | uncovered) & set(current)
+        compact_rewrite = ((stale | uncovered | catalog.forced_documents) & set(current)
                            if preserve_complete else set(current))
         if allow_compaction and sweep_hint and catalog.fragmented(self.compaction_fragments):
             return "compaction", all_parts, compact_rewrite, dirty
@@ -1868,7 +1880,7 @@ class CanonicalParquetScanProjector:
             or len(stale) * 2 > len(recorded)
         ):
             return "compaction", all_parts, compact_rewrite, dirty
-        effective = stale | uncovered
+        effective = stale | uncovered | catalog.forced_documents
         victims: set[tuple[str, int]] = set()
         # Datasets pack independently: a shared metadata fragment must not pull
         # unrelated record fragments into this delta. Preserve its sibling rows.
@@ -1884,6 +1896,60 @@ class CanonicalParquetScanProjector:
             dirty,
         )
 
+    def _unchanged_raw_documents(
+        self, candidate: ScanCandidate, documents: list[dict[str, Any]],
+        catalog: ScanCatalog, rewrite: set[str],
+    ) -> set[str]:
+        """Prove raw inputs from existing small document fragments, including old catalogs.
+
+        Passage fingerprints cannot establish raw equality. The immutable document
+        row carries the original content, revision and actor inputs independently.
+        Missing or ambiguous ownership keeps that parent on the original rebuild.
+        """
+        current = {row["logical_document_id"]: row for row in documents
+                   if row["logical_document_id"] in rewrite}
+        fingerprints = {}
+        for identity, members in catalog.members.items():
+            if identity[0] != "passages":
+                for member in members:
+                    if member.logical_document_id in current:
+                        fingerprints.setdefault(member.logical_document_id, set()).add(
+                            (member.revision, member.generation_sha256))
+        seen = {}
+        unavailable = set()
+        for identity, members in catalog.members.items():
+            if identity[0] != "documents" or not any(m.logical_document_id in current for m in members):
+                continue
+            shard = catalog.shards[identity]
+            owners = {m.logical_document_id: m for m in members}
+            if (len(owners) != len(members) or shard["tenant_id"] != candidate.tenant_id
+                    or shard["source_id"] != candidate.source_id
+                    or shard["bucket_start"] != candidate.bucket_start
+                    or shard["dataset"] != "documents" or int(shard["shard_index"]) != identity[1]
+                    or shard["media_type"] != PARQUET_MEDIA_TYPE
+                    or not 0 < int(shard["size_bytes"]) <= MAX_PARQUET_OBJECT_BYTES):
+                raise ParquetScanError("parquet_scan_state_invalid")
+            try:
+                for row in _preserved_fragment_rows(self.archive, shard, _schemas()["documents"]):
+                    key = row["logical_document_id"]
+                    if key not in current:
+                        continue
+                    document = current[key]
+                    member = owners.get(key)
+                    ids, names, relations = self._actor_columns(document.get("actor_links") or [])
+                    exact = (member is not None
+                        and fingerprints.get(key) == {(member.revision, member.generation_sha256)}
+                        and row["schema_version"] == SCAN_SCHEMA_VERSION
+                        and row["tenant_id"] == candidate.tenant_id and row["source_id"] == candidate.source_id
+                        and row["revision"] == member.revision == int(document["revision"])
+                        and row["document_content_sha256"] == document["document_content_sha256"]
+                        and row["part_count"] == int(document["part_count"])
+                        and (row["actor_ids"], row["actor_names"], row["actor_relations"]) == (ids, names, relations))
+                    seen.setdefault(key, []).append(exact)
+            except _DerivedFragmentUnavailable:
+                unavailable.update(owners.keys() & current.keys())
+        return {key for key, matches in seen.items() if matches == [True] and key not in unavailable}
+
     def _preserve_rows(
         self,
         candidate: ScanCandidate,
@@ -1892,6 +1958,7 @@ class CanonicalParquetScanProjector:
         rewrite: set[str],
         documents: list[dict[str, Any]],
         upload: _StreamingUpload,
+        *, raw_rewrite: set[str] | None = None,
     ) -> tuple[datetime | None, datetime | None]:
         """Copy current siblings from immutable victim parts into packed output.
 
@@ -1907,7 +1974,8 @@ class CanonicalParquetScanProjector:
                 member.logical_document_id: member
                 for member in catalog.members.get(identity, ())
             }
-            keep = (set(members) & set(current)) - rewrite
+            excluded = rewrite if dataset == "passages" or raw_rewrite is None else raw_rewrite
+            keep = (set(members) & set(current)) - excluded
             if not keep:
                 continue
             shard = catalog.shards[identity]
@@ -2041,7 +2109,7 @@ class CanonicalParquetScanProjector:
             for document in documents
             if document["logical_document_id"] in rewrite
         ]
-        self._attach_parts(candidate, rewrite_documents)
+        original_catalog = catalog
         surviving = {
             dataset: [
                 shard_index
@@ -2097,14 +2165,47 @@ class CanonicalParquetScanProjector:
                     self._passage_row(candidate, passage),
                     member=members[passage["logical_document_id"]],
                 )
+            # Only marked passage updates can reuse raw datasets. Complete the
+            # native passage proof before reading any derived document fragment.
+            raw_unchanged = set()
+            if not _rebuild and mode == "delta" and catalog.forced_documents:
+                raw_unchanged = self._unchanged_raw_documents(
+                    candidate, documents, catalog, rewrite & catalog.forced_documents)
+            raw_rewrite = rewrite - raw_unchanged
+            if raw_unchanged:
+                current = {row["logical_document_id"]: row for row in documents}
+                victims = {identity for identity in victims if identity[0] == "passages" or any(
+                    member.logical_document_id not in current or member.logical_document_id in raw_rewrite
+                    for member in catalog.members.get(identity, ())) or not catalog.members.get(identity)}
+                catalog = replace(catalog, members={identity: tuple(
+                    FragmentMember(member.logical_document_id, member.revision,
+                        self._fingerprint(current[member.logical_document_id]))
+                    if identity[0] != "passages" and member.logical_document_id in raw_unchanged else member
+                    for member in members) for identity, members in catalog.members.items()})
+            raw_documents = [row for row in rewrite_documents if row["logical_document_id"] in raw_rewrite]
+            self._attach_parts(candidate, raw_documents)
+            if raw_unchanged:
+                # No raw rows have entered the upload yet. Retained raw parts
+                # now reserve their original indexes before any new raw upload.
+                surviving = {
+                    dataset: [index for (kind, index) in catalog.shards
+                              if kind == dataset and (kind, index) not in victims]
+                    for dataset in SCAN_DATASETS
+                }
+                for dataset, indexes in surviving.items():
+                    if dataset != "passages":
+                        upload.part_indexes[dataset] = max(indexes) + 1 if indexes else 0
+                ensure_datasets = tuple(dataset for dataset, indexes in surviving.items() if not indexes)
+                removed = tuple(sorted(victims))
             first, last = timing.call(
                 "preserve", self._preserve_rows,
-                candidate, catalog, victims, rewrite, documents, upload
+                candidate, catalog, victims, rewrite, documents, upload,
+                **({"raw_rewrite": raw_rewrite} if raw_unchanged else {}),
             )
             with _PartReadAhead(self.archive, _read_ahead_parts(
-                rewrite_documents, bucket_start, bucket_end
+                raw_documents, bucket_start, bucket_end
             )) as read_part:
-                for document in rewrite_documents:
+                for document in raw_documents:
                     member = members[document["logical_document_id"]]
                     upload.claim("documents", member)
                     links = document.get("actor_links") or []
@@ -2265,7 +2366,14 @@ class CanonicalParquetScanProjector:
             candidate.bucket_start.isoformat(),
             candidate.generation,
         )
-        return replace(result, dirty_plan_epoch=self.sparse_plan_epoch)
+        retained_members = {identity: tuple((old, new) for old, new in zip(
+            original_catalog.members[identity], members, strict=True) if old != new)
+            for identity, members in catalog.members.items() if identity not in victims}
+        retained_members = {identity: pairs for identity, pairs in retained_members.items() if pairs}
+        return replace(result, dirty_plan_epoch=self.sparse_plan_epoch,
+            retained_members=retained_members,
+            retained_references={identity: _reference(original_catalog.shards[identity])
+                                 for identity in retained_members})
 
     @staticmethod
     def _enqueue_cleanup(connection: Any, references: Iterable[dict[str, Any]]) -> None:
@@ -2331,6 +2439,9 @@ class CanonicalParquetScanProjector:
                         scope,
                     ).fetchall()
                 }
+                if any(identity not in live or _reference(live[identity]) != reference
+                       for identity, reference in upload.retained_references.items()):
+                    return "stale"
                 if upload.mode == "reuse":
                     if set(live) != set(upload.references):
                         return "stale"
@@ -2428,6 +2539,18 @@ class CanonicalParquetScanProjector:
                                    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)""",
                                 member_rows,
                             )
+                for (dataset, shard_index), pairs in upload.retained_members.items():
+                    for old, new in pairs:
+                        updated = connection.execute(
+                            """UPDATE canonical_parquet_scan_fragment_documents
+                                  SET generation_sha256=%s
+                                WHERE tenant_id=%s AND source_id=%s AND bucket_start=%s
+                                  AND dataset=%s AND shard_index=%s AND logical_document_id=%s
+                                  AND revision=%s AND generation_sha256=%s""",
+                            (new.generation_sha256, *scope, dataset, shard_index,
+                             old.logical_document_id, old.revision, old.generation_sha256))
+                        if updated.rowcount != 1:
+                            raise ParquetScanError("parquet_scan_state_invalid")
                 if upload.dirty_plan_epoch is not None:
                     if upload.dirty_plan_epoch != self.sparse_plan_epoch:
                         raise ParquetScanError("parquet_sparse_epoch_changed")
