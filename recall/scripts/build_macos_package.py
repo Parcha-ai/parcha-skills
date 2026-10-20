@@ -14,6 +14,8 @@ import stat
 import tarfile
 import tempfile
 import urllib.request
+import zipfile
+from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -148,6 +150,45 @@ def runtime_payloads(archive_data: bytes, lock: dict[str, Any]) -> dict[str, Pay
     return payloads
 
 
+def decoder_payloads(wheel_data: bytes, lock_data: bytes) -> dict[str, Payload]:
+    """Add the pinned optional decoder without changing the Python runtime."""
+    lock = json.loads(lock_data)
+    if (lock.get("schema_version") != 1 or lock.get("package") != "backports.zstd"
+            or lock.get("version") != "1.0.0"
+            or lock.get("target") != "cp312-cp312-macosx_11_0_arm64"):
+        raise ValueError("unsupported decoder wheel contract")
+    verify_artifact(wheel_data, lock)
+    payloads = {}
+    names = set()
+    with zipfile.ZipFile(io.BytesIO(wheel_data)) as wheel:
+        for member in wheel.infolist():
+            name = member.filename.rstrip("/")
+            if (not any(safe_member_name(name, root) for root in
+                        ("backports", "backports_zstd-1.0.0.dist-info"))
+                    or PurePosixPath(name).as_posix() != name
+                    or stat.S_ISLNK(member.external_attr >> 16)
+                    or name in names):
+                raise ValueError("unsafe or duplicate decoder wheel member")
+            names.add(name)
+            if member.is_dir():
+                continue
+            payloads["runtime/lib/python3.12/site-packages/" + name] = Payload(
+                data=wheel.read(member),
+            )
+    for name in lock["license_paths"]:
+        item = payloads.get("runtime/lib/python3.12/site-packages/" + name)
+        if item is None or not item.data:
+            raise ValueError("decoder wheel license missing")
+    extension = payloads.get(
+        "runtime/lib/python3.12/site-packages/backports/zstd/_zstd.cpython-312-darwin.so",
+    )
+    if (extension is None or extension.data is None
+            or extension.data[:8] != MACHO_64_LITTLE_ENDIAN + CPU_TYPE_ARM64_LITTLE_ENDIAN):
+        raise ValueError("decoder extension must be CPython 3.12 arm64 Mach-O")
+    payloads["lib/collector/DECODER_LOCK.json"] = Payload(data=lock_data)
+    return payloads
+
+
 def application_payloads(source_root: Path, runtime_lock_data: bytes) -> dict[str, Payload]:
     selected: dict[str, Payload] = {}
     mappings = {
@@ -162,6 +203,8 @@ def application_payloads(source_root: Path, runtime_lock_data: bytes) -> dict[st
         source_root / "collector" / "__init__.py": "lib/collector/__init__.py",
         source_root / "skills" / "recall" / "scripts" / "codex_identity.py":
             "lib/skills/recall/scripts/codex_identity.py",
+        source_root / "skills" / "recall" / "scripts" / "codex_rollout.py":
+            "lib/skills/recall/scripts/codex_rollout.py",
         source_root / "connectors" / "sdk.py": "lib/connectors/sdk.py",
         source_root / "connectors" / "export_inbox.py": "lib/connectors/export_inbox.py",
         source_root / "connectors" / "cowork_local.py": "lib/connectors/cowork_local.py",
@@ -336,12 +379,18 @@ def render_package(payloads: dict[str, Payload]) -> bytes:
 
 
 def build(source_root: Path, output: Path, runtime_archive: Path, runtime_lock: Path,
-          *, native_app: Path | None = None, source_revision: str | None = None) -> None:
+          *, native_app: Path | None = None, source_revision: str | None = None,
+          decoder_wheel: Path | None = None) -> None:
     lock = read_lock(runtime_lock)
     archive_data = runtime_archive.read_bytes()
     verify_artifact(archive_data, lock)
     payloads = application_payloads(source_root, runtime_lock.read_bytes())
     payloads.update(runtime_payloads(archive_data, lock))
+    if decoder_wheel is not None:
+        payloads.update(decoder_payloads(
+            decoder_wheel.read_bytes(),
+            (source_root / "client" / "macos" / "DECODER_LOCK.json").read_bytes(),
+        ))
     if native_app is not None:
         payloads.update(native_app_payloads(native_app))
     payloads["MANIFEST.json"] = Payload(data=manifest(payloads, lock, source_revision=source_revision))
@@ -370,6 +419,10 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--runtime-lock", type=Path)
     parser.add_argument("--runtime-archive", type=Path)
+    parser.add_argument("--decoder-wheel", type=Path,
+                        help="Optional exact wheel pinned by client/macos/DECODER_LOCK.json")
+    parser.add_argument("--download-decoder", action="store_true",
+                        help="Download and include the exact pinned optional decoder wheel")
     parser.add_argument("--native-app", type=Path, help="Precompiled, codesigned arm64 Recall Brain.app")
     parser.add_argument("--source-revision", help="Exact source Git SHA recorded in the manifest")
     args = parser.parse_args()
@@ -377,15 +430,25 @@ def main() -> None:
     runtime_lock = (args.runtime_lock or source_root / "client" / "macos" / "RUNTIME_LOCK.json").resolve()
     try:
         lock = read_lock(runtime_lock)
-        if args.runtime_archive:
-            build(source_root, args.output, args.runtime_archive.resolve(), runtime_lock,
-                  native_app=args.native_app, source_revision=args.source_revision)
-        else:
-            with tempfile.TemporaryDirectory() as temporary:
+        if args.decoder_wheel and args.download_decoder:
+            raise ValueError("choose decoder-wheel or download-decoder")
+        with ExitStack() as resources:
+            if args.download_decoder:
+                temporary = resources.enter_context(tempfile.TemporaryDirectory())
+                args.decoder_wheel = Path(temporary) / "decoder.whl"
+                decoder_lock = json.loads(
+                    (source_root / "client/macos/DECODER_LOCK.json").read_bytes(),
+                )
+                download_runtime(decoder_lock, args.decoder_wheel)
+            if args.runtime_archive:
+                archive = args.runtime_archive.resolve()
+            else:
+                temporary = resources.enter_context(tempfile.TemporaryDirectory())
                 archive = Path(temporary) / "runtime.tar.gz"
                 download_runtime(lock, archive)
-                build(source_root, args.output, archive, runtime_lock,
-                      native_app=args.native_app, source_revision=args.source_revision)
+            build(source_root, args.output, archive, runtime_lock,
+                  native_app=args.native_app, source_revision=args.source_revision,
+                  decoder_wheel=args.decoder_wheel)
     except (OSError, ValueError) as exc:
         parser.exit(1, f"error: {exc}\n")
     print(json.dumps({"output": str(args.output), "sha256": sha256(args.output.read_bytes())}, sort_keys=True))
