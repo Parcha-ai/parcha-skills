@@ -12,6 +12,12 @@ from recall_server import slack_captured_attribution as captured
 
 
 class ThinnedCapturedDocument(CapturedSlackActors):
+    def managed(self, **kwargs):
+        worker = super().managed(**kwargs)
+        # This fixture intentionally stores raw and logical objects together.
+        worker.plane.chunk_body_archive = self.archive
+        return worker
+
     def captured_file(self):
         worker, record, event, sdk_bytes = super().captured_file()
         with self.store.connect() as c:
@@ -109,6 +115,87 @@ class ThinnedCapturedDocument(CapturedSlackActors):
         self.assertNotIn(artifact, reads)
         self.assertEqual(self.immutable(), before)
 
+    def test_distinct_raw_and_evidence_stores_use_the_configured_owner(self):
+        import tempfile
+        from recall_server.archive import FilesystemArchiveStore
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        evidence = FilesystemArchiveStore(directory.name, namespace_key=b'e' * 32)
+        self.projector.projection = LogicalEvidenceProjectionStore(evidence)
+        original_managed = self.managed
+        def configured(*args, **kwargs):
+            worker = original_managed(*args, **kwargs)
+            worker.plane.chunk_body_archive = evidence
+            return worker
+        with patch.object(self, 'managed', side_effect=configured):
+            worker, _ = self.captured(thin=True)
+        self.message_phase(worker)
+        raw_read, evidence_read = worker.archive.read_raw, evidence.read_raw
+        reads = {'raw': 0, 'evidence': 0}
+        def raw(reference):
+            reads['raw'] += 1
+            return raw_read(reference)
+        def logical(reference):
+            reads['evidence'] += 1
+            return evidence_read(reference)
+        with patch.object(worker.archive, 'read_raw', side_effect=raw), patch.object(
+            evidence, 'read_raw', side_effect=logical):
+            self.assertEqual(self.step(worker)['failed'], 0)
+        self.assertEqual(self.counts(), (1, 1))
+        self.assertGreater(reads['evidence'], 0)
+        self.assertEqual(self.captured_checkpoint()['unresolved'], 0)
+
+    def shared_part_messages(self, *, large=False):
+        from connectors.sdk import ConnectorPage
+        from connectors.slack_source import normalize_slack_message
+        worker = self.managed()
+        connector, self.spool = worker.connector_factory()
+        count = 12 if large else 4
+        records = tuple(normalize_slack_message(workspace_id='T123', channel_id='C123',
+            value={'ts': f'1789981200.{index + 1:06d}', 'thread_ts': '1789981200.000001',
+                   'user': 'U123', 'text': ('x' * 800000 if large else 'Synthetic shared part')})
+            for index in range(count))
+        connector.pages['message'] = ConnectorPage(records[:6], 'second', True)
+        connector.pages['second'] = ConnectorPage(records[6:], 'contacts-again', True)
+        for _ in range(3):
+            self.assertEqual(self.step(worker)['failed'], 0)
+        put = self.projector.projection.put_records
+        def sized(*args, **kwargs):
+            return put(*args, **dict(kwargs, part_bytes=16 * 1024 * 1024))
+        with patch.object(self.projector.projection, 'put_records', side_effect=sized):
+            self.project()
+        self.thin_history()
+        if large:
+            self.thin_history()
+        self.enroll()
+        source = self.source
+        class LiveOnly:
+            source_id = source
+            connector_id = 'slack.messages'
+            def pull(self, cursor):
+                return ConnectorPage((), 'live-only', False)
+        worker.connector_factory = lambda *_: (LiveOnly(), self.spool)
+        self.message_phase(worker)
+        reads = []
+        original = worker.archive.read_raw
+        def read(reference):
+            reads.append((reference['artifact_id'], reference['size_bytes']))
+            return original(reference)
+        with patch.object(worker.archive, 'read_raw', side_effect=read):
+            self.assertEqual(self.step(worker)['failed'], 0)
+        self.assertEqual(self.counts(), (1, count))
+        self.assertEqual(self.captured_checkpoint()['unresolved'], 0)
+        self.assertTrue(reads)
+        self.assertEqual(len(reads), len({artifact for artifact, _ in reads}), reads)
+        if large:
+            self.assertGreater(max(size for _, size in reads), 8000000)
+
+    def test_shared_logical_part_read_once_per_native_slice(self):
+        self.shared_part_messages()
+
+    def test_valid_large_logical_part_uses_native_read_allowance(self):
+        self.shared_part_messages(large=True)
+
     def claimed_file(self):
         worker, record, event, _ = self.captured_file()
         with self.store.connect() as c:
@@ -192,10 +279,11 @@ class ThinnedCapturedDocument(CapturedSlackActors):
     def test_hydration_byte_refusal_keeps_native_target_recoverable(self):
         worker, row, selected = self.claimed_file()
         before = self.immutable()
-        with patch('recall_server.slack_captured_attribution.MAX_PAGE_BYTES', 1):
-            with patch.object(worker.archive, 'read_raw', side_effect=AssertionError('must not read')):
+        with patch('recall_server.chunk_bodies.MAX_READ_BYTES', 1):
+            with patch.object(worker.archive, 'read_raw', side_effect=AssertionError('must not read')) as read:
                 with self.assertRaises(ValueError):
                     captured._record(worker, row, selected, time.monotonic() + 10)
+                read.assert_not_called()
         self.assertEqual(self.immutable(), before)
         result = captured._record(worker, row, selected, time.monotonic() + 10)
         self.assertEqual(result['content']['kind'], 'document.v1')
@@ -275,6 +363,9 @@ class ThinnedCapturedDocument(CapturedSlackActors):
 
 if __name__ == '__main__':
     unittest.main(defaultTest=[
+        'ThinnedCapturedDocument.test_distinct_raw_and_evidence_stores_use_the_configured_owner',
+        'ThinnedCapturedDocument.test_shared_logical_part_read_once_per_native_slice',
+        'ThinnedCapturedDocument.test_valid_large_logical_part_uses_native_read_allowance',
         'ThinnedCapturedDocument.test_native_binary_attachment_owner_survives_actual_thinning',
         'ThinnedCapturedDocument.test_thinned_message_uses_canonical_content_without_sdk_raw_reparse',
         'ThinnedCapturedDocument.test_hydration_rechecks_source_grant_after_archive_read',

@@ -34,25 +34,51 @@ _DEBT_EXAMPLES_PER_REASON = 2
 
 
 class _CapturedArchive:
-    """One slice's actual archive bytes, including shared logical parts."""
-    def __init__(self, archive):
+    """Slice-scoped immutable bytes; native per-record verification still runs."""
+    def __init__(self, archive, *, max_bytes=None, logical_archive=None):
         self.archive = archive
+        self.max_bytes = max_bytes
+        self.logical_archive = logical_archive
         self.consumed = 0
+        self.cache = {}
+        self._logical = None
+
+    @property
+    def logical(self):
+        if self._logical is None:
+            from .chunk_bodies import MAX_READ_BYTES
+            if self.logical_archive is None:
+                raise ValueError('captured_archive_unavailable')
+            self._logical = _CapturedArchive(self.logical_archive, max_bytes=MAX_READ_BYTES)
+        return self._logical
 
     def read_raw_bounded(self, reference, *, deadline_at):
-        size = reference.get('size_bytes')
-        if type(size) is not int or size <= 0 or self.consumed + size > MAX_PAGE_BYTES:
-            raise ValueError('captured_archive_unavailable')
         if time.monotonic() >= deadline_at:
             raise TimeoutError()
+        size = reference.get('size_bytes')
+        if type(size) is not int or size <= 0:
+            raise ValueError('captured_archive_unavailable')
+        digest = reference.get('content_sha256')
+        key = json.dumps(reference, sort_keys=True) if isinstance(digest, str) else None
+        if key is not None and key in self.cache:
+            return self.cache[key]
+        limit = MAX_PAGE_BYTES if self.max_bytes is None else self.max_bytes
+        if self.consumed + size > limit:
+            raise ValueError('captured_archive_unavailable')
         # A failed or uncertain read still consumes its reserved byte allowance.
         self.consumed += size
         bounded = getattr(self.archive, 'read_raw_bounded', None)
         if callable(bounded):
-            return bounded(reference, deadline_at=deadline_at)
-        if isinstance(self.archive, FilesystemArchiveStore):
-            return self.archive.read_raw(reference)
-        raise ValueError('captured_archive_unavailable')
+            payload = bounded(reference, deadline_at=deadline_at)
+        elif isinstance(self.archive, FilesystemArchiveStore):
+            payload = self.archive.read_raw(reference)
+        else:
+            raise ValueError('captured_archive_unavailable')
+        if key is not None:
+            if len(payload) != size or hashlib.sha256(payload).hexdigest() != digest:
+                raise ValueError('captured_archive_corrupt')
+            self.cache[key] = payload
+        return payload
 
 
 def _debt_reason(error):
@@ -169,7 +195,7 @@ def _page(worker, row, after, upper, limit, native_ids=None):
 
 def _record(worker, row, selected, deadline, *, contacts_only=False, skip_only=False,
             archive_budget=None):
-    archive_budget = archive_budget or _CapturedArchive(worker.archive)
+    archive_budget = archive_budget or _CapturedArchive(worker.archive, logical_archive=worker.plane.chunk_body_archive)
     thinned = selected.get('body_location') == 'raw'
     with worker.store.connect() as c, c.transaction():
         c.execute("SELECT set_config('statement_timeout',%s,true)", (str(worker.store.search_deadline_ms),))
@@ -196,10 +222,12 @@ def _record(worker, row, selected, deadline, *, contacts_only=False, skip_only=F
             # Pure malformed-input failures become debt, never write failures.
             from .projectors import validate_envelope
             return validate_envelope(event)
-    if thinned:
+    # Legacy callers without logical storage retain their existing SDK-only
+    # parser. Configured evidence failures never fall back to a raw bucket.
+    if thinned and worker.plane.chunk_body_archive is not None:
         from .chunk_bodies import read_archived_chunks
         from .projectors import validate_envelope
-        bodies = read_archived_chunks(worker.store, archive_budget,
+        bodies = read_archived_chunks(worker.store, archive_budget.logical,
             tenant_id=row['tenant_id'], source_ids=(row['source_id'],),
             document_ids=(selected['document_id'],), deadline_at=deadline,
             located_only=True)
@@ -324,7 +352,7 @@ def repair_slice(worker, row, runner, *, deadline_at):
         state['unresolved'] -= removed
         page.sort(key=lambda item: hashlib.sha256(item['native_id'].encode()).hexdigest())
         _save(db, state, retry_next=False if removed else None)
-    archive_budget = _CapturedArchive(worker.archive)
+    archive_budget = _CapturedArchive(worker.archive, logical_archive=worker.plane.chunk_body_archive)
     for selected in page:
         contacts_only = state['phase'] == 'contacts' and not retry
         no_raw_read = (selected.get('body_location') == 'raw' or

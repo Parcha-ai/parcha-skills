@@ -63,8 +63,16 @@ content commitment and rechecks the managed lease, source owner grant, and
 Forget state before applying actor links. Binary attachments remain binary;
 their bytes are not treated as SDK JSON. Contact enrollment still reads the
 original SDK record because privacy-filtered canonical content may no longer
-contain the email needed to resolve an identity. Archive reads share the
-existing eight-megabyte slice allowance. Missing locators, unavailable or
+contain the email needed to resolve an identity. Raw SDK reads share the
+existing eight-megabyte slice allowance. Logical parts use the native
+64 MiB reader allowance separately through the existing evidence archive client.
+Raw SDK records retain the raw archive client. Legacy callers without an
+evidence client retain only their existing SDK parser; they never hydrate
+logical parts through the raw bucket. Configured evidence failures do not fall
+back to raw SDK parsing. Exact immutable references share verified
+bytes within one slice; each record still passes the original catalog, content,
+currentness, authority and Forget checks. Failed reads reserve their bytes; cached
+reads still obey the current deadline. Missing locators, unavailable or
 oversized parts, corrupt content, and stale revisions remain unresolved debt;
 the worker does not restore large inline bodies or infer missing identities.
 
