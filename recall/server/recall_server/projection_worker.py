@@ -279,6 +279,8 @@ def run_projection_worker(
     certification_enabled = getattr(getattr(passages, "membership_certification", None), "enabled", False)
     certification_budget = CertificationBudget()
     last_certification_started = clock()
+    typed_admission = getattr(passages, "admit_typed_pending", None)
+    last_typed_admission_started = clock() - 30.0 if callable(typed_admission) else 0.0
     quiet_passages_during_parquet = False
     # A child can finish before a later publication phase fails. Carry its
     # observed counters until a successful cycle records them exactly once.
@@ -339,6 +341,7 @@ def run_projection_worker(
             projected: dict[str, Any] = {}
             searched: dict[str, Any] = {}
             passage_elapsed_ms = search_plane_elapsed_ms = 0
+            typed_admission_failed = 0
             count_passages = getattr(passages, "count_pending", None)
 
             def accumulate(total, current):
@@ -380,6 +383,38 @@ def run_projection_worker(
                                  certification_budget=certification_budget)
                     accumulate(projected, tick)
                     report_membership_failures(tick)
+                finally:
+                    passage_elapsed_ms += elapsed_ms(phase_started)
+                    phase_elapsed["passage_elapsed_ms"] = passage_elapsed_ms
+                    if previous_phase == "logical":
+                        previous_started += clock() - phase_started
+                    active_phase, phase_started = previous_phase, previous_started
+
+            def maintain_typed_admission():
+                nonlocal last_typed_admission_started, active_phase, phase_started
+                nonlocal passage_elapsed_ms
+                nonlocal typed_admission_failed
+                if active_phase == "passage" or not callable(typed_admission):
+                    return
+                now = clock()
+                if now - last_typed_admission_started < 30.0:
+                    return
+                previous_phase, previous_started = active_phase, phase_started
+                active_phase, phase_started = "passage", now
+                # Reserve this turn before calling: an unknown commit is never
+                # replayed in the same turn. Durable requested mode owns progress.
+                last_typed_admission_started = now
+                try:
+                    tick = typed_admission(tenant_id=tenant_id, limit=passage_batch_size,
+                                           deadline_at=time.monotonic() + 3.0)
+                    LOG.info("typed admission selected=%s attempted=%s queued=%s",
+                             tick["selected"], tick["attempted"], tick["queued"])
+                except Exception as error:
+                    # Optional historical admission must not stop publication.
+                    # A lost ACK is left to durable eligibility on a later turn.
+                    typed_admission_failed += 1
+                    LOG.warning("typed admission incomplete type=%s sqlstate=%s",
+                                type(error).__name__, getattr(error, "sqlstate", None))
                 finally:
                     passage_elapsed_ms += elapsed_ms(phase_started)
                     phase_elapsed["passage_elapsed_ms"] = passage_elapsed_ms
@@ -542,10 +577,12 @@ def run_projection_worker(
                 maintain_retirement(True)
                 maintain_thinning(True)
                 maintain_certification()
+                maintain_typed_admission()
                 service_due_parquet()
 
             def publish_ready():
                 nonlocal active_phase, phase_started, passage_elapsed_ms
+                maintain_typed_admission()
                 previous_phase, previous_started = active_phase, phase_started
                 publication_started = clock()
                 renew_certification()
@@ -611,7 +648,7 @@ def run_projection_worker(
                 max_wait_seconds=max_wait_seconds,
                 cleanup_concurrency=cleanup_concurrency,
                 on_progress=publish_progress,
-                on_heartbeat=heartbeat if search_plane is not None or retirement_maintainer is not None or background_thinner is not None or scan is not None or certification_enabled else None,
+                on_heartbeat=heartbeat if search_plane is not None or retirement_maintainer is not None or background_thinner is not None or scan is not None or certification_enabled or callable(typed_admission) else None,
                 # Stop admitting at the existing scan cadence, then settle
                 # active owners. Translate the worker clock's remaining time
                 # into the projector's monotonic clock; callbacks are not killed.
@@ -737,6 +774,7 @@ def run_projection_worker(
                     and retired["status"] == "disabled"
                     and int(searched["months"]) == 0
                     and int(searched["failed"]) == 0
+                    and typed_admission_failed == 0
                     else "pending"
                 ),
                 "retirement_status": str(retired["status"]),
@@ -752,6 +790,7 @@ def run_projection_worker(
                 "logical_waiting": int(documents.get("waiting", 0)),
                 "records": int(documents["records"]),
                 "passage_documents": int(projected["documents"]),
+                "typed_admission_failed": typed_admission_failed,
                 "passage_pending": int(projected.get("pending", 0)),
                 "passage_requeued": int(projected.get("requeued", 0)),
                 "passage_unavailable": int(projected.get("unavailable", 0)),

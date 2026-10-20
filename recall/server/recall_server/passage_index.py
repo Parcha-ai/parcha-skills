@@ -896,6 +896,7 @@ class CanonicalPassageProjector:
         # attempted, since selected siblings can outlive that allowance.
         # A fresh worker honors durable queue age before rotating source turns.
         self._certification_source_cursor = None
+        self._typed_admission_source_cursor = None
         # Known refusals yield to siblings without changing authoritative queue
         # age or generation. At most one position per encountered source/mode;
         # restart resets these admission hints, never publication state.
@@ -984,6 +985,19 @@ class CanonicalPassageProjector:
         source_document_sha256: str, extraction_version: str,
         principal_id: str, tenant_id: str | None = None,
     ) -> dict[str, Any]:
+        """Request an exact current document upgrade with caller authority."""
+        return self._request_extraction_version(
+            source_id=source_id, logical_document_id=logical_document_id,
+            revision=revision, source_document_sha256=source_document_sha256,
+            extraction_version=extraction_version, principal_id=principal_id,
+            tenant_id=tenant_id)
+
+    def _request_extraction_version(
+        self, *, source_id: str, logical_document_id: str, revision: int,
+        source_document_sha256: str, extraction_version: str,
+        principal_id: str | None, tenant_id: str | None = None,
+        worker: bool = False, deadline_at: float | None = None,
+    ) -> dict[str, Any]:
         """Enroll one current projected document and queue its rebuild atomically.
 
         This maintenance operation uses the existing source-owner/brain-admin
@@ -995,13 +1009,23 @@ class CanonicalPassageProjector:
         if (tenant_id is None or extraction_version not in {"tool_groups_v1", "codex_tool_groups_v1"}
             or (extraction_version == "codex_tool_groups_v1" and not source_id.startswith("codex:"))):
             raise ValueError("unsupported_document_extraction_request")
+        if worker and (tenant_id != self.bound_tenant_id or principal_id is not None
+                       or extraction_version != "codex_tool_groups_v1"):
+            raise ValueError("worker extraction scope is invalid")
         key = (tenant_id, source_id, logical_document_id)
-        with self.store.connect() as connection, connection.transaction():
+        connect_options = ({"timeout": max(0.001, deadline_at-time.monotonic())}
+                           if deadline_at is not None else {})
+        with self.store.connect(**connect_options) as connection, connection.transaction():
+            def execute(sql, params):
+                if deadline_at is None:
+                    return connection.execute(sql, params)
+                return self.store._execute_bounded(connection, sql, params, deadline_at)
+
             # Same lock order as logical publication and passage commit.
             for owner in ("logical-evidence", "lossless-passages"):
-                connection.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s,0))",
+                execute("SELECT pg_advisory_xact_lock(hashtextextended(%s,0))",
                                    (owner + "\x1f" + logical_document_id,))
-            row = connection.execute("""SELECT evidence.revision,
+            catalog_sql = """SELECT evidence.revision,
                     evidence.document_content_sha256, evidence.native_parent_id,
                     projected.revision AS projected_revision,
                     projected.source_document_sha256, projected.policy_fingerprint,
@@ -1013,11 +1037,16 @@ class CanonicalPassageProjector:
                 JOIN canonical_source_grants grant_row USING(tenant_id,source_id)
                 WHERE evidence.tenant_id=%s AND evidence.source_id=%s
                   AND evidence.logical_document_id=%s AND grant_row.principal_id=%s
-                FOR UPDATE OF projected FOR SHARE OF evidence,source,grant_row""",
-                (*key, principal_id)).fetchone()
+                FOR UPDATE OF projected FOR SHARE OF evidence,source,grant_row"""
+            if worker:
+                # Internal projection authority uses an existing locked owner
+                # grant. It does not claim to be that principal in the public API.
+                catalog_sql = catalog_sql.replace("grant_row.principal_id=%s",
+                    "grant_row.principal_id=source.owner_principal_id AND grant_row.permission='owner'")
+            row = execute(catalog_sql, key if worker else (*key, principal_id)).fetchone()
             if row is None:
                 raise ValueError("source_or_projected_document_unavailable")
-            if row['owner_principal_id'] != principal_id or row['permission'] != 'owner':
+            if not worker and (row['owner_principal_id'] != principal_id or row['permission'] != 'owner'):
                 ControlPlane._brain_admin(connection, principal_id=principal_id,
                                           tenant_id=tenant_id, lock=True)
             if (row['revision'] != revision or row['projected_revision'] != revision
@@ -1025,7 +1054,7 @@ class CanonicalPassageProjector:
                 or row['source_document_sha256'] != source_document_sha256
                 or row['policy_fingerprint'] != self.policy.fingerprint):
                 raise ValueError("document_extraction_catalog_changed")
-            forgetting = connection.execute("""SELECT 1 FROM canonical_evidence_document_queue
+            forgetting = execute("""SELECT 1 FROM canonical_evidence_document_queue
                 WHERE tenant_id=%s AND source_id=%s AND native_parent_id=%s AND reason='forget'""",
                 (tenant_id, source_id, row['native_parent_id'])).fetchone()
             if forgetting:
@@ -1035,11 +1064,13 @@ class CanonicalPassageProjector:
                 raise ValueError("document_extraction_downgrade_refused")
             if row['requested_extraction_version'] == row['applied_extraction_version'] == extraction_version:
                 return {"status": "current", "extraction_version": extraction_version}
-            connection.execute("""UPDATE canonical_passage_documents
+            if worker and row['requested_extraction_version'] == extraction_version:
+                return {"status": "pending", "extraction_version": extraction_version}
+            execute("""UPDATE canonical_passage_documents
                 SET requested_extraction_version=%s
                 WHERE tenant_id=%s AND source_id=%s AND logical_document_id=%s""",
                 (extraction_version, *key))
-            connection.execute("""INSERT INTO canonical_passage_projection_queue(
+            execute("""INSERT INTO canonical_passage_projection_queue(
                     tenant_id,source_id,logical_document_id,revision,generation,reason,changed_at)
                 VALUES (%s,%s,%s,%s,1,'backfill',clock_timestamp())
                 ON CONFLICT(tenant_id,source_id,logical_document_id) DO UPDATE SET
@@ -1047,6 +1078,75 @@ class CanonicalPassageProjector:
                     generation=canonical_passage_projection_queue.generation+1,
                     reason='backfill',changed_at=clock_timestamp()""", (*key, revision))
             return {"status": "queued", "extraction_version": extraction_version}
+
+    def admit_typed_pending(self, *, tenant_id: str, limit: int,
+                            deadline_at: float) -> dict[str, Any]:
+        """Admit metadata-only Codex upgrades; requested mode is durable progress."""
+        tenant_id = self._tenant(tenant_id)
+        if (tenant_id != self.bound_tenant_id or not tenant_id
+            or type(limit) is not int or not 1 <= limit <= MAX_PASSAGE_PROJECTION_BATCH
+            or not math.isfinite(deadline_at)):
+            raise ValueError("typed admission scope is invalid")
+        after = self._typed_admission_source_cursor
+        with self.store.connect(timeout=max(0.001, deadline_at-time.monotonic())) as connection:
+            rows = self.store._execute_bounded(connection, """WITH outstanding AS MATERIALIZED (
+                    SELECT 1 FROM canonical_passage_projection_queue
+                    WHERE tenant_id=%s AND reason<>'certification' LIMIT %s
+                ), candidates AS (
+                    SELECT source.source_id,parent.*,
+                           row_number() OVER (PARTITION BY source.source_id
+                               ORDER BY parent.logical_document_id) AS source_position
+                    FROM canonical_sources source
+                    JOIN canonical_source_grants grant_row USING(tenant_id,source_id)
+                    CROSS JOIN LATERAL (
+                        SELECT projected.logical_document_id,
+                               evidence.revision,evidence.document_content_sha256
+                        FROM canonical_passage_documents projected
+                        JOIN canonical_evidence_documents evidence USING(tenant_id,source_id,logical_document_id)
+                        WHERE projected.tenant_id=source.tenant_id AND projected.source_id=source.source_id
+                          AND projected.requested_extraction_version=projected.applied_extraction_version
+                          AND projected.requested_extraction_version<>'codex_tool_groups_v1'
+                          AND projected.revision=evidence.revision
+                          AND projected.source_document_sha256=evidence.document_content_sha256
+                          AND projected.policy_fingerprint=%s
+                          AND NOT EXISTS (SELECT 1 FROM canonical_passage_projection_queue queue
+                              WHERE queue.tenant_id=projected.tenant_id AND queue.source_id=projected.source_id
+                                AND queue.logical_document_id=projected.logical_document_id
+                                AND queue.reason<>'certification')
+                          AND NOT EXISTS (SELECT 1 FROM canonical_evidence_document_queue queue
+                              WHERE queue.tenant_id=evidence.tenant_id AND queue.source_id=evidence.source_id
+                                AND queue.native_parent_id=evidence.native_parent_id)
+                        ORDER BY projected.logical_document_id LIMIT %s
+                    ) parent
+                    WHERE source.tenant_id=%s AND source.source_id LIKE 'codex:%%'
+                      AND grant_row.principal_id=source.owner_principal_id AND grant_row.permission='owner'
+                ) SELECT source_id,logical_document_id,revision,document_content_sha256
+                FROM candidates ORDER BY source_position,
+                    CASE WHEN %s::text IS NULL OR source_id>%s THEN 0 ELSE 1 END,
+                    source_id,logical_document_id
+                LIMIT greatest(0,%s-(SELECT count(*) FROM outstanding))""",
+                (tenant_id, limit, self.policy.fingerprint, limit, tenant_id, after, after, limit),
+                deadline_at).fetchall()
+        outcomes = []
+        for row in rows:
+            if time.monotonic() >= deadline_at:
+                break
+            self._typed_admission_source_cursor = row['source_id']
+            try:
+                outcome = self._request_extraction_version(tenant_id=tenant_id,
+                    source_id=row['source_id'], logical_document_id=row['logical_document_id'],
+                    revision=row['revision'], source_document_sha256=row['document_content_sha256'],
+                    extraction_version='codex_tool_groups_v1', principal_id=None,
+                    worker=True, deadline_at=deadline_at)
+            except ValueError as error:
+                if str(error) not in {'source_or_projected_document_unavailable',
+                    'document_extraction_catalog_changed', 'document_extraction_forget_pending'}:
+                    raise
+                outcome = {'status': 'refused', 'reason': str(error)}
+            outcomes.append(dict(source_id=row['source_id'],
+                logical_document_id=row['logical_document_id'], **outcome))
+        return dict(selected=len(rows), attempted=len(outcomes),
+                    queued=sum(row['status']=='queued' for row in outcomes), outcomes=outcomes)
 
     def seed_backfill(self, *, tenant_id: str | None = None) -> int:
         tenant_id = self._tenant(tenant_id)
