@@ -55,7 +55,7 @@ def fixture(version='tool_groups_v1', count=10000):
         2, 1, datetime(2026, 1, 1, tzinfo=timezone.utc), 'b' * 64, {}, archive.parts,
         extraction_version=version)
     state = dict(available=False, projected=dict(requested_extraction_version='legacy',
-        applied_extraction_version='legacy')) if version == 'legacy' else None
+        applied_extraction_version='legacy')) if version == 'legacy' else dict(available=False, projected=None)
     return projector, candidate, archive, state
 
 

@@ -1464,9 +1464,10 @@ class CanonicalPassageProjector:
             != len(candidate.part_references)
         ):
             raise LogicalEvidenceError("passage_manifest_catalog_mismatch")
-        state = self._append_state(candidate) if policy == self.policy else None
-        if ((incremental or _migrate_legacy) and not grouped_tools
-            and candidate.source_id.startswith('claude:') and state is None):
+        state = (self._append_state(candidate) if policy == self.policy
+                 or (grouped_tools and candidate.source_id.startswith('claude:')) else None)
+        if (candidate.source_id.startswith('claude:') and state is None
+            and (grouped_tools or incremental or _migrate_legacy)):
             # Append reuse is optional; the prior publication needed to preserve
             # historical tool coverage is not. Retry through the existing queue.
             raise LogicalEvidenceError('legacy_tool_migration_required')
@@ -1553,12 +1554,15 @@ class CanonicalPassageProjector:
             passages = payload_resources.enter_context(_DiskSequence())
             messages = resources.enter_context(_DiskSequence())
             try:
-                # Both views share verified records, preserving visible coordinates.
-                migration_check = ((incremental or _migrate_legacy) and not grouped_tools and not resume
-                    and candidate.source_id.startswith('claude:')
+                # Explicit Claude enrollment must preserve the same historical
+                # tool bytes as automatic migration, including full rebuilds.
+                migration_check = (not resume and candidate.source_id.startswith('claude:')
                     and state and state.get('projected')
-                    and state['projected'].get('requested_extraction_version') == 'legacy'
-                    and state['projected'].get('applied_extraction_version') == 'legacy')
+                    and state['projected'].get('applied_extraction_version') == 'legacy'
+                    and ((grouped_tools
+                          and state['projected'].get('requested_extraction_version') == 'tool_groups_v1')
+                         or ((incremental or _migrate_legacy) and not grouped_tools
+                             and state['projected'].get('requested_extraction_version') == 'legacy')))
                 source_records = records()
                 if grouped_tools or migration_check:
                     # Never unpickle external input: this anonymous file contains
@@ -1610,7 +1614,7 @@ class CanonicalPassageProjector:
                 coverage = _spool_tool_groups(source_records, extract_tool_event_groups, groups)
                 obligations = _legacy_result_intervals(old, messages, passages, groups,
                     {r for record in source_records for r in record.receipts})
-                if obligations is not None:
+                if obligations is not None or grouped_tools:
                     migration = dict(projected={k: state['projected'][k] for k in _MIGRATION_FIELDS},
                                      passages_sha256=passage_append.digest(old))
                     candidate = replace(candidate, extraction_version='tool_groups_v1')
@@ -1756,7 +1760,8 @@ class CanonicalPassageProjector:
                     != candidate.source_document_sha256
                     or _document_extraction_version(candidate.source_id,
                         extraction['requested_extraction_version'] if extraction else None)
-                    != ('legacy' if prepared.legacy_migration else candidate.extraction_version)
+                    != (prepared.legacy_migration['projected']['requested_extraction_version']
+                        if prepared.legacy_migration else candidate.extraction_version)
                 ):
                     return {"status": "stale"}
                 if prepared.legacy_migration:
