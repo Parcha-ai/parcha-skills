@@ -609,6 +609,55 @@ class SparsePlanning(ReceiptMembershipTests):
         )
 
 
+    def test_metadata_keeps_empty_and_ordered_multi_actor_parents(self):
+        self.ingest_parent("alpha", "alpha/one", "Synthetic metadata shape change")
+        self.project()
+        candidate = self.candidate()
+        before = {row["logical_document_id"]: row
+                  for row in self.scan._documents(candidate)}
+        first, last = "actor_" + "0" * 32, "actor_" + "f" * 32
+        with self.store.connect() as c:
+            c.execute(
+                "DELETE FROM canonical_evidence_document_actors "
+                "WHERE tenant_id=%s AND source_id=%s AND logical_document_id=ANY(%s)",
+                (self.tenant, self.source, [self.ids["alpha"], self.ids["beta"]]),
+            )
+            c.execute(
+                "DELETE FROM canonical_passage_documents "
+                "WHERE tenant_id=%s AND source_id=%s AND logical_document_id=%s",
+                (self.tenant, self.source, self.ids["beta"]),
+            )
+            for actor, name in ((last, "Later actor"), (first, "First actor")):
+                c.execute(
+                    "INSERT INTO brain_actors(tenant_id,actor_id,actor_kind,display_name) "
+                    "VALUES (%s,%s,'human',%s)", (self.tenant, actor, name),
+                )
+            for actor, relation in ((last, "contributor"), (first, "owner"),
+                                    (first, "author")):
+                c.execute(
+                    "INSERT INTO canonical_evidence_document_actors "
+                    "(tenant_id,source_id,logical_document_id,revision,actor_id,relation) "
+                    "SELECT tenant_id,source_id,logical_document_id,revision,%s,%s "
+                    "FROM canonical_evidence_documents WHERE tenant_id=%s "
+                    "AND source_id=%s AND logical_document_id=%s",
+                    (actor, relation, self.tenant, self.source, self.ids["alpha"]),
+                )
+        expected = {key: dict(row) for key, row in before.items()}
+        expected[self.ids["alpha"]]["actor_links"] = [
+            {"actor_id": first, "display_name": "First actor", "relation": "author"},
+            {"actor_id": first, "display_name": "First actor", "relation": "owner"},
+            {"actor_id": last, "display_name": "Later actor", "relation": "contributor"},
+        ]
+        expected[self.ids["beta"]].update(actor_links=[], passage_count=None,
+            passage_policy_fingerprint=None, passage_source_sha256=None)
+        actual = self.scan._documents(candidate)
+        self.assertEqual(actual, [expected[key] for key in sorted(expected)])
+        selected = [self.ids["alpha"], self.ids["beta"]]
+        self.assertEqual(self.scan._documents(candidate, document_ids=selected),
+                         [row for row in actual if row["logical_document_id"] in selected])
+        self.assertEqual(self.scan._documents(candidate, document_ids=[]), [])
+
+
 class SparseSchema(unittest.TestCase):
     def setUp(self):
         self.connection = psycopg.connect(
