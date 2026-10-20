@@ -22,6 +22,7 @@ from .retirement_maintenance import RetirementMaintenance
 class RetirementStore:
     _set_statement_deadline = staticmethod(BrainStore._set_statement_deadline)
     _execute_bounded = staticmethod(BrainStore._execute_bounded_pipeline)
+    _execute_bounded_pipeline = staticmethod(BrainStore._execute_bounded_pipeline)
 
     def __init__(self, dsn):
         self.verified_singleton_receipts = singleton_receipt_capability()
