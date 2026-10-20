@@ -969,6 +969,255 @@ class MembershipRemainderTests(ParentMembershipPublicationTests):
 
 
 class RepairWithRemainder(Repair):
+    def stale_reconciliation(self):
+        self.store.provision_brain(
+            organization_id=self.tenant + ":org", organization_kind="company",
+            display_name="Receipt reconciliation", tenant_id=self.tenant,
+            brain_kind="company", slug="company", owner_principal_id=self.principal,
+        )
+        self.store.verified_singleton_receipts = True
+        self.passages.membership_certification = enrollment.CertificationSettings(
+            enabled=True, binding_epoch="synthetic-epoch-a"
+        )
+        ingest = self.plane.ingest_document
+        def slack_provenance(**kwargs):
+            envelope = dict(kwargs["envelope"])
+            envelope["provenance"] = dict(envelope["provenance"], uri="slack://fixture/channel/message")
+            self.assertNotIn("byte_start", envelope["provenance"])
+            return ingest(**dict(kwargs, envelope=envelope))
+        with patch.object(
+            enrollment, "enroll_parent_passages", side_effect=OSError("interruption")
+        ), patch.object(self.plane, "ingest_document", side_effect=slack_provenance):
+            self.corrupt_old_receipt()
+        with self.store.connect() as c:
+            self.assertTrue(c.execute("SELECT bool_and(source_ordinal IS NULL) AS no_offsets FROM canonical_events WHERE tenant_id=%s", (self.tenant,)).fetchone()["no_offsets"])
+        return remainder.pending(
+            self.store, tenant_id=self.tenant, limit=10,
+            deadline_at=time.monotonic() + 3,
+        )[0]
+
+    def resume_reconciliation(self, queued):
+        return remainder.resume(
+            self.store, queued, settings=self.passages.membership_certification,
+            deadline_at=time.monotonic() + 3,
+        )
+
+    def assert_no_repair(self, outcome):
+        self.assertNotEqual(outcome["status"], "repair-queued")
+        self.assertEqual(outcome["certified_passages"], 0)
+        with self.store.connect() as c:
+            self.assertEqual(c.execute(
+                "SELECT count(*) AS n FROM canonical_passage_projection_queue WHERE tenant_id=%s AND reason='backfill'",
+                (self.tenant,),
+            ).fetchone()["n"], 0)
+
+    def test_superseded_receipt_refusal_queues_native_repair_without_certifying(self):
+        queued = self.stale_reconciliation()
+        stale = self.rows()
+        self.assertNotEqual(stale[0]["receipts"], self.correct[0]["receipts"])
+        outcome = self.resume_reconciliation(queued)
+        self.assertEqual(outcome["certified_passages"], 0)
+        self.assertEqual(outcome["status"], "repair-queued")
+        # Scheduling is not publication or a certificate ACK. The logical
+        # owner runs first here; unchanged content preserves the existing revision.
+        self.assertEqual(self.rows(), stale)
+        self.logical.project_pending(tenant_id=self.tenant, batch_size=10, max_batches=1)
+        result = self.passages.project_pending(
+            tenant_id=self.tenant, batch_size=10, max_batches=1
+        )
+        self.assertEqual(result["documents"], 1)
+        self.assertEqual(self.rows(), self.correct)
+        self.writer.drain(tenant_id=self.tenant, max_months=2)
+        self.assertEqual(len(self.search()["results"]), 1)
+
+    def test_reconciliation_recovers_stale_logical_manifest_even_if_passages_run_first(self):
+        from recall_server.projectors import item_receipt
+
+        queued = self.stale_reconciliation()
+        self.ingest(3)
+        # Reproduce the missing upstream notification from a historical publication.
+        with self.store.connect() as c:
+            c.execute("DELETE FROM canonical_evidence_document_queue WHERE tenant_id=%s", (self.tenant,))
+        outcome = self.resume_reconciliation(queued)
+        self.assertEqual(outcome["status"], "repair-queued")
+        self.assertEqual(outcome["certified_passages"], 0)
+        with self.store.connect() as c:
+            logical = c.execute("SELECT reason FROM canonical_evidence_document_queue WHERE tenant_id=%s", (self.tenant,)).fetchone()
+        self.assertEqual(logical, dict(reason="backfill"))
+        # A passage lane can run before the independent logical lane. Its old
+        # output still fails native authority; the queued logical owner survives.
+        self.passages.project_pending(tenant_id=self.tenant, batch_size=10, max_batches=1)
+        self.writer.drain(tenant_id=self.tenant, max_months=2)
+        self.assertEqual(self.search()["results"], [])
+        pending = remainder.pending(self.store, tenant_id=self.tenant, limit=10, deadline_at=time.monotonic()+3)
+        self.assertEqual(len(pending), 1)
+        with self.store.connect() as c:
+            logical_generation = c.execute("SELECT generation FROM canonical_evidence_document_queue WHERE tenant_id=%s", (self.tenant,)).fetchone()["generation"]
+        for _ in range(2):
+            polled = self.resume_reconciliation(pending[0])
+            self.assertEqual(polled["status"], "changed")
+            self.assertEqual(polled["certified_passages"], 0)
+        with self.store.connect() as c:
+            self.assertEqual(c.execute("SELECT generation FROM canonical_evidence_document_queue WHERE tenant_id=%s", (self.tenant,)).fetchone()["generation"], logical_generation)
+        self.logical.project_pending(tenant_id=self.tenant, batch_size=10, max_batches=1)
+        self.passages.project_pending(tenant_id=self.tenant, batch_size=10, max_batches=1)
+        self.assertEqual(self.rows(), [dict(self.correct[0], revision=3,
+            receipts=[item_receipt(self.source, "event-one", 3, 0)])])
+        self.writer.drain(tenant_id=self.tenant, max_months=2)
+        self.assertEqual(len(self.search()["results"]), 1)
+        self.assertEqual(self.passages.project_pending(
+            tenant_id=self.tenant, batch_size=10, max_batches=1
+        )["documents"], 0)
+
+    def test_reconciliation_rejects_deleted_old_document(self):
+        queued = self.stale_reconciliation()
+        with self.store.connect() as c:
+            c.execute("UPDATE canonical_documents SET deleted_at=clock_timestamp() WHERE tenant_id=%s AND revision=1", (self.tenant,))
+        self.assert_no_repair(self.resume_reconciliation(queued))
+
+    def test_reconciliation_rejects_unavailable_current_document(self):
+        queued = self.stale_reconciliation()
+        with self.store.connect() as c:
+            c.execute("UPDATE canonical_documents SET deleted_at=clock_timestamp(),is_current=false WHERE tenant_id=%s AND is_current", (self.tenant,))
+        self.assert_no_repair(self.resume_reconciliation(queued))
+
+    def test_reconciliation_rejects_foreign_receipt(self):
+        queued = self.stale_reconciliation()
+        with self.store.connect() as c:
+            c.execute("UPDATE canonical_passages SET receipts=%s WHERE tenant_id=%s", ([self.rows()[0]["receipts"][0].replace(self.source, "source:foreign")], self.tenant))
+        self.assert_no_repair(self.resume_reconciliation(queued))
+
+    def test_reconciliation_rejects_malformed_receipt(self):
+        queued = self.stale_reconciliation()
+        with self.store.connect() as c:
+            c.execute("UPDATE canonical_passages SET receipts=%s WHERE tenant_id=%s", (["not-a-receipt"], self.tenant))
+        self.assert_no_repair(self.resume_reconciliation(queued))
+
+    def test_reconciliation_rejects_different_historical_parent(self):
+        queued = self.stale_reconciliation()
+        with self.store.connect() as c:
+            c.execute("UPDATE canonical_events SET native_parent_id='other-parent' WHERE tenant_id=%s AND revision=1", (self.tenant,))
+        self.assert_no_repair(self.resume_reconciliation(queued))
+
+    def test_reconciliation_preserves_pending_forget(self):
+        from recall_server.canonical import CanonicalLifecycleError
+
+        queued = self.stale_reconciliation()
+        request = dict(
+            contract="recall.forget-request.v1", schema_version=1,
+            tenant_id=self.tenant, principal_id=self.principal, source_id=self.source,
+            target_receipt=self.correct[0]["receipts"][0], mode="explicit_forget",
+            reason="owner_requested", requested_at="2026-10-14T00:01:00Z",
+            idempotency_key="stale-reconciliation-forget",
+        )
+        with patch.object(self.archive, "delete_internal_raw_bounded", side_effect=OSError("archive unavailable")):
+            with self.assertRaisesRegex(CanonicalLifecycleError, "archive_delete_failed"):
+                self.plane.forget(request)
+        self.assert_no_repair(self.resume_reconciliation(queued))
+        with self.store.connect() as c:
+            self.assertEqual(c.execute("SELECT reason FROM canonical_evidence_document_queue WHERE tenant_id=%s", (self.tenant,)).fetchone()["reason"], "forget")
+
+    def test_reconciliation_rechecks_source_grant_before_admission(self):
+        queued = self.stale_reconciliation()
+        original = type(self.passages).requeue_receipt_repair
+        def revoked(projector, **kwargs):
+            with self.store.connect() as c:
+                c.execute("DELETE FROM canonical_source_grants WHERE tenant_id=%s AND principal_id=%s", (self.tenant, self.principal))
+            return original(projector, **kwargs)
+        with patch.object(type(self.passages), "requeue_receipt_repair", revoked):
+            self.assert_no_repair(self.resume_reconciliation(queued))
+
+    def test_reconciliation_rechecks_supersession_before_admission(self):
+        queued = self.stale_reconciliation()
+        original = type(self.passages).requeue_receipt_repair
+        def deleted(projector, **kwargs):
+            with self.store.connect() as c:
+                c.execute("UPDATE canonical_documents SET deleted_at=clock_timestamp() WHERE tenant_id=%s AND revision=1", (self.tenant,))
+            return original(projector, **kwargs)
+        with patch.object(type(self.passages), "requeue_receipt_repair", deleted):
+            self.assert_no_repair(self.resume_reconciliation(queued))
+
+    def test_reconciliation_preserves_newer_publication_queue(self):
+        queued = self.stale_reconciliation()
+        original = type(self.passages).requeue_receipt_repair
+        def newer(projector, **kwargs):
+            with self.store.connect() as c:
+                c.execute("UPDATE canonical_passage_projection_queue SET generation=generation+1,reason='logical-update' WHERE tenant_id=%s", (self.tenant,))
+            return original(projector, **kwargs)
+        with patch.object(type(self.passages), "requeue_receipt_repair", newer):
+            outcome = self.resume_reconciliation(queued)
+        self.assertEqual(outcome["status"], "changed")
+        self.assertEqual(outcome["certified_passages"], 0)
+        with self.store.connect() as c:
+            row = c.execute("SELECT generation,reason FROM canonical_passage_projection_queue WHERE tenant_id=%s", (self.tenant,)).fetchone()
+        self.assertEqual(row, dict(generation=queued["generation"]+1, reason="logical-update"))
+
+    def test_reconciliation_preserves_changed_certification_checkpoint(self):
+        import json
+
+        queued = self.stale_reconciliation()
+        original = type(self.passages).requeue_receipt_repair
+        replacement = dict(queued["checkpoint"], after="a-newer-native-prefix")
+        def changed(projector, **kwargs):
+            with self.store.connect() as c:
+                c.execute("UPDATE canonical_passage_projection_queue SET certification_checkpoint=%s::jsonb WHERE tenant_id=%s", (json.dumps(replacement), self.tenant))
+            return original(projector, **kwargs)
+        with patch.object(type(self.passages), "requeue_receipt_repair", changed):
+            outcome = self.resume_reconciliation(queued)
+        self.assertEqual(outcome["status"], "changed")
+        current = remainder.pending(self.store, tenant_id=self.tenant, limit=10, deadline_at=time.monotonic()+3)
+        self.assertEqual(current, [dict(queued, checkpoint=replacement)])
+
+    def test_reconciliation_preserves_forget_between_plan_and_admission(self):
+        queued = self.stale_reconciliation()
+        original = type(self.passages).requeue_receipt_repair
+        request = dict(
+            contract="recall.forget-request.v1", schema_version=1,
+            tenant_id=self.tenant, principal_id=self.principal, source_id=self.source,
+            target_receipt=self.correct[0]["receipts"][0], mode="explicit_forget",
+            reason="owner_requested", requested_at="2026-10-14T00:01:00Z",
+            idempotency_key="stale-reconciliation-forget-during-plan",
+        )
+        def forgotten(projector, **kwargs):
+            self.plane.forget(request)
+            return original(projector, **kwargs)
+        with patch.object(type(self.passages), "requeue_receipt_repair", forgotten):
+            self.assert_no_repair(self.resume_reconciliation(queued))
+        self.assertEqual(self.search()["results"], [])
+
+    def test_reconciliation_rolls_back_late_admission_failure(self):
+        queued = self.stale_reconciliation()
+        original = self.store._execute_bounded
+        def failed(connection, statement, parameters, deadline_at):
+            result = original(connection, statement, parameters, deadline_at)
+            if "INSERT INTO canonical_passage_projection_queue(" in statement and "'backfill'" in statement:
+                raise OSError("synthetic failure after native queue write")
+            return result
+        with patch.object(self.store, "_execute_bounded", failed):
+            outcome = self.resume_reconciliation(queued)
+        self.assertEqual(outcome["status"], "failed")
+        self.assert_no_repair(outcome)
+        current = remainder.pending(self.store, tenant_id=self.tenant, limit=10, deadline_at=time.monotonic()+3)
+        self.assertEqual(current, [queued])
+
+    def test_reconciliation_rolls_back_after_both_native_queue_writes(self):
+        queued = self.stale_reconciliation()
+        original = type(self.passages)._requeue_missing
+        def failed(projector, candidate, *, connection=None):
+            result = original(projector, candidate, connection=connection)
+            self.assertEqual(result, 1)
+            self.assertIsNotNone(connection)
+            self.assertEqual(connection.execute("SELECT count(*) AS n FROM canonical_evidence_document_queue WHERE tenant_id=%s", (self.tenant,)).fetchone()["n"], 1)
+            raise OSError("synthetic failure after both native writes")
+        with patch.object(type(self.passages), "_requeue_missing", failed):
+            outcome = self.resume_reconciliation(queued)
+        self.assertEqual(outcome["status"], "failed")
+        self.assert_no_repair(outcome)
+        with self.store.connect() as c:
+            self.assertEqual(c.execute("SELECT count(*) AS n FROM canonical_evidence_document_queue WHERE tenant_id=%s", (self.tenant,)).fetchone()["n"], 0)
+        current = remainder.pending(self.store, tenant_id=self.tenant, limit=10, deadline_at=time.monotonic()+3)
+        self.assertEqual(current, [queued])
+
     def test_native_receipt_repair_supersedes_only_optional_phase(self):
         self.passages.membership_certification = enrollment.CertificationSettings(
             enabled=True, binding_epoch="synthetic-epoch-a"
