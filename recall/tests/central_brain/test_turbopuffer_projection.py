@@ -115,6 +115,8 @@ class _Catalog:
     def execute(self, sql: str, params: Any = None) -> _Result:
         folded = " ".join(sql.split())
         self.statements.append((folded, params))
+        if folded == "SELECT to_regclass('public.search_parent_reconciliation') IS NOT NULL AS ready":
+            return _Result([{"ready": False}])  # Existing pre094 catalog fixture.
         if "pg_try_advisory_lock" in folded:
             return _Result([{"acquired": True}])
         if "pg_advisory_unlock" in folded:

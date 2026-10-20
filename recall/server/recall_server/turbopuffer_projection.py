@@ -645,7 +645,8 @@ class TurbopufferProjector:
             for row in connection.execute(_PASSAGE_BY_ID_SQL, (tenant_id, list(passage_ids))).fetchall()
         ]
 
-    def upsert_passages(self, tenant_id: str, passage_ids: list[str]) -> int:
+    def upsert_passages(self, tenant_id: str, passage_ids: list[str],
+                        *, metadata_byte_limit: int | None = None) -> int:
         """Write the live passages among ``passage_ids`` to the tenant namespace.
 
         The reconcile's repair path for rows the outbox never carried (a
@@ -654,6 +655,8 @@ class TurbopufferProjector:
         Returns the rows written.
         """
 
+        if metadata_byte_limit is not None and (type(metadata_byte_limit) is not int or metadata_byte_limit <= 0):
+            raise ValueError("search publication metadata budget is invalid")
         if not passage_ids:
             return 0
         namespace = self.client.namespace(self.settings.namespace(tenant_id))
@@ -662,8 +665,12 @@ class TurbopufferProjector:
         for start in range(0, len(passage_ids), self.page_rows):
             chunk = passage_ids[start:start + self.page_rows]
             with self.store.connect() as connection:
-                if getattr(self.store, "verified_singleton_receipts", False):
+                if metadata_byte_limit is not None or getattr(self.store, "verified_singleton_receipts", False):
                     connection.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+                if metadata_byte_limit is not None:
+                    from .search_parent_reconciliation import measure_metadata
+                    measure_metadata(self, connection, tenant_id, chunk,
+                        time.monotonic() + self.store.search_deadline_ms / 1000, metadata_byte_limit)
                 page = self.passages_by_id(connection, tenant_id, chunk)
                 connection.commit()
             groups: dict[tuple[str, date], list[str]] = {}
@@ -676,8 +683,12 @@ class TurbopufferProjector:
                     # The nomination may predate the lease. Re-read authority
                     # under it before the external write, just like month pages.
                     with self.store.connect() as connection:
-                        if getattr(self.store, "verified_singleton_receipts", False):
+                        if metadata_byte_limit is not None or getattr(self.store, "verified_singleton_receipts", False):
                             connection.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+                        if metadata_byte_limit is not None:
+                            from .search_parent_reconciliation import measure_metadata
+                            measure_metadata(self, connection, tenant_id, ids,
+                                time.monotonic() + self.store.search_deadline_ms / 1000, metadata_byte_limit)
                         current = self.passages_by_id(connection, tenant_id, ids)
                         connection.commit()
                     page = [row for row in current if row["source_id"] == source_id
@@ -1033,6 +1044,20 @@ class TurbopufferProjector:
                 result["retired"] = step["retired"]
         return result
 
+    def _reconcile_parent(self, tenant_id: str, result: dict[str, Any]) -> bool:
+        from .search_parent_reconciliation import step
+        try:
+            outcome = step(self, tenant_id)
+        except Exception as error:  # noqa: BLE001 - unacknowledged queue page stays durable
+            result["failed"] += 1
+            LOG.warning("search parent reconciliation failed type=%s", type(error).__name__)
+            return True
+        result["rows"] += outcome["written"]
+        if outcome["attempted"]:
+            LOG.info("search parent reconciliation examined=%s written=%s",
+                     outcome["examined"], outcome["written"])
+        return bool(outcome["attempted"])
+
     def drain_quantum(self, *, tenant_id: str, max_months: int) -> dict[str, int | str]:
         """Report active call work even when its claim remains unfinished."""
         timing = _MonthTiming()
@@ -1047,7 +1072,7 @@ class TurbopufferProjector:
                 pass
 
     def _drain_quantum(self, *, tenant_id: str, max_months: int, timing: _MonthTiming) -> dict[str, int | str]:
-        """Advance one page then return to the worker's sole coordinator.
+        """Advance one month page and at most one bounded reconciliation page.
 
         The worker owns this projector for one tenant and process lifetime.
         Restart resumes acknowledged upsert pages when the exact claim, catalog,
@@ -1097,11 +1122,16 @@ class TurbopufferProjector:
                     result["requeued"] = int(not step["retired"])
                 else:
                     self._quantum_months.append((claim, steps, month_timing))
+        # Both lanes advance across restarts; a failing parent cannot starve a
+        # month. Reconciliation adds at most one 128-row/8MiB native page.
+        self._reconcile_parent(tenant_id, result)
         with timing.measure("pending"), self.store.connect() as connection:
             result["pending"] = int(connection.execute(
                 "SELECT count(*) AS count FROM search_projection_outbox WHERE tenant_id=%s",
                 (tenant_id,),
             ).fetchone()["count"])
+            from .search_parent_reconciliation import pending
+            result["pending"] += pending(connection, tenant_id)
             connection.commit()
         if result["pending"] or result["failed"]:
             result["status"] = "pending"
@@ -1131,8 +1161,10 @@ class TurbopufferProjector:
             "rate_limited": 0,
             "pending": 0,
         }
+        budget_expired = False
         for claim in claims:
             if deadline_at is not None and self.clock() >= deadline_at:
+                budget_expired = True
                 break
             try:
                 outcome = self.project_month(claim)
@@ -1149,6 +1181,8 @@ class TurbopufferProjector:
             result["rate_limited"] = int(result["rate_limited"]) + int(outcome["rate_limited"])
             if not outcome["retired"]:
                 result["requeued"] = int(result["requeued"]) + 1
+        if not budget_expired and (deadline_at is None or self.clock() < deadline_at):
+            self._reconcile_parent(tenant_id, result)
         with self.store.connect() as connection:
             result["pending"] = int(
                 connection.execute(
@@ -1157,6 +1191,8 @@ class TurbopufferProjector:
                     (tenant_id,),
                 ).fetchone()["count"]
             )
+            from .search_parent_reconciliation import pending
+            result["pending"] += pending(connection, tenant_id)
             connection.commit()
         if int(result["pending"]) or int(result["failed"]):
             result["status"] = "pending"
