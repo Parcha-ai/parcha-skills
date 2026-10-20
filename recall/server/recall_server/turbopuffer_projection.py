@@ -676,24 +676,33 @@ class TurbopufferProjector:
             groups: dict[tuple[str, date], list[str]] = {}
             for passage in page:
                 groups.setdefault((passage["source_id"], _month(passage["first_occurred_at"])), []).append(passage["passage_id"])
-            for (source_id, month), ids in sorted(groups.items()):
-                with self._publication_lease(tenant_id, source_id, month) as acquired:
-                    if not acquired:
-                        raise ValueError("search_publication_busy")
-                    # The nomination may predate the lease. Re-read authority
-                    # under it before the external write, just like month pages.
-                    with self.store.connect() as connection:
-                        if metadata_byte_limit is not None or getattr(self.store, "verified_singleton_receipts", False):
-                            connection.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
-                        if metadata_byte_limit is not None:
-                            from .search_parent_reconciliation import measure_metadata
-                            measure_metadata(self, connection, tenant_id, ids,
-                                time.monotonic() + self.store.search_deadline_ms / 1000, metadata_byte_limit)
-                        current = self.passages_by_id(connection, tenant_id, ids)
-                        connection.commit()
-                    page = [row for row in current if row["source_id"] == source_id
-                            and _month(row["first_occurred_at"]) == month]
-                    written += self._write_page(namespace, budget, page, _MonthTiming())
+            written += self._upsert_passage_groups(tenant_id, groups, namespace=namespace,
+                budget=budget, metadata_byte_limit=metadata_byte_limit)
+        return written
+
+    def _upsert_passage_groups(self, tenant_id: str, groups: dict[tuple[str, date], list[str]],
+                              *, namespace: Any, budget: dict[str, float],
+                              metadata_byte_limit: int | None) -> int:
+        """Use native nomination routes only; fetch current bodies under each lease."""
+        written = 0
+        for (source_id, month), ids in sorted(groups.items()):
+            with self._publication_lease(tenant_id, source_id, month) as acquired:
+                if not acquired:
+                    raise ValueError("search_publication_busy")
+                # The nomination may predate the lease. Re-read authority
+                # under it before the external write, just like month pages.
+                with self.store.connect() as connection:
+                    if metadata_byte_limit is not None or getattr(self.store, "verified_singleton_receipts", False):
+                        connection.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+                    if metadata_byte_limit is not None:
+                        from .search_parent_reconciliation import measure_metadata
+                        measure_metadata(self, connection, tenant_id, ids,
+                            time.monotonic() + self.store.search_deadline_ms / 1000, metadata_byte_limit)
+                    current = self.passages_by_id(connection, tenant_id, ids)
+                    connection.commit()
+                page = [row for row in current if row["source_id"] == source_id
+                        and _month(row["first_occurred_at"]) == month]
+                written += self._write_page(namespace, budget, page, _MonthTiming())
         return written
 
     def queue_stale_passages(self, tenant_id: str, passage_ids: list[str]) -> int:
