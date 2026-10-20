@@ -181,6 +181,29 @@ class CodexArchiveCollectorTest(unittest.TestCase):
         self.assertEqual(collector.doctor()["archive_coverage_percent"], 100.0)
         collector.close()
 
+    def test_compressed_only_archived_rollout_is_captured(self) -> None:
+        # Synthetic native JSONL, encoded by libzstd's CLI at level 3 without
+        # a checksum, compatible with Codex's streaming zstd encoder.
+        fixture = Path(__file__).parent / "fixtures" / "codex-rollout.jsonl.zst"
+        path = self.archived / (
+            "rollout-2026-08-10T00-00-00-"
+            "019f1111-2222-7333-8444-555555555555.jsonl.zst"
+        )
+        path.write_bytes(fixture.read_bytes())
+        collector = self.collector()
+        self.addCleanup(collector.close)
+        scanned = collector.scan()
+        self.assertEqual(scanned["records_queued"], 2)
+        self.assertEqual(scanned["parse_errors"], 0)
+        self.assertEqual(scanned["tombstones_queued"], 0)
+        self.assertEqual(collector.flush()["acked"], 2)
+        self.assertEqual(len(self._rows(collector)), 2)
+        progress = collector.db.execute(
+            "SELECT scanned_offset,committed_offset FROM files WHERE path=?",
+            (str(path),),
+        ).fetchone()
+        self.assertEqual(tuple(progress), (255, 255))
+
     def test_restart_after_remote_commit_replays_once_after_move(self) -> None:
         session_id = "019f1111-2222-7333-8444-555555555555"
         source = self.active / f"rollout-{session_id}.jsonl"

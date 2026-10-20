@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import time
+from collections import Counter
 
 from connectors.sdk import ConnectorRecordV2, MAX_PAGE_BYTES, MAX_PAGE_RECORDS, MAX_RECORD_BYTES
 
@@ -16,6 +17,12 @@ DEBT = KEY + ':unresolved:'
 DEBT_END = DEBT + '~'
 RETRY_TURN = KEY + ':retry_turn'
 _NOT_A_CONTACT_SKIP = object()
+_REPORTED_DEBT_REASONS = frozenset({
+    'ArchiveError', 'ArchiveNotFound', 'ValueError', 'ConnectorContractError',
+    'JSONDecodeError', 'TimeoutError', 'SearchDeadlineExceeded',
+    'StructuredEnvelopeValidationError', 'archive_unavailable', 'current_record_changed',
+})
+_DEBT_SAMPLE_LIMIT = 32
 
 
 def _epoch(worker, row):
@@ -42,19 +49,36 @@ def _save(db, state, *, retry_next=None):
 
 
 def progress_report(row, runner):
-    """Report persisted progress and debt presence from one SQLite snapshot."""
-    saved = runner.db.execute("""SELECT value, EXISTS(
-        SELECT 1 FROM meta WHERE key>=? AND key<?) AS has_debt
-        FROM meta WHERE key=?""", (DEBT, DEBT_END, KEY)).fetchone()
-    if saved is None:
+    """Observe progress and a bounded debt sample in one read-only snapshot."""
+    saved = dict(runner.db.execute("""SELECT key,value FROM meta WHERE key IN (?,?)
+        UNION ALL
+        SELECT key,value FROM (
+            SELECT key,value FROM meta WHERE key>=? AND key<?
+            ORDER BY key LIMIT ?)""",
+        (KEY, RETRY_TURN, DEBT, DEBT_END, _DEBT_SAMPLE_LIMIT)))
+    if KEY not in saved:
         raise ValueError('captured_progress_invalid')
-    state = json.loads(saved[0])
-    has_debt = bool(saved[1])
+    state = json.loads(saved.pop(KEY))
+    turn = saved.pop(RETRY_TURN, None)
+    has_debt = bool(saved)
     if (state['unresolved'] > 0) != has_debt:
         raise ValueError('captured_progress_invalid')
+    reasons = Counter()
+    for value in saved.values():
+        try:
+            debt = json.loads(value)
+            reason = debt.get('reason') if isinstance(debt, dict) else None
+            label = reason if isinstance(reason, str) and reason in _REPORTED_DEBT_REASONS else 'other'
+        except (ValueError, TypeError):
+            label = 'invalid_debt_record'
+        reasons[label] += 1
     return dict(installation_id=str(row['id']), source_id=row['source_id'],
         checkpoint_version=state['version'], authority_epoch=state['epoch'],
         frontier_sha256=hashlib.sha256(json.dumps(state['upper']).encode()).hexdigest(),
+        forward_cursor_sha256=hashlib.sha256(state['after'].encode()).hexdigest(),
+        retry_cursor_sha256=hashlib.sha256(state['retry_after'].encode()).hexdigest(),
+        retry_turn=turn == '1' if turn in ('0', '1') else None,
+        debt_reason_sample=dict(count=len(saved), limit=_DEBT_SAMPLE_LIMIT, reasons=dict(reasons)),
         phase=state['phase'], examined=state['examined'], unresolved=state['unresolved'],
         unresolved_entries_present=has_debt,
         status='unresolved' if has_debt else 'complete' if state['phase'] == 'complete' else 'in_progress')

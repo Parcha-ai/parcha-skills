@@ -14,7 +14,9 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY server/requirements.txt /opt/recall/requirements.txt
-RUN python -m pip install --no-cache-dir --disable-pip-version-check --no-compile -r requirements.txt \
+COPY collector/requirements.txt /opt/recall/collector-requirements.txt
+RUN python -m pip install --no-cache-dir --disable-pip-version-check --no-compile \
+      --only-binary=backports.zstd -r requirements.txt -r collector-requirements.txt \
     && groupadd --gid 10001 recall \
     && useradd --uid 10001 --gid 10001 --no-create-home --shell /usr/sbin/nologin recall \
     && (getent group 1000 >/dev/null || groupadd --gid 1000 render-secrets) \
@@ -32,6 +34,7 @@ COPY --chown=10001:10001 privacy /opt/recall/privacy
 COPY --chown=10001:10001 scripts/install_gws.py /opt/recall/scripts/install_gws.py
 COPY --chown=10001:10001 skills/recall/scripts/recall.py /opt/skills/recall/scripts/recall.py
 COPY --chown=10001:10001 skills/recall/scripts/codex_identity.py /opt/skills/recall/scripts/codex_identity.py
+COPY --chown=10001:10001 skills/recall/scripts/codex_rollout.py /opt/skills/recall/scripts/codex_rollout.py
 
 RUN python /opt/recall/scripts/install_gws.py \
       --target x86_64-unknown-linux-gnu \

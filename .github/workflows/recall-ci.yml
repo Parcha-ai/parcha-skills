@@ -320,6 +320,7 @@ jobs:
         run: |
           docker build --pull --tag "$RECALL_CORE_IMAGE" --file Dockerfile .
           python server/tests/e2e_core_container.py
+          python server/tests/e2e_codex_container_decoder.py
       - name: Recall Core image vulnerability gate
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
@@ -334,6 +335,7 @@ jobs:
         run: |
           docker build --pull --tag "$RECALL_REMOTE_WORKER_IMAGE" --file Dockerfile.remote-worker .
           python server/tests/e2e_remote_worker_container.py
+          python server/tests/e2e_codex_container_decoder.py
       - name: Remote worker image vulnerability gate
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
