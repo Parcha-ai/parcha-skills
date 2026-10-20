@@ -17,7 +17,11 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Callable
 
-from contracts.source_units import resolve_claude_tool_source_unit, resolve_codex_tool_source_unit
+from contracts.source_units import (
+    codex_history_source_unit_index, iter_codex_history_source_units,
+    resolve_claude_tool_source_unit, resolve_codex_history_source_unit,
+    resolve_codex_tool_source_unit,
+)
 from .boundary_identity import native_family_id, protected_family_ids
 from .private_holdout import _private_path
 from .retrieval import EvaluationInputError, receipt_source
@@ -43,6 +47,9 @@ def _read_page(root, spec):
 
     legacy_units = (None, 'subagent_handback.complete.v1', 'assistant_final.complete.v1')
     new_units = any(s.get('source_unit') not in legacy_units for p in spec['passages'] for s in p['spans'])
+
+    def history_unit(unit):
+        return isinstance(unit, str) and unit.startswith('codex.history-message.v1#')
 
     def unique(pairs):
         result = {}
@@ -119,7 +126,9 @@ def _read_page(root, spec):
                 require(all(r['segment_ordinal'] == i and r['segment_count'] == count and r['event_native_id'] == first['event_native_id'] for i, r in enumerate(group)), 'segment_identity_mismatch')
                 text = ''.join(body(r) for r in group)
                 if codex_tool:
-                    _, _, tool = resolve_codex_tool_source_unit(text, span['source_unit'])
+                    resolver = (resolve_codex_history_source_unit if history_unit(span['source_unit'])
+                                else resolve_codex_tool_source_unit)
+                    _, _, tool = resolver(text, span['source_unit'])
                     require(first['roles'] in ([], [tool['role']]), 'nonvisible_role')
                 groups[ordinal] = (first, text)
                 if spec['source_id'].startswith('claude:'):
@@ -144,10 +153,14 @@ def _read_page(root, spec):
                 first, original = groups[span['record_ordinal']]
                 unit = span.get('source_unit')
                 tool = None
+                message = None
                 if unit in legacy_units:
                     raw = visible(original).encode()
                 elif spec['source_id'].startswith('codex:'):
-                    resolved, origin, tool = resolve_codex_tool_source_unit(original, unit)
+                    if history_unit(unit):
+                        resolved, origin, message = resolve_codex_history_source_unit(original, unit)
+                    else:
+                        resolved, origin, tool = resolve_codex_tool_source_unit(original, unit)
                     raw = resolved.encode()
                 else:
                     require(spec['source_id'].startswith('claude:'), 'tool_source_unit_invalid')
@@ -163,6 +176,7 @@ def _read_page(root, spec):
                         'text': text[offset:offset + 900], 'event_native_id': first['event_native_id'],
                         'occurred_at': first['occurred_at'], 'ordinal': first['ordinal'], 'receipts': first['receipts'],
                         **({'source_unit': unit, 'source_origin': origin} if unit not in legacy_units else {}),
+                        **({'source_message': message} if message is not None else {}),
                         **({'source_tool': tool} if tool is not None else {})})
             text = '\n'.join(parts)
             for span, part in zip(passage['spans'], parts):
@@ -222,7 +236,13 @@ class CandidateCapture:
         resolver = ''
         reader = inspect.getsource(_read_page) + '\n' + inspect.getsource(_page_stdout)
         if new_units:
-            source = (inspect.getsource(resolve_codex_tool_source_unit if spec['source_id'].startswith('codex:')
+            history = any(isinstance(s.get('source_unit'), str)
+                          and s['source_unit'].startswith('codex.history-message.v1#')
+                          for p in spec['passages'] for s in p['spans'])
+            history_reader = ('\n'.join(inspect.getsource(f) for f in (
+                codex_history_source_unit_index, iter_codex_history_source_units,
+                resolve_codex_history_source_unit)) + '\n') if history else ''
+            source = (history_reader + inspect.getsource(resolve_codex_tool_source_unit if spec['source_id'].startswith('codex:')
                                         else resolve_claude_tool_source_unit) + '\n' + reader).encode()
             packed = base64.b64encode(gzip.compress(source, mtime=0)).decode()
             resolver = f"TOOL_UNIT_RESOLVER = '{packed}'\nexec(gzip.decompress(base64.b64decode(TOOL_UNIT_RESOLVER)))\n"
@@ -438,16 +458,24 @@ class CandidateCapture:
                     _require(type(chunk['ordinal']) is int and chunk['ordinal'] == span['record_ordinal'], 'capture_fragment_ordinal')
                     _require(all(chunk[k] == chunks[0][k] for k in ('event_native_id', 'occurred_at', 'receipts')), 'capture_fragment_identity')
                     if span.get('source_unit') is not None:
-                        kind = 'tool_input' if span['source_unit'].startswith(('claude.tool-input.', 'codex.tool-input.')) else 'tool_result'
+                        history = span['source_unit'].startswith('codex.history-message.v1#')
+                        kind = ('history_message' if history else 'tool_input'
+                                if span['source_unit'].startswith(('claude.tool-input.', 'codex.tool-input.'))
+                                else 'tool_result')
                         _require(chunk.get('source_unit') == span['source_unit'] and chunk.get('source_origin') == kind, 'capture_fragment_identity')
                         _require(chunk.get('source_tool') == chunks[0].get('source_tool'), 'capture_fragment_identity')
+                        if history:
+                            _require(chunk.get('source_message') == chunks[0].get('source_message'), 'capture_fragment_identity')
                     cursor = chunk['end']
                 _require(cursor == chunks[0]['length'], 'capture_fragment_incomplete')
                 parts.append(''.join(c['text'] for c in chunks))
                 spans.append({**span, **{k: chunks[0][k] for k in ('event_native_id', 'occurred_at', 'receipts')}})
                 if span.get('source_unit') is not None:
                     spans[-1]['source_origin'] = chunks[0]['source_origin']
-                    if span['source_unit'].startswith('codex.'):
+                    if span['source_unit'].startswith('codex.history-message.v1#'):
+                        _require(isinstance(chunks[0].get('source_message'), dict), 'capture_fragment_identity')
+                        spans[-1]['source_message'] = chunks[0]['source_message']
+                    elif span['source_unit'].startswith('codex.'):
                         _require(isinstance(chunks[0].get('source_tool'), dict), 'capture_fragment_identity')
                         spans[-1]['source_tool'] = chunks[0]['source_tool']
             text = '\n'.join(parts)
