@@ -149,6 +149,7 @@ jobs:
             e2e_turbopuffer_forget_fence.py \
             e2e_turbopuffer_mixed_ranges.py \
             e2e_retained_passage_receipts.py \
+            e2e_reconciliation_metadata_first.py \
             e2e_forgotten_trigger_index.py \
             e2e_parent_authority_generation.py \
             e2e_parent_membership_enrollment.py \

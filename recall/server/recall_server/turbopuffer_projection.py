@@ -78,12 +78,12 @@ _LIVE_PASSAGE_PREDICATE = """
     )
 """
 
-_PASSAGE_SELECT_SQL = """
+_PASSAGE_SELECT_TEMPLATE = """
     SELECT passage.passage_id,passage.source_id,passage.logical_document_id,
            passage.policy_fingerprint,passage.ordinal,
            passage.first_occurred_at,passage.last_occurred_at,
            passage.roles,passage.receipts,passage.spans,
-           passage.text_redacted,passage.text_sha256,passage.header_redacted,
+           {body}passage.text_sha256,passage.header_redacted,
            evidence.native_parent_id,evidence.revision,
            evidence.manifest_object_key,evidence.manifest_content_sha256,
            evidence.first_occurred_at AS doc_first_occurred_at,
@@ -100,6 +100,8 @@ _PASSAGE_SELECT_SQL = """
                '[]'::jsonb
            ) AS actors
 """
+_PASSAGE_SELECT_SQL = _PASSAGE_SELECT_TEMPLATE.format(body="passage.text_redacted,")
+_PASSAGE_METADATA_SELECT_SQL = _PASSAGE_SELECT_TEMPLATE.format(body="")
 
 _PASSAGE_FROM_SQL = """      FROM canonical_passages passage
       JOIN canonical_passage_documents projected
@@ -136,12 +138,13 @@ _PASSAGE_PAGE_SQL = (
     " ORDER BY hydrated.first_occurred_at,hydrated.passage_id\n"
 )
 
-_PASSAGE_BY_ID_SQL = _PASSAGE_SELECT_SQL + _PASSAGE_FROM_SQL + f"""
+_PASSAGE_BY_ID_SUFFIX_SQL = _PASSAGE_FROM_SQL + f"""
      WHERE passage.tenant_id=%s
        AND passage.passage_id=ANY(%s::text[])
        AND {_LIVE_PASSAGE_PREDICATE}
      ORDER BY passage.first_occurred_at,passage.passage_id
 """
+_PASSAGE_BY_ID_SQL = _PASSAGE_SELECT_SQL + _PASSAGE_BY_ID_SUFFIX_SQL
 
 _CERTIFICATE_PRESENCE = (
     "passage.membership_generation AS _membership_generation,"
@@ -627,11 +630,13 @@ class TurbopufferProjector:
                 or all((row["source_id"], receipt) in members
                                           for receipt in row["receipts"])]
 
-    def passages_by_id(self, connection: Any, tenant_id: str, passage_ids: list[str]) -> list[dict[str, Any]]:
-        """The live passages among ``passage_ids``, in page order."""
+    def passages_by_id(self, connection: Any, tenant_id: str, passage_ids: list[str],
+                       *, metadata_only: bool = False) -> list[dict[str, Any]]:
+        """Live passages with identical authority; presence checks can omit bodies."""
+        sql = (_PASSAGE_METADATA_SELECT_SQL + _PASSAGE_BY_ID_SUFFIX_SQL
+               if metadata_only else _PASSAGE_BY_ID_SQL)
         if getattr(self.store, "verified_singleton_receipts", False):
             deadline = time.monotonic() + self.store.search_deadline_ms / 1000
-            sql = _PASSAGE_BY_ID_SQL
             if self.parent_membership_read.enabled:
                 sql = sql.replace("SELECT passage.passage_id,",
                                   "SELECT " + _CERTIFICATE_PRESENCE + "passage.passage_id,", 1)
@@ -642,7 +647,7 @@ class TurbopufferProjector:
             return self._authorized_publication_rows(connection, tenant_id, rows, deadline_at=deadline)
         return [
             dict(row)
-            for row in connection.execute(_PASSAGE_BY_ID_SQL, (tenant_id, list(passage_ids))).fetchall()
+            for row in connection.execute(sql, (tenant_id, list(passage_ids))).fetchall()
         ]
 
     def upsert_passages(self, tenant_id: str, passage_ids: list[str],
