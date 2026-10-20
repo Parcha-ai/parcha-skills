@@ -124,6 +124,100 @@ class RetainedPassageReceipts(unittest.TestCase):
             return connection.execute("SELECT * FROM search_parent_reconciliation WHERE tenant_id=%s",
                 (self.tenant,)).fetchone()
 
+    def test_reconciliation_reuses_nomination_routes_without_a_third_authority_read(self):
+        from recall_server import search_parent_reconciliation
+        self.ingest(1)
+        self.project()
+        self.writer.drain(tenant_id=self.tenant, max_months=2)
+        namespace = self.client.namespace(self.settings.namespace(self.tenant))
+        namespace.rows.clear()
+        self.ingest(2)
+        self.project()
+        self.store.verified_singleton_receipts = True
+        writer = self.restart_writer()
+        with patch.object(writer, 'passages_by_id', wraps=writer.passages_by_id) as hydrate, \
+                patch.object(search_parent_reconciliation, 'measure_metadata',
+                             wraps=search_parent_reconciliation.measure_metadata) as measure:
+            outcome = search_parent_reconciliation.step(writer, self.tenant)
+        self.assertEqual(outcome, dict(attempted=1, examined=1, written=1))
+        self.assertEqual(set(namespace.rows), {row['passage_id'] for row in self.rows()})
+        self.assertEqual(hydrate.call_count, 2,
+            'presence comparison and final locked authority are sufficient; routing needs no reread')
+        self.assertEqual(measure.call_count, 1,
+            'the final locked read retains its metadata budget')
+
+    def test_reconciliation_uses_current_body_after_native_nomination(self):
+        from recall_server import search_parent_reconciliation
+        self.ingest(1)
+        self.project()
+        self.writer.drain(tenant_id=self.tenant, max_months=2)
+        namespace = self.client.namespace(self.settings.namespace(self.tenant))
+        namespace.rows.clear()
+        self.ingest(2)
+        self.project()
+        self.store.verified_singleton_receipts = True
+        query = namespace.query
+        def change_header(**kwargs):
+            result = query(**kwargs)
+            with self.store.connect() as connection:
+                connection.execute('UPDATE canonical_passages SET header_redacted=%s WHERE tenant_id=%s',
+                    ('Current header after nomination.', self.tenant))
+            return result
+        with patch.object(namespace, 'query', side_effect=change_header):
+            outcome = search_parent_reconciliation.step(self.restart_writer(), self.tenant)
+        self.assertEqual(outcome['written'], 1)
+        self.assertEqual(next(iter(namespace.rows.values()))['header'], 'Current header after nomination.')
+
+    def test_reconciliation_revision_change_after_nomination_refuses_write(self):
+        from recall_server import search_parent_reconciliation
+        self.ingest(1)
+        self.project()
+        self.writer.drain(tenant_id=self.tenant, max_months=2)
+        namespace = self.client.namespace(self.settings.namespace(self.tenant))
+        namespace.rows.clear()
+        self.ingest(2)
+        self.project()
+        self.store.verified_singleton_receipts = True
+        query = namespace.query
+        def revise(**kwargs):
+            result = query(**kwargs)
+            self.ingest(3, text='Changed current source evidence.')
+            return result
+        writes = len(namespace.writes)
+        with patch.object(namespace, 'query', side_effect=revise):
+            with self.assertRaisesRegex(ValueError, 'write_incomplete'):
+                search_parent_reconciliation.step(self.restart_writer(), self.tenant)
+        self.assertEqual(len(namespace.writes), writes)
+        self.assertEqual(self.reconciliation_row()['page_checkpoint']['after'], -1)
+
+    def test_reconciliation_month_move_after_nomination_keeps_work_owed(self):
+        from recall_server import search_parent_reconciliation
+        self.ingest(1)
+        self.project()
+        self.writer.drain(tenant_id=self.tenant, max_months=2)
+        namespace = self.client.namespace(self.settings.namespace(self.tenant))
+        namespace.rows.clear()
+        self.ingest(2)
+        self.project()
+        self.store.verified_singleton_receipts = True
+        query = namespace.query
+        def move_month(**kwargs):
+            result = query(**kwargs)
+            with self.store.connect() as connection:
+                connection.execute("""UPDATE canonical_passages
+                    SET first_occurred_at='2026-11-01T12:00:00Z',last_occurred_at='2026-11-01T12:00:00Z'
+                    WHERE tenant_id=%s""", (self.tenant,))
+            return result
+        writes = len(namespace.writes)
+        with patch.object(namespace, 'query', side_effect=move_month):
+            with self.assertRaisesRegex(ValueError, 'write_incomplete'):
+                search_parent_reconciliation.step(self.restart_writer(), self.tenant)
+        self.assertEqual(len(namespace.writes), writes)
+        self.assertEqual(self.reconciliation_row()['page_checkpoint']['after'], -1)
+        # A new attempt nominates the new route and can settle the same work.
+        outcome = search_parent_reconciliation.step(self.restart_writer(), self.tenant)
+        self.assertEqual(outcome['written'], 1)
+
     def restart_writer(self, *, batch_rows=1):
         return TurbopufferProjector(self.store, self.settings, client=self.client,
             batch_rows=batch_rows, write_concurrency=1, tokens_per_minute=0)

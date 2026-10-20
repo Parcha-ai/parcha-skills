@@ -13,6 +13,7 @@ from typing import Any
 
 from psycopg.types.json import Jsonb
 
+from .search_outbox import _month
 from .turbopuffer_plane import namespace_schema
 
 MAX_PAGE_ROWS = 128
@@ -177,15 +178,20 @@ def step(writer: Any, tenant_id: str) -> dict[str, int]:
                 raise ValueError("search_parent_reconciliation_vendor_scope")
             present[identifier] = row
         missing = []
+        groups = {}
         for row in page:
             expected = {field: row[field] for field in fields if field != "header"}
             expected["header"] = row.get("header_redacted") or ""
             current = present.get(row["passage_id"], {})
             if any(current.get(field) != value for field, value in expected.items()):
                 missing.append(row["passage_id"])
+                groups.setdefault((row["source_id"], _month(row["first_occurred_at"])), []).append(row["passage_id"])
         # Native write owner repeats authority under the existing source/month
-        # lease. Receipt/revision changes alone do not re-embed a correct body.
-        result["written"] = writer.upsert_passages(tenant_id, missing, metadata_byte_limit=MAX_METADATA_BYTES)
+        # lease. Reuse only routes from the authorized comparison, never bodies
+        # or vendor metadata. Receipt/revision changes alone do not re-embed.
+        result["written"] = writer._upsert_passage_groups(tenant_id, groups, namespace=namespace,
+            budget={"remaining": writer.rate_limit_budget_seconds, "rate_limited": 0},
+            metadata_byte_limit=MAX_METADATA_BYTES)
         if result["written"] != len(missing):
             raise ValueError("search_parent_reconciliation_write_incomplete")
     deadline = time.monotonic() + writer.store.search_deadline_ms / 1000
