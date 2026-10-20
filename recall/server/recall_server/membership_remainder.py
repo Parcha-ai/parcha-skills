@@ -9,6 +9,9 @@ import time
 
 from . import parent_membership_enrollment as native
 
+# Version2 prefixes were proved with the v3 certificate binding.
+_CHECKPOINT_VERSION = 2
+
 FIELDS = (
     "revision",
     "source_sha256",
@@ -69,10 +72,10 @@ def retain_retirement(store, *, scope, manifest, settings, deadline_at):
             AND evidence.revision=%s AND evidence.document_content_sha256=%s
             AND evidence.manifest_content_sha256=%s"""
         row = native._query(store, connection, """WITH current_scope AS ("""
-            + current + """) INSERT INTO canonical_passage_projection_queue
+            + current + f""") INSERT INTO canonical_passage_projection_queue
             (tenant_id,source_id,logical_document_id,revision,reason,certification_checkpoint)
             SELECT %s,%s,%s,revision,'certification',
-              jsonb_build_object('version',1,'epoch',%s::text,'after','',
+              jsonb_build_object('version',{_CHECKPOINT_VERSION},'epoch',%s::text,'after','',
                 'revision',revision,'source_sha256',source_sha256,
                 'manifest_sha256',manifest_sha256,'policy',policy,
                 'authority_generation',authority_generation)
@@ -107,7 +110,7 @@ def retain(connection, candidate, settings):
     # Null generation is only a scheduling request for native initialization.
     # It carries no certified prefix and cannot authorize a reader.
     checkpoint = dict(
-        version=1,
+        version=_CHECKPOINT_VERSION,
         epoch=settings.binding_epoch,
         after="",
         **{name: scope[name] for name in FIELDS},
@@ -223,7 +226,8 @@ def resume(store, row, *, settings, deadline_at):
                 ).fetchone()
                 valid = (
                     isinstance(checkpoint, dict)
-                    and checkpoint.get("version") == 1
+                    and type(checkpoint.get("version")) is int
+                    and checkpoint["version"] in (1, _CHECKPOINT_VERSION)
                     and checkpoint.get("epoch") == settings.binding_epoch
                     and isinstance(checkpoint.get("after"), str)
                     and (
@@ -248,19 +252,20 @@ def resume(store, row, *, settings, deadline_at):
                 generation_changed = valid and (
                     checkpoint["authority_generation"] != scope["authority_generation"]
                 )
+                binding_changed = valid and checkpoint["version"] != _CHECKPOINT_VERSION
                 initialize = (valid and checkpoint["authority_generation"] is None
                               and scope["authority_generation"] is None and not busy)
                 if valid and scope["authority_generation"] is None and not initialize:
                     # A previously positive binding must never be reset.
                     valid = checkpoint["authority_generation"] is None
-                if valid and generation_changed:
+                if valid and (generation_changed or binding_changed):
                     # Reset an invalidated prefix only after current metadata.
                     updated = checkpoint
-                    if generation_changed and not busy:
-                        # A membership change invalidates the acknowledged prefix.
+                    if not busy:
+                        # Membership or binding-format changes invalidate the prefix.
                         # Keep the publication binding and reprove from the start.
                         updated = dict(
-                            checkpoint, after="",
+                            checkpoint, version=_CHECKPOINT_VERSION, after="",
                             authority_generation=scope["authority_generation"],
                         )
                     scheduled = native._query(
@@ -477,7 +482,7 @@ def seed_history(
                   INSERT INTO canonical_passage_projection_queue
                     (tenant_id,source_id,logical_document_id,revision,reason,certification_checkpoint)
                   SELECT %s,source_id,logical_document_id,revision,'certification',
-                    jsonb_build_object('version',1,'epoch',%s::text,'after','',
+                    jsonb_build_object('version',{_CHECKPOINT_VERSION},'epoch',%s::text,'after','',
                       'revision',revision,'source_sha256',source_sha256,
                       'manifest_sha256',manifest_sha256,'policy',policy,
                       'authority_generation',authority_generation)

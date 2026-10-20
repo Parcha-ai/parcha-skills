@@ -1971,6 +1971,23 @@ representation mismatches conservatively invalidate.
 Mixed v2/v3 readers never treat the other binding domain as a certificate match:
 they use the unchanged native receipt proof. Current grants, source ownership,
 Forget, generation/CAS and full native enrollment proof remain mandatory.
+Remainder checkpoint version 2 records that its acknowledged prefix used the v3
+binding contract. A compatible consumer rechecks current publication metadata and
+uses the existing queue CAS to migrate a valid, nonbusy version 1 checkpoint,
+then proves its prefix again through native enrollment before reporting completion.
+The epoch and authority generation are not rotated. New version 2 checkpoints keep
+their acknowledged progress on subsequent resumes.
+
+Version 1 cannot distinguish older v2 proofs from newer v3 proofs. Its migration
+therefore repeats metadata membership and ownership SQL even for current v3
+certificates; enrollment has no certificate shortcut. It reads no archive bodies
+and keeps the existing proof budgets. Update every certification consumer before
+resuming the historical campaign. Older consumers reject version 2 as incompatible
+optional work and may remove its queue row; reader authority still falls back to
+native proof. After a rollback or previously completed old checkpoints, use the
+existing historical seed and consumer to re-admit completed work. Queue completion
+alone does not establish corpus-wide certificate coverage.
+
 Rollback requires a binary with explicit 092 capability compatibility; retain
 the migration marker and data. Do not assume an older binary's HTTP health check
 proves schema compatibility or automatically restore an older collector.
