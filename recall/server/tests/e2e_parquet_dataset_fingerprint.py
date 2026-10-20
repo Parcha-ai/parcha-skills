@@ -260,6 +260,25 @@ class SharedDatasetWitness(SparsePlanning):
                 (self.tenant,),
             ).fetchall()
 
+    def test_failed_passage_proof_precedes_raw_reuse_metadata_reads(self):
+        candidate, _ = self.passage_only_build()
+        before = live_parts(self.store, self.tenant, self.source)
+        with (
+            patch.object(
+                self.scan,
+                "_passages",
+                side_effect=ParquetScanError("parquet_scan_state_invalid"),
+            ),
+            patch.object(self.archive, "read_raw", wraps=self.archive.read_raw) as read,
+            patch.object(self.archive, "put_raw", wraps=self.archive.put_raw) as put,
+        ):
+            with self.assertRaises(ParquetScanError):
+                self.scan._build(candidate, allow_compaction=False)
+        self.assertEqual(read.call_count, 0)
+        self.assertEqual(put.call_count, 0)
+        self.assertEqual(live_parts(self.store, self.tenant, self.source), before)
+        self.assertEqual(self.candidate(), candidate)
+
     def test_retained_member_compare_and_swap_rolls_back_catalog(self):
         candidate, result = self.passage_only_build()
         identity, pairs = next(iter(result.retained_members.items()))

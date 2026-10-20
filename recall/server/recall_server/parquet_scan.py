@@ -2109,23 +2109,7 @@ class CanonicalParquetScanProjector:
             for document in documents
             if document["logical_document_id"] in rewrite
         ]
-        raw_unchanged = set()
-        if not _rebuild and mode == "delta" and catalog.members:
-            raw_unchanged = self._unchanged_raw_documents(candidate, documents, catalog, rewrite)
-        raw_rewrite = rewrite - raw_unchanged
         original_catalog = catalog
-        if raw_unchanged:
-            current = {row["logical_document_id"]: row for row in documents}
-            victims = {identity for identity in victims if identity[0] == "passages" or any(
-                member.logical_document_id not in current or member.logical_document_id in raw_rewrite
-                for member in catalog.members.get(identity, ())) or not catalog.members.get(identity)}
-            catalog = replace(catalog, members={identity: tuple(
-                FragmentMember(member.logical_document_id, member.revision,
-                    self._fingerprint(current[member.logical_document_id]))
-                if identity[0] != "passages" and member.logical_document_id in raw_unchanged else member
-                for member in members) for identity, members in catalog.members.items()})
-        raw_documents = [row for row in rewrite_documents if row["logical_document_id"] in raw_rewrite]
-        self._attach_parts(candidate, raw_documents)
         surviving = {
             dataset: [
                 shard_index
@@ -2181,9 +2165,42 @@ class CanonicalParquetScanProjector:
                     self._passage_row(candidate, passage),
                     member=members[passage["logical_document_id"]],
                 )
+            # Only marked passage updates can reuse raw datasets. Complete the
+            # native passage proof before reading any derived document fragment.
+            raw_unchanged = set()
+            if not _rebuild and mode == "delta" and catalog.forced_documents:
+                raw_unchanged = self._unchanged_raw_documents(
+                    candidate, documents, catalog, rewrite & catalog.forced_documents)
+            raw_rewrite = rewrite - raw_unchanged
+            if raw_unchanged:
+                current = {row["logical_document_id"]: row for row in documents}
+                victims = {identity for identity in victims if identity[0] == "passages" or any(
+                    member.logical_document_id not in current or member.logical_document_id in raw_rewrite
+                    for member in catalog.members.get(identity, ())) or not catalog.members.get(identity)}
+                catalog = replace(catalog, members={identity: tuple(
+                    FragmentMember(member.logical_document_id, member.revision,
+                        self._fingerprint(current[member.logical_document_id]))
+                    if identity[0] != "passages" and member.logical_document_id in raw_unchanged else member
+                    for member in members) for identity, members in catalog.members.items()})
+            raw_documents = [row for row in rewrite_documents if row["logical_document_id"] in raw_rewrite]
+            self._attach_parts(candidate, raw_documents)
+            if raw_unchanged:
+                # No raw rows have entered the upload yet. Retained raw parts
+                # now reserve their original indexes before any new raw upload.
+                surviving = {
+                    dataset: [index for (kind, index) in catalog.shards
+                              if kind == dataset and (kind, index) not in victims]
+                    for dataset in SCAN_DATASETS
+                }
+                for dataset, indexes in surviving.items():
+                    if dataset != "passages":
+                        upload.part_indexes[dataset] = max(indexes) + 1 if indexes else 0
+                ensure_datasets = tuple(dataset for dataset, indexes in surviving.items() if not indexes)
+                removed = tuple(sorted(victims))
             first, last = timing.call(
                 "preserve", self._preserve_rows,
-                candidate, catalog, victims, rewrite, documents, upload, raw_rewrite=raw_rewrite
+                candidate, catalog, victims, rewrite, documents, upload,
+                **({"raw_rewrite": raw_rewrite} if raw_unchanged else {}),
             )
             with _PartReadAhead(self.archive, _read_ahead_parts(
                 raw_documents, bucket_start, bucket_end
