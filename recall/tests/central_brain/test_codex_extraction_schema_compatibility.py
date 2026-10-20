@@ -14,7 +14,7 @@ class CodexExtractionSchemaCompatibilityTests(unittest.TestCase):
             self.assertEqual(assess_snapshot(snapshot)['schema_version'], 90)
 
     def test_known_90_does_not_hide_unknown_or_incomplete_schema(self):
-        for versions in (list(range(1, 94)), [n for n in range(1, 91) if n != 89],
+        for versions in (list(range(1, 95)), [n for n in range(1, 91) if n != 89],
                          [n for n in range(1, 91) if n != 69], list(range(1, 91)) + [90]):
             with self.subTest(versions=versions):
                 snapshot = healthy_snapshot()
