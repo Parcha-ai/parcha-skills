@@ -158,6 +158,7 @@ jobs:
             e2e_certification_fairness_diagnosis.py \
             e2e_membership_queue_initialization.py \
             e2e_certification_selection_batch.py \
+            e2e_certification_locked_queue.py \
             e2e_certification_cadence.py \
             e2e_membership_seed.py \
             e2e_retirement_membership_certification.py \

@@ -139,6 +139,9 @@ def pending(
 ):
     # The reason exists on old schemas; no column lookup or archive hydration is
     # needed when no certification rows exist before migration085.
+    # A publication holding the oldest queue row must not consume the whole
+    # optional allowance before ready siblings can be considered. These short
+    # selection locks end here; resume still checks the original queue CAS.
     if after_source is not None:
         where = """reason='certification' AND (%s::text IS NULL OR tenant_id=%s)
             AND (%s::text IS NULL OR logical_document_id=%s)
@@ -152,13 +155,15 @@ def pending(
                 """WITH next AS MATERIALIZED (
                     SELECT * FROM canonical_passage_projection_queue WHERE """ + where + """
                       AND (tenant_id,source_id)>(%s::text,%s::text)
-                    ORDER BY """ + order + """ LIMIT %s
+                    ORDER BY """ + order + """ LIMIT %s FOR UPDATE SKIP LOCKED
+                ), wrapped AS MATERIALIZED (
+                    SELECT * FROM canonical_passage_projection_queue WHERE """ + where + """
+                       AND NOT EXISTS(SELECT 1 FROM next)
+                     ORDER BY """ + order + """ LIMIT %s FOR UPDATE SKIP LOCKED
                 ), selected AS (
                     SELECT * FROM next
                     UNION ALL
-                    (SELECT * FROM canonical_passage_projection_queue WHERE """ + where + """
-                       AND NOT EXISTS(SELECT 1 FROM next)
-                     ORDER BY """ + order + """ LIMIT %s)
+                    SELECT * FROM wrapped
                 )
                 SELECT tenant_id,source_id,logical_document_id,generation,
                        to_jsonb(selected)->'certification_checkpoint' AS checkpoint
@@ -175,7 +180,8 @@ def pending(
          WHERE reason='certification' AND (%s::text IS NULL OR tenant_id=%s)
            AND (%s::text IS NULL OR logical_document_id=%s)
            AND (%s::text IS NULL OR source_id=%s)
-         ORDER BY changed_at,tenant_id,source_id,logical_document_id LIMIT %s""",
+         ORDER BY changed_at,tenant_id,source_id,logical_document_id LIMIT %s
+         FOR UPDATE OF queue SKIP LOCKED""",
             (
                 tenant_id,
                 tenant_id,
