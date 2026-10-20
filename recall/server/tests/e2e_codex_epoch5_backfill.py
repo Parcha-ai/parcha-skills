@@ -7,8 +7,8 @@ import time
 import unittest
 from unittest.mock import patch
 
-from contracts.source_units import resolve_codex_tool_source_unit
 from e2e_codex_tool_publication import CodexToolPublication
+from contracts.source_units import resolve_codex_tool_source_unit
 from recall_server import passage_append, tool_passage_projection
 
 
