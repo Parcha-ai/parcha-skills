@@ -1,15 +1,15 @@
 # Portable collectors
 
-The collector discovers only Claude Code `*.jsonl` or Codex `rollout-*.jsonl` files under one
-explicit root. Claude's `subagents/workflows/wf_<run-id>/journal.jsonl` replay journals
+The collector discovers Claude Code `*.jsonl` and Codex `rollout-*.jsonl` or
+`rollout-*.jsonl.zst` files under the configured active and archive roots.
+Claude's `subagents/workflows/wf_<run-id>/journal.jsonl` replay journals
 are excluded from future discovery: they cache workflow return values rather than
 transcript messages. Agent transcripts beside them, moved transcripts, and custom
 paths remain discoverable. Previously captured journal records and pending outbox
 entries are retained; this exclusion does not authorize Forget.
 
-The decoded-rollout reader is a preparation for compressed Codex capture;
-`.jsonl.zst` discovery is not enabled yet. Install its Linux dependency in the
-collector's Python environment:
+Before activating compressed capture on Linux, install the decoder into the
+exact Python environment used by the collector service:
 
 ```bash
 python -m pip install -r collector/requirements.txt
@@ -21,6 +21,17 @@ For the bundled macOS CPython 3.12 runtime, the package builder accepts
 `client/macos/DECODER_LOCK.json`, or `--download-decoder` to fetch that wheel.
 The wheel and its licenses become manifest
 entries; a system `zstd` executable is never required or invoked.
+
+Compressed inputs use decoded byte offsets and the original native session and
+segment IDs. Equal plain and compressed copies share the existing capture ledger;
+different decoded contents remain an identity conflict. The physical source path,
+inode, size and timestamps fence a private decoded snapshot, whose original hash
+checks run before capture. Decoding streams through bounded buffers to private
+temporary disk; it does not impose a total history-size cutoff. Unchanged,
+fully acknowledged snapshots can skip decoding using their saved physical proof.
+Invalid compression is retained as an unavailable source or a failed scan, never
+as an empty transcript. A completed capture proves the locally available decoded
+records; it does not prove that provider-hosted history was present locally.
 
 Complete JSONL records enter a mode-0600 SQLite outbox before network I/O. The
 scan offset may move once the spool transaction is durable; the separate committed offset moves

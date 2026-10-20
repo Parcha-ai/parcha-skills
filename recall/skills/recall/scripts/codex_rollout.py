@@ -26,13 +26,44 @@ class DecodedSourceChanged(OSError):
     pass
 
 
+class DecodedSourceDeadline(TimeoutError):
+    pass
+
+
+class DecodedSourceInvalid(ValueError, EOFError):
+    """Invalid compression is not a proved empty or complete transcript."""
+
+
+def identity_name(path: Path) -> Path:
+    """Name presented to the unchanged native filename parser, never an IO path."""
+    path = Path(path)
+    return path.with_suffix("") if path.name.endswith(".jsonl.zst") else path
+
+
+@dataclass(frozen=True)
+class IdentityReadView:
+    """Supply decoded bytes to the native identity parser without changing it."""
+
+    source_path: Path
+    deadline: float
+
+    @property
+    def stem(self) -> str:
+        return identity_name(self.source_path).stem
+
+    def open(self, mode: str):
+        if mode != "rb":
+            raise ValueError("identity view only supports binary reads")
+        return open_decoded(self.source_path, deadline=self.deadline)
+
+
 def physical_signature(value) -> tuple[int, ...]:
     return (value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns, value.st_ctime_ns)
 
 
 def _check_deadline(deadline: float) -> None:
     if time.monotonic() >= deadline:
-        raise TimeoutError("decoded_source_deadline")
+        raise DecodedSourceDeadline("decoded_source_deadline")
 
 
 def _zstd():
@@ -96,10 +127,13 @@ class _DecodedReader(io.RawIOBase):
                         data = self._source.read(BLOCK_BYTES)
                     if not data:
                         if not self._at_frame_end:
-                            raise EOFError("decoded_source_truncated")
+                            raise DecodedSourceInvalid("decoded_source_truncated")
                         return 0
                     self._at_frame_end = False
-                block = self._decoder.decompress(data, max_length=maximum)
+                try:
+                    block = self._decoder.decompress(data, max_length=maximum)
+                except self._zstd_module.ZstdError as error:
+                    raise DecodedSourceInvalid("decoded_source_invalid") from error
         _check_deadline(self._deadline)
         target[:len(block)] = block
         self._position += len(block)
@@ -165,7 +199,7 @@ class _DecodedStream:
 
 
 @contextmanager
-def open_decoded(path: Path, *, deadline: float):
+def open_decoded(path: Path, *, deadline: float, expected_signature: tuple[int, ...] | None = None):
     """Read bounded decoded blocks; offsets never refer to compressed bytes.
 
     A bounded prefix read does not validate an unread frame tail. Consumers
@@ -174,6 +208,8 @@ def open_decoded(path: Path, *, deadline: float):
     path = Path(path)
     _check_deadline(deadline)
     before = physical_signature(path.stat())
+    if expected_signature is not None and before != expected_signature:
+        raise DecodedSourceChanged("decoded_source_changed")
     with path.open("rb") as source:
         if physical_signature(os.fstat(source.fileno())) != before:
             raise DecodedSourceChanged("decoded_source_changed")
@@ -187,6 +223,14 @@ def open_decoded(path: Path, *, deadline: float):
                 raise DecodedSourceChanged("decoded_source_changed")
 
 
+def verify_source(path: Path, expected_signature: tuple[int, ...], *, deadline: float) -> None:
+    """Recheck the physical input and the same deadline before a checkpoint."""
+    _check_deadline(deadline)
+    if physical_signature(path.stat()) != expected_signature:
+        raise DecodedSourceChanged("decoded_source_changed")
+    _check_deadline(deadline)
+
+
 @dataclass(frozen=True)
 class DecodedSnapshot:
     source_path: Path
@@ -198,10 +242,7 @@ class DecodedSnapshot:
 
     def verify_current(self) -> None:
         """Call again immediately before persisting a source checkpoint."""
-        _check_deadline(self.deadline)
-        if physical_signature(self.source_path.stat()) != self.physical_signature:
-            raise DecodedSourceChanged("decoded_source_changed")
-        _check_deadline(self.deadline)
+        verify_source(self.source_path, self.physical_signature, deadline=self.deadline)
 
 
 @contextmanager
@@ -215,7 +256,7 @@ def decoded_snapshot(path: Path, *, deadline: float, directory: Path | None = No
         size = 0
         with decoded.open("xb") as output:
             decoded.chmod(0o600)
-            with open_decoded(path, deadline=deadline) as source:
+            with open_decoded(path, deadline=deadline, expected_signature=before) as source:
                 while block := source.read(BLOCK_BYTES):
                     output.write(block)
                     digest.update(block)
