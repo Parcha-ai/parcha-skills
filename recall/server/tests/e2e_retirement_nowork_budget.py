@@ -107,6 +107,56 @@ class NoWorkBudgetTests(unittest.TestCase):
         self.assertEqual(self.state(), before)
         self.assertEqual(self.progress()['last_record_ordinal'], 0)
 
+    def test_timed_out_probe_is_not_repeated_within_one_parent_attempt(self):
+        from recall_server.chunk_bodies import read_archived_chunks
+        documents = tuple(row['document_id'] for row in self.docs)
+        expected = read_archived_chunks(self.store, self.archive, tenant_id=self.tenant,
+            source_ids=(self.source,), document_ids=documents, deadline_at=time.monotonic()+10)
+        execute = self.store._execute_bounded
+        cancellations = []
+        diagnostic = {}
+
+        def blocked_selection(connection, sql, values, deadline):
+            if 'AS physical_row' not in sql:
+                return execute(connection, sql, values, deadline)
+            with psycopg.connect(os.environ['RECALL_DATABASE_URL']) as blocker:
+                blocker.execute("SET LOCAL lock_timeout='1s'")
+                blocker.execute('LOCK canonical_chunks IN ACCESS EXCLUSIVE MODE')
+                try:
+                    return execute(connection, sql, values, deadline)
+                except SearchDeadlineExceeded as error:
+                    self.assertIsInstance(error.__cause__, psycopg.errors.QueryCanceled)
+                    self.assertEqual(diagnostic['phase'], 'no_work_sql')
+                    cancellations.append(self.progress()['last_record_ordinal'])
+                    raise
+
+        arguments = dict(tenant_id=self.tenant, source_id=self.source,
+            native_parent_id=self.scope[2], apply=True, reviewed_plan=self.plan,
+            required_scope_epoch=self.progress()['scope_epoch'],
+            owner_principal_id=self.principal, metadata_mode='singleton',
+            limits=replace(self.limits, batch_documents=1, max_batches=2),
+            diagnostic=diagnostic)
+        with patch.object(self.store, '_execute_bounded', blocked_selection):
+            first = window_owner.retire_parent_windows(self.store, self.archive,
+                deadline_at=time.monotonic()+20, **arguments)
+            self.assertEqual(first['cleared_documents'], 2)
+            self.assertEqual(first['retired_metadata_chunks'], 2)
+            self.assertEqual(first['batches'], 2)
+            self.assertEqual(self.progress()['last_record_ordinal'], 1)
+            self.assertEqual(cancellations, [-1])
+            self.assertFalse(first['complete'])
+            # A new bounded attempt retries the optimization; it retains no
+            # scheduling state from the earlier attempt or another parent.
+            second = window_owner.retire_parent_windows(self.store, self.archive,
+                deadline_at=time.monotonic()+20, **arguments)
+            self.assertEqual(cancellations, [-1, 1])
+            self.assertTrue(second['complete'])
+            self.assertEqual(second['cleared_documents'], 0)
+        self.assertEqual(self.progress()['status'], 'complete')
+        self.assertEqual(read_archived_chunks(self.store, self.archive,
+            tenant_id=self.tenant, source_ids=(self.source,), document_ids=documents,
+            deadline_at=time.monotonic()+10), expected)
+
 
 if __name__ == '__main__':
     unittest.main()
