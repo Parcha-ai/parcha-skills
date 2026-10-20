@@ -25,7 +25,7 @@ of upserts are clamped to ``max_batch_bytes`` of row payload as well as
 use the same byte budget for the ID array, independently of embedding rows.
 
 Nothing here logs passage text or the API key; failures carry the error
-class only.
+class and, when recognized, a fixed publication guard code.
 """
 
 from __future__ import annotations
@@ -62,6 +62,25 @@ RATE_LIMIT_BACKOFF_SECONDS = 1.0
 RATE_LIMIT_BACKOFF_CAP_SECONDS = 60.0
 RATE_LIMIT_BUDGET_SECONDS = 300.0
 INCREMENTAL_REASONS = frozenset({"logical-update", "forget", "header-change"})
+
+_PUBLICATION_ERROR_CODES = frozenset({
+    "publication_checkpoint_scope_changed",
+    "publication_resume_scope_changed",
+    "search_publication_busy",
+    "search_parent_reconciliation_metadata_unavailable",
+    "search_parent_reconciliation_authority_unavailable",
+    "search_parent_reconciliation_vendor_scope",
+    "search_parent_reconciliation_write_incomplete",
+})
+
+
+def _publication_error_code(error: Exception) -> str:
+    # Never stringify arbitrary exceptions: SDK and source errors may carry text.
+    if (type(error) is ValueError and len(error.args) == 1
+            and type(error.args[0]) is str and error.args[0] in _PUBLICATION_ERROR_CODES):
+        return error.args[0]
+    return "unknown"
+
 
 # Copied from passage_retrieval._lexical_query: a passage is live only while
 # every receipt it cites still has an undeleted canonical chunk.
@@ -1059,7 +1078,8 @@ class TurbopufferProjector:
             outcome = step(self, tenant_id)
         except Exception as error:  # noqa: BLE001 - unacknowledged queue page stays durable
             result["failed"] += 1
-            LOG.warning("search parent reconciliation failed type=%s", type(error).__name__)
+            LOG.warning("search parent reconciliation failed type=%s code=%s",
+                        type(error).__name__, _publication_error_code(error))
             return True
         result["rows"] += outcome["written"]
         if outcome["attempted"]:
@@ -1119,8 +1139,8 @@ class TurbopufferProjector:
             except Exception as error:  # noqa: BLE001 - retain the outbox for replay
                 steps.close()
                 result["failed"] = 1
-                LOG.warning("search plane month failed reason=%s generation=%s type=%s",
-                    claim["reason"], claim["generation"], type(error).__name__)
+                LOG.warning("search plane month failed reason=%s generation=%s type=%s code=%s",
+                    claim["reason"], claim["generation"], type(error).__name__, _publication_error_code(error))
             else:
                 for key in ("rows", "deleted", "rate_limited"):
                     result[key] = step[key]
@@ -1180,8 +1200,8 @@ class TurbopufferProjector:
             except Exception as error:  # noqa: BLE001 - one month must not stop the cycle
                 result["failed"] = int(result["failed"]) + 1
                 LOG.warning(
-                    "search plane month failed reason=%s generation=%s type=%s",
-                    claim["reason"], claim["generation"], type(error).__name__,
+                    "search plane month failed reason=%s generation=%s type=%s code=%s",
+                    claim["reason"], claim["generation"], type(error).__name__, _publication_error_code(error),
                 )
                 continue
             result["months"] = int(result["months"]) + 1
