@@ -15,7 +15,34 @@ from recall_server import chunk_bodies
 LEGACY_SQL = Path(__file__).with_name('catalog_before_dedup.sql').read_text()
 
 
+class CustomCatalogObject(dict):
+    pass
+
+
+def custom_catalog_loads(value):
+    return json.loads(value, object_hook=CustomCatalogObject)
+
+
 class CatalogDedup(SingletonMetadataAdmission):
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        # Install future-field fixtures before the pool prepares any part reads.
+        with cls.store.connect() as c:
+            c.execute("""ALTER TABLE canonical_evidence_document_parts
+                ADD COLUMN copy_number numeric, ADD COLUMN copy_flag boolean,
+                ADD COLUMN copy_null text, ADD COLUMN copy_nested jsonb""")
+
+    @classmethod
+    def tearDownClass(cls):
+        try:
+            with cls.store.connect() as c:
+                c.execute("""ALTER TABLE canonical_evidence_document_parts
+                    DROP COLUMN copy_number, DROP COLUMN copy_flag,
+                    DROP COLUMN copy_null, DROP COLUMN copy_nested""")
+        finally:
+            super().tearDownClass()
+
     def populate(self):
         ingest = self.plane.ingest_document
         put = self.projector.projection.put_records
@@ -133,6 +160,52 @@ class CatalogDedup(SingletonMetadataAdmission):
             self.assertEqual(actual, before)
             self.assertEqual(self.store.resolve(original['receipt'], tenant_id=self.tenant,
                 authorized_sources=(self.source,), chunk_body_archive=self.archive), self.public_response)
+
+    def test_flat_parts_preserve_large_scalars_and_independent_rows(self):
+        self.populate()
+        large = 10**80 + 17
+        with self.store.connect() as c:
+            c.execute("""UPDATE canonical_evidence_document_parts SET copy_number=%s,copy_flag=true
+                          WHERE tenant_id=%s""", (large, self.tenant))
+        actual = self.equivalent()
+        siblings = [r for r in actual.values() if r['native_parent_id'] == 'parent/a']
+        for row in siblings:
+            self.assertEqual(row['parts'][0]['copy_number'], large)
+            self.assertIs(type(row['parts'][0]['copy_number']), int)
+            self.assertIs(row['parts'][0]['copy_flag'], True)
+            self.assertIsNone(row['parts'][0]['copy_null'])
+        siblings[0]['parts'][0]['copy_number'] = -1
+        self.assertEqual(siblings[1]['parts'][0]['copy_number'], large)
+
+    def test_future_nested_part_values_remain_independent(self):
+        self.populate()
+        with self.store.connect() as c:
+            c.execute("""UPDATE canonical_evidence_document_parts
+                            SET copy_nested='{"items":[{"value":"original"}]}'::jsonb
+                          WHERE tenant_id=%s""", (self.tenant,))
+        actual = self.equivalent()
+        siblings = [r for r in actual.values() if r['native_parent_id'] == 'parent/a']
+        siblings[0]['parts'][0]['copy_nested']['items'][0]['value'] = 'changed'
+        self.assertEqual(siblings[1]['parts'][0]['copy_nested']['items'][0]['value'], 'original')
+
+    def test_custom_json_objects_retain_type_and_independence(self):
+        from psycopg.types.json import set_json_loads
+
+        self.populate()
+        with self.store.connect() as c, c.transaction():
+            c.execute('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ')
+            set_json_loads(custom_catalog_loads, c)
+            expected = c.execute(LEGACY_SQL,
+                (self.tenant, [self.source], list(self.ids), False)).fetchall()
+            actual = chunk_bodies.chunk_catalog_snapshot(self.store, tenant_id=self.tenant,
+                source_ids=(self.source,), document_ids=self.ids, connection=c)
+        self.assertEqual(list(actual.values()), expected)
+        siblings = [r for r in actual.values() if r['native_parent_id'] == 'parent/a']
+        for row in siblings:
+            self.assertIs(type(row['parts'][0]), CustomCatalogObject)
+            self.assertIs(type(row['manifest']), CustomCatalogObject)
+        siblings[0]['parts'][0]['size_bytes'] = -1
+        self.assertNotEqual(siblings[1]['parts'][0]['size_bytes'], -1)
 
 
 if __name__ == '__main__':
