@@ -587,7 +587,11 @@ class TurbopufferProjector:
         since: datetime | None,
         after: tuple[datetime, str] | None,
         deadline_at: float | None = None,
+        page_rows: int | None = None,
     ) -> list[dict[str, Any]]:
+        page_rows = self.page_rows if page_rows is None else page_rows
+        if type(page_rows) is not int or not 1 <= page_rows <= self.page_rows:
+            raise ValueError("search publication page width is invalid")
         start, end = _month_bounds(claim["month"])
         cursor_time, cursor_id = after or (datetime(1, 1, 1, tzinfo=timezone.utc), "")
         if getattr(self.store, "verified_singleton_receipts", False):
@@ -601,7 +605,7 @@ class TurbopufferProjector:
             return self.store._execute_bounded(connection,
                 sql.replace(_LIVE_PASSAGE_PREDICATE, "true"),
                 (claim["tenant_id"], claim["source_id"], start, end,
-                 since, since, cursor_time, cursor_id, self.page_rows),
+                 since, since, cursor_time, cursor_id, page_rows),
                 deadline_at,
             ).fetchall()
         return [
@@ -610,7 +614,7 @@ class TurbopufferProjector:
                 _PASSAGE_PAGE_SQL,
                 (
                     claim["tenant_id"], claim["source_id"], start, end,
-                    since, since, cursor_time, cursor_id, self.page_rows,
+                    since, since, cursor_time, cursor_id, page_rows,
                 ),
             ).fetchall()
         ]
@@ -979,9 +983,12 @@ class TurbopufferProjector:
             checkpoint_current = True
             last_rows = 0
             resume_after_timeout = restored is not None
+            page_rows = self.page_rows
             while True:
                 page = []
                 timed_out = False
+                page_phase = "selection"
+                requested_page_rows = page_rows
                 verified = getattr(self.store, "verified_singleton_receipts", False)
                 try:
                     with timing.measure("page"), self.store.connect() as connection:
@@ -1005,15 +1012,23 @@ class TurbopufferProjector:
                                 if not current:
                                     raise ValueError("publication_resume_scope_changed")
                             page = self.passage_page(connection, claim, since=since, after=after,
-                                                     deadline_at=deadline)
+                                                     deadline_at=deadline, page_rows=page_rows)
                         else:
                             page = self.passage_page(connection, claim, since=since, after=after)
                         examined = len(page)
                         next_after = ((page[-1]["first_occurred_at"], page[-1]["passage_id"])
                                       if page else after)
                         if verified:
-                            page = self._authorized_publication_rows(connection, tenant_id, page,
-                                                                     deadline_at=deadline)
+                            page_phase = "authority"
+                            try:
+                                page = self._authorized_publication_rows(connection, tenant_id, page,
+                                                                         deadline_at=deadline)
+                            except SearchDeadlineExceeded:
+                                if cooperative:
+                                    # Retry the same cursor with less proof work;
+                                    # selection failures cannot establish this.
+                                    page_rows = max(1, page_rows // 2)
+                                raise
                         connection.commit()
                 except SearchDeadlineExceeded:
                     if not cooperative or not verified:
@@ -1023,8 +1038,9 @@ class TurbopufferProjector:
                     page = []
                     timed_out = True
                 if timed_out:
-                    LOG.warning("search plane page deferred reason=%s generation=%s type=SearchDeadlineExceeded",
-                        claim["reason"], claim["generation"])
+                    LOG.warning("search plane page deferred reason=%s generation=%s type=SearchDeadlineExceeded "
+                        "phase=%s page_rows=%s next_page_rows=%s",
+                        claim["reason"], claim["generation"], page_phase, requested_page_rows, page_rows)
                     resume_after_timeout = True
                     yield {"rows": 0, "deleted": 0, "rate_limited": 0, "failed": 1}
                     continue
@@ -1042,7 +1058,7 @@ class TurbopufferProjector:
                     with timing.measure("commit"):
                         checkpoint_current = self._save_page_checkpoint(claim, checkpoint, next_checkpoint)
                     checkpoint = next_checkpoint
-                exhausted = examined < self.page_rows
+                exhausted = examined < page_rows
                 if exhausted:
                     break
                 current_rate = int(budget["rate_limited"])
