@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "package": "backports.zstd",
+  "version": "1.0.0",
+  "target": "cp312-cp312-macosx_11_0_arm64",
+  "artifact": {
+    "filename": "backports_zstd-1.0.0-cp312-cp312-macosx_11_0_arm64.whl",
+    "url": "https://files.pythonhosted.org/packages/3a/44/c3f06c172f128bf1160f6122df2a942440e36b8450cf4ba44c69465c5f55/backports_zstd-1.0.0-cp312-cp312-macosx_11_0_arm64.whl",
+    "bytes": 362142,
+    "sha256": "86498856adc6e8c6f50cbfb1d4afd4e0997d5837fb225245d3fb26008f3c9412"
+  },
+  "license_paths": [
+    "backports_zstd-1.0.0.dist-info/licenses/LICENSE.txt",
+    "backports_zstd-1.0.0.dist-info/licenses/LICENSE_zstd.txt"
+  ]
+}

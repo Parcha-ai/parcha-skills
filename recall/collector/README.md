@@ -7,6 +7,21 @@ transcript messages. Agent transcripts beside them, moved transcripts, and custo
 paths remain discoverable. Previously captured journal records and pending outbox
 entries are retained; this exclusion does not authorize Forget.
 
+The decoded-rollout reader is a preparation for compressed Codex capture;
+`.jsonl.zst` discovery is not enabled yet. Install its Linux dependency in the
+collector's Python environment:
+
+```bash
+python -m pip install -r collector/requirements.txt
+```
+
+CPython 3.14 uses its standard library decoder.
+For the bundled macOS CPython 3.12 runtime, the package builder accepts
+`--decoder-wheel` with the exact arm64 wheel pinned in
+`client/macos/DECODER_LOCK.json`, or `--download-decoder` to fetch that wheel.
+The wheel and its licenses become manifest
+entries; a system `zstd` executable is never required or invoked.
+
 Complete JSONL records enter a mode-0600 SQLite outbox before network I/O. The
 scan offset may move once the spool transaction is durable; the separate committed offset moves
 only after BrainStore returns a commit acknowledgement. A lost acknowledgement retries the same

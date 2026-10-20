@@ -9,8 +9,12 @@ on:
       - 'recall/contracts/**'
       - 'recall/privacy/**'
       - 'recall/skills/recall/scripts/codex_identity.py'
+      - 'recall/skills/recall/scripts/codex_rollout.py'
       - 'recall/scripts/build_macos_package.py'
       - 'recall/tests/test_mac_package.py'
+      - 'recall/tests/test_mac_decoder_package.py'
+      - 'recall/tests/test_codex_decoded_rollout.py'
+      - 'recall/tests/fixtures/codex-rollout.jsonl.zst'
       - '.github/workflows/recall-macos.yml'
   push:
     branches: [main]
@@ -21,6 +25,8 @@ on:
       - 'recall/contracts/**'
       - 'recall/privacy/**'
       - 'recall/skills/recall/scripts/codex_identity.py'
+      - 'recall/skills/recall/scripts/codex_rollout.py'
+      - 'recall/tests/fixtures/codex-rollout.jsonl.zst'
       - 'recall/scripts/build_macos_package.py'
       - '.github/workflows/recall-macos.yml'
   workflow_dispatch:
@@ -40,6 +46,7 @@ jobs:
         run: |
           python3 recall/scripts/build_macos_package.py \
             --source-root recall \
+            --download-decoder \
             --native-app "$RUNNER_TEMP/recall-native/Recall Brain.app" \
             --source-revision "$GITHUB_SHA" \
             --output "$RUNNER_TEMP/recall-release/recall-brain-macos-arm64.tar.gz"
@@ -76,6 +83,21 @@ jobs:
             --codex-archive-root "$RUNNER_TEMP/recall-fixture/archive"
           "$RUNNER_TEMP/recall-installed/bin/recall-brain" mac-status \
             --prefix "$RUNNER_TEMP/recall-installed" --launch-agents "$RUNNER_TEMP/recall-agents"
+      - name: Verify decoded rollout using only the installed runtime and decoder
+        run: |
+          "$RUNNER_TEMP/recall-installed/runtime/bin/python3" -I -B - \
+            "$RUNNER_TEMP/recall-installed" \
+            "$GITHUB_WORKSPACE/recall/tests/fixtures/codex-rollout.jsonl.zst" <<'PY'
+          import json, pathlib, sys, time
+          sys.path.insert(0, str(pathlib.Path(sys.argv[1]) / "lib"))
+          from skills.recall.scripts.codex_rollout import decoded_snapshot
+          with decoded_snapshot(pathlib.Path(sys.argv[2]), deadline=time.monotonic() + 5) as snapshot:
+              assert snapshot.size == 255
+              records = [json.loads(line) for line in snapshot.path.read_bytes().splitlines()]
+              assert records[0]["payload"]["id"] == "019f1111-2222-7333-8444-555555555555"
+              assert records[1]["payload"]["marker"] == "compressed synthetic work"
+              snapshot.verify_current()
+          PY
       - name: Upload reviewed bundle and checksum
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
