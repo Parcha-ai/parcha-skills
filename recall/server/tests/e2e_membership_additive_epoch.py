@@ -778,6 +778,159 @@ class AdditiveEpochTests(MembershipRemainderTests):
         self.assert_native_search_equal()
 
 
+    def test_additive_publication_reuses_current_retained_certificates(self):
+        from recall_server.passage_index import CertificationBudget
+        self.ingest('turn/long-prefix', 'Exact immutable prefix with independent receipts. ' * 400)
+        self.publish()
+        self.refresh_scope()
+        self.assertEqual(self.enroll()['status'], 'enrolled')
+        before = {row['passage_id']: row for row in self.rows()}
+        self.assertEqual(self.compare()['certified_passages'], len(before))
+        generation = self.generation()
+        self.ingest('zzzz/later-tail', 'A genuinely new native event. ' * 120)
+        logical = self.projector.project_pending(tenant_id=self.tenant, batch_size=10,
+            max_batches=1, upload_concurrency=1)
+        self.assertEqual(logical['failed'], 0)
+        budget = CertificationBudget()
+        publisher = self.publisher()
+        # The existing allowance is legitimately occupied. Native publication
+        # commits, retaining optional work without a mocked proof outcome.
+        with budget.lease():
+            publication = publisher.project_pending(tenant_id=self.tenant, batch_size=10,
+                max_batches=1, certification_budget=budget)
+        self.assertEqual(publication['documents'], 1)
+        self.assertEqual(publication['membership_certified_passages'], 0)
+        self.refresh_scope()
+        current_rows = self.rows()
+        already_current = {
+            row['passage_id'] for row in current_rows
+            if row['membership_generation'] == row['generation']
+            and row['membership_binding_sha256'] == enrollment._binding(row, self.scope)
+        }
+        new_or_changed = {row['passage_id'] for row in current_rows} - already_current
+        self.assertTrue(already_current)
+        self.assertTrue(new_or_changed)
+        self.assertEqual(self.generation(), generation)
+        self.assertEqual(self.compare()['certified_passages'], len(already_current))
+        self.assertEqual(self.compare()['disagreements'], 0)
+        queued = self.queued()
+        self.assertEqual(len(queued), 1)
+        self.assertEqual(queued[0]['checkpoint']['after'], '')
+        with self.store.connect() as connection:
+            versions = {row['passage_id']: row['xmin'] for row in connection.execute(
+                'SELECT passage_id,xmin::text AS xmin FROM canonical_passages '
+                'WHERE tenant_id=%s', (self.tenant,))}
+        outcomes = []
+        certify = enrollment.certify_published_passages
+        def observed_certify(*args, **kwargs):
+            outcome = certify(*args, **kwargs)
+            outcomes.append(outcome)
+            return outcome
+        captures = []
+        original = enrollment._capture
+        def observed_capture(*args, **kwargs):
+            result = original(*args, **kwargs)
+            scope = args[1] if len(args) > 1 else kwargs['scope']
+            captures.append(dict(passage_ids=list(scope['passage_ids']),
+                prove_ownership=kwargs.get('prove_ownership', False)))
+            return result
+        with patch.object(enrollment, '_capture', observed_capture), \
+                patch.object(enrollment, 'certify_published_passages', observed_certify):
+            outcome = remainder.resume(self.store, queued[0], settings=self.settings(),
+                deadline_at=time.monotonic()+3)
+        self.assertEqual(outcome['status'], 'enrolled')
+        self.assertEqual(outcome['certified_passages'], len(current_rows))
+        self.assertEqual(self.queued(), [])
+        self.assertEqual(sum(row['reused_passages'] for row in outcomes), len(already_current))
+        self.assertEqual(sum(row['proved_passages'] for row in outcomes), len(new_or_changed))
+        self.assertEqual(sum(row['written_passages'] for row in outcomes), len(new_or_changed))
+        with self.store.connect() as connection:
+            after_versions = {row['passage_id']: row['xmin'] for row in connection.execute(
+                'SELECT passage_id,xmin::text AS xmin FROM canonical_passages '
+                'WHERE tenant_id=%s', (self.tenant,))}
+        self.assertTrue(all(versions[key] == after_versions[key] for key in already_current))
+        self.assertTrue(all(versions[key] != after_versions[key] for key in new_or_changed))
+
+        proved = {value for capture in captures for value in capture['passage_ids']}
+        self.assertEqual(already_current & proved, set())
+        self.assertEqual(new_or_changed, proved)
+        after = self.compare()
+        self.assertEqual(after['certified_passages'], len(current_rows))
+        self.assertEqual(after['disagreements'], 0)
+
+
+    def test_current_certificates_skip_native_proof_but_comparison_still_proves(self):
+        self.assertEqual(self.enroll()['status'], 'enrolled')
+        with patch.object(enrollment, '_capture', wraps=enrollment._capture) as capture:
+            self.assertEqual(self.enroll()['status'], 'enrolled')
+            capture.assert_not_called()
+            compared = self.compare()
+            self.assertEqual(compared['native_allowed_passages'], len(self.ids))
+            self.assertEqual(compared['certified_passages'], len(self.ids))
+            self.assertEqual(compared['disagreements'], 0)
+            self.assertEqual(capture.call_count, 1)
+            self.assertFalse(capture.call_args.kwargs['prove_ownership'])
+
+    def test_mismatched_certificate_still_uses_native_proof(self):
+        self.assertEqual(self.enroll()['status'], 'enrolled')
+        target = self.ids[0]
+        with self.store.connect() as connection:
+            connection.execute('UPDATE canonical_passages SET membership_binding_sha256=%s '
+                'WHERE tenant_id=%s AND passage_id=%s', ('0'*64, self.tenant, target))
+        with patch.object(enrollment, '_capture', wraps=enrollment._capture) as capture:
+            self.assertEqual(self.enroll()['status'], 'enrolled')
+        self.assertEqual(capture.call_count, 1)
+        self.assertEqual(capture.call_args.args[1]['passage_ids'], (target,))
+        self.assertTrue(capture.call_args.kwargs['prove_ownership'])
+        self.assertEqual(self.compare()['disagreements'], 0)
+        self.assertEqual(self.compare()['certified_passages'], len(self.ids))
+
+    def test_edit_after_certificate_reuse_refuses_stale_generation(self):
+        self.assertEqual(self.enroll()['status'], 'enrolled')
+        original = enrollment._capture_for_enrollment
+        def changed(*args, **kwargs):
+            captured = original(*args, **kwargs)
+            self.edit()
+            return captured
+        with patch.object(enrollment, '_capture_for_enrollment', side_effect=changed), \
+                patch.object(enrollment, '_capture', wraps=enrollment._capture) as capture:
+            self.assertEqual(self.enroll()['status'], 'changed')
+            capture.assert_not_called()
+        self.assertEqual(self.compare()['certified_passages'], 0)
+        self.assertEqual(self.compare()['disagreements'], 0)
+
+    def test_grant_revocation_after_certificate_reuse_is_unauthorized(self):
+        self.assertEqual(self.enroll()['status'], 'enrolled')
+        original = enrollment._capture_for_enrollment
+        def revoked(*args, **kwargs):
+            captured = original(*args, **kwargs)
+            with self.store.connect() as connection:
+                connection.execute('DELETE FROM brain_access_grants WHERE tenant_id=%s', (self.tenant,))
+            return captured
+        with patch.object(enrollment, '_capture_for_enrollment', side_effect=revoked), \
+                patch.object(enrollment, '_capture', wraps=enrollment._capture) as capture:
+            self.assertEqual(self.enroll()['status'], 'unauthorized')
+            capture.assert_not_called()
+
+
+
+    def test_current_certificate_reuse_does_not_rewrite_passage_tuples(self):
+        self.assertEqual(self.enroll()['status'], 'enrolled')
+        def versions():
+            with self.store.connect() as connection:
+                return {row['passage_id']: row['xmin'] for row in connection.execute(
+                    'SELECT passage_id,xmin::text AS xmin FROM canonical_passages '
+                    'WHERE tenant_id=%s', (self.tenant,))}
+        before = versions()
+        outcome = self.enroll()
+        self.assertEqual(outcome['status'], 'enrolled')
+        self.assertEqual(outcome['reused_passages'], len(self.ids))
+        self.assertEqual(outcome['proved_passages'], 0)
+        self.assertEqual(outcome['written_passages'], 0)
+        self.assertEqual(versions(), before)
+        self.assertEqual(self.compare()['disagreements'], 0)
+
+
 if __name__ == '__main__':
     suite = unittest.TestSuite(AdditiveEpochTests(name) for name in AdditiveEpochTests.__dict__
                                if name.startswith('test_'))
