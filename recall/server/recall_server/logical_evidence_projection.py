@@ -1488,6 +1488,7 @@ class CanonicalLogicalEvidenceProjector:
         ranges: tuple[tuple[Any, Any], ...],
         reason: str,
         logical_document_id: str | None = None,
+        force_document: bool = False,
     ) -> int:
         """Invalidate only source/month fragments touched by a logical change.
 
@@ -1551,9 +1552,12 @@ class CanonicalLogicalEvidenceProjector:
                       AND queue.bucket_start=month.value::date
                     GROUP BY month.value,queue.changed_at
                    ON CONFLICT(tenant_id,source_id,bucket_start,logical_document_id)
-                   DO UPDATE SET reason=excluded.reason,
+                   DO UPDATE SET reason=CASE
+                       WHEN canonical_parquet_scan_dirty_documents.reason='backfill'
+                       THEN 'backfill' ELSE excluded.reason END,
                                  queued_at=excluded.queued_at""",
-                (tenant_id, source_id, logical_document_id, reason, starts, ends,
+                (tenant_id, source_id, logical_document_id,
+                 "backfill" if force_document else reason, starts, ends,
                  tenant_id, source_id),
             )
         return max(0, result.rowcount)

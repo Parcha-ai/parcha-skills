@@ -2047,8 +2047,9 @@ class CanonicalPassageProjector:
                     for passage in prepared.passages
                     if passage.passage_id in retained_ids
                 )
+                metadata_changed = False
                 while receipt_batch := list(islice(retained_receipts, MAX_PASSAGE_PROJECTION_BATCH)):
-                    connection.execute(
+                    updated = connection.execute(
                         """UPDATE canonical_passages passage
                               SET revision=%s,receipts=current.receipts,
                                   spans=coalesce(current.spans,passage.spans)
@@ -2064,6 +2065,7 @@ class CanonicalPassageProjector:
                         (candidate.revision,json.dumps(receipt_batch), candidate.tenant_id,
                          candidate.source_id, candidate.logical_document_id,candidate.revision),
                     )
+                    metadata_changed = metadata_changed or updated.rowcount > 0
                 if retained_unheaded:
                     self._write_headers(
                         connection,
@@ -2191,6 +2193,11 @@ class CanonicalPassageProjector:
                     source_id=candidate.source_id,
                     ranges=((current["first_occurred_at"], current["last_occurred_at"]),),
                     reason="logical-update", logical_document_id=candidate.logical_document_id,
+                    # Same raw input can publish different passage identities
+                    # without changing the scan's count/policy fingerprint.
+                    force_document=bool(extraction and
+                        extraction["source_document_sha256"] == candidate.source_document_sha256
+                        and (diff.to_insert or diff.to_delete or diff.moved or metadata_changed)),
                 )
                 # H3-a: the search outbox sees only what this commit changed.
                 # Deleted rows become tombstones; every month an inserted or
