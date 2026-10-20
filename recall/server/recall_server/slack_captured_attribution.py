@@ -17,12 +17,28 @@ DEBT = KEY + ':unresolved:'
 DEBT_END = DEBT + '~'
 RETRY_TURN = KEY + ':retry_turn'
 _NOT_A_CONTACT_SKIP = object()
-_REPORTED_DEBT_REASONS = frozenset({
+_DEBT_ERROR_TYPES = frozenset({
     'ArchiveError', 'ArchiveNotFound', 'ValueError', 'ConnectorContractError',
     'JSONDecodeError', 'TimeoutError', 'SearchDeadlineExceeded',
-    'StructuredEnvelopeValidationError', 'archive_unavailable', 'current_record_changed',
+    'StructuredEnvelopeValidationError',
 })
+_CAPTURED_FAILURE_CODES = frozenset({
+    'captured_archive_unavailable', 'captured_archive_corrupt',
+    'captured_record_invalid', 'captured_commitment_changed',
+})
+_REPORTED_DEBT_REASONS = (_DEBT_ERROR_TYPES | _CAPTURED_FAILURE_CODES
+                          | {'archive_unavailable', 'current_record_changed'})
 _DEBT_SAMPLE_LIMIT = 32
+
+
+def _debt_reason(error):
+    # Only exact codes already raised by this owner may leave the exception.
+    # Arbitrary messages (including codes embedded in text) remain private.
+    if (type(error) is ValueError and len(error.args) == 1
+            and type(error.args[0]) is str and error.args[0] in _CAPTURED_FAILURE_CODES):
+        return error.args[0]
+    name = type(error).__name__
+    return name if name in _DEBT_ERROR_TYPES else 'archive_unavailable'
 
 
 def _epoch(worker, row):
@@ -257,12 +273,8 @@ def repair_slice(worker, row, runner, *, deadline_at):
         except ControlError:
             raise
         except Exception as error:
-            # Archive/shape failures are unresolved debt; no body or exception
-            # message is persisted. Effectful errors below must propagate.
-            reason = type(error).__name__ if type(error).__name__ in {
-                'ArchiveError', 'ArchiveNotFound', 'ValueError', 'ConnectorContractError',
-                'JSONDecodeError', 'TimeoutError', 'SearchDeadlineExceeded',
-                'StructuredEnvelopeValidationError'} else 'archive_unavailable'
+            # Read failures remain debt. Effectful errors below must propagate.
+            reason = _debt_reason(error)
             record = None
         if not skip:
             debt_key = DEBT + hashlib.sha256(selected['native_id'].encode()).hexdigest()

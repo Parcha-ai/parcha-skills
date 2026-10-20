@@ -89,6 +89,17 @@ class CapturedProgressTests(unittest.TestCase):
         self.assertNotIn("private@example.com", json.dumps(report))
         self.assertEqual(report["status"], "unresolved")
 
+    def test_fixed_capture_codes_are_reported_without_exception_text(self):
+        codes = ("captured_archive_unavailable", "captured_archive_corrupt",
+                 "captured_record_invalid", "captured_commitment_changed")
+        self.state["unresolved"] = len(codes)
+        self.save()
+        for index, code in enumerate(codes):
+            self.db.execute("INSERT INTO meta VALUES (?,?)",
+                            (DEBT + str(index), json.dumps(dict(native_id="private", reason=code))))
+        self.assertEqual(self.report()["debt_reason_sample"]["reasons"],
+                         {code: 1 for code in codes})
+
     def test_existing_counter_debt_mismatch_still_fails(self):
         self.db.execute("INSERT INTO meta VALUES (?,?)",
                         (DEBT + "a", json.dumps(dict(native_id="private", reason="ValueError"))))

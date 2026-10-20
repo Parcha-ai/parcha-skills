@@ -264,6 +264,42 @@ class CapturedSlackActors(ManagedSlackHistoryActors):
             self.assertTrue(c.execute("SELECT 1 FROM canonical_evidence_document_actors WHERE tenant_id=%s AND source_id=%s AND actor_id=%s AND relation='owner'",
                 (self.tenant, self.source, self.actor)).fetchone())
 
+    def test_fixed_capture_code_persists_and_retry_recovery_clears_it(self):
+        from recall_server import slack_captured_attribution as captured
+        worker, record, event, before, old = self.unfinished_document_debt()
+        with sqlite3.connect(self.spool) as c:
+            debt = json.loads(c.execute("SELECT value FROM meta WHERE key>=? AND key<?",
+                (captured.DEBT, captured.DEBT_END)).fetchone()[0])
+        self.assertEqual(debt["reason"], "captured_archive_unavailable")
+        with sqlite3.connect(self.spool) as c:
+            report = captured.progress_report({"id": "synthetic", "source_id": self.source},
+                type("Runner", (), {"db": c})())
+        self.assertEqual(report["debt_reason_sample"]["reasons"],
+                         {"captured_archive_unavailable": 1})
+        with patch.object(captured, "MAX_PAGE_RECORDS", 2):
+            self.assertEqual(self.step(worker)["failed"], 0)
+        self.assertEqual(self.captured_checkpoint()["unresolved"], 0)
+        self.assertEqual(self.immutable(), before)
+
+    def test_arbitrary_value_error_text_never_enters_debt_or_report(self):
+        from recall_server import slack_captured_attribution as captured
+        worker, record, event, before, old = self.unfinished_document_debt()
+        original = captured._record
+        def unavailable(worker, row, selected, deadline, **kwargs):
+            if selected["native_id"] == record.native_id:
+                raise ValueError("private@example.com captured_archive_corrupt")
+            return original(worker, row, selected, deadline, **kwargs)
+        with patch.object(captured, "MAX_PAGE_RECORDS", 2), patch.object(
+                captured, "_record", side_effect=unavailable):
+            report = self.step(worker)["captured_attribution"]
+        with sqlite3.connect(self.spool) as c:
+            values = c.execute("SELECT value FROM meta WHERE key>=? AND key<?",
+                               (captured.DEBT, captured.DEBT_END)).fetchall()
+        self.assertEqual(len(values), 1)
+        self.assertEqual(json.loads(values[0][0])["reason"], "ValueError")
+        self.assertNotIn("private@example.com", json.dumps([values, report]))
+        self.assertEqual(self.immutable(), before)
+
     def test_persistent_retry_debt_cannot_starve_forward_scan(self):
         from recall_server import slack_captured_attribution as captured
         worker, record, event, before, old = self.unfinished_document_debt()
