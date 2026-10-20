@@ -100,6 +100,69 @@ class CapturedProgressTests(unittest.TestCase):
         self.assertEqual(self.report()["debt_reason_sample"]["reasons"],
                          {code: 1 for code in codes})
 
+    def test_examples_select_exact_bounded_persisted_debts(self):
+        self.state["unresolved"] = 40
+        self.save()
+        entries = []
+        for index in range(40):
+            native = f"slack:T123:C123:1790000000.{index:06d}"
+            reason = ("captured_record_invalid" if index < 30
+                      else "captured_archive_unavailable")
+            key = DEBT + hashlib.sha256(native.encode()).hexdigest()
+            entries.append((key, dict(native_id=native, reason=reason)))
+        self.db.executemany("INSERT INTO meta VALUES (?,?)",
+                            [(key, json.dumps(value)) for key, value in entries])
+        self.db.commit()
+        changes = self.db.total_changes
+        sampled = sorted(entries)[:32]
+        expected = []
+        per_reason = {}
+        for _, value in sampled:
+            if per_reason.get(value["reason"], 0) < 2:
+                expected.append(value)
+                per_reason[value["reason"]] = per_reason.get(value["reason"], 0) + 1
+        report = self.report()
+        self.assertEqual(report["debt_examples"], expected)
+        self.assertEqual(report["debt_examples_limit"], 8)
+        self.assertEqual(self.db.total_changes, changes)
+        self.assertEqual(report["debt_reason_sample"]["count"], 32)
+        removed = expected[0]["native_id"]
+        self.db.execute("DELETE FROM meta WHERE key=?",
+                        (DEBT + hashlib.sha256(removed.encode()).hexdigest(),))
+        self.assertNotIn(removed, json.dumps(self.report()["debt_examples"]))
+
+    def test_examples_reject_bad_keys_shapes_lengths_and_unknown_reasons(self):
+        values = [
+            dict(native_id="bad-key", reason="ValueError"),
+            dict(native_id="x" * 513, reason="ValueError"),
+            dict(native_id="private", reason="secret free-form failure"),
+            dict(native_id="extra", reason="ValueError", content="private body"),
+            dict(native_id="newline\nidentity", reason="ValueError"),
+        ]
+        self.state["unresolved"] = len(values)
+        self.save()
+        for index, value in enumerate(values):
+            key = DEBT + hashlib.sha256(value["native_id"].encode()).hexdigest()
+            if index == 0:
+                key = DEBT + "bad-key"
+            self.db.execute("INSERT INTO meta VALUES (?,?)", (key, json.dumps(value)))
+        self.assertEqual(self.report()["debt_examples"], [])
+
+    def test_examples_have_an_absolute_limit_across_reasons(self):
+        reasons = ("ValueError", "ArchiveNotFound", "TimeoutError",
+                   "captured_record_invalid", "captured_archive_unavailable")
+        self.state["unresolved"] = 20
+        self.save()
+        for index in range(20):
+            native = f"slack-user:T123:U{index}"
+            self.db.execute("INSERT INTO meta VALUES (?,?)", (
+                DEBT + hashlib.sha256(native.encode()).hexdigest(),
+                json.dumps(dict(native_id=native, reason=reasons[index % 5]))))
+        examples = self.report()["debt_examples"]
+        self.assertEqual(len(examples), 8)
+        self.assertTrue(all(sum(x["reason"] == reason for x in examples) <= 2
+                            for reason in reasons))
+
     def test_existing_counter_debt_mismatch_still_fails(self):
         self.db.execute("INSERT INTO meta VALUES (?,?)",
                         (DEBT + "a", json.dumps(dict(native_id="private", reason="ValueError"))))

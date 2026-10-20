@@ -29,6 +29,8 @@ _CAPTURED_FAILURE_CODES = frozenset({
 _REPORTED_DEBT_REASONS = (_DEBT_ERROR_TYPES | _CAPTURED_FAILURE_CODES
                           | {'archive_unavailable', 'current_record_changed'})
 _DEBT_SAMPLE_LIMIT = 32
+_DEBT_EXAMPLE_LIMIT = 8
+_DEBT_EXAMPLES_PER_REASON = 2
 
 
 def _debt_reason(error):
@@ -80,11 +82,24 @@ def progress_report(row, runner):
     if (state['unresolved'] > 0) != has_debt:
         raise ValueError('captured_progress_invalid')
     reasons = Counter()
-    for value in saved.values():
+    examples = []
+    example_reasons = Counter()
+    for key, value in saved.items():
         try:
             debt = json.loads(value)
             reason = debt.get('reason') if isinstance(debt, dict) else None
             label = reason if isinstance(reason, str) and reason in _REPORTED_DEBT_REASONS else 'other'
+            native_id = debt.get('native_id') if isinstance(debt, dict) else None
+            # Diagnose actual persisted debt, never arbitrary exception text or
+            # malformed rows. Examples share the existing bounded snapshot.
+            if (label in _REPORTED_DEBT_REASONS and set(debt) == {'native_id', 'reason'}
+                    and isinstance(native_id, str) and 0 < len(native_id) <= 512
+                    and native_id.isascii() and all(33 <= ord(char) <= 126 for char in native_id)
+                    and key == DEBT + hashlib.sha256(native_id.encode()).hexdigest()
+                    and len(examples) < _DEBT_EXAMPLE_LIMIT
+                    and example_reasons[label] < _DEBT_EXAMPLES_PER_REASON):
+                examples.append(dict(native_id=native_id, reason=label))
+                example_reasons[label] += 1
         except (ValueError, TypeError):
             label = 'invalid_debt_record'
         reasons[label] += 1
@@ -95,6 +110,7 @@ def progress_report(row, runner):
         retry_cursor_sha256=hashlib.sha256(state['retry_after'].encode()).hexdigest(),
         retry_turn=turn == '1' if turn in ('0', '1') else None,
         debt_reason_sample=dict(count=len(saved), limit=_DEBT_SAMPLE_LIMIT, reasons=dict(reasons)),
+        debt_examples=examples, debt_examples_limit=_DEBT_EXAMPLE_LIMIT,
         phase=state['phase'], examined=state['examined'], unresolved=state['unresolved'],
         unresolved_entries_present=has_debt,
         status='unresolved' if has_debt else 'complete' if state['phase'] == 'complete' else 'in_progress')

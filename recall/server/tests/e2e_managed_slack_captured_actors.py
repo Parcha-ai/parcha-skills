@@ -281,6 +281,53 @@ class CapturedSlackActors(ManagedSlackHistoryActors):
         self.assertEqual(self.captured_checkpoint()["unresolved"], 0)
         self.assertEqual(self.immutable(), before)
 
+    def test_debt_examples_identify_native_invalid_and_unavailable_records(self):
+        worker, _ = self.captured()
+        invalid, unavailable = self.contacts
+        malformed = self.gateway.put_raw(tenant_id=self.tenant, source_id=self.source,
+            native_id=invalid.native_id, payload=b'{"synthetic_invalid_record":true}',
+            media_type='application/json', created_at=invalid.occurred_at)
+        with self.store.connect() as c:
+            # Model an existing committed raw object with an invalid SDK shape.
+            fields = ('tenant_id', 'source_id', 'artifact_id', 'storage_backend',
+                      'object_key', 'content_sha256', 'size_bytes', 'media_type',
+                      'encryption', 'version_id', 'created_at')
+            c.execute('INSERT INTO raw_artifacts (' + ','.join(fields)
+                      + ') VALUES (' + ','.join(['%s'] * len(fields)) + ')',
+                      tuple(malformed[key] for key in fields))
+            rows = c.execute("""SELECT native_id,event_id,artifact_id FROM canonical_events
+                WHERE tenant_id=%s AND source_id=%s AND native_id=ANY(%s)""",
+                (self.tenant, self.source, [invalid.native_id, unavailable.native_id])).fetchall()
+            by_id = {item['native_id']: item for item in rows}
+            c.execute("UPDATE canonical_events SET artifact_id=%s WHERE tenant_id=%s AND source_id=%s AND event_id=%s",
+                (malformed['artifact_id'], self.tenant, self.source, by_id[invalid.native_id]['event_id']))
+            c.execute("UPDATE raw_artifacts SET state='deleted',deleted_at=now() WHERE tenant_id=%s AND source_id=%s AND artifact_id=%s",
+                (self.tenant, self.source, by_id[unavailable.native_id]['artifact_id']))
+        before = self.immutable()
+        report = self.step(worker)
+        self.assertEqual(report['failed'], 0)
+        progress = report['captured_attribution']
+        self.assertEqual(progress['installation_id'], self.installation)
+        self.assertEqual(progress['source_id'], self.source)
+        self.assertEqual({item['native_id']: item['reason'] for item in progress['debt_examples']},
+            {invalid.native_id: 'captured_record_invalid',
+             unavailable.native_id: 'captured_archive_unavailable'})
+        self.assertEqual(progress['unresolved'], 2)
+        with sqlite3.connect(self.spool) as c:
+            persisted = [json.loads(row[0]) for row in c.execute(
+                "SELECT value FROM meta WHERE key LIKE 'slack_captured_attribution:unresolved:%'")]
+        self.assertEqual(sorted(progress['debt_examples'], key=lambda item: item['native_id']),
+                         sorted(persisted, key=lambda item: item['native_id']))
+        self.assertEqual(self.immutable(), before)
+        self.assertNotIn(self.email, json.dumps(progress))
+        with self.store.connect() as c:
+            c.execute("UPDATE canonical_events SET artifact_id=%s WHERE tenant_id=%s AND source_id=%s AND event_id=%s",
+                (by_id[invalid.native_id]['artifact_id'], self.tenant, self.source, by_id[invalid.native_id]['event_id']))
+            c.execute("UPDATE raw_artifacts SET state='live',deleted_at=NULL WHERE tenant_id=%s AND source_id=%s AND artifact_id=%s",
+                (self.tenant, self.source, by_id[unavailable.native_id]['artifact_id']))
+        reports = self.converge(worker)
+        self.assertEqual(reports[-1]['captured_attribution']['debt_examples'], [])
+
     def test_arbitrary_value_error_text_never_enters_debt_or_report(self):
         from recall_server import slack_captured_attribution as captured
         worker, record, event, before, old = self.unfinished_document_debt()
