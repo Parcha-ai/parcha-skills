@@ -1033,6 +1033,123 @@ class CanonicalPassageProjector:
             )
         return max(0, result.rowcount)
 
+    def seed_backfill_page(
+        self, *, tenant_id: str, source_id: str, after: str | None,
+        upper: str, limit: int, max_source_bytes: int, deadline_at: float,
+    ) -> dict[str, Any]:
+        """Queue one finite metadata page; deferred rows remain caller obligations.
+
+        The cursor covers examined keys, not successful writes. Persist the
+        returned dispositions with it before resuming. Source bytes bound queue
+        admission, not decoded memory or embedding tokens. Only the existing
+        projector can validate and publish the queued work.
+        """
+        tenant_id = self._tenant(tenant_id)
+        if not tenant_id or not source_id:
+            raise ValueError("backfill page requires a tenant and source")
+        if not LOGICAL_DOCUMENT_ID_RE.fullmatch(upper) or (
+            after is not None and not LOGICAL_DOCUMENT_ID_RE.fullmatch(after)
+        ):
+            raise ValueError("backfill page requires exact logical document bounds")
+        if type(limit) is not int or not 1 <= limit <= MAX_PASSAGE_PROJECTION_BATCH:
+            raise ValueError("invalid backfill page limit")
+        if type(max_source_bytes) is not int or max_source_bytes <= 0:
+            raise ValueError("backfill page requires a positive source byte budget")
+        if not math.isfinite(deadline_at):
+            raise ValueError("backfill page requires a finite deadline")
+        with self.store.connect(timeout=max(0.001, deadline_at - time.monotonic())) as connection:
+            rows = self.store._execute_bounded(
+                connection,
+                """WITH page AS MATERIALIZED (
+                    SELECT tenant_id,source_id,logical_document_id,revision
+                    FROM canonical_evidence_documents
+                    WHERE tenant_id=%s AND source_id=%s
+                      AND logical_document_id>%s
+                      AND logical_document_id<=%s
+                    ORDER BY logical_document_id LIMIT %s
+                ), eligible AS MATERIALIZED (
+                    SELECT page.*,
+                           projected.logical_document_id IS NOT NULL AS current,
+                           coalesce(queue.reason<>'certification',false) AS conflict
+                    FROM page
+                    LEFT JOIN canonical_passage_documents projected
+                      ON projected.tenant_id=page.tenant_id
+                     AND projected.source_id=page.source_id
+                     AND projected.logical_document_id=page.logical_document_id
+                     AND projected.revision=page.revision
+                     AND projected.policy_fingerprint=%s
+                     AND projected.requested_extraction_version=projected.applied_extraction_version
+                     AND (page.source_id NOT LIKE 'claude:%%'
+                          OR projected.append_checkpoint->'version'=to_jsonb(%s::integer))
+                     AND (page.source_id NOT LIKE 'codex:%%'
+                          OR projected.append_checkpoint->'version'=to_jsonb(%s::integer))
+                    LEFT JOIN canonical_passage_projection_queue queue
+                      ON queue.tenant_id=page.tenant_id
+                     AND queue.source_id=page.source_id
+                     AND queue.logical_document_id=page.logical_document_id
+                ), costs AS MATERIALIZED (
+                    SELECT eligible.*,parts.source_bytes
+                    FROM eligible
+                    LEFT JOIN LATERAL (
+                        SELECT sum(size_bytes)::bigint AS source_bytes
+                        FROM canonical_evidence_document_parts part
+                        WHERE part.tenant_id=eligible.tenant_id
+                          AND part.source_id=eligible.source_id
+                          AND part.logical_document_id=eligible.logical_document_id
+                          AND part.revision=eligible.revision
+                          AND NOT eligible.current AND NOT eligible.conflict
+                    ) parts ON true
+                ), budgeted AS MATERIALIZED (
+                    SELECT costs.*,
+                           sum(CASE WHEN source_bytes<=%s THEN source_bytes ELSE 0 END)
+                             OVER (ORDER BY logical_document_id) AS admitted_bytes
+                    FROM costs
+                ), queued AS (
+                    INSERT INTO canonical_passage_projection_queue(
+                        tenant_id,source_id,logical_document_id,revision,
+                        generation,reason,changed_at)
+                    SELECT tenant_id,source_id,logical_document_id,revision,
+                           1,'backfill',clock_timestamp()
+                    FROM budgeted
+                    WHERE NOT current AND NOT conflict
+                      AND source_bytes<=%s AND admitted_bytes<=%s
+                    ON CONFLICT(tenant_id,source_id,logical_document_id)
+                    DO UPDATE SET revision=excluded.revision,
+                        generation=canonical_passage_projection_queue.generation+1,
+                        reason='backfill',changed_at=clock_timestamp()
+                    WHERE canonical_passage_projection_queue.reason='certification'
+                    RETURNING logical_document_id,generation
+                )
+                SELECT budgeted.logical_document_id,budgeted.revision,
+                       budgeted.source_bytes,queued.generation,
+                       CASE WHEN budgeted.current THEN 'current'
+                            WHEN budgeted.conflict THEN 'conflict'
+                            WHEN budgeted.source_bytes IS NULL THEN 'parts_unavailable'
+                            WHEN budgeted.source_bytes>%s OR budgeted.admitted_bytes>%s
+                              THEN 'byte_deferred'
+                            WHEN queued.logical_document_id IS NOT NULL THEN 'queued'
+                            ELSE 'conflict' END AS disposition
+                FROM budgeted LEFT JOIN queued USING(logical_document_id)
+                ORDER BY budgeted.logical_document_id""",
+                (tenant_id, source_id, after or "", upper, limit,
+                 self.policy.fingerprint, passage_append.CHECKPOINT_VERSION,
+                 passage_append.CODEX_CHECKPOINT_VERSION,
+                 max_source_bytes, max_source_bytes, max_source_bytes,
+                 max_source_bytes, max_source_bytes),
+                deadline_at,
+            ).fetchall()
+        # No cursor or queue ACK escapes a failed/uncertain COMMIT.
+        return {
+            "source_id": source_id, "upper": upper,
+            "after": rows[-1]["logical_document_id"] if rows else after,
+            "examined": len(rows),
+            "queued": sum(row["disposition"] == "queued" for row in rows),
+            "queued_source_bytes": sum(
+                row["source_bytes"] for row in rows if row["disposition"] == "queued"
+            ),
+            "rows": rows,
+        }
+
     def _yield_unavailable_parents(self, keys, *, recent: bool, previous=None) -> None:
         grouped = {}
         for tenant, source, changed_at, document in keys:
