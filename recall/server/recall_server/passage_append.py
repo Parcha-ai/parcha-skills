@@ -12,6 +12,13 @@ from .passage_projection import COMPLETE_SOURCE_UNITS, build_passages, passage_i
 # Version 3 includes Claude request-replay tool leaves and single-owner handbacks,
 # both introduced after version 2. Other source extraction remains compatible.
 CHECKPOINT_VERSION = 3
+# Codex's typed output lists were previously raw-only. Other source contracts
+# retain their existing epoch; no unrelated Claude rebuild is required.
+CODEX_CHECKPOINT_VERSION = 4
+
+
+def checkpoint_version(source_id):
+    return CODEX_CHECKPOINT_VERSION if source_id.startswith('codex:') else CHECKPOINT_VERSION
 
 
 def reuse_enabled():
@@ -65,12 +72,13 @@ def resume_passages(messages, checkpoint, arguments):
 
 
 def make_checkpoint(candidate, manifest, messages, passages, policy, *, previous=None):
+    version = checkpoint_version(getattr(candidate, 'source_id', ''))
     if not passages or not messages:
-        if not candidate.source_id.startswith('claude:'):
+        if not candidate.source_id.startswith(('claude:', 'codex:')):
             return None
         # Record completed extraction even when no reusable visible prefix exists.
         # Missing prefix fields deliberately cannot satisfy proves_append.
-        return dict(version=CHECKPOINT_VERSION, full_rebuild_only=True,
+        return dict(version=version, full_rebuild_only=True,
             source_document_sha256=candidate.source_document_sha256,
             revision=candidate.revision,
             manifest_sha256=candidate.manifest_reference['content_sha256'])
@@ -84,7 +92,7 @@ def make_checkpoint(candidate, manifest, messages, passages, policy, *, previous
         byte = 0
         ordinal = next(p.ordinal for p in passages if not isinstance(p, RetainedPassage)
                        and any(s.message_index == index for s in p.spans))
-    return dict(version=CHECKPOINT_VERSION, policy_fingerprint=policy.fingerprint,
+    return dict(version=version, policy_fingerprint=policy.fingerprint,
         source_document_sha256=candidate.source_document_sha256, revision=candidate.revision,
         manifest_sha256=candidate.manifest_reference['content_sha256'],
         part_count=len(manifest['parts']), sealed_parts_sha256=digest(manifest['parts'][:-1]),
@@ -97,11 +105,13 @@ def make_checkpoint(candidate, manifest, messages, passages, policy, *, previous
 def proves_append(checkpoint, projected, candidate, manifest, read_part):
     """Prove the old record stream is an exact prefix without reading old objects."""
     try:
-        # Only Claude's historical visible tool-result extraction changed.
-        # Unchanged source contracts can keep their exact v1/v2 prefix proof.
+        # Changed source contracts rebuild their old extraction once. Unchanged
+        # sources retain the original v1/v2 prefix proof.
+        source_id = getattr(candidate, 'source_id', '')
         compatible = isinstance(checkpoint, dict) and (
-            checkpoint.get('version') == CHECKPOINT_VERSION
-            or (checkpoint.get('version') in (1, 2) and not candidate.source_id.startswith('claude:')))
+            checkpoint.get('version') == checkpoint_version(source_id)
+            or (checkpoint.get('version') in (1, 2)
+                and not source_id.startswith(('claude:', 'codex:'))))
         if (not compatible
             or checkpoint['policy_fingerprint'] != projected['policy_fingerprint']
             or checkpoint['revision'] != projected['revision']

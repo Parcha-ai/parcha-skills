@@ -48,6 +48,48 @@ class CodexSourceContractTests(unittest.TestCase):
         cap=CandidateCapture(self.root/f'capture{self.number}',client_factory=lambda:client,protected_families=set())
         result=cap.capture_case('fixture','Exact source',{'results':[hit]})['candidates'][0]
         return result,client
+    def test_typed_output_blocks_use_shared_normalized_coordinates(self):
+        form = FORMS[3]
+        expected = 'Café 🧠 first.\n\nLast complete result.'
+        value = envelope(form, [
+            {'type': 'input_text', 'text': 'Café 🧠 first.'},
+            {'type': 'input_text', 'text': ''},
+            {'type': 'input_text', 'text': 'Last complete result.'},
+        ])
+        hit = mount(self.mount, form, value=value, split=True)
+        span = hit['matching_ranges'][0]['spans'][0]
+        span['source_byte_end'] = span['passage_byte_end'] = len(expected.encode())
+        before = {p.name: p.read_bytes() for p in self.mount.iterdir()}
+        row, client = self.capture(hit)
+        self.assertTrue(row['complete_selected_passages'], row)
+        self.assertEqual(row['text'], expected)
+        self.assertEqual(before, {p.name: p.read_bytes() for p in self.mount.iterdir()})
+        self.assertEqual(row['source_evidence'][0]['spans'][0]['source_unit'], reference(form))
+        self.assertTrue(all(len(args['program'].encode()) <= 16000 for _, args, _ in client.calls))
+
+    def test_typed_output_rejects_mixed_unknown_and_analysis_blocks_as_a_whole(self):
+        good = {'type': 'input_text', 'text': TEXT}
+        bad_blocks = [
+            {'type': 'image', 'text': 'not a text block'},
+            {'type': 'text', 'text': 'unsupported provider type'},
+            {'type': 'input_text', 'text': 7},
+            {'type': 'input_text', 'text': TEXT, 'channel': 'analysis'},
+            {'type': 'input_text', 'text': TEXT, 'role': 'user'},
+            'untyped string', None,
+        ]
+        for output in ([], *([good, bad] for bad in bad_blocks)):
+            with self.subTest(output=output):
+                hit = mount(self.mount, FORMS[3], value=envelope(FORMS[3], output))
+                row, _ = self.capture(hit)
+                self.assertFalse(row['complete_selected_passages'])
+                self.assertNotIn('text', row)
+        # This observed representation belongs to custom-tool output, not input
+        # or a new interpretation of function-call JSON arguments.
+        for form in FORMS[:3]:
+            with self.subTest(form=form), self.assertRaises(ValueError):
+                resolve_codex_tool_source_unit(
+                    json.dumps(envelope(form, [good])), reference(form))
+
     def test_native_typed_strings_with_empty_archive_roles_and_exact_provenance(self):
         for form in FORMS:
             for split in [False,True]:
