@@ -28,19 +28,25 @@ from recall_server.projectors import canonical_json
 class ReceiptMembershipTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        # Borrowing fixtures still share the DSN used by their independent clients.
+        if cls is not ReceiptMembershipTests:
+            cls.store=BrainStore(os.environ['RECALL_DATABASE_URL']);cls.store.migrate()
+            return
         # The indexed corpus has its own statistics, independent of other scripts.
         cls.admin_dsn=os.environ['RECALL_DATABASE_URL']
         cls.database='receipt_membership_'+uuid.uuid4().hex
         with psycopg.connect(cls.admin_dsn,autocommit=True) as admin:
             admin.execute(sql.SQL('CREATE DATABASE {}').format(sql.Identifier(cls.database)))
-        cls.addClassCleanup(cls.drop_database)
+        def drop_database():
+            with psycopg.connect(cls.admin_dsn,autocommit=True) as admin:
+                admin.execute(sql.SQL('DROP DATABASE {}').format(sql.Identifier(cls.database)))
+        cls.addClassCleanup(drop_database)
         cls.store=BrainStore(make_conninfo(cls.admin_dsn,dbname=cls.database))
         cls.addClassCleanup(cls.store.close)
         cls.store.migrate()
     @classmethod
-    def drop_database(cls):
-        with psycopg.connect(cls.admin_dsn,autocommit=True) as admin:
-            admin.execute(sql.SQL('DROP DATABASE {}').format(sql.Identifier(cls.database)))
+    def tearDownClass(cls):
+        cls.store.close()
     def setUp(self):
         nonce=uuid.uuid4().hex
         self.tenant,self.source,self.principal='tenant:membership:'+nonce,'source:membership:'+nonce,'principal:membership:'+nonce
