@@ -1,6 +1,7 @@
 """Native witnesses for passage-only scan invalidation."""
 
 import json
+import unittest
 from unittest.mock import patch
 from e2e_passage_origin import PassageOrigin
 from e2e_legacy_tool_migration import LegacyToolMigration
@@ -440,3 +441,18 @@ class RetainedMetadataWitness(PassageOrigin):
             },
             {row["passage_id"] for row in after},
         )
+
+
+if __name__ == "__main__":
+    suite = unittest.TestSuite(
+        case(name)
+        for case in (
+            DatasetFingerprintWitness,
+            SameCountExtractionWitness,
+            SharedDatasetWitness,
+            RetainedMetadataWitness,
+        )
+        for name in case.__dict__
+        if name.startswith("test_")
+    )
+    raise SystemExit(not unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful())

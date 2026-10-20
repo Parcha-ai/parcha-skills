@@ -135,6 +135,7 @@ jobs:
             e2e_parquet_scan_fragments.py \
             e2e_parquet_dirty_completeness.py \
             e2e_parquet_sparse_planning.py \
+            e2e_parquet_dataset_fingerprint.py \
             e2e_parquet_compaction_reuse.py \
             e2e_parquet_worker_fairness.py \
             e2e_passage_parquet_cadence.py \
