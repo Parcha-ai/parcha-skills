@@ -13,6 +13,13 @@ from recall_server import passage_append, tool_passage_projection
 
 
 class CodexEpoch5Backfill(CodexToolPublication):
+    def setUp(self):
+        super().setUp()
+        # These fixtures compare the historical epoch 4 and epoch 5 contracts.
+        epoch = patch.object(passage_append, 'CODEX_CHECKPOINT_VERSION', 5)
+        epoch.start()
+        self.addCleanup(epoch.stop)
+
     def reset_fixture(self):
         # Each subcase owns its pool/archive; release them before the next one.
         self.doCleanups()
