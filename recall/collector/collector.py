@@ -12,6 +12,7 @@ import urllib.error
 import urllib.request
 from bisect import bisect_right
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import ExitStack
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -23,6 +24,10 @@ from skills.recall.scripts.codex_identity import (
     codex_session_id_from_record,
     resolve_codex_session_identity,
     stable_codex_record_key,
+)
+from skills.recall.scripts.codex_rollout import (
+    DecodedSourceChanged, DecodedSourceDeadline, DecodedSourceInvalid, IdentityReadView,
+    decoded_snapshot, identity_name, open_decoded, verify_source,
 )
 from privacy.policy import PrivacyPolicy, summarize_receipts
 from privacy.transport import open_no_redirect, retry_delay_seconds
@@ -468,7 +473,9 @@ class Collector:
                         for entry in entries:
                             if entry.is_dir(follow_symlinks=False):
                                 pending.append(Path(entry.path))
-                            elif entry.name.endswith(".jsonl") and (
+                            elif (entry.name.endswith(".jsonl") or (
+                                self.harness == "codex" and entry.name.endswith(".jsonl.zst")
+                            )) and (
                                 (entry.name.startswith("rollout-") if self.harness == "codex"
                                  else not self._claude_workflow_journal(Path(entry.path)))
                             ):
@@ -506,7 +513,7 @@ class Collector:
         ).fetchone()
         if row is None:
             raise CollectorRuntimeError("codex_identity_unavailable")
-        segment_id = codex_segment_id_from_filename(path)
+        segment_id = codex_segment_id_from_filename(identity_name(path))
         key = stable_codex_segment_key(row["session_id"], segment_id) if segment_id else row["record_key"]
         self._codex_path_keys[path_text] = key
         return key
@@ -520,10 +527,24 @@ class Collector:
             return "archived"
         return "active"
 
-    @staticmethod
-    def _content_digest(path: Path) -> str:
+    def _compressed(self, path: Path) -> bool:
+        return self.harness == "codex" and path.name.endswith(".jsonl.zst")
+
+    def _source_deadline(self) -> float:
+        current = getattr(self, "_scan_source_deadline", None)
+        return current if current is not None else time.monotonic() + self.max_scan_seconds
+
+    def _identity_input(self, path: Path):
+        return IdentityReadView(path, self._source_deadline()) if self._compressed(path) else path
+
+    def _open_source(self, path: Path, *, expected_signature=None):
+        if self._compressed(path):
+            return open_decoded(path, deadline=self._source_deadline(), expected_signature=expected_signature)
+        return path.open("rb")
+
+    def _content_digest(self, path: Path) -> str:
         value = hashlib.sha256()
-        with path.open("rb") as source:
+        with self._open_source(path) as source:
             for chunk in iter(lambda: source.read(1024 * 1024), b""):
                 value.update(chunk)
         return value.hexdigest()
@@ -532,9 +553,9 @@ class Collector:
         result: dict[str, list[str]] = {}
         for file_row in self.db.execute("SELECT path FROM files ORDER BY path"):
             path = file_row["path"]
-            if codex_segment_id_from_filename(Path(path)) is not None:
+            if codex_segment_id_from_filename(identity_name(Path(path))) is not None:
                 continue  # Segment IDs never determine the legacy root's key.
-            filename_id = codex_session_id_from_filename(Path(path))
+            filename_id = codex_session_id_from_filename(identity_name(Path(path)))
             if filename_id is not None:
                 result.setdefault(filename_id, []).append(path)
                 continue
@@ -566,7 +587,7 @@ class Collector:
     def _rebind_codex_path(self, old_path: str, new_path: str) -> bool:
         if old_path == new_path:
             return True
-        tables = ("files", "active_records", "scan_members", "outbox", "dead_letters")
+        tables = ("files", "active_records", "scan_members", "outbox", "dead_letters", "record_repeats")
         if any(
             self.db.execute(
                 f"SELECT 1 FROM {table} WHERE path=? LIMIT 1",
@@ -577,7 +598,7 @@ class Collector:
             return False
         self.db.execute("SAVEPOINT codex_rebind")
         try:
-            for table in ("files", "active_records", "scan_members", "dead_letters"):
+            for table in ("files", "active_records", "scan_members", "dead_letters", "record_repeats"):
                 self.db.execute(
                     f"UPDATE {table} SET path=? WHERE path=?",
                     (new_path, old_path),
@@ -621,7 +642,7 @@ class Collector:
         for segment in segments:
             segment_id = segment["identity"].segment_id
             old_paths = [row["path"] for row in known
-                         if codex_segment_id_from_filename(Path(row["path"])) == segment_id
+                         if codex_segment_id_from_filename(identity_name(Path(row["path"]))) == segment_id
                          and self.db.execute("SELECT 1 FROM files WHERE path=?", (row["path"],)).fetchone()]
             if len(old_paths) > 1 or (old_paths and not self._rebind_codex_path(old_paths[0], segment["path_text"])):
                 return False
@@ -631,7 +652,7 @@ class Collector:
         groups: dict[tuple[str, str], int] = {}
         for row in self.db.execute("SELECT session_id,path FROM codex_session_locations "
                                    "WHERE status!='missing' AND session_id IS NOT NULL"):
-            key = (row["session_id"], codex_segment_id_from_filename(Path(row["path"])) or row["session_id"])
+            key = (row["session_id"], codex_segment_id_from_filename(identity_name(Path(row["path"]))) or row["session_id"])
             groups[key] = groups.get(key, 0) + 1
         return len({session for (session, _segment), count in groups.items() if count > 1})
 
@@ -665,7 +686,7 @@ class Collector:
             identity = None
             if (
                 unchanged
-                and codex_segment_id_from_filename(path) is None
+                and codex_segment_id_from_filename(identity_name(path)) is None
                 and location["session_id"] is not None
             ):
                 session_id = location["session_id"]
@@ -679,9 +700,19 @@ class Collector:
                 session_id = None
                 identity_status = location["status"]
             else:
-                identity = resolve_codex_session_identity(path)
-                session_id = identity.native_session_id
-                identity_status = identity.status
+                try:
+                    identity = resolve_codex_session_identity(self._identity_input(path))
+                except DecodedSourceInvalid:
+                    session_id = None
+                    identity_status = "identity_unavailable"
+                    self.db.execute(
+                        "INSERT OR IGNORE INTO dead_letters(path,byte_offset,error_code,error_summary,created_at) "
+                        "VALUES (?,?,?,?,?)",
+                        (path_text, 0, "decoded_source_invalid", "compressed source rejected", time.time()),
+                    )
+                else:
+                    session_id = identity.native_session_id
+                    identity_status = identity.status
             preliminary = "current" if session_id is not None else identity_status
             cached_current = bool(
                 unchanged
@@ -745,27 +776,28 @@ class Collector:
             candidates = [item for item in candidates if item not in segments]
             try:
                 selected_segments = self._codex_segments(segments)
-            except CollectorRuntimeError:
+                divergent = False
+                if len(candidates) > 1:
+                    duplicate_sessions += 1
+                    self.db.executemany(
+                        "UPDATE codex_session_locations SET last_scan_id=? WHERE path=?",
+                        [
+                            (scan_id, item["path_text"])
+                            for item in candidates
+                            if item["cached_current"]
+                        ],
+                    )
+                    divergent = len({
+                        self._content_digest(item["path"])
+                        for item in candidates
+                    }) > 1
+            except (CollectorRuntimeError, DecodedSourceInvalid):
+                # No physical copy may win when equivalence cannot be proved.
                 conflicts += 1
                 self.db.execute("UPDATE codex_session_locations SET status='identity_conflict' "
                                 "WHERE session_id=? AND last_scan_id=?", (session_id, scan_id))
                 self._protect_codex_session(session_id, scan_id)
                 continue
-            divergent = False
-            if len(candidates) > 1:
-                duplicate_sessions += 1
-                self.db.executemany(
-                    "UPDATE codex_session_locations SET last_scan_id=? WHERE path=?",
-                    [
-                        (scan_id, item["path_text"])
-                        for item in candidates
-                        if item["cached_current"]
-                    ],
-                )
-                divergent = len({
-                    self._content_digest(item["path"])
-                    for item in candidates
-                }) > 1
             session = self.db.execute(
                 "SELECT * FROM codex_sessions WHERE session_id=?",
                 (session_id,),
@@ -853,7 +885,7 @@ class Collector:
             try:
                 # A rootless session may use a segment as its metadata anchor.
                 # Its physical ledger must never move into a later root file.
-                move_root = bool(candidates) and codex_segment_id_from_filename(Path(old_path)) is None
+                move_root = bool(candidates) and codex_segment_id_from_filename(identity_name(Path(old_path))) is None
                 rebound = ((not move_root or self._rebind_codex_path(old_path, chosen["path_text"]))
                            and self._rebind_codex_segments(session_id, selected_segments))
                 if not rebound:
@@ -878,7 +910,7 @@ class Collector:
                    SET canonical_path=?,lifecycle=?,status='resolved',last_seen_at=?
                    WHERE session_id=?""",
                 (
-                    (chosen["path_text"] if candidates or codex_segment_id_from_filename(Path(old_path))
+                    (chosen["path_text"] if candidates or codex_segment_id_from_filename(identity_name(Path(old_path)))
                      else old_path),
                     chosen["lifecycle"], time.time(), session_id,
                 ),
@@ -953,10 +985,10 @@ class Collector:
             "byte_start": start,
             "byte_end": end,
         }
-        if self.harness == "codex" and kind != "tombstone" and codex_segment_id_from_filename(path):
+        if self.harness == "codex" and kind != "tombstone" and codex_segment_id_from_filename(identity_name(path)):
             identity = self._codex_segment_identities.get(str(path))
             if identity is None:
-                identity = resolve_codex_session_identity(path)
+                identity = resolve_codex_session_identity(self._identity_input(path))
                 if identity.status != "resolved" or identity.segment_id is None:
                     raise CollectorRuntimeError("codex_identity_unavailable")
                 self._codex_segment_identities[str(path)] = identity
@@ -1209,7 +1241,7 @@ class Collector:
 
     def _save_file_progress(self, path: str, stat, current_fingerprint: str, offset: int,
                             status: str, scan_id: str, snapshot_sha256: str | None = None,
-                            snapshot_verified: bool = True) -> None:
+                            snapshot_verified: bool = True, decoded_size: int | None = None) -> None:
         self.db.execute(
             """INSERT INTO files(path,size,mtime_ns,fingerprint,scanned_offset,committed_offset,status,last_scan_id,snapshot_sha256,snapshot_stat)
                VALUES (?,?,?,?,?,0,?,?,?,?)
@@ -1217,7 +1249,7 @@ class Collector:
                fingerprint=excluded.fingerprint,scanned_offset=excluded.scanned_offset,
                status=excluded.status,last_scan_id=excluded.last_scan_id,
                snapshot_sha256=excluded.snapshot_sha256,snapshot_stat=excluded.snapshot_stat""",
-            (path, stat.st_size, stat.st_mtime_ns, current_fingerprint, offset, status, scan_id,
+            (path, stat.st_size if decoded_size is None else decoded_size, stat.st_mtime_ns, current_fingerprint, offset, status, scan_id,
              snapshot_sha256, json.dumps(snapshot_identity(stat)) if snapshot_sha256 and snapshot_verified else None),
         )
 
@@ -1242,7 +1274,7 @@ class Collector:
         self._set_meta("last_scan_complete", "1" if summary["scan_complete"] else "0")
         self.db.execute(
             "DELETE FROM meta WHERE key='last_error_code' "
-            "AND value IN ('archive_unavailable','scan_failed','source_unavailable','inventory_incomplete','source_snapshot_changed','source_snapshot_deadline')"
+            "AND value IN ('archive_unavailable','scan_failed','source_unavailable','inventory_incomplete','source_snapshot_changed','source_snapshot_deadline','decoded_source_invalid')"
         )
         self.db.commit()
         return summary
@@ -1260,22 +1292,19 @@ class Collector:
             "scan_complete": True,
         }
         scan_started = time.monotonic()
+        self._scan_source_deadline = scan_started + self.max_scan_seconds
         records_seen = 0
         bounded = False
         last_visited_path = None
         privacy_receipts = []
-        if self.brain_writer is not None and not self.defer_scan_flush:
-            self.flush()
-        executor = (
-            ThreadPoolExecutor(max_workers=self.archive_workers)
-            if (
-                self.archive is not None
-                and self.archive_workers > 1
-                and not self.bulk_manifest_archive
-            )
-            else None
-        )
+        executor = None
+        fair_slice = False
         try:
+            if self.brain_writer is not None and not self.defer_scan_flush:
+                self.flush()
+            if (self.archive is not None and self.archive_workers > 1
+                    and not self.bulk_manifest_archive):
+                executor = ThreadPoolExecutor(max_workers=self.archive_workers)
             paths = self.discover()
             if self.harness == "codex":
                 paths = self._prepare_codex_discovery(paths, scan_id, summary)
@@ -1322,330 +1351,365 @@ class Collector:
                     self.flush()
                 summary["files_seen"] += 1
                 last_visited_path = str(path)
-                stat = path.stat()
-                path_text = str(path)
-                row = self.db.execute("SELECT * FROM files WHERE path=?", (path_text,)).fetchone()
-                current_fingerprint = fingerprint(path, stat.st_size)
-                current_snapshot_stat = json.dumps(snapshot_identity(stat))
-                restoring_tombstone = bool(
-                    row and row["status"] in {"tombstone", "scanning-restore"}
-                )
-                if (
-                    row and not restoring_tombstone
-                    and not row["status"].startswith("scanning-")
-                    and row["size"] == stat.st_size
-                    and row["mtime_ns"] == stat.st_mtime_ns
-                    and row["fingerprint"] == current_fingerprint
-                    and row["snapshot_sha256"]
-                    and row["snapshot_stat"] == current_snapshot_stat
-                ):
-                    # Legacy cursors without a verified snapshot must walk the
-                    # records once; EOF alone does not prove their delivery.
-                    self.db.execute("UPDATE files SET last_scan_id=? WHERE path=?", (scan_id, path_text))
-                    continue
-                same_snapshot = bool(
-                    row and row["snapshot_sha256"]
-                    and row["snapshot_stat"] == current_snapshot_stat
-                    and row["size"] == stat.st_size
-                    and row["mtime_ns"] == stat.st_mtime_ns
-                    and row["fingerprint"] == current_fingerprint
-                )
-                if same_snapshot:
-                    snapshot_sha256 = saved_prefix = row["snapshot_sha256"]
-                else:
-                    snapshot_sha256, saved_prefix = snapshot_hashes(
-                        path, stat, stat.st_size,
-                        row["size"] if row and row["size"] <= stat.st_size else None,
-                        scan_started + self.max_scan_seconds,
+                with ExitStack() as source_resources:
+                    stat = path.stat()
+                    path_text = str(path)
+                    row = self.db.execute("SELECT * FROM files WHERE path=?", (path_text,)).fetchone()
+                    compressed = self._compressed(path)
+                    input_path = path
+                    decoded = None
+                    known_compressed = bool(
+                        compressed and row and row["snapshot_sha256"]
+                        and row["snapshot_stat"] == json.dumps(snapshot_identity(stat))
                     )
-                prefix_matches = bool(row and row["snapshot_sha256"]
-                                      and saved_prefix == row["snapshot_sha256"])
-                if (
-                    row and row["status"] == "ok" and row["snapshot_stat"]
-                    and row["scanned_offset"] == row["committed_offset"] == row["size"] == stat.st_size
-                    and prefix_matches
-                    and snapshot_identity(path.stat()) == snapshot_identity(stat)
-                ):
-                    # A fresh strong hash proves a completed, acknowledged file
-                    # only changed metadata. Refresh its witness without replay.
-                    self._save_file_progress(
-                        path_text, stat, current_fingerprint, row["scanned_offset"],
-                        "ok", scan_id, snapshot_sha256,
+                    if compressed and not known_compressed:
+                        decoded = source_resources.enter_context(decoded_snapshot(
+                            path, deadline=self._scan_source_deadline,
+                        ))
+                        if decoded.physical_signature != snapshot_identity(stat):
+                            raise DecodedSourceChanged("decoded_source_changed")
+                        input_path = decoded.path
+                    decoded_size = row["size"] if known_compressed else decoded.size if decoded else stat.st_size
+                    current_fingerprint = row["fingerprint"] if known_compressed else fingerprint(input_path, decoded_size)
+                    current_snapshot_stat = json.dumps(snapshot_identity(stat))
+                    restoring_tombstone = bool(
+                        row and row["status"] in {"tombstone", "scanning-restore"}
                     )
-                    continue
-                resume_mode = row["status"].removeprefix("scanning-") if row and row["status"].startswith("scanning-") else None
-                if resume_mode and not prefix_matches:
-                    # Missing legacy proof or a rewrite requires a fresh walk;
-                    # previously captured records and acknowledgements remain.
-                    resume_mode = None
-
-                def save_progress(offset: int, status: str, progress_scan_id: str) -> None:
-                    nonlocal bounded
-                    verified = snapshot_identity(path.stat()) == snapshot_identity(stat)
-                    if not verified:
-                        # Keep the original digest as a reference, not a proof
-                        # of changed bytes. NULL stat forbids both skip paths;
-                        # the next scan must hash before reusing this cursor.
-                        status = "scanning-" + mode
-                        bounded = True
-                    self._save_file_progress(
-                        path_text, stat, current_fingerprint, offset, status,
-                        progress_scan_id, snapshot_sha256, snapshot_verified=verified,
+                    if (
+                        row and not restoring_tombstone
+                        and not row["status"].startswith("scanning-")
+                        and row["size"] == decoded_size
+                        and row["mtime_ns"] == stat.st_mtime_ns
+                        and row["fingerprint"] == current_fingerprint
+                        and row["snapshot_sha256"]
+                        and row["snapshot_stat"] == current_snapshot_stat
+                        and (not compressed or row["status"] == "ok"
+                             and row["scanned_offset"] == row["committed_offset"] == decoded_size)
+                    ):
+                        # Legacy cursors without a verified snapshot must walk the
+                        # records once; EOF alone does not prove their delivery.
+                        self.db.execute("UPDATE files SET last_scan_id=? WHERE path=?", (scan_id, path_text))
+                        continue
+                    same_snapshot = bool(
+                        row and row["snapshot_sha256"]
+                        and row["snapshot_stat"] == current_snapshot_stat
+                        and row["size"] == decoded_size
+                        and row["mtime_ns"] == stat.st_mtime_ns
+                        and row["fingerprint"] == current_fingerprint
                     )
-
-                if resume_mode:
-                    mode = resume_mode
-                    file_scan_id = row["last_scan_id"]
-                else:
-                    mode = (
-                        "restore"
-                        if restoring_tombstone
-                        else "append"
-                        if row
-                        and stat.st_size > row["size"]
+                    if same_snapshot:
+                        snapshot_sha256 = saved_prefix = row["snapshot_sha256"]
+                    else:
+                        snapshot_sha256, saved_prefix = snapshot_hashes(
+                            input_path, input_path.stat() if decoded else stat, decoded_size,
+                            row["size"] if row and row["size"] <= decoded_size else None,
+                            scan_started + self.max_scan_seconds,
+                        )
+                    prefix_matches = bool(row and row["snapshot_sha256"]
+                                          and saved_prefix == row["snapshot_sha256"])
+                    if (
+                        row and row["status"] == "ok" and row["snapshot_stat"]
+                        and row["scanned_offset"] == row["committed_offset"] == row["size"] == decoded_size
                         and prefix_matches
-                        else "full"
-                        if row
-                        else "new"
-                    )
-                    file_scan_id = scan_id
-                    if mode != "append":
-                        self.db.execute("DELETE FROM scan_members WHERE path=?", (path_text,))
-                        self.db.execute("DELETE FROM record_repeats WHERE path=?", (path_text,))
-                    if restoring_tombstone:
-                        self.db.execute(
-                            "UPDATE files SET committed_offset=0 WHERE path=?",
+                        and snapshot_identity(path.stat()) == snapshot_identity(stat)
+                    ):
+                        # A fresh strong hash proves a completed, acknowledged file
+                        # only changed metadata. Refresh its witness without replay.
+                        if compressed:
+                            verify_source(path, snapshot_identity(stat), deadline=self._scan_source_deadline)
+                        self._save_file_progress(
+                            path_text, stat, current_fingerprint, row["scanned_offset"],
+                            "ok", scan_id, snapshot_sha256, decoded_size=decoded_size,
+                        )
+                        continue
+                    resume_mode = row["status"].removeprefix("scanning-") if row and row["status"].startswith("scanning-") else None
+                    if resume_mode and not prefix_matches:
+                        # Missing legacy proof or a rewrite requires a fresh walk;
+                        # previously captured records and acknowledgements remain.
+                        resume_mode = None
+
+                    def save_progress(offset: int, status: str, progress_scan_id: str) -> None:
+                        nonlocal bounded
+                        if compressed:
+                            verify_source(path, snapshot_identity(stat), deadline=self._scan_source_deadline)
+                        verified = snapshot_identity(path.stat()) == snapshot_identity(stat)
+                        if not verified:
+                            # Keep the original digest as a reference, not a proof
+                            # of changed bytes. NULL stat forbids both skip paths;
+                            # the next scan must hash before reusing this cursor.
+                            status = "scanning-" + mode
+                            bounded = True
+                        self._save_file_progress(
+                            path_text, stat, current_fingerprint, offset, status,
+                            progress_scan_id, snapshot_sha256, snapshot_verified=verified,
+                            decoded_size=decoded_size,
+                        )
+
+                    if resume_mode:
+                        mode = resume_mode
+                        file_scan_id = row["last_scan_id"]
+                    else:
+                        mode = (
+                            "restore"
+                            if restoring_tombstone
+                            else "append"
+                            if row
+                            and decoded_size > row["size"]
+                            and prefix_matches
+                            else "full"
+                            if row
+                            else "new"
+                        )
+                        file_scan_id = scan_id
+                        if mode != "append":
+                            self.db.execute("DELETE FROM scan_members WHERE path=?", (path_text,))
+                            self.db.execute("DELETE FROM record_repeats WHERE path=?", (path_text,))
+                        if restoring_tombstone:
+                            self.db.execute(
+                                "UPDATE files SET committed_offset=0 WHERE path=?",
+                                (path_text,),
+                            )
+                    append = mode == "append"
+                    start_offset = int(row["scanned_offset"]) if append or resume_mode else 0
+                    old_active = {item["native_id"]: item for item in self.db.execute("SELECT * FROM active_records WHERE path=?", (path_text,))}
+                    complete_end = start_offset
+                    complete_records = 0
+                    repeats: dict[str, list[int]] = {
+                        item["repeat_key"]: [item["seen"], item["collapsed"]]
+                        for item in self.db.execute(
+                            "SELECT repeat_key,seen,collapsed FROM record_repeats WHERE path=?",
                             (path_text,),
                         )
-                append = mode == "append"
-                start_offset = int(row["scanned_offset"]) if append or resume_mode else 0
-                old_active = {item["native_id"]: item for item in self.db.execute("SELECT * FROM active_records WHERE path=?", (path_text,))}
-                complete_end = start_offset
-                complete_records = 0
-                repeats: dict[str, list[int]] = {
-                    item["repeat_key"]: [item["seen"], item["collapsed"]]
-                    for item in self.db.execute(
-                        "SELECT repeat_key,seen,collapsed FROM record_repeats WHERE path=?",
-                        (path_text,),
-                    )
-                }
-                dirty_repeats: set[str] = set()
+                    }
+                    dirty_repeats: set[str] = set()
 
-                def save_repeats() -> None:
-                    if not dirty_repeats:
-                        return
-                    self.db.executemany(
-                        "INSERT INTO record_repeats(path,repeat_key,seen,collapsed) VALUES (?,?,?,?) "
-                        "ON CONFLICT(path,repeat_key) DO UPDATE SET seen=excluded.seen,collapsed=excluded.collapsed",
-                        [
-                            (path_text, key, repeats[key][0], repeats[key][1])
-                            for key in dirty_repeats
-                        ],
-                    )
-                    dirty_repeats.clear()
+                    def save_repeats() -> None:
+                        if not dirty_repeats:
+                            return
+                        self.db.executemany(
+                            "INSERT INTO record_repeats(path,repeat_key,seen,collapsed) VALUES (?,?,?,?) "
+                            "ON CONFLICT(path,repeat_key) DO UPDATE SET seen=excluded.seen,collapsed=excluded.collapsed",
+                            [
+                                (path_text, key, repeats[key][0], repeats[key][1])
+                                for key in dirty_repeats
+                            ],
+                        )
+                        dirty_repeats.clear()
 
-                pending: list[tuple[
-                    str, dict[str, Any], str, int, int,
-                    Future[dict[str, Any] | None] | None,
-                    dict[str, Any] | None,
-                ]] = []
-
-                def commit_item(
-                    item: tuple[
+                    pending: list[tuple[
                         str, dict[str, Any], str, int, int,
                         Future[dict[str, Any] | None] | None,
                         dict[str, Any] | None,
-                    ],
-                    *,
-                    shared_artifact: dict[str, Any] | None = None,
-                    artifact_member: dict[str, Any] | None = None,
-                ) -> None:
-                    (
-                        native_id, content, occurred_at, line_start, line_end,
-                        future, artifact_ref,
-                    ) = item
-                    if future is not None:
-                        artifact_ref = future.result()
-                    if shared_artifact is not None:
-                        artifact_ref = shared_artifact
-                    versioned_content = self._versioned_record_content(
-                        native_id,
-                        content,
-                        was_active=native_id in old_active,
-                        force_revision=restoring_tombstone,
-                    )
-                    envelope = self._bounded_record_envelope(
-                        path=path,
-                        native_id=native_id,
-                        content=versioned_content,
-                        occurred_at=occurred_at,
-                        start=line_start,
-                        end=line_end,
-                        artifact_ref=artifact_ref,
-                        artifact_member=artifact_member,
-                    )
-                    if self._queue(path, envelope, line_end):
-                        summary["records_queued"] += 1
-                        summary["restored_records_queued"] += int(
-                            restoring_tombstone
-                        )
-                    self.db.execute(
-                        "INSERT INTO active_records(path,native_id,content_sha256,start_offset,end_offset) VALUES (?,?,?,?,?) "
-                        "ON CONFLICT(path,native_id) DO UPDATE SET content_sha256=excluded.content_sha256,start_offset=excluded.start_offset,end_offset=excluded.end_offset",
+                    ]] = []
+
+                    def commit_item(
+                        item: tuple[
+                            str, dict[str, Any], str, int, int,
+                            Future[dict[str, Any] | None] | None,
+                            dict[str, Any] | None,
+                        ],
+                        *,
+                        shared_artifact: dict[str, Any] | None = None,
+                        artifact_member: dict[str, Any] | None = None,
+                    ) -> None:
                         (
-                            path_text,
+                            native_id, content, occurred_at, line_start, line_end,
+                            future, artifact_ref,
+                        ) = item
+                        if future is not None:
+                            artifact_ref = future.result()
+                        if shared_artifact is not None:
+                            artifact_ref = shared_artifact
+                        versioned_content = self._versioned_record_content(
                             native_id,
-                            envelope["content_sha256"],
-                            line_start,
-                            line_end,
-                        ),
-                    )
-
-                def commit_pending() -> None:
-                    commit_item(pending.pop(0))
-
-                def commit_bulk() -> None:
-                    if not pending:
-                        return
-                    artifact_ref, members = self._archive_manifest(pending)
-                    items = list(pending)
-                    pending.clear()
-                    for item, member in zip(items, members, strict=True):
-                        commit_item(
-                            item,
-                            shared_artifact=artifact_ref,
-                            artifact_member=member,
+                            content,
+                            was_active=native_id in old_active,
+                            force_revision=restoring_tombstone,
                         )
-
-                with path.open("rb") as source:
-                    source.seek(start_offset)
-                    while source.tell() < stat.st_size:
-                        if (
-                            records_seen >= self.max_scan_records
-                            or time.monotonic() - scan_started >= self.max_scan_seconds
-                        ):
-                            bounded = True
-                            break
-                        line_start = source.tell()
-                        line = source.readline(stat.st_size - line_start)
-                        if not line:
-                            break
-                        if not line.endswith(b"\n"):
-                            summary["partial_files"] += 1
-                            break
-                        complete_end = source.tell()
-                        complete_records += 1
-                        records_seen += 1
-                        native_id = f"{self._file_key(path)}-{line_start:016x}"
-                        try:
-                            content = json.loads(line)
-                            if not isinstance(content, dict):
-                                raise ValueError("record is not an object")
-                        except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
-                            summary["parse_errors"] += 1
-                            self.db.execute(
-                                "INSERT OR IGNORE INTO dead_letters(path,byte_offset,error_code,error_summary,created_at) VALUES (?,?,?,?,?)",
-                                (path_text, line_start, type(exc).__name__, "record rejected", time.time()),
-                            )
-                            continue
-                        occurred_at = normalized_timestamp(content.get("timestamp"), stat.st_mtime)
-                        repeat_key = record_repeat_key(content)
-                        counts = repeats.setdefault(repeat_key, [0, 0])
-                        counts[0] += 1
-                        dirty_repeats.add(repeat_key)
-                        if counts[0] > MAX_IDENTICAL_RECORDS_PER_FILE:
-                            counts[1] += 1
-                            summary["records_collapsed"] += 1
-                            continue
-                        privacy = self.privacy.apply(content)
-                        privacy_receipts.append(privacy.receipt())
-                        if privacy.action == "drop":
-                            continue
-                        content = privacy.value
-                        if not restoring_tombstone and self._acked_record_unchanged(
-                            path_text, native_id, content, old_active.get(native_id),
-                            line_start, complete_end,
-                        ):
-                            continue
-                        if self.bulk_manifest_archive:
-                            future = None
-                            artifact_ref = None
-                        elif executor is None:
-                            future = None
-                            artifact_ref = self._archive_raw(
-                                native_id=native_id,
-                                payload=canonical_json(content),
-                                occurred_at=occurred_at,
-                            )
-                        else:
-                            future = executor.submit(
-                                self._archive_raw,
-                                native_id=native_id,
-                                payload=canonical_json(content),
-                                occurred_at=occurred_at,
-                            )
-                            artifact_ref = None
-                        pending.append(
-                            (
-                                native_id,
-                                content,
-                                occurred_at,
-                                line_start,
-                                complete_end,
-                                future,
-                                artifact_ref,
-                            )
+                        envelope = self._bounded_record_envelope(
+                            path=path,
+                            native_id=native_id,
+                            content=versioned_content,
+                            occurred_at=occurred_at,
+                            start=line_start,
+                            end=line_end,
+                            artifact_ref=artifact_ref,
+                            artifact_member=artifact_member,
                         )
-                        if (
-                            self.bulk_manifest_archive
-                            and len(pending) >= self.bulk_bundle_records
-                        ):
-                            commit_bulk()
-                        elif (
-                            not self.bulk_manifest_archive
-                            and len(pending) >= self.archive_workers * 2
-                        ):
-                            commit_pending()
-                        if complete_records % 1000 == 0:
-                            if self.bulk_manifest_archive:
-                                commit_bulk()
-                            else:
-                                while pending:
-                                    commit_pending()
-                            save_repeats()
-                            save_progress(complete_end, "scanning-" + mode, file_scan_id)
-                            self.db.commit()
-                            if (
-                                self.brain_writer is not None
-                                and not self.defer_scan_flush
-                            ):
-                                self.flush()
-                if self.bulk_manifest_archive:
-                    commit_bulk()
-                else:
-                    while pending:
-                        commit_pending()
-                save_repeats()
-                if bounded and complete_end < stat.st_size:
-                    save_progress(complete_end, "scanning-" + mode, file_scan_id)
-                    if not self.db.execute(
-                        "SELECT 1 FROM outbox WHERE path=? AND state='pending' LIMIT 1",
-                        (path_text,),
-                    ).fetchone():
+                        if self._queue(path, envelope, line_end):
+                            summary["records_queued"] += 1
+                            summary["restored_records_queued"] += int(
+                                restoring_tombstone
+                            )
                         self.db.execute(
-                            "UPDATE files SET committed_offset=scanned_offset WHERE path=?",
-                            (path_text,),
+                            "INSERT INTO active_records(path,native_id,content_sha256,start_offset,end_offset) VALUES (?,?,?,?,?) "
+                            "ON CONFLICT(path,native_id) DO UPDATE SET content_sha256=excluded.content_sha256,start_offset=excluded.start_offset,end_offset=excluded.end_offset",
+                            (
+                                path_text,
+                                native_id,
+                                envelope["content_sha256"],
+                                line_start,
+                                line_end,
+                            ),
                         )
+
+                    def commit_pending() -> None:
+                        commit_item(pending.pop(0))
+
+                    def commit_bulk() -> None:
+                        if not pending:
+                            return
+                        artifact_ref, members = self._archive_manifest(pending)
+                        items = list(pending)
+                        pending.clear()
+                        for item, member in zip(items, members, strict=True):
+                            commit_item(
+                                item,
+                                shared_artifact=artifact_ref,
+                                artifact_member=member,
+                            )
+
+                    with self._open_source(
+                        input_path, expected_signature=snapshot_identity(stat) if compressed and decoded is None else None,
+                    ) as source:
+                        source.seek(start_offset)
+                        while source.tell() < decoded_size:
+                            if (
+                                records_seen >= self.max_scan_records
+                                or time.monotonic() - scan_started >= self.max_scan_seconds
+                            ):
+                                bounded = True
+                                break
+                            line_start = source.tell()
+                            line = source.readline(decoded_size - line_start)
+                            if not line:
+                                break
+                            if not line.endswith(b"\n"):
+                                summary["partial_files"] += 1
+                                break
+                            complete_end = source.tell()
+                            complete_records += 1
+                            records_seen += 1
+                            native_id = f"{self._file_key(path)}-{line_start:016x}"
+                            try:
+                                content = json.loads(line)
+                                if not isinstance(content, dict):
+                                    raise ValueError("record is not an object")
+                            except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
+                                summary["parse_errors"] += 1
+                                self.db.execute(
+                                    "INSERT OR IGNORE INTO dead_letters(path,byte_offset,error_code,error_summary,created_at) VALUES (?,?,?,?,?)",
+                                    (path_text, line_start, type(exc).__name__, "record rejected", time.time()),
+                                )
+                                continue
+                            occurred_at = normalized_timestamp(content.get("timestamp"), stat.st_mtime)
+                            repeat_key = record_repeat_key(content)
+                            counts = repeats.setdefault(repeat_key, [0, 0])
+                            counts[0] += 1
+                            dirty_repeats.add(repeat_key)
+                            if counts[0] > MAX_IDENTICAL_RECORDS_PER_FILE:
+                                counts[1] += 1
+                                summary["records_collapsed"] += 1
+                                continue
+                            privacy = self.privacy.apply(content)
+                            privacy_receipts.append(privacy.receipt())
+                            if privacy.action == "drop":
+                                continue
+                            content = privacy.value
+                            if not restoring_tombstone and self._acked_record_unchanged(
+                                path_text, native_id, content, old_active.get(native_id),
+                                line_start, complete_end,
+                            ):
+                                continue
+                            if self.bulk_manifest_archive:
+                                future = None
+                                artifact_ref = None
+                            elif executor is None:
+                                future = None
+                                artifact_ref = self._archive_raw(
+                                    native_id=native_id,
+                                    payload=canonical_json(content),
+                                    occurred_at=occurred_at,
+                                )
+                            else:
+                                future = executor.submit(
+                                    self._archive_raw,
+                                    native_id=native_id,
+                                    payload=canonical_json(content),
+                                    occurred_at=occurred_at,
+                                )
+                                artifact_ref = None
+                            pending.append(
+                                (
+                                    native_id,
+                                    content,
+                                    occurred_at,
+                                    line_start,
+                                    complete_end,
+                                    future,
+                                    artifact_ref,
+                                )
+                            )
+                            if (
+                                self.bulk_manifest_archive
+                                and len(pending) >= self.bulk_bundle_records
+                            ):
+                                commit_bulk()
+                            elif (
+                                not self.bulk_manifest_archive
+                                and len(pending) >= self.archive_workers * 2
+                            ):
+                                commit_pending()
+                            if complete_records % 1000 == 0:
+                                if self.bulk_manifest_archive:
+                                    commit_bulk()
+                                else:
+                                    while pending:
+                                        commit_pending()
+                                save_repeats()
+                                save_progress(complete_end, "scanning-" + mode, file_scan_id)
+                                self.db.commit()
+                                if (
+                                    self.brain_writer is not None
+                                    and not self.defer_scan_flush
+                                ):
+                                    self.flush()
+                    if self.bulk_manifest_archive:
+                        commit_bulk()
+                    else:
+                        while pending:
+                            commit_pending()
+                    save_repeats()
+                    if bounded and complete_end < decoded_size:
+                        save_progress(complete_end, "scanning-" + mode, file_scan_id)
+                        if not self.db.execute(
+                            "SELECT 1 FROM outbox WHERE path=? AND state='pending' LIMIT 1",
+                            (path_text,),
+                        ).fetchone():
+                            self.db.execute(
+                                "UPDATE files SET committed_offset=scanned_offset WHERE path=?",
+                                (path_text,),
+                            )
+                        self.db.commit()
+                        break
+                    # Rewrites may remove local lines without revoking captured history.
+                    status = "partial" if complete_end < decoded_size else "ok"
+                    save_progress(complete_end, status, scan_id)
+                    if not self.db.execute("SELECT 1 FROM outbox WHERE path=? AND state='pending' LIMIT 1", (path_text,)).fetchone():
+                        self.db.execute("UPDATE files SET committed_offset=scanned_offset WHERE path=?", (path_text,))
+                    self.db.execute("DELETE FROM scan_members WHERE path=?", (path_text,))
+                    # Bound crash recovery to one source file; acknowledged offsets still move only in flush().
                     self.db.commit()
-                    break
-                # Rewrites may remove local lines without revoking captured history.
-                status = "partial" if complete_end < stat.st_size else "ok"
-                save_progress(complete_end, status, scan_id)
-                if not self.db.execute("SELECT 1 FROM outbox WHERE path=? AND state='pending' LIMIT 1", (path_text,)).fetchone():
-                    self.db.execute("UPDATE files SET committed_offset=scanned_offset WHERE path=?", (path_text,))
-                self.db.execute("DELETE FROM scan_members WHERE path=?", (path_text,))
-                # Bound crash recovery to one source file; acknowledged offsets still move only in flush().
+        except (DecodedSourceChanged, DecodedSourceDeadline, DecodedSourceInvalid) as error:
+            code = ("source_snapshot_deadline" if isinstance(error, DecodedSourceDeadline)
+                    else "decoded_source_invalid" if isinstance(error, DecodedSourceInvalid)
+                    else "source_snapshot_changed")
+            if last_visited_path is not None:
+                if fair_slice:
+                    self._set_meta("scan_resume_after_path", last_visited_path)
+                self._set_meta("scan_next_lane", "fair")
                 self.db.commit()
+            raise CollectorRuntimeError(code) from error
         except CollectorRuntimeError as error:
             if (error.error_code in {"source_snapshot_changed", "source_snapshot_deadline"}
                     and last_visited_path is not None):
@@ -1658,6 +1722,7 @@ class Collector:
                 self.db.commit()
             raise
         finally:
+            self._scan_source_deadline = None
             if executor is not None:
                 executor.shutdown(wait=True, cancel_futures=True)
         # A missing local transcript is not an instruction to forget captured history.
@@ -1708,7 +1773,7 @@ class Collector:
                 continue
             try:
                 path = Path(row["path"])
-                with path.open("rb") as source:
+                with self._open_source(path) as source:
                     source.seek(row["start_offset"])
                     raw = source.read(row["end_offset"] - row["start_offset"])
                 provenance = retained_envelope.get("provenance", {}) if isinstance(retained_envelope, dict) else {}
@@ -1805,7 +1870,7 @@ class Collector:
                     content = envelope["content"]
                 else:
                     path = Path(row["path"])
-                    with path.open("rb") as source:
+                    with self._open_source(path) as source:
                         source.seek(row["start_offset"])
                         raw = source.read(row["end_offset"] - row["start_offset"])
                     self._check_recovered_suffix_bytes(envelope.get("provenance", {}), raw, row["start_offset"], row["end_offset"])
@@ -2119,18 +2184,18 @@ class Collector:
         inventory_error = None
         if self.harness == "codex":
             active_disk = {
-                str(path) for path in self.root.rglob("rollout-*.jsonl")
-                if path.is_file()
+                str(path) for path in self.root.rglob("rollout-*.jsonl*")
+                if path.is_file() and (path.name.endswith(".jsonl") or path.name.endswith(".jsonl.zst"))
             }
             archive_disk = {
                 str(path)
                 for path in (
-                    self.archive_root.rglob("rollout-*.jsonl")
+                    self.archive_root.rglob("rollout-*.jsonl*")
                     if self.archive_root is not None
                     and self.archive_root.is_dir()
                     else ()
                 )
-                if path.is_file()
+                if path.is_file() and (path.name.endswith(".jsonl") or path.name.endswith(".jsonl.zst"))
             }
             disk = active_disk | archive_disk
         else:
