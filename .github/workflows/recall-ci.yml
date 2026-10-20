@@ -240,6 +240,7 @@ jobs:
             e2e_tool_unit_audit.py \
             e2e_tool_extraction_capability.py \
             e2e_codex_extraction_capability.py \
+            e2e_codex_text_block_storage.py \
             e2e_tool_group_publication.py \
             e2e_claude_first_projection.py \
             e2e_codex_tool_publication.py \
