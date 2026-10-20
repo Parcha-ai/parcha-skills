@@ -7,7 +7,7 @@ from unittest.mock import patch
 import psycopg
 import e2e_tool_group_publication as fixture
 from contracts.source_units import resolve_codex_tool_source_unit
-from recall_server import passage_index
+from recall_server import passage_append, passage_index
 from recall_server.passage_retrieval import rerank_document
 from evals.passage_index_audit import _exact_sample, _span_coverage
 
@@ -52,7 +52,9 @@ class CodexToolPublication(unittest.TestCase):
         self.assertEqual(len(rows), 2)
         self.assertEqual(self.document()['requested_extraction_version'], VERSION)
         self.assertEqual(self.document()['applied_extraction_version'], VERSION)
-        self.assertIsNone(self.document()['append_checkpoint'])
+        checkpoint = self.document()['append_checkpoint']
+        self.assertEqual(checkpoint['version'], passage_append.CODEX_CHECKPOINT_VERSION)
+        self.assertTrue(checkpoint['full_rebuild_only'])
         for row in rows:
             opened = self.grant_and_open(row)
             self.assertTrue(opened['complete'])
@@ -101,7 +103,9 @@ class CodexToolPublication(unittest.TestCase):
         self.assertEqual(self.passages._commit(legacy)['status'],'stale')
         self.assertEqual(self.passages._commit(prepared)['status'],'committed')
         self.assertTrue(prior <= {p['passage_id'] for p in self.projected()})
-        self.assertIsNone(self.document()['append_checkpoint'])
+        checkpoint = self.document()['append_checkpoint']
+        self.assertEqual(checkpoint['version'], passage_append.CODEX_CHECKPOINT_VERSION)
+        self.assertTrue(checkpoint['full_rebuild_only'])
 
     def test_failed_commit_rolls_back_and_retries_first_projection(self):
         self.ingest('input');prepared=self.prepare()
@@ -130,7 +134,9 @@ class CodexToolPublication(unittest.TestCase):
         self.assertTrue(all('Updated Sapphire' in p['text_redacted'] for p in self.projected()))
         self.writer.drain(tenant_id=self.tenant,max_months=10)
         self.assertEqual(set(self.client.namespace(self.settings.namespace(self.tenant)).rows),after)
-        self.assertIsNone(self.document()['append_checkpoint'])
+        checkpoint = self.document()['append_checkpoint']
+        self.assertEqual(checkpoint['version'], passage_append.CODEX_CHECKPOINT_VERSION)
+        self.assertTrue(checkpoint['full_rebuild_only'])
 
     def test_explicit_request_queue_failure_rolls_back_and_retry_is_atomic(self):
         self.ingest('input')

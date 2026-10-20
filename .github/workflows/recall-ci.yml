@@ -241,6 +241,7 @@ jobs:
             e2e_tool_group_publication.py \
             e2e_claude_first_projection.py \
             e2e_codex_tool_publication.py \
+            e2e_codex_typed_output_blocks.py \
             e2e_retire_postgres_plane.py \
             e2e_parent_scoped_retrieval.py \
             e2e_archived_chunk_reads.py \

@@ -1015,6 +1015,8 @@ class CanonicalPassageProjector:
                       AND projected.requested_extraction_version=projected.applied_extraction_version
                       AND (evidence.source_id NOT LIKE 'claude:%%'
                            OR projected.append_checkpoint->'version'=to_jsonb(%s::integer))
+                      AND (evidence.source_id NOT LIKE 'codex:%%'
+                           OR projected.append_checkpoint->'version'=to_jsonb(%s::integer))
                    WHERE (%s::text IS NULL OR evidence.tenant_id=%s)
                       AND projected.logical_document_id IS NULL
                    ON CONFLICT(tenant_id,source_id,logical_document_id)
@@ -1022,7 +1024,8 @@ class CanonicalPassageProjector:
                        generation=canonical_passage_projection_queue.generation+1,
                        reason='backfill',changed_at=clock_timestamp()
                    WHERE canonical_passage_projection_queue.reason='certification'""",
-                (self.policy.fingerprint, passage_append.CHECKPOINT_VERSION, tenant_id, tenant_id),
+                (self.policy.fingerprint, passage_append.CHECKPOINT_VERSION,
+                 passage_append.CODEX_CHECKPOINT_VERSION, tenant_id, tenant_id),
             )
         return max(0, result.rowcount)
 
