@@ -33,6 +33,28 @@ _DEBT_EXAMPLE_LIMIT = 8
 _DEBT_EXAMPLES_PER_REASON = 2
 
 
+class _CapturedArchive:
+    """One slice's actual archive bytes, including shared logical parts."""
+    def __init__(self, archive):
+        self.archive = archive
+        self.consumed = 0
+
+    def read_raw_bounded(self, reference, *, deadline_at):
+        size = reference.get('size_bytes')
+        if type(size) is not int or size <= 0 or self.consumed + size > MAX_PAGE_BYTES:
+            raise ValueError('captured_archive_unavailable')
+        if time.monotonic() >= deadline_at:
+            raise TimeoutError()
+        # A failed or uncertain read still consumes its reserved byte allowance.
+        self.consumed += size
+        bounded = getattr(self.archive, 'read_raw_bounded', None)
+        if callable(bounded):
+            return bounded(reference, deadline_at=deadline_at)
+        if isinstance(self.archive, FilesystemArchiveStore):
+            return self.archive.read_raw(reference)
+        raise ValueError('captured_archive_unavailable')
+
+
 def _debt_reason(error):
     # Only exact codes already raised by this owner may leave the exception.
     # Arbitrary messages (including codes embedded in text) remain private.
@@ -126,6 +148,8 @@ def _page(worker, row, after, upper, limit, native_ids=None):
         worker.plane._require_existing_source_owner(c, tenant_id=row['tenant_id'],
             principal_id=row['principal_id'], source_id=row['source_id'])
         return c.execute('''SELECT event.event_id,event.native_id,event.content_sha256,
+            event.native_parent_id,event.kind,event.occurred_at,event.observed_at,
+            event.body_location,document.document_id,
             event.canonical_redacted#>>'{content,kind}' AS content_kind,
             artifact.artifact_id,artifact.storage_backend,artifact.object_key,
             artifact.content_sha256 AS raw_sha256,artifact.size_bytes,artifact.media_type,
@@ -143,7 +167,10 @@ def _page(worker, row, after, upper, limit, native_ids=None):
                 upper, upper, native_ids, native_ids, limit)).fetchall()
 
 
-def _record(worker, row, selected, deadline, *, contacts_only=False, skip_only=False):
+def _record(worker, row, selected, deadline, *, contacts_only=False, skip_only=False,
+            archive_budget=None):
+    archive_budget = archive_budget or _CapturedArchive(worker.archive)
+    thinned = selected.get('body_location') == 'raw'
     with worker.store.connect() as c, c.transaction():
         c.execute("SELECT set_config('statement_timeout',%s,true)", (str(worker.store.search_deadline_ms),))
         worker._require_slack_page_authority(c, row)
@@ -156,7 +183,7 @@ def _record(worker, row, selected, deadline, *, contacts_only=False, skip_only=F
         document = selected['content_kind'] == 'document.v1' and not contacts_only
         event = worker._require_captured_slack_event(c, row, selected['native_id'],
             {selected['native_id']: (selected['event_id'], selected['content_sha256'])},
-            **({'captured_document': True} if document else {}))
+            **({'captured_document': True} if document or thinned else {}))
         if skip_only:
             # The native current-event check holds the event lock. Thinning may
             # have changed its representation since the page nominated a skip.
@@ -164,11 +191,47 @@ def _record(worker, row, selected, deadline, *, contacts_only=False, skip_only=F
                 FROM canonical_events WHERE tenant_id=%s AND source_id=%s AND event_id=%s''',
                 (row['tenant_id'], row['source_id'], selected['event_id'])).fetchone()['kind']
             return None if kind in {'communication_message.v1', 'document.v1'} else _NOT_A_CONTACT_SKIP
-        if document:
+        if document and not thinned:
             # Validate accepted typed content before it leaves the read boundary.
             # Pure malformed-input failures become debt, never write failures.
             from .projectors import validate_envelope
             return validate_envelope(event)
+    if thinned:
+        from .chunk_bodies import read_archived_chunks
+        from .projectors import validate_envelope
+        bodies = read_archived_chunks(worker.store, archive_budget,
+            tenant_id=row['tenant_id'], source_ids=(row['source_id'],),
+            document_ids=(selected['document_id'],), deadline_at=deadline,
+            located_only=True)
+        chunks = bodies.get((row['source_id'], selected['document_id']))
+        if not chunks:
+            raise ValueError('captured_archive_unavailable')
+        content = json.loads(''.join(chunk['text_redacted'] for chunk in chunks))
+        restored = dict(
+            {key: event[key] for key in ('principal_id', 'visibility', 'content_type', 'provenance')},
+            schema_version=1, source_id=row['source_id'],
+            native_id=selected['native_id'], kind=selected['kind'],
+            occurred_at=selected['occurred_at'].isoformat(),
+            observed_at=selected['observed_at'].isoformat(),
+            content=content, content_sha256=selected['content_sha256'])
+        if selected['native_parent_id'] is not None:
+            restored['native_parent_id'] = selected['native_parent_id']
+        validate_envelope(restored)
+        with worker.store.connect() as c, c.transaction():
+            c.execute("SELECT set_config('statement_timeout',%s,true)", (str(worker.store.search_deadline_ms),))
+            worker._require_slack_page_authority(c, row)
+            worker.plane._require_existing_source_owner(c, tenant_id=row['tenant_id'],
+                principal_id=row['principal_id'], source_id=row['source_id'])
+            if c.execute('''SELECT 1 FROM forget_tombstones WHERE tenant_id=%s AND source_id=%s
+                    AND target_identity_sha256=%s''', (row['tenant_id'], row['source_id'],
+                    _identity_sha256(row['tenant_id'], row['source_id'], selected['native_id']))).fetchone():
+                return None
+            worker._require_captured_slack_event(c, row, selected['native_id'],
+                {selected['native_id']: (selected['event_id'], selected['content_sha256'])})
+        if content.get('kind') in {'communication_message.v1', 'document.v1'}:
+            # These are already privacy-filtered canonical commitments. Contact
+            # identity enrollment still needs the original SDK input below.
+            return None if contacts_only else restored
     if contacts_only and selected['content_kind'] in {'communication_message.v1', 'document.v1'}:
         return None  # The messages phase owns non-contact attribution.
     if (selected['state'] != 'live' or selected['media_type'] != 'application/json'
@@ -180,15 +243,9 @@ def _record(worker, row, selected, deadline, *, contacts_only=False, skip_only=F
         **{key: selected[key] for key in ('artifact_id', 'storage_backend', 'object_key',
             'size_bytes', 'media_type', 'encryption', 'version_id')},
         content_sha256=selected['raw_sha256'], created_at=selected['created_at'].isoformat())
-    read = getattr(worker.archive, 'read_raw_bounded', None)
     if time.monotonic() >= deadline:
         raise TimeoutError()
-    if callable(read):
-        payload = read(reference, deadline_at=deadline)
-    elif isinstance(worker.archive, FilesystemArchiveStore):
-        payload = worker.archive.read_raw(reference)
-    else:
-        raise ValueError('captured_archive_unavailable')
+    payload = archive_budget.read_raw_bounded(reference, deadline_at=deadline)
     if time.monotonic() >= deadline:
         raise TimeoutError()
     if len(payload) != reference['size_bytes'] or hashlib.sha256(payload).hexdigest() != selected['raw_sha256']:
@@ -267,15 +324,15 @@ def repair_slice(worker, row, runner, *, deadline_at):
         state['unresolved'] -= removed
         page.sort(key=lambda item: hashlib.sha256(item['native_id'].encode()).hexdigest())
         _save(db, state, retry_next=False if removed else None)
-    consumed = 0
+    archive_budget = _CapturedArchive(worker.archive)
     for selected in page:
         contacts_only = state['phase'] == 'contacts' and not retry
-        no_raw_read = (selected['content_kind'] == 'document.v1' or
+        no_raw_read = (selected.get('body_location') == 'raw' or
+            selected['content_kind'] == 'document.v1' or
             contacts_only and selected['content_kind'] == 'communication_message.v1')
         charge = 0 if no_raw_read else min(max(0, selected['size_bytes'] or 0), MAX_RECORD_BYTES + 100_000)
-        if time.monotonic() >= deadline or consumed + charge > MAX_PAGE_BYTES:
+        if time.monotonic() >= deadline or archive_budget.consumed + charge > MAX_PAGE_BYTES:
             return state
-        consumed += charge
         reason = None
         skip = contacts_only and selected['content_kind'] in {'communication_message.v1', 'document.v1'}
         if skip:
@@ -283,7 +340,8 @@ def repair_slice(worker, row, runner, *, deadline_at):
             existing_debt = db.execute('SELECT 1 FROM meta WHERE key=?', (debt_key,)).fetchone()
         try:
             record = _record(worker, row, selected, deadline,
-                contacts_only=contacts_only, **({'skip_only': True} if skip else {}))
+                contacts_only=contacts_only, archive_budget=archive_budget,
+                **({'skip_only': True} if skip else {}))
             if record is _NOT_A_CONTACT_SKIP:
                 return state  # Reconsider the changed representation on the next normal page.
         except ControlError:

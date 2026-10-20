@@ -759,7 +759,7 @@ class ManagedConnectorWorker:
             # The captured reader validates this accepted canonical commitment.
             # Reuse its typed references without double-redacting stored content.
             if (expected_events is None or event['source_id'] != row['source_id']
-                    or event['content'].get('kind') != 'document.v1'):
+                    or event['content'].get('kind') not in {'document.v1', 'communication_message.v1'}):
                 raise ControlError('connector_record_changed')
             prepared[(event['native_id'], event['content_sha256'])] = event
         for record in records:

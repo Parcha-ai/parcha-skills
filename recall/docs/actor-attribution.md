@@ -57,6 +57,17 @@ boundary.
 
 Raw artifacts and canonical events do **not** need to be re-ingested.
 
+Managed Slack attribution can recover thinned message and attachment content
+through the existing logical archive reader. It verifies the current event's
+content commitment and rechecks the managed lease, source owner grant, and
+Forget state before applying actor links. Binary attachments remain binary;
+their bytes are not treated as SDK JSON. Contact enrollment still reads the
+original SDK record because privacy-filtered canonical content may no longer
+contain the email needed to resolve an identity. Archive reads share the
+existing eight-megabyte slice allowance. Missing locators, unavailable or
+oversized parts, corrupt content, and stale revisions remain unresolved debt;
+the worker does not restore large inline bodies or infer missing identities.
+
 1. Create an actor for each enrolled employee and link their login principal.
 2. Bind their existing Codex/Claude sources as `contributor`.
 3. Add exact event-level actors where a connector already exposes author IDs.
