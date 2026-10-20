@@ -1077,6 +1077,8 @@ class CanonicalPassageProjector:
                      AND projected.requested_extraction_version=projected.applied_extraction_version
                      AND (page.source_id NOT LIKE 'claude:%%'
                           OR projected.append_checkpoint->'version'=to_jsonb(%s::integer))
+                     AND (page.source_id NOT LIKE 'codex:%%'
+                          OR projected.append_checkpoint->'version'=to_jsonb(%s::integer))
                     LEFT JOIN canonical_passage_projection_queue queue
                       ON queue.tenant_id=page.tenant_id
                      AND queue.source_id=page.source_id
@@ -1127,6 +1129,7 @@ class CanonicalPassageProjector:
                 ORDER BY budgeted.logical_document_id""",
                 (tenant_id, source_id, after or "", upper, limit,
                  self.policy.fingerprint, passage_append.CHECKPOINT_VERSION,
+                 passage_append.CODEX_CHECKPOINT_VERSION,
                  max_source_bytes, max_source_bytes, max_source_bytes,
                  max_source_bytes, max_source_bytes),
                 deadline_at,

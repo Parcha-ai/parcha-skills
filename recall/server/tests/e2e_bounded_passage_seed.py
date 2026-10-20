@@ -230,6 +230,34 @@ class BoundedPassageSeed(LegacyToolMigration):
             ).fetchall()
         self.assertEqual(sources, [{"source_id": claude_source}])
 
+    def test_codex_epoch4_matches_original_seed_and_rebuild_terminates(self):
+        self.source = "codex:" + self.source
+        with patch.object(passage_append, "CODEX_CHECKPOINT_VERSION", 3):
+            keys = [row["logical_document_id"] for row in self.history(2)]
+        old = self.published_rows()
+        self.assertEqual(self.passages.seed_backfill(tenant_id=self.tenant), 2)
+        with self.store.connect() as connection:
+            connection.execute(
+                "DELETE FROM canonical_passage_projection_queue WHERE tenant_id=%s",
+                (self.tenant,),
+            )
+        result = self.page(upper=keys[-1])
+        self.assertEqual(result["queued"], 2)
+        self.assertEqual(self.project()["documents"], 2)
+        self.assertEqual(self.published_rows(), old)
+        with self.store.connect() as connection:
+            versions = connection.execute(
+                """SELECT append_checkpoint->>'version' AS version
+                FROM canonical_passage_documents WHERE tenant_id=%s""",
+                (self.tenant,),
+            ).fetchall()
+        self.assertEqual(versions, [{"version": "4"}, {"version": "4"}])
+        self.assertEqual(self.passages.seed_backfill(tenant_id=self.tenant), 0)
+        self.assertEqual(
+            [row["disposition"] for row in self.page(upper=keys[-1])["rows"]],
+            ["current", "current"],
+        )
+
 
 if __name__ == "__main__":
     suite = unittest.TestSuite(
