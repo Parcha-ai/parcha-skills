@@ -58,6 +58,28 @@ class Opening(unittest.TestCase):
         self.assertNotIn('synthetic-private-value',''.join(pages));self.assertIn('[REDACTED]',''.join(pages))
 
 
+    def reserved_reader(self):
+        import os
+        from recall_server.db import BrainStore
+        serving=BrainStore(os.environ['RECALL_DATABASE_URL'],pool_max_size=8,reserved_read_connections=2)
+        self.addCleanup(serving.close)
+        self.reader=BoundCanonicalRetrieval(serving.read_only_view(),tenant_id=self.tenant,
+            principal_id=self.principal,authorized_sources=(self.source,),archive=self.archive)
+        with self.reader.store.connect() as connection:
+            self.assertEqual(connection.execute('SHOW transaction_read_only').fetchone()['transaction_read_only'],'on')
+
+    def test_reserved_read_view_restores_complete_source(self):
+        self.reserved_reader()
+        self.test_public_receipt_restores_full_source_in_pages()
+
+    def test_reserved_read_view_refuses_revocation_during_read(self):
+        self.reserved_reader()
+        self.test_grant_revoked_during_read()
+
+    def test_reserved_read_view_refuses_forget_between_pages(self):
+        self.reserved_reader()
+        self.test_forget_between_pages()
+
     def forget(self):
         self.plane.forget(dict(contract='recall.forget-request.v1',schema_version=1,tenant_id=self.tenant,principal_id=self.principal,source_id=self.source,target_receipt=self.target['receipt'],mode='explicit_forget',reason='owner_requested',requested_at='2026-10-17T11:00:00Z',idempotency_key=uuid.uuid4().hex))
     def mutate_content(self,updates):
