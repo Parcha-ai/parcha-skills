@@ -53,15 +53,18 @@ class CertificationSelectionTests(ParentMembershipPublicationTests):
         self.assertEqual(attempted.count(self.source), 1,
                          "unattempted selected sources incorrectly consumed their turns")
 
-    def test_concurrent_source_index_is_idempotent_and_rejects_invalid_same_name(self):
+    def test_concurrent_source_index_is_idempotent_and_readiness_rejects_invalid_same_name(self):
         migration = (Path(__file__).resolve().parents[1] /
-                     "schema/085_membership_remainder_concurrent.sql").read_text()
+                     "schema/085a_membership_remainder_concurrent.sql").read_text()
+        readiness = (Path(__file__).resolve().parents[1] /
+                     "operations/certification_source_index_readiness.sql").read_text()
         name = "canonical_passage_certification_source_idx"
         with self.store.connect() as connection:
             versions = connection.execute("SELECT version FROM schema_migrations ORDER BY version").fetchall()
             before = connection.execute("SELECT %s::regclass::oid AS oid", (name,)).fetchone()["oid"]
             for _ in range(2):
                 self.store._migrate_concurrently(connection, migration)
+                connection.execute(readiness)
             self.assertEqual(connection.execute("SELECT %s::regclass::oid AS oid", (name,)).fetchone()["oid"], before)
             self.assertEqual(connection.execute(
                 "SELECT version FROM schema_migrations ORDER BY version").fetchall(), versions)
@@ -70,9 +73,11 @@ class CertificationSelectionTests(ParentMembershipPublicationTests):
                     try:
                         connection.execute(sql.SQL("UPDATE pg_index SET {}=false WHERE indexrelid=%s::regclass").format(
                             sql.Identifier(flag)), (name,))
+                        self.store._migrate_concurrently(connection, migration)
                         with self.assertRaisesRegex(psycopg.errors.InvalidTextRepresentation,
                                                     "certification_source_index_unavailable"):
-                            self.store._migrate_concurrently(connection, migration)
+                            connection.execute(readiness)
+                        connection.rollback()
                     finally:
                         connection.execute(sql.SQL("UPDATE pg_index SET {}=true WHERE indexrelid=%s::regclass").format(
                             sql.Identifier(flag)), (name,))
@@ -81,12 +86,15 @@ class CertificationSelectionTests(ParentMembershipPublicationTests):
                 connection.execute(sql.SQL("DROP INDEX {}").format(sql.Identifier(name)))
                 connection.execute(sql.SQL("CREATE INDEX {} ON canonical_passage_projection_queue "
                                            "(tenant_id,source_id,logical_document_id)").format(sql.Identifier(name)))
+                self.store._migrate_concurrently(connection, migration)
                 with self.assertRaisesRegex(psycopg.errors.InvalidTextRepresentation,
                                             "certification_source_index_unavailable"):
-                    self.store._migrate_concurrently(connection, migration)
+                    connection.execute(readiness)
+                connection.rollback()
             finally:
                 connection.execute(sql.SQL("DROP INDEX {}").format(sql.Identifier(name)))
                 self.store._migrate_concurrently(connection, migration)
+                connection.execute(readiness)
 
     def test_source_turn_selection_does_not_scan_the_whole_bulk_queue(self):
         plans = []

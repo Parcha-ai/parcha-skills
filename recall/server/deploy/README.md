@@ -1819,11 +1819,12 @@ can safely run again against current generation, bindings, live grants, and Forg
 No archive hydration, embedding, or source publication repeats for this phase.
 
 Before deploying source-turn certification scheduling, run the existing migration
-owner with `085_membership_remainder_concurrent.sql`. It builds the partial
-`canonical_passage_certification_source_idx` concurrently and checks its exact
+owner with `085a_membership_remainder_concurrent.sql`. It builds the partial
+`canonical_passage_certification_source_idx` concurrently. Then run
+`operations/certification_source_index_readiness.sql` to verify its exact
 definition and ready/valid/live flags, even when the index already exists. An
-interrupted or mismatched same-name index refuses completion and needs operator
-repair; `IF NOT EXISTS` alone is not acceptance. This companion records no new
+interrupted or mismatched same-name index refuses rollout acceptance and needs
+operator repair; successful migration or `IF NOT EXISTS` alone is not acceptance. This companion records no new
 schema version. An older worker can run with the index left in place.
 
 The worker starts each allowance after the last source it actually attempted,
