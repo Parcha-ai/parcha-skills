@@ -292,6 +292,7 @@ def restore_outgoing(connection, staged, *, tenant_id, source_id, native_ids, st
                   AND chunk.text_redacted='' AND chunk.text_sha256<>%s))
          ORDER BY document.document_id FOR UPDATE
     ''', (tenant_id, source_id, native_ids, EMPTY_SHA256)).fetchall()
+    reader_floor_verified = False
     for row in rows:
         archived = (restore_mode == 'body' and staged is not None
                     and staged.admit_outgoing(connection, row))
@@ -312,6 +313,16 @@ def restore_outgoing(connection, staged, *, tenant_id, source_id, native_ids, st
                     or restored[0]['receipt'] != receipt
                     or hashlib.sha256(restored[0]['text_redacted'].encode()).hexdigest() != member['text_sha256']):
                 raise HistoryUnavailable()
+            if archived and getattr(store, 'retain_archived_singletons', False):
+                from . import HISTORICAL_SINGLETON_RECEIPT_VERSION
+                # Keep the locked receipt/profile and staged hash checks above.
+                # The reader floor and archive admission share this transaction.
+                if not reader_floor_verified:
+                    if execute('SELECT 1 FROM schema_migrations WHERE version=%s',
+                               (HISTORICAL_SINGLETON_RECEIPT_VERSION,)).fetchone() is None:
+                        raise HistoryUnavailable()
+                    reader_floor_verified = True
+                continue
             execute('''INSERT INTO canonical_chunks(
                 tenant_id,source_id,chunk_id,document_id,ordinal,receipt,text_redacted,text_sha256,created_at)
                 VALUES (%s,%s,%s,%s,0,%s,%s,%s,%s)''',

@@ -1,8 +1,9 @@
-"""Inactive exact receipt metadata lookup for admitted singleton documents.
+"""Exact receipt metadata authority for physical and admitted singleton rows.
 
-No production caller enables this boundary yet. Profile support requires a
-separate SQL admission owner; archive pointers or missing chunk rows are never
-proof of admission. This module does not hydrate bodies or grant source access.
+Profile admission requires the native SQL lifecycle owner. Historical singleton
+metadata also requires its exact committed evidence catalog entry. Missing rows
+or archive pointers alone do not prove membership. Callers retain source-grant
+checks; this module neither hydrates bodies nor grants source access.
 """
 from __future__ import annotations
 
@@ -37,7 +38,9 @@ def _identity(receipt: str) -> tuple[str, str, int, int]:
 def admitted_singleton_metadata(row: dict[str, Any], *, include_deleted: bool = False) -> dict[str, Any]:
     """Derive metadata from an exact SQL authority snapshot, never an archive pointer."""
     if (row['profile'] != 1 or row['physical_chunks_remain']
-            or (not row['is_current'] and not (include_deleted and row['document_deleted_at'] is not None))):
+            or (not row['is_current']
+                and not row.get('historical_singleton_archive', False)
+                and not (include_deleted and row['document_deleted_at'] is not None))):
         raise ReceiptMembershipError('receipt_membership_profile_invalid')
     receipt = item_receipt(row['source_id'], row['native_id'], row['revision'], 0)
     _identity(receipt)
@@ -127,7 +130,7 @@ def lookup_receipt_metadata(
 
     Source grants remain the caller's authority. The optional existing SQL
     transaction allows lifecycle owners to retain their lock/snapshot boundary.
-    The future profile column is never queried by the default path.
+    The admitted profile column is queried only when singleton support is enabled.
     Only the forget owner uses include_deleted after its own authority/lock gate.
     """
     if (not isinstance(tenant_id, str) or not V2_AUTHORITY_RE.fullmatch(tenant_id)
@@ -155,6 +158,16 @@ def lookup_receipt_metadata(
            document.revision,document.is_current,document.deleted_at AS document_deleted_at,
            document.text_sha256 AS document_text_sha256,
            {profile} AS profile,
+           CASE WHEN {profile}=1 AND NOT document.is_current
+                AND document.deleted_at IS NULL THEN EXISTS (
+               SELECT 1 FROM canonical_evidence_objects evidence
+                WHERE evidence.tenant_id=document.tenant_id
+                  AND evidence.source_id=document.source_id
+                  AND evidence.document_id=document.document_id
+                  AND evidence.revision=document.revision
+                  AND evidence.text_sha256=document.text_sha256
+                  AND evidence.receipt_count=1
+           ) ELSE false END AS historical_singleton_archive,
            CASE WHEN {profile} IS NOT NULL THEN EXISTS (
                SELECT 1 FROM canonical_chunks remaining
                 WHERE remaining.tenant_id=document.tenant_id

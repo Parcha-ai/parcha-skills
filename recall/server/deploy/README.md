@@ -336,7 +336,7 @@ are supported: versions through 69 are required except optional migration 67,
 which retires the Postgres vector plane and is applied explicitly from the
 turbopuffer plane. Migration 70 adds only a reconciliation performance index;
 serving accepts both schema 69 and 70 and reports the actual recorded version.
-The latest shipped migration is 94; migration 71 remains optional and reserved
+The latest shipped migration is 95; migration 71 remains optional and reserved
 for native-conversation metadata. Migration 72 adds nullable
 `canonical_evidence_document_queue.notification_queued_at`, with no default,
 index, or historical reclassification. Apply it before deploying the notification
@@ -2029,3 +2029,36 @@ proves schema compatibility or automatically restore an older collector.
 This ordering describes the product contract, not evidence of a production
 rollout. Actual roles, CI, migration receipt, rollback target and post-release
 selected-cohort/public-latency acceptance must be bound by the operator.
+
+### Retain archived singleton metadata across revisions (optional 095)
+
+`RECALL_RETAIN_ARCHIVED_SINGLETONS=1` avoids recreating a retired singleton's
+Postgres chunk row when an ordinary revision successfully admits its exact
+outgoing evidence bundle. It defaults to `0` and requires the existing
+`RECALL_VERIFIED_SINGLETON_RECEIPTS=1` reader configuration. Writers without an
+outgoing evidence projector keep their existing restoration behavior. Explicit
+metadata and body restoration paths retain their existing behavior.
+
+Deploy compatible readers on every serving, worker, managed and operational
+reader first, with the new writer option off. The new capability owner accepts
+both schema 094 and optional 095. Then apply `095_historical_singleton_receipts.sql`
+through the existing migration owner and verify the capability gate on all roles
+before enabling the writer option. The migration records only a reader floor;
+it does not admit documents, delete chunks, or rewrite tables. The enabled writer
+checks that marker inside the same transaction as exact archive admission and
+the existing locked singleton receipt/hash checks.
+
+Schema 095 makes older capability owners refuse readiness with `schema_drift`.
+Keep that marker during rollback: turning the writer option off stops new
+retention but does not make already-retained historical receipts readable by an
+older binary. Roll back only to a reader that supports 095. Do not remove the
+marker to bypass the existing release capability gate.
+
+Historical metadata requires an exact, nondeleted document/event revision, no
+later tombstone, profile 1, no physical chunk, and a matching committed evidence
+catalog revision, content hash and singleton receipt count. Body reads still
+verify the immutable bundle and repeat the native metadata authority check.
+Source grants and Forget remain the callers' authority. This does not make old
+receipts current search candidates or erase captured history. It prevents new
+metadata recreation; it does not reclaim existing index allocation or lower
+provisioned database capacity by itself.

@@ -33,6 +33,7 @@ from . import (
     ADDITIVE_MEMBERSHIP_GENERATION_VERSION,
     CODEX_TEXT_BLOCK_STORAGE_VERSION,
     SEARCH_PARENT_RECONCILIATION_VERSION,
+    HISTORICAL_SINGLETON_RECEIPT_VERSION,
 )
 
 
@@ -252,7 +253,12 @@ def assess_snapshot(snapshot: dict[str, Any], profile: str = "production") -> di
                       + ([CODEX_TEXT_BLOCK_STORAGE_VERSION]
                          if CODEX_TEXT_BLOCK_STORAGE_VERSION in versions else [])
                       + ([SEARCH_PARENT_RECONCILIATION_VERSION]
-                         if SEARCH_PARENT_RECONCILIATION_VERSION in versions else []))
+                         if SEARCH_PARENT_RECONCILIATION_VERSION in versions else [])
+                      + ([HISTORICAL_SINGLETON_RECEIPT_VERSION]
+                         if HISTORICAL_SINGLETON_RECEIPT_VERSION in versions else []))
+    if (HISTORICAL_SINGLETON_RECEIPT_VERSION in versions
+            and SINGLETON_RECEIPT_PROFILE_VERSION not in versions):
+        raise CapabilityError("schema_drift")
     if (CODEX_TEXT_BLOCK_STORAGE_VERSION in versions
             and CODEX_EXTRACTION_VERSION not in versions):
         raise CapabilityError("schema_drift")

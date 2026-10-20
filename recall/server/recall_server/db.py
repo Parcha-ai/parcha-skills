@@ -246,6 +246,12 @@ class BrainStore:
         verified_singleton_receipts = singleton_receipt_capability(verified_singleton_receipts)
         # Off by default. Migration and explicit activation never admit rows.
         self.verified_singleton_receipts = verified_singleton_receipts
+        history_retention = os.environ.get("RECALL_RETAIN_ARCHIVED_SINGLETONS", "0")
+        if history_retention not in {"0", "1"}:
+            raise ValueError("RECALL_RETAIN_ARCHIVED_SINGLETONS must be 0 or 1")
+        if history_retention == "1" and not verified_singleton_receipts:
+            raise ValueError("historical singleton retention requires singleton receipts")
+        self.retain_archived_singletons = history_retention == "1"
         self.dsn = dsn
         self._pool: ConnectionPool | None = None
         self._read_pool: ConnectionPool | None = None
