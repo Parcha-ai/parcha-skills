@@ -93,6 +93,21 @@ class CodexToolPassageProjectionTests(unittest.TestCase):
         self.assertIn('does not prove execution, selection, or human approval',tool_evidence_context(passages[0].spans))
         self.assertEqual(groups[0].messages[0].origin['semantic_role'],'unknown')
 
+    def test_mixed_typed_output_is_wholly_raw_with_observable_refusal(self):
+        from recall_server.tool_passage_projection import extract_codex_tool_event_groups
+        for block in ({'type': 'image', 'text': 'untyped'},
+                      {'type': 'input_text', 'text': 'hidden', 'channel': 'analysis'},
+                      {'type': 'input_text', 'text': {'nested': 'untyped'}}):
+            event = dict(type='response_item', payload=dict(type='custom_tool_call_output',
+                output=[dict(type='input_text', text='Do not publish a partial output.'), block]))
+            records = self.records(event, segmented=True)
+            groups, coverage = extract_codex_tool_event_groups(records)
+            self.assertEqual(groups, ())
+            self.assertEqual(coverage['dispositions'], {'source_unit_refused': 1})
+            self.assertEqual(coverage['included_string_leaves'], 0)
+            self.assertEqual(''.join(record.text for record in records),
+                             json.dumps(event, ensure_ascii=False))
+
     def test_duplicate_keys_are_raw_only_without_deleting_original_bytes(self):
         from recall_server.tool_passage_projection import extract_codex_tool_event_groups
         raw='{"type":"response_item","payload":{"type":"function_call_output","output":"first","output":"second"}}'

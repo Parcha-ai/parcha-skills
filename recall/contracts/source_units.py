@@ -101,6 +101,9 @@ def resolve_codex_tool_source_unit(record_text, source_unit):
     Input is an authored request; output is reported tool output. Neither the
     item type nor optional call identity establishes execution or human assent.
     JSON-looking strings remain literal, with decoded UTF-8 byte coordinates.
+    A custom output's all-input_text block list resolves to its ordered strings
+    joined by newlines, including empty blocks. Coordinates refer to that
+    normalized string. Mixed or unknown blocks refuse the complete output.
     """
     import json
 
@@ -133,6 +136,14 @@ def resolve_codex_tool_source_unit(record_text, source_unit):
                 or any('role' in item and item['role'] != role for item in (value, payload))):
             refuse()
         text = payload[field]
+        if payload['type'] == 'custom_tool_call_output' and isinstance(text, list):
+            if not text or any(
+                not isinstance(block, dict) or set(block) != {'type', 'text'}
+                or block['type'] != 'input_text' or not isinstance(block['text'], str)
+                for block in text
+            ):
+                refuse()
+            text = '\n'.join(block['text'] for block in text)
         if not isinstance(text, str):
             refuse()
         text.encode('utf-8')
