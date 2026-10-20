@@ -346,12 +346,14 @@ def _advance_without_physical_work(store, *, scope, principal_id, reviewed_plan,
             _fail('pending')
         cursor = progress['last_record_ordinal'] if progress['manifest_artifact_id'] == manifest['manifest_artifact_id'] else -1
         bound = min(MAX_DOCUMENTS, limits.batch_documents)
+        # Keep physical existence checks keyed to the limited document rows;
+        # a hashed EXISTS plan can otherwise scan every chunk in the source.
         rows = query('''SELECT document.document_id,document.native_id,
                 document.body_record_ordinal,document.body_record_count,
                 document.chunk_receipt_profile,
                 EXISTS(SELECT 1 FROM canonical_chunks chunk
                     WHERE chunk.tenant_id=document.tenant_id AND chunk.source_id=document.source_id
-                      AND chunk.document_id=document.document_id) AS physical_row
+                      AND chunk.document_id=document.document_id OFFSET 0) AS physical_row
             FROM canonical_documents document
             JOIN canonical_events event USING(tenant_id,source_id,event_id)
             WHERE document.tenant_id=%s AND document.source_id=%s
