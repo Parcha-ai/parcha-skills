@@ -164,9 +164,8 @@ class ThinnedCapturedDocument(CapturedSlackActors):
             return put(*args, **dict(kwargs, part_bytes=16 * 1024 * 1024))
         with patch.object(self.projector.projection, 'put_records', side_effect=sized):
             self.project()
-        self.thin_history()
-        if large:
-            self.thin_history()
+        # The large fixture exceeds one ten-document thinning batch.
+        self.thin_history(max_batches=2 if large else 1)
         self.enroll()
         source = self.source
         class LiveOnly:
