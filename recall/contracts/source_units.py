@@ -1,6 +1,116 @@
 """Resolve versioned tool text inside an already authorized source record."""
 
 
+def codex_history_source_unit_index(source_unit):
+    """Recognize one canonical replacement-history message coordinate."""
+    prefix = 'codex.history-message.v1#/payload/replacement_history/'
+    if not isinstance(source_unit, str) or not source_unit.startswith(prefix):
+        return None
+    index = source_unit[len(prefix):]
+    if not index.isascii() or not index.isdecimal() or (len(index) > 1 and index[0] == '0'):
+        return None
+    try:
+        return int(index)
+    except ValueError:
+        return None
+
+
+def iter_codex_history_source_units(record_text):
+    """Yield literal visible messages from one captured compaction envelope.
+
+    This is a source-text contract, not source authorization. Hidden or opaque
+    siblings remain captured evidence and are never recursively flattened.
+    Native message identity describes copied history, not a new utterance.
+    """
+    import hashlib
+    import json
+
+    def unique(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError('history_source_unit_invalid')
+            result[key] = value
+        return result
+
+    def invalid_constant(_):
+        raise ValueError('history_source_unit_invalid')
+
+    try:
+        value = json.loads(record_text, object_pairs_hook=unique, parse_constant=invalid_constant)
+    except (ValueError, TypeError, RecursionError):
+        raise ValueError('history_source_unit_invalid') from None
+    if not isinstance(value, dict) or value.get('type') != 'compacted' or value.get('channel') == 'analysis':
+        return
+    payload = value.get('payload')
+    if not isinstance(payload, dict) or payload.get('channel') == 'analysis':
+        return
+    history = payload.get('replacement_history')
+    if not isinstance(history, list):
+        return
+    history_metadata = payload.get('replacement_history_metadata')
+    if history_metadata is not None and (
+        not isinstance(history_metadata, list) or len(history_metadata) != len(history)
+        or any(not isinstance(item, dict)
+               or ('compaction_output' in item and type(item['compaction_output']) is not bool)
+               for item in history_metadata)
+    ):
+        return
+    for index, message in enumerate(history):
+        if history_metadata is not None and history_metadata[index].get('compaction_output', False):
+            continue
+        if not isinstance(message, dict) or message.get('type') != 'message':
+            continue
+        role = message.get('role')
+        if role not in ('user', 'assistant') or message.get('channel') == 'analysis':
+            continue
+        if value.get('role') not in (None, role) or payload.get('role') not in (None, role):
+            continue
+        blocks = message.get('content')
+        if not isinstance(blocks, list) or not blocks:
+            continue
+        block_type = 'input_text' if role == 'user' else 'output_text'
+        if any(not isinstance(block, dict) or set(block) != {'type', 'text'}
+               or block['type'] != block_type or not isinstance(block['text'], str)
+               for block in blocks):
+            continue
+        metadata = message.get('internal_chat_message_metadata_passthrough')
+        if metadata is not None and not isinstance(metadata, dict):
+            continue
+        kinds = metadata.get('content_item_kinds') if metadata else None
+        if kinds is not None and (
+            not isinstance(kinds, list) or len(kinds) != len(blocks)
+            or any(kind != role + '.text' for kind in kinds)
+        ):
+            continue
+        # Match the existing visible-message normalization for native origin
+        # equality; do not deduplicate different messages or source records.
+        text = '\n'.join(dict.fromkeys(block['text'] for block in blocks if block['text'].strip()))
+        if not text:
+            continue
+        try:
+            encoded = text.encode('utf-8')
+        except UnicodeError:
+            continue
+        provenance = {'type': 'message', 'role': role}
+        message_id = message.get('id')
+        turn_id = metadata.get('turn_id') if metadata else None
+        if all(isinstance(item, str) and item.strip() for item in (message_id, turn_id)):
+            provenance.update(message_id=message_id, turn_id=turn_id,
+                              text_sha256=hashlib.sha256(encoded).hexdigest())
+        yield f'codex.history-message.v1#/payload/replacement_history/{index}', text, provenance
+
+
+def resolve_codex_history_source_unit(record_text, source_unit):
+    """Resolve exactly one visible history message, never an arbitrary pointer."""
+    if codex_history_source_unit_index(source_unit) is None:
+        raise ValueError('history_source_unit_invalid')
+    for unit, text, provenance in iter_codex_history_source_units(record_text):
+        if unit == source_unit:
+            return text, 'history_message', provenance
+    raise ValueError('history_source_unit_invalid')
+
+
 def codex_tool_source_unit_role(source_unit):
     """Declared provider role for a supported discriminator, not source proof."""
     if not isinstance(source_unit, str):
