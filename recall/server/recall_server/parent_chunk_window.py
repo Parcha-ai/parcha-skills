@@ -424,7 +424,8 @@ def _advance_without_physical_work(store, *, scope, principal_id, reviewed_plan,
 
 
 def retire_window(store, archive, *, scope, principal_id, limits, deadline_at, reviewed_plan,
-                  metadata_mode='keep', remaining_bytes=None, should_stop=None, required_scope_epoch=None, diagnostic=None):
+                  metadata_mode='keep', remaining_bytes=None, should_stop=None, required_scope_epoch=None, diagnostic=None,
+                  no_work_probe_state=None):
     from .chunk_retirement import _retire_parent_batch, _require_singleton_archive_runtime, retire_parent_chunks
     from .db import SearchDeadlineExceeded
     if metadata_mode not in ('keep','singleton'):
@@ -435,7 +436,7 @@ def retire_window(store, archive, *, scope, principal_id, limits, deadline_at, r
         return dict(status='stopped',complete=False)
     if should_stop is not None and should_stop():
         return dict(status='stopped',complete=False)
-    if metadata_mode == 'singleton':
+    if metadata_mode == 'singleton' and not (no_work_probe_state or {}).get('timed_out', False):
         probe = diagnostic if diagnostic is not None else {}
         try:
             skipped = _advance_without_physical_work(store, scope=scope, principal_id=principal_id,
@@ -446,6 +447,8 @@ def retire_window(store, archive, *, scope, principal_id, limits, deadline_at, r
             # COMMIT or renew the caller's deadline to obtain archive proof.
             if probe.get('phase') != 'no_work_sql' or time.monotonic() >= deadline_at:
                 raise
+            if no_work_probe_state is not None:
+                no_work_probe_state['timed_out'] = True
             skipped = None
         if skipped is not None:
             return skipped
@@ -497,6 +500,9 @@ def retire_parent_windows(store, archive, *, tenant_id, source_id, native_parent
     meter = RunArchive(archive,max_bytes=limits.max_archive_bytes)
     totals = dict(retired_metadata_chunks=0,cleared_documents=0,cleared_chunks=0,
         cleared_utf8_bytes=0,hashed_utf8_bytes=0,hash_ms=0.0,sql_ms=0.0,batches=0)
+    # A rolled-back optional SQL timeout need not recur in every window.
+    # Fresh parent attempts retry; archive proof and its fences remain mandatory.
+    no_work_probe_state = {}
     result = dict(status='partial',complete=False)
     _attempt_phase(diagnostic, 'parent_connection')
     try:
@@ -518,6 +524,7 @@ def retire_parent_windows(store, archive, *, tenant_id, source_id, native_parent
                         max_clear_bytes=clear_left,max_archive_bytes=archive_left),
                     remaining_bytes=clear_left,deadline_at=deadline_at,reviewed_plan=reviewed_plan,
                     required_scope_epoch=required_scope_epoch,metadata_mode=metadata_mode,should_stop=should_stop,
+                    no_work_probe_state=no_work_probe_state,
                     **({"diagnostic": diagnostic} if diagnostic is not None else {}))
             except ChunkRetirementError as error:
                 clear_limited = error.error_code == 'parent_retirement_window_clear_budget_hold'
