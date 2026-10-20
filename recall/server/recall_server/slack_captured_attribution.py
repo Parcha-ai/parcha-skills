@@ -15,6 +15,7 @@ KEY = 'slack_captured_attribution'
 DEBT = KEY + ':unresolved:'
 DEBT_END = DEBT + '~'
 RETRY_TURN = KEY + ':retry_turn'
+_NOT_A_CONTACT_SKIP = object()
 
 
 def _epoch(worker, row):
@@ -86,7 +87,7 @@ def _page(worker, row, after, upper, limit, native_ids=None):
                 upper, upper, native_ids, native_ids, limit)).fetchall()
 
 
-def _record(worker, row, selected, deadline, *, contacts_only=False):
+def _record(worker, row, selected, deadline, *, contacts_only=False, skip_only=False):
     with worker.store.connect() as c, c.transaction():
         c.execute("SELECT set_config('statement_timeout',%s,true)", (str(worker.store.search_deadline_ms),))
         worker._require_slack_page_authority(c, row)
@@ -100,6 +101,13 @@ def _record(worker, row, selected, deadline, *, contacts_only=False):
         event = worker._require_captured_slack_event(c, row, selected['native_id'],
             {selected['native_id']: (selected['event_id'], selected['content_sha256'])},
             **({'captured_document': True} if document else {}))
+        if skip_only:
+            # The native current-event check holds the event lock. Thinning may
+            # have changed its representation since the page nominated a skip.
+            kind = c.execute('''SELECT canonical_redacted#>>'{content,kind}' AS kind
+                FROM canonical_events WHERE tenant_id=%s AND source_id=%s AND event_id=%s''',
+                (row['tenant_id'], row['source_id'], selected['event_id'])).fetchone()['kind']
+            return None if kind in {'communication_message.v1', 'document.v1'} else _NOT_A_CONTACT_SKIP
         if document:
             # Validate accepted typed content before it leaves the read boundary.
             # Pure malformed-input failures become debt, never write failures.
@@ -213,9 +221,15 @@ def repair_slice(worker, row, runner, *, deadline_at):
             return state
         consumed += charge
         reason = None
+        skip = contacts_only and selected['content_kind'] in {'communication_message.v1', 'document.v1'}
+        if skip:
+            debt_key = DEBT + hashlib.sha256(selected['native_id'].encode()).hexdigest()
+            existing_debt = db.execute('SELECT 1 FROM meta WHERE key=?', (debt_key,)).fetchone()
         try:
             record = _record(worker, row, selected, deadline,
-                contacts_only=contacts_only)
+                contacts_only=contacts_only, **({'skip_only': True} if skip else {}))
+            if record is _NOT_A_CONTACT_SKIP:
+                return state  # Reconsider the changed representation on the next normal page.
         except ControlError:
             raise
         except Exception as error:
@@ -226,8 +240,9 @@ def repair_slice(worker, row, runner, *, deadline_at):
                 'JSONDecodeError', 'TimeoutError', 'SearchDeadlineExceeded',
                 'StructuredEnvelopeValidationError'} else 'archive_unavailable'
             record = None
-        debt_key = DEBT + hashlib.sha256(selected['native_id'].encode()).hexdigest()
-        existing_debt = db.execute('SELECT 1 FROM meta WHERE key=?', (debt_key,)).fetchone()
+        if not skip:
+            debt_key = DEBT + hashlib.sha256(selected['native_id'].encode()).hexdigest()
+            existing_debt = db.execute('SELECT 1 FROM meta WHERE key=?', (debt_key,)).fetchone()
         content = record.get('content') if isinstance(record, dict) else record.content if record is not None else None
         relevant = record is not None and (retry or existing_debt or
             (content.get('kind') == 'contact_identity.v1') == (state['phase'] == 'contacts'))
@@ -242,12 +257,13 @@ def repair_slice(worker, row, runner, *, deadline_at):
                 if error.code != 'connector_record_changed':
                     raise
                 reason = 'current_record_changed'
-        # Recheck authority even for a missing archive or a privacy exclusion.
-        with worker.store.connect() as c, c.transaction():
-            c.execute("SELECT set_config('statement_timeout',%s,true)", (str(worker.store.search_deadline_ms),))
-            worker._require_slack_page_authority(c, row)
-            worker.plane._require_existing_source_owner(c, tenant_id=row['tenant_id'],
-                principal_id=row['principal_id'], source_id=row['source_id'])
+        if not (skip and reason is None):
+            # Recheck authority even for a missing archive or a privacy exclusion.
+            with worker.store.connect() as c, c.transaction():
+                c.execute("SELECT set_config('statement_timeout',%s,true)", (str(worker.store.search_deadline_ms),))
+                worker._require_slack_page_authority(c, row)
+                worker.plane._require_existing_source_owner(c, tenant_id=row['tenant_id'],
+                    principal_id=row['principal_id'], source_id=row['source_id'])
         if reason:
             state['unresolved'] += int(not existing_debt)
             db.execute('INSERT OR REPLACE INTO meta(key,value) VALUES (?,?)',
