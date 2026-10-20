@@ -843,7 +843,8 @@ class CanonicalPassageProjector:
         }
         # Optional proof has a shared deadline. Rotate only sources actually
         # attempted, since selected siblings can outlive that allowance.
-        self._certification_source_cursor = ("", "")
+        # A fresh worker honors durable queue age before rotating source turns.
+        self._certification_source_cursor = None
         # Known refusals yield to siblings without changing authoritative queue
         # age or generation. At most one position per encountered source/mode;
         # restart resets these admission hints, never publication state.

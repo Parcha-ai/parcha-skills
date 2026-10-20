@@ -1827,10 +1827,11 @@ interrupted or mismatched same-name index refuses rollout acceptance and needs
 operator repair; successful migration or `IF NOT EXISTS` alone is not acceptance. This companion records no new
 schema version. An older worker can run with the index left in place.
 
-The worker starts each allowance after the last source it actually attempted,
-wrapping only when no later source has pending work. Within a source it visits
-the oldest parent first. This process-local scheduling hint resets on restart
-and never advances an unattempted source or an acknowledged proof checkpoint.
+The worker's first allowance uses the existing durable oldest-first queue order,
+so a restart honors prior failure rotation. Later allowances start after the last
+source it actually attempted, wrapping only when no later source has pending
+work. Within a source it visits the oldest parent first. This process-local
+scheduling hint never advances an unattempted source or an acknowledged proof checkpoint.
 Explicit maintenance consumers keep their existing global oldest-first order.
 
 On schema 85 and later, a first or legacy publication without a generation also
