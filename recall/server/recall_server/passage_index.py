@@ -1081,7 +1081,7 @@ class CanonicalPassageProjector:
 
     def admit_typed_pending(self, *, tenant_id: str, limit: int,
                             deadline_at: float) -> dict[str, Any]:
-        """Admit metadata-only Codex upgrades; requested mode is durable progress."""
+        """Bound outstanding mode upgrades independently of live publication work."""
         tenant_id = self._tenant(tenant_id)
         if (tenant_id != self.bound_tenant_id or not tenant_id
             or type(limit) is not int or not 1 <= limit <= MAX_PASSAGE_PROJECTION_BATCH
@@ -1090,8 +1090,12 @@ class CanonicalPassageProjector:
         after = self._typed_admission_source_cursor
         with self.store.connect(timeout=max(0.001, deadline_at-time.monotonic())) as connection:
             rows = self.store._execute_bounded(connection, """WITH outstanding AS MATERIALIZED (
-                    SELECT 1 FROM canonical_passage_projection_queue
-                    WHERE tenant_id=%s AND reason<>'certification' LIMIT %s
+                    SELECT 1 FROM canonical_passage_projection_queue queue
+                    JOIN canonical_passage_documents projected
+                        USING(tenant_id,source_id,logical_document_id)
+                    WHERE queue.tenant_id=%s AND queue.reason<>'certification'
+                      AND projected.requested_extraction_version<>projected.applied_extraction_version
+                    LIMIT %s
                 ), candidates AS (
                     SELECT source.source_id,parent.*,
                            row_number() OVER (PARTITION BY source.source_id
