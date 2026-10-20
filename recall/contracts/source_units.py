@@ -5,6 +5,12 @@ def codex_tool_source_unit_role(source_unit):
     """Declared provider role for a supported discriminator, not source proof."""
     if not isinstance(source_unit, str):
         return None
+    prefix = 'codex.tool-result.block-text.v1#/payload/output/'
+    if source_unit.startswith(prefix):
+        index, separator, leaf = source_unit[len(prefix):].partition('/')
+        if (separator == '/' and leaf == 'text' and index.isascii() and index.isdecimal()
+                and (len(index) == 1 or not index.startswith('0'))):
+            return 'tool'
     return {
         'codex.tool-input.string.v1#/payload/arguments': 'assistant',
         'codex.tool-input.string.v1#/payload/input': 'assistant',
@@ -104,6 +110,8 @@ def resolve_codex_tool_source_unit(record_text, source_unit):
     A custom output's all-input_text block list resolves to its ordered strings
     joined by newlines, including empty blocks. Coordinates refer to that
     normalized string. Mixed or unknown blocks refuse the complete output.
+    A block-text unit instead names one exact input_text leaf. Its coordinates
+    refer only to that literal string; no sibling block is included.
     """
     import json
 
@@ -131,12 +139,30 @@ def resolve_codex_tool_source_unit(record_text, source_unit):
             'function_call_output': ('output', 'result', 'tool'),
             'custom_tool_call_output': ('output', 'result', 'tool'),
         }[payload['type']]
-        if (source_unit != 'codex.tool-' + kind + '.string.v1#/payload/' + field
+        block_index = None
+        block_prefix = 'codex.tool-result.block-text.v1#/payload/output/'
+        if source_unit.startswith(block_prefix):
+            index, separator, leaf = source_unit[len(block_prefix):].partition('/')
+            if (payload['type'] != 'custom_tool_call_output' or separator != '/'
+                    or leaf != 'text' or not index.isascii() or not index.isdecimal()
+                    or (len(index) > 1 and index.startswith('0'))):
+                refuse()
+            block_index = int(index)
+        if ((source_unit != 'codex.tool-' + kind + '.string.v1#/payload/' + field
+                and block_index is None)
                 or payload.get('channel') == 'analysis'
                 or any('role' in item and item['role'] != role for item in (value, payload))):
             refuse()
         text = payload[field]
-        if payload['type'] == 'custom_tool_call_output' and isinstance(text, list):
+        if block_index is not None:
+            if not isinstance(text, list) or block_index >= len(text):
+                refuse()
+            block = text[block_index]
+            if (not isinstance(block, dict) or set(block) != {'type', 'text'}
+                    or block['type'] != 'input_text'):
+                refuse()
+            text = block['text']
+        elif payload['type'] == 'custom_tool_call_output' and isinstance(text, list):
             if not text or any(
                 not isinstance(block, dict) or set(block) != {'type', 'text'}
                 or block['type'] != 'input_text' or not isinstance(block['text'], str)
