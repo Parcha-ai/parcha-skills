@@ -97,6 +97,24 @@ and the catalog flips in one transaction; replaced objects go through
 `canonical_evidence_cleanup_queue`, so a reader holding an object list is never cut off.
 Gaps in `shard_index` are normal.
 
+A passage commit that changes rows over unchanged source bytes marks that document with a sticky
+`backfill` reason. Both planners refresh its passages even when passage count and
+policy are unchanged. A delta can retain raw/document/actor fragments after the
+existing immutable document row proves matching revision, content, part count and
+actors. Retained member fingerprints move in the same fenced catalog transaction;
+missing or mismatched evidence keeps the original per-document rebuild. This reads
+small document metadata fragments, not the source body archive. Shared fragments
+still preserve siblings through the original reader.
+
+There is no hash-format migration or automatic historical requeue. Already-stale
+same-count catalogs remain an explicit audit/repair obligation; scoped named
+backfill through the existing queue owner can refresh them without a whole-month
+sentinel. Before relying on this repair, check which logical/passage/scan projectors
+are enabled and upgrade those processes together. An older logical writer can erase
+the named force reason, and an older scan planner does not honor it. The managed
+worker's optional embedded projection must be checked against its actual setting;
+inactive projector roles need no extra rollout gate.
+
 - **Compaction**: a month with more than `RECALL_PARQUET_COMPACTION_FRAGMENTS` (default 16)
   live parts in any dataset, or more than half its recorded documents dead, is rebuilt fully.
   The worker does this through `scan.project_pending(compaction_budget=1)`: at most one
