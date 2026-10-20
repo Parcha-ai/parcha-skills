@@ -49,6 +49,36 @@ def history_text():
 
 
 class CodexHistorySourceUnitTests(unittest.TestCase):
+    def test_native_parallel_metadata_excludes_compaction_output(self):
+        base = history_envelope()
+        metadata = [{}, {}, {"compaction_output": True}, {}]
+        base["payload"]["replacement_history_metadata"] = metadata
+        user_unit = "codex.history-message.v1#/payload/replacement_history/0"
+        reply_unit = "codex.history-message.v1#/payload/replacement_history/2"
+        self.assertEqual(
+            resolve_codex_history_source_unit(json.dumps(base), user_unit)[0],
+            "Keep the café window closed.",
+        )
+        with self.assertRaises(ValueError):
+            resolve_codex_history_source_unit(json.dumps(base), reply_unit)
+        for invalid in ([], {}, metadata[:-1], [None, {}, {}, {}],
+                        [{"compaction_output": "false"}, {}, {}, {}]):
+            value = copy.deepcopy(base)
+            value["payload"]["replacement_history_metadata"] = invalid
+            with self.subTest(metadata=invalid), self.assertRaises(ValueError):
+                resolve_codex_history_source_unit(json.dumps(value), user_unit)
+        base["payload"]["replacement_history_metadata"] = [
+            {"inherited_user_message": True}, {}, {"compaction_output": False}, {},
+        ]
+        self.assertEqual(
+            resolve_codex_history_source_unit(json.dumps(base), user_unit)[2],
+            resolve_codex_history_source_unit(history_text(), user_unit)[2],
+        )
+        self.assertEqual(
+            resolve_codex_history_source_unit(json.dumps(base), reply_unit)[0],
+            "The window remains closed. 🪟",
+        )
+
     def test_history_contract_refuses_hidden_metadata_and_arbitrary_coordinates(self):
         unit = "codex.history-message.v1#/payload/replacement_history/0"
         base = json.loads(history_text())
@@ -66,6 +96,8 @@ class CodexHistorySourceUnitTests(unittest.TestCase):
             lambda value: value["payload"]["replacement_history"][0]["content"][0].update(channel="analysis"),
             lambda value: value["payload"]["replacement_history"][0][
                 "internal_chat_message_metadata_passthrough"].update(content_item_kinds=["agents_md.instructions"]),
+            lambda value: value["payload"]["replacement_history"][0][
+                "internal_chat_message_metadata_passthrough"].update(content_item_kinds=["compaction.summary"]),
         ):
             value = copy.deepcopy(base)
             change(value)
@@ -127,7 +159,7 @@ class CodexHistorySourceUnitTests(unittest.TestCase):
         from test_candidate_capture import LocalClient
         from test_codex_source_units import mount
 
-        for conflict in ("source", "role", "mixed_roles", "pointer", "second_role"):
+        for conflict in ("source", "role", "mixed_roles", "pointer", "second_role", "compaction_output"):
             with self.subTest(conflict=conflict), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 mounted = root / "mount"
@@ -135,7 +167,12 @@ class CodexHistorySourceUnitTests(unittest.TestCase):
                 roles = (["assistant"] if conflict == "role" else
                          ["user"] if conflict == "second_role" else
                          ["user", "assistant"] if conflict == "mixed_roles" else [])
-                hit = mount(mounted, value=history_envelope(), roles=roles, split=True)
+                envelope = history_envelope()
+                if conflict == "compaction_output":
+                    envelope["payload"]["replacement_history_metadata"] = [
+                        {"compaction_output": True}, {}, {}, {},
+                    ]
+                hit = mount(mounted, value=envelope, roles=roles, split=True)
                 expected = "Keep the café window closed."
                 hit["matching_ranges"][0]["text"] = expected[:4]
                 span = hit["matching_ranges"][0]["spans"][0]

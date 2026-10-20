@@ -48,7 +48,17 @@ def iter_codex_history_source_units(record_text):
     history = payload.get('replacement_history')
     if not isinstance(history, list):
         return
+    history_metadata = payload.get('replacement_history_metadata')
+    if history_metadata is not None and (
+        not isinstance(history_metadata, list) or len(history_metadata) != len(history)
+        or any(not isinstance(item, dict)
+               or ('compaction_output' in item and type(item['compaction_output']) is not bool)
+               for item in history_metadata)
+    ):
+        return
     for index, message in enumerate(history):
+        if history_metadata is not None and history_metadata[index].get('compaction_output', False):
+            continue
         if not isinstance(message, dict) or message.get('type') != 'message':
             continue
         role = message.get('role')
