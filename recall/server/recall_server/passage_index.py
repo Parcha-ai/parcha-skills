@@ -841,6 +841,10 @@ class CanonicalPassageProjector:
         self._ordinary_source_cursor: dict[bool, tuple[str, str] | None] = {
             False: None, True: None,
         }
+        # Optional proof has a shared deadline. Rotate only sources actually
+        # attempted, since selected siblings can outlive that allowance.
+        # A fresh worker honors durable queue age before rotating source turns.
+        self._certification_source_cursor = None
         # Known refusals yield to siblings without changing authoritative queue
         # age or generation. At most one position per encountered source/mode;
         # restart resets these admission hints, never publication state.
@@ -3102,10 +3106,12 @@ class CanonicalPassageProjector:
                         row = None
                         certification_rows = membership_remainder.pending(self.store,
                             tenant_id=tenant_id, limit=batch_size,
-                            deadline_at=certification_deadline)
+                            deadline_at=certification_deadline,
+                            after_source=self._certification_source_cursor)
                         for row in certification_rows:
                             if time.monotonic() >= certification_deadline:
                                 break
+                            self._certification_source_cursor = (row["tenant_id"], row["source_id"])
                             outcome = membership_remainder.resume(self.store, row,
                                 settings=self.membership_certification, deadline_at=certification_deadline)
                             membership_certified += outcome['certified_passages']
