@@ -11,6 +11,13 @@ from recall_server.passage_projection import PassagePolicy
 
 
 class CodexTypedOutputBlocks(CodexToolPublication):
+    def setUp(self):
+        super().setUp()
+        # These fixtures compare the historical epoch 4 and epoch 5 contracts.
+        epoch = patch.object(passage_append, 'CODEX_CHECKPOINT_VERSION', 5)
+        epoch.start()
+        self.addCleanup(epoch.stop)
+
     def test_same_source_epoch_rebuild_reconciles_retained_vendor_absence(self):
         original_checkpoint = passage_append.make_checkpoint
         def old_checkpoint(*args, **kwargs):
