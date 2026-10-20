@@ -221,9 +221,21 @@ def chunk_catalog_snapshot(
         for row in rows:
             parent = row['tenant_id'], row['source_id'], row.pop('_catalog_parent_id')
             if row.pop('_catalog_first'):
-                catalogs[parent] = row['manifest'], row['parts']
+                parts = row['parts']
+                # Flat JSON parts need independent dictionaries, not recursive copies.
+                flat = type(parts) is list and all(
+                    type(part) is dict and all(
+                        type(key) is str and (value is None or type(value) in (str, int, float, bool))
+                        for key, value in part.items())
+                    for part in parts)
+                catalogs[parent] = row['manifest'], parts, flat
             else:
-                row['manifest'], row['parts'] = deepcopy(catalogs[parent])
+                manifest, parts, flat = catalogs[parent]
+                if flat:
+                    row['manifest'] = deepcopy(manifest)
+                    row['parts'] = [part.copy() for part in parts]
+                else:
+                    row['manifest'], row['parts'] = deepcopy((manifest, parts))
             # Preserve the legacy column order as well as its values.
             row['chunks'] = row.pop('chunks')
         if singleton:
