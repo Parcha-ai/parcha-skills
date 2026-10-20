@@ -224,7 +224,10 @@ def extract_codex_tool_event_groups(
             resolved = []
             refused = 0
             if form == 'custom_tool_call_output' and isinstance(payload.get('output'), list):
-                for index in range(len(payload['output'])):
+                for index, block in enumerate(payload['output']):
+                    if not isinstance(block, dict) or block.get('type') != 'input_text':
+                        refused += 1
+                        continue
                     block_unit = f'codex.tool-result.block-text.v1#/payload/output/{index}/text'
                     try:
                         text, evidence_kind, provenance = resolve_codex_tool_source_unit(raw, block_unit)
@@ -235,8 +238,7 @@ def extract_codex_tool_event_groups(
                 dispositions['source_unit_refused'] += 1
                 continue
             dispositions['unsupported_output_block'] += refused
-        _, _, evidence_kind, provenance = resolved[0]
-        role = provenance['role']
+        role = resolved[0][3]['role']
         if first.roles not in ((), (role,)) or not first.receipts:
             dispositions['provider_role_or_receipts_mismatch'] += 1
             continue

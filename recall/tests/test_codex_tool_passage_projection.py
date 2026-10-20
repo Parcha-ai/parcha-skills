@@ -2,6 +2,7 @@
 import json
 import unittest
 from dataclasses import replace
+from unittest.mock import patch
 
 from contracts.source_units import resolve_codex_tool_source_unit
 from recall_server.logical_evidence import LogicalEvidenceRecord
@@ -115,6 +116,23 @@ class CodexToolPassageProjectionTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 resolve_codex_tool_source_unit(groups[0].full_event_text,
                     'codex.tool-result.string.v1#/payload/output')
+
+    def test_mixed_output_resolves_only_nominated_text_leaves(self):
+        from recall_server.tool_passage_projection import extract_codex_tool_event_groups
+        event = dict(type='response_item', payload=dict(type='custom_tool_call_output',
+            output=[dict(type='input_image', image_url='data:image/png;base64,' + 'x'*1024)
+                    for _ in range(128)] + [dict(type='input_text', text='exact text')]))
+        records = self.records(event, segmented=True)
+        with patch('recall_server.tool_passage_projection.resolve_codex_tool_source_unit',
+                   wraps=resolve_codex_tool_source_unit) as resolver:
+            groups, coverage = extract_codex_tool_event_groups(records)
+        self.assertEqual([call.args[1] for call in resolver.call_args_list], [
+            'codex.tool-result.string.v1#/payload/output',
+            'codex.tool-result.block-text.v1#/payload/output/128/text'])
+        self.assertEqual(groups[0].full_event_text, ''.join(record.text for record in records))
+        self.assertEqual([message.text for message in groups[0].messages], ['exact text'])
+        self.assertEqual(coverage['dispositions'], {'unsupported_output_block': 128})
+        self.assertEqual(coverage['included_string_leaves'], 1)
 
     def test_duplicate_keys_are_raw_only_without_deleting_original_bytes(self):
         from recall_server.tool_passage_projection import extract_codex_tool_event_groups
