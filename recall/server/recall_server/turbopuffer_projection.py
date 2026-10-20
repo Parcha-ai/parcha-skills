@@ -25,7 +25,7 @@ of upserts are clamped to ``max_batch_bytes`` of row payload as well as
 use the same byte budget for the ID array, independently of embedding rows.
 
 Nothing here logs passage text or the API key; failures carry the error
-class only.
+class and, when recognized, a fixed publication guard code.
 """
 
 from __future__ import annotations
@@ -62,6 +62,25 @@ RATE_LIMIT_BACKOFF_SECONDS = 1.0
 RATE_LIMIT_BACKOFF_CAP_SECONDS = 60.0
 RATE_LIMIT_BUDGET_SECONDS = 300.0
 INCREMENTAL_REASONS = frozenset({"logical-update", "forget", "header-change"})
+
+_PUBLICATION_ERROR_CODES = frozenset({
+    "publication_checkpoint_scope_changed",
+    "publication_resume_scope_changed",
+    "search_publication_busy",
+    "search_parent_reconciliation_metadata_unavailable",
+    "search_parent_reconciliation_authority_unavailable",
+    "search_parent_reconciliation_vendor_scope",
+    "search_parent_reconciliation_write_incomplete",
+})
+
+
+def _publication_error_code(error: Exception) -> str:
+    # Never stringify arbitrary exceptions: SDK and source errors may carry text.
+    if (type(error) is ValueError and len(error.args) == 1
+            and type(error.args[0]) is str and error.args[0] in _PUBLICATION_ERROR_CODES):
+        return error.args[0]
+    return "unknown"
+
 
 # Copied from passage_retrieval._lexical_query: a passage is live only while
 # every receipt it cites still has an undeleted canonical chunk.
@@ -571,7 +590,11 @@ class TurbopufferProjector:
         since: datetime | None,
         after: tuple[datetime, str] | None,
         deadline_at: float | None = None,
+        page_rows: int | None = None,
     ) -> list[dict[str, Any]]:
+        page_rows = self.page_rows if page_rows is None else page_rows
+        if type(page_rows) is not int or not 1 <= page_rows <= self.page_rows:
+            raise ValueError("search publication page width is invalid")
         start, end = _month_bounds(claim["month"])
         cursor_time, cursor_id = after or (datetime(1, 1, 1, tzinfo=timezone.utc), "")
         if getattr(self.store, "verified_singleton_receipts", False):
@@ -585,7 +608,7 @@ class TurbopufferProjector:
             return self.store._execute_bounded(connection,
                 sql.replace(_LIVE_PASSAGE_PREDICATE, "true"),
                 (claim["tenant_id"], claim["source_id"], start, end,
-                 since, since, cursor_time, cursor_id, self.page_rows),
+                 since, since, cursor_time, cursor_id, page_rows),
                 deadline_at,
             ).fetchall()
         return [
@@ -594,7 +617,7 @@ class TurbopufferProjector:
                 _PASSAGE_PAGE_SQL,
                 (
                     claim["tenant_id"], claim["source_id"], start, end,
-                    since, since, cursor_time, cursor_id, self.page_rows,
+                    since, since, cursor_time, cursor_id, page_rows,
                 ),
             ).fetchall()
         ]
@@ -965,9 +988,12 @@ class TurbopufferProjector:
             checkpoint_current = True
             last_rows = 0
             resume_after_timeout = restored is not None
+            page_rows = self.page_rows
             while True:
                 page = []
                 timed_out = False
+                page_phase = "selection"
+                requested_page_rows = page_rows
                 verified = getattr(self.store, "verified_singleton_receipts", False)
                 try:
                     with timing.measure("page"), self.store.connect() as connection:
@@ -991,15 +1017,23 @@ class TurbopufferProjector:
                                 if not current:
                                     raise ValueError("publication_resume_scope_changed")
                             page = self.passage_page(connection, claim, since=since, after=after,
-                                                     deadline_at=deadline)
+                                                     deadline_at=deadline, page_rows=page_rows)
                         else:
                             page = self.passage_page(connection, claim, since=since, after=after)
                         examined = len(page)
                         next_after = ((page[-1]["first_occurred_at"], page[-1]["passage_id"])
                                       if page else after)
                         if verified:
-                            page = self._authorized_publication_rows(connection, tenant_id, page,
-                                                                     deadline_at=deadline)
+                            page_phase = "authority"
+                            try:
+                                page = self._authorized_publication_rows(connection, tenant_id, page,
+                                                                         deadline_at=deadline)
+                            except SearchDeadlineExceeded:
+                                if cooperative:
+                                    # Retry the same cursor with less proof work;
+                                    # selection failures cannot establish this.
+                                    page_rows = max(1, page_rows // 2)
+                                raise
                         connection.commit()
                 except SearchDeadlineExceeded:
                     if not cooperative or not verified:
@@ -1009,8 +1043,9 @@ class TurbopufferProjector:
                     page = []
                     timed_out = True
                 if timed_out:
-                    LOG.warning("search plane page deferred reason=%s generation=%s type=SearchDeadlineExceeded",
-                        claim["reason"], claim["generation"])
+                    LOG.warning("search plane page deferred reason=%s generation=%s type=SearchDeadlineExceeded "
+                        "phase=%s page_rows=%s next_page_rows=%s",
+                        claim["reason"], claim["generation"], page_phase, requested_page_rows, page_rows)
                     resume_after_timeout = True
                     yield {"rows": 0, "deleted": 0, "rate_limited": 0, "failed": 1}
                     continue
@@ -1028,7 +1063,7 @@ class TurbopufferProjector:
                     with timing.measure("commit"):
                         checkpoint_current = self._save_page_checkpoint(claim, checkpoint, next_checkpoint)
                     checkpoint = next_checkpoint
-                exhausted = examined < self.page_rows
+                exhausted = examined < page_rows
                 if exhausted:
                     break
                 current_rate = int(budget["rate_limited"])
@@ -1064,7 +1099,8 @@ class TurbopufferProjector:
             outcome = step(self, tenant_id)
         except Exception as error:  # noqa: BLE001 - unacknowledged queue page stays durable
             result["failed"] += 1
-            LOG.warning("search parent reconciliation failed type=%s", type(error).__name__)
+            LOG.warning("search parent reconciliation failed type=%s code=%s",
+                        type(error).__name__, _publication_error_code(error))
             return True
         result["rows"] += outcome["written"]
         if outcome["attempted"]:
@@ -1124,8 +1160,8 @@ class TurbopufferProjector:
             except Exception as error:  # noqa: BLE001 - retain the outbox for replay
                 steps.close()
                 result["failed"] = 1
-                LOG.warning("search plane month failed reason=%s generation=%s type=%s",
-                    claim["reason"], claim["generation"], type(error).__name__)
+                LOG.warning("search plane month failed reason=%s generation=%s type=%s code=%s",
+                    claim["reason"], claim["generation"], type(error).__name__, _publication_error_code(error))
             else:
                 for key in ("rows", "deleted", "rate_limited"):
                     result[key] = step[key]
@@ -1185,8 +1221,8 @@ class TurbopufferProjector:
             except Exception as error:  # noqa: BLE001 - one month must not stop the cycle
                 result["failed"] = int(result["failed"]) + 1
                 LOG.warning(
-                    "search plane month failed reason=%s generation=%s type=%s",
-                    claim["reason"], claim["generation"], type(error).__name__,
+                    "search plane month failed reason=%s generation=%s type=%s code=%s",
+                    claim["reason"], claim["generation"], type(error).__name__, _publication_error_code(error),
                 )
                 continue
             result["months"] = int(result["months"]) + 1
