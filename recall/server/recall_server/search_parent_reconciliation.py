@@ -82,14 +82,20 @@ def measure_metadata(writer: Any, connection: Any, tenant_id: str, ids: list[str
 
 
 def metadata_prefix(writer: Any, connection: Any, tenant_id: str,
-                    keys: list[dict[str, Any]], deadline: float) -> list[dict[str, Any]]:
-    from .turbopuffer_projection import _PASSAGE_SELECT_SQL, _PASSAGE_FROM_SQL
-    if not keys:
+                    keys: list[dict[str, Any]], deadline: float, *,
+                    metadata_only: bool = False,
+                    body_ids: set[str] | None = None) -> list[dict[str, Any]]:
+    from .turbopuffer_projection import (
+        _PASSAGE_SELECT_SQL, _PASSAGE_METADATA_SELECT_SQL, _PASSAGE_FROM_SQL,
+    )
+    ids = [row["passage_id"] for row in keys
+           if body_ids is None or row["passage_id"] in body_ids]
+    if not ids:
         return keys
-    ids = [row["passage_id"] for row in keys]
+    select = _PASSAGE_METADATA_SELECT_SQL if metadata_only else _PASSAGE_SELECT_SQL
     measured = writer.store._execute_bounded(connection,
         "SELECT hydrated.passage_id,octet_length(row_to_json(hydrated)::text)+128 AS bytes FROM ("
-        + _PASSAGE_SELECT_SQL + _PASSAGE_FROM_SQL
+        + select + _PASSAGE_FROM_SQL
         + " WHERE passage.tenant_id=%s AND passage.passage_id=ANY(%s::text[])) hydrated",
         (tenant_id, ids), deadline).fetchall()
     sizes = {row["passage_id"]: row["bytes"] for row in measured}
@@ -98,7 +104,9 @@ def metadata_prefix(writer: Any, connection: Any, tenant_id: str,
     total = 0
     prefix = []
     for key in keys:
-        size = sizes[key["passage_id"]]
+        # Matching rows need no bodies. Keep them in the contiguous cursor
+        # prefix, but never skip a changed row that does not fit.
+        size = sizes.get(key["passage_id"], 0)
         if total + size > MAX_METADATA_BYTES:
             if not prefix:
                 raise ReconciliationMetadataBudgetExceeded()
@@ -151,10 +159,10 @@ def step(writer: Any, tenant_id: str) -> dict[str, int]:
         # A short byte-bounded prefix is not EOF. Measure only IDs and sizes
         # before transferring the original native metadata in this snapshot.
         selected_count = len(keys)
-        keys = metadata_prefix(writer, connection, tenant_id, keys, deadline)
+        keys = metadata_prefix(writer, connection, tenant_id, keys, deadline, metadata_only=True)
         has_more = selected_count == page_limit or len(keys) < selected_count
         ids = [row["passage_id"] for row in keys]
-        page = writer.passages_by_id(connection, tenant_id, ids) if ids else []
+        page = writer.passages_by_id(connection, tenant_id, ids, metadata_only=True) if ids else []
         if {row["passage_id"] for row in page} != set(ids):
             raise ValueError("search_parent_reconciliation_authority_unavailable")
         connection.commit()
@@ -178,13 +186,29 @@ def step(writer: Any, tenant_id: str) -> dict[str, int]:
                 raise ValueError("search_parent_reconciliation_vendor_scope")
             present[identifier] = row
         missing = []
-        groups = {}
         for row in page:
             expected = {field: row[field] for field in fields if field != "header"}
             expected["header"] = row.get("header_redacted") or ""
             current = present.get(row["passage_id"], {})
             if any(current.get(field) != value for field, value in expected.items()):
                 missing.append(row["passage_id"])
+        if missing:
+            # Size only bodies that require repair; matching bodies are neither
+            # serialized nor hydrated. The final leased read repeats this guard.
+            deadline = time.monotonic() + writer.store.search_deadline_ms / 1000
+            with writer.store.connect() as connection:
+                connection.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+                prefix = metadata_prefix(writer, connection, tenant_id, keys, deadline,
+                                         body_ids=set(missing))
+                connection.commit()
+            has_more = has_more or len(prefix) < len(keys)
+            keys = prefix
+            accepted = {row["passage_id"] for row in keys}
+            missing = [identifier for identifier in missing if identifier in accepted]
+        groups = {}
+        missing_ids = set(missing)
+        for row in page:
+            if row["passage_id"] in missing_ids:
                 groups.setdefault((row["source_id"], _month(row["first_occurred_at"])), []).append(row["passage_id"])
         # Native write owner repeats authority under the existing source/month
         # lease. Reuse only routes from the authorized comparison, never bodies
