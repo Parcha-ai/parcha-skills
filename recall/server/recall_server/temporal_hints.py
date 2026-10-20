@@ -14,7 +14,7 @@ Grammar (case-insensitive unless noted; ``now`` resolves the defaults):
 * ISO dates ``2026-05-03``; ISO ranges ``2026-05-02..2026-05-04``,
   ``2026-05-02 to 2026-05-04``, ``between 2026-05-02 and 2026-05-04``.
 * Month-name dates ``May 3``, ``May 3rd``, ``3 May``, ``May 3, 2026``,
-  ``Sep 14 2026``; day ranges ``May 2-4``, ``May 2 to 4``, ``May 2 - May 4``,
+  ``Sep 14 2026``, compact ``July13`` or ``October19``; day ranges ``May 2-4``, ``May 2 to 4``, ``May 2 - May 4``,
   ``May 30 - June 2``, ``between May 2 and May 4``.
 * A single full date followed by ``at HH:MM UTC`` retains that minute.
   Missing years/zones, multiple clocks/dates, and hedges retain the date hint.
@@ -115,7 +115,7 @@ MONTH_DAY_RANGE_RE = re.compile(
 )
 MONTH_DAY_RE = re.compile(
     _LB + _HEDGE + r"(?:the\s+)?(?:(?P<dfirst>" + _DAY + r")\s+(?:of\s+)?)?" + _MONTH
-    + r"(?:\s+(?P<day>" + _DAY + r"))?" + _YEAR_OPT + _RB,
+    + r"(?:\s*(?P<day>" + _DAY + r"))?" + _YEAR_OPT + _RB,
     re.IGNORECASE,
 )
 NUMERIC_RANGE_RE = re.compile(

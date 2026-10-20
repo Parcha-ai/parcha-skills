@@ -41,6 +41,47 @@ def _hint(query: str) -> tuple[str, str, str] | None:
 
 
 class ParserTableTests(unittest.TestCase):
+    def test_compact_month_day_questions_keep_the_day_window(self) -> None:
+        now = datetime(2026, 10, 20, tzinfo=timezone.utc)
+        for query, expected in (
+            ("What did the October19 Ready for you guide say this section showed, and where did Earlier work lead?", "2026-10-19"),
+            ("What review-age and batch-size settings appeared in the July13 Desloppify blind packet configuration?", "2026-07-13"),
+        ):
+            with self.subTest(query=query):
+                hint = parse_temporal_hint(query, now=now)
+                self.assertIsNotNone(hint)
+                self.assertEqual(hint.since, expected + "T00:00:00+00:00")
+                self.assertEqual(hint.until, expected + "T23:59:59+00:00")
+                self.assertEqual(hint.confidence, "exact")
+                self.assertTrue(hint.day_level)
+
+    def test_compact_dates_reject_invalid_days_and_identifier_fragments(self) -> None:
+        for query in (
+            "February30", "April31", "July0", "July32", "February29, 2025",
+            "releaseJuly13", "July13release", "July13_test", "test_July13",
+            "/July13", "July13.md", "v.July13", "#July13", "release-July13",
+            "may13", "jul13",
+        ):
+            with self.subTest(query=query):
+                self.assertIsNone(parse_temporal_hint(query, now=NOW))
+
+    def test_compact_dates_preserve_leap_days_and_year_boundaries(self) -> None:
+        now = datetime(2026, 1, 1, 12, tzinfo=timezone.utc)
+        for query, expected in (
+            ("December31", "2025-12-31"),
+            ("January1", "2026-01-01"),
+            ("January2", "2025-01-02"),
+            ("February29, 2024", "2024-02-29"),
+            ("Jul13th, 2025", "2025-07-13"),
+        ):
+            with self.subTest(query=query):
+                hint = parse_temporal_hint(query, now=now)
+                self.assertIsNotNone(hint)
+                self.assertEqual(hint.since, expected + "T00:00:00+00:00")
+                self.assertEqual(hint.until, expected + "T23:59:59+00:00")
+        self.assertIsNone(parse_temporal_hint("January2, 2026", now=now))
+        self.assertEqual(_hint("May 2026"), ("2026-05-01", "2026-05-31", "loose"))
+
     def test_explicit_utc_minute_preserves_supplied_precision(self) -> None:
         hint = parse_temporal_hint("the run on February 29, 2024 at 23:59 UTC", now=NOW)
         assert hint is not None
@@ -426,6 +467,26 @@ class SearchWiringTests(unittest.TestCase):
             key: 0.0 for key in response["diagnostics"]["arm_elapsed_ms"]
         }
         return response
+
+    def test_compact_date_uses_existing_window_without_rewriting_query(self) -> None:
+        query = "What review-age and batch-size settings appeared in the July13 Desloppify blind packet configuration?"
+        calls: list[dict] = []
+        queries: list[str] = []
+        retrieval = self._retrieval(self._Store(), dense_calls=calls)
+        dense = retrieval._dense_candidates
+        def observe_query(text, **kwargs):
+            queries.append(text)
+            return dense(text, **kwargs)
+        retrieval._dense_candidates = observe_query
+        with mock.patch.dict(os.environ, {}, clear=True):
+            response = self._search(retrieval, query)
+        self.assertEqual(queries, [query, query])
+        self.assertEqual(len(calls), 2)
+        self.assertIsNone(calls[0]["since"])
+        self.assertEqual(calls[1]["since"], "2026-07-13T00:00:00+00:00")
+        self.assertEqual(calls[1]["until"], "2026-07-13T23:59:59+00:00")
+        self.assertEqual(response["diagnostics"]["dense_window_status"], "ok")
+        self.assertEqual(response["diagnostics"]["temporal_hint"]["confidence"], "exact")
 
     def test_query_without_a_hint_is_byte_identical(self) -> None:
         calls: list[dict] = []
