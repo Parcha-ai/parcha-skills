@@ -101,7 +101,7 @@ def _connect(store, deadline):
 
 
 def _query(store, connection, statement, parameters, deadline):
-    return store._execute_bounded(connection,statement,parameters,deadline)
+    return store._execute_bounded_pipeline(connection,statement,parameters,deadline)
 
 
 def _authorized(store, connection, scope, deadline):

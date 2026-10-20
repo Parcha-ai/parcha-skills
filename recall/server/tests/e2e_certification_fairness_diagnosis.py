@@ -68,7 +68,7 @@ class CertificationFairness(MembershipRemainderTests):
 
     def test_current_query_timeout_rotates_without_proof_progress_and_allows_three_ready(self):
         head, ready = self.four_parents()
-        original = self.store._execute_bounded
+        original = self.store._execute_bounded_pipeline
         attempted = []
         def timeout_current(connection, statement, parameters, deadline):
             if statement == remainder.CURRENT:
@@ -77,7 +77,7 @@ class CertificationFairness(MembershipRemainderTests):
                     return original(connection, 'SELECT pg_sleep(5)', (), deadline)
             return original(connection, statement, parameters, deadline)
         outcomes = []
-        with patch.object(self.store, '_execute_bounded', side_effect=timeout_current):
+        with patch.object(self.store, '_execute_bounded_pipeline', side_effect=timeout_current):
             for window in range(2):
                 outcome, elapsed = self.run_window()
                 self.assertEqual(outcome['membership_failures'][0]['sqlstate'], '57014')
@@ -97,7 +97,7 @@ class CertificationFairness(MembershipRemainderTests):
     def test_lost_rotation_ack_changes_no_proof_checkpoint_and_restart_recovers(self):
         self.interrupted_publication()
         before = self.queued()
-        original = self.store._execute_bounded
+        original = self.store._execute_bounded_pipeline
         connect = enrollment._connect
         rotated = []
         lost = []
@@ -113,7 +113,7 @@ class CertificationFairness(MembershipRemainderTests):
             if rotated and not lost:
                 lost.append(True)
                 raise OSError('synthetic lost scheduling commit acknowledgement')
-        with patch.object(self.store, '_execute_bounded', side_effect=observe_rotation), \
+        with patch.object(self.store, '_execute_bounded_pipeline', side_effect=observe_rotation), \
                 patch.object(enrollment, '_connect', side_effect=lose_committed_ack):
             result, _ = self.run_window()
         self.assertEqual(lost, [True])

@@ -47,6 +47,10 @@ class Store:
             self.rolled_back = True
             raise
 
+    @contextmanager
+    def pipeline(self):
+        yield
+
     def execute(self, sql, values):
         if self.error is not None:
             raise self.error

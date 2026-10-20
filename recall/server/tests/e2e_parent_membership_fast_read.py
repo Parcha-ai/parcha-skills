@@ -14,6 +14,52 @@ from recall_server.receipt_membership import lookup_current_search_membership
 
 
 class ParentMembershipFastReadTests(ParentEnrollmentTests):
+    def test_catalog_pipeline_preserves_complete_rows_and_exits_before_membership(self):
+        import psycopg
+        from psycopg.pq import PipelineStatus
+        from recall_server.db import BrainStore
+        from recall_server import turbopuffer_retrieval as retrieval
+
+        self.enroll()
+        catalogs = (retrieval._SELECTED_AUTHORITY_SQL, retrieval._CERTIFICATE_PRESENCE_SQL)
+        execute = psycopg.Connection.execute
+        for enabled in (False, True):
+            with self.subTest(certificates=enabled):
+                if enabled:
+                    self.enable()
+                with patch.object(self.store, '_execute_bounded_pipeline',
+                                  side_effect=BrainStore._execute_bounded):
+                    baseline, _ = self.authorize()
+                observed = []
+                def traced(connection, sql, params=None, **kwargs):
+                    if sql in catalogs or str(sql).startswith("SELECT set_config('statement_timeout'"):
+                        observed.append((sql in catalogs, connection.info.pipeline_status != PipelineStatus.OFF))
+                    return execute(connection, sql, params, **kwargs)
+                def membership(*args, **kwargs):
+                    self.assertEqual(kwargs['connection'].info.pipeline_status, PipelineStatus.OFF)
+                    return lookup_current_search_membership(*args, **kwargs)
+                with patch.object(psycopg.Connection, 'execute', traced), patch(
+                    'recall_server.receipt_membership.lookup_current_search_membership', membership):
+                    actual, _ = self.authorize()
+                self.assertCountEqual(actual, baseline)
+                index = next(i for i, (catalog, _) in enumerate(observed) if catalog)
+                self.assertEqual(observed[index - 1:index + 1], [(False, True), (True, True)])
+
+    def test_catalog_cancellation_rolls_back_before_native_proof_and_connection_reuse(self):
+        from psycopg.pq import PipelineStatus, TransactionStatus
+        with self.store.connect() as locked, locked.transaction():
+            locked.execute('LOCK TABLE canonical_passages IN ACCESS EXCLUSIVE MODE')
+            with self.store.connect() as connection:
+                with patch('recall_server.receipt_membership.lookup_current_search_membership',
+                           wraps=lookup_current_search_membership) as proof:
+                    with self.assertRaises(SearchDeadlineExceeded):
+                        self.retrieval._authorize_singletons(connection,
+                            [(self.source, value) for value in self.ids], time.monotonic() + 0.05)
+                proof.assert_not_called()
+                self.assertEqual(connection.info.pipeline_status, PipelineStatus.OFF)
+                self.assertEqual(connection.info.transaction_status, TransactionStatus.IDLE)
+                self.assertEqual(connection.execute('SELECT 7 AS n').fetchone()['n'], 7)
+
     def setUp(self):
         super().setUp()
         self.store.verified_singleton_receipts = True
@@ -357,7 +403,7 @@ class ParentMembershipFastReadTests(ParentEnrollmentTests):
 
     def test_certificate_appearance_after_catalog_stays_on_original_snapshot_proof(self):
         before, _ = self.authorize(); self.enable()
-        execute = self.store._execute_bounded
+        execute = self.store._execute_bounded_pipeline
         class Captured:
             def __init__(inner, rows): inner.rows = rows
             def fetchall(inner): return inner.rows
@@ -370,7 +416,7 @@ class ParentMembershipFastReadTests(ParentEnrollmentTests):
                 changed.append(True)
                 return Captured(rows)
             return result
-        with patch.object(self.store, '_execute_bounded', side_effect=appeared), patch(
+        with patch.object(self.store, '_execute_bounded_pipeline', side_effect=appeared), patch(
                 'recall_server.receipt_membership.lookup_current_search_membership',
                 wraps=lookup_current_search_membership) as native:
             after, stages = self.authorize()
@@ -383,7 +429,7 @@ class ParentMembershipFastReadTests(ParentEnrollmentTests):
 
     def test_prefilter_off_shadow_and_malformed_vendor_body_keep_original_output(self):
         from recall_server import turbopuffer_retrieval as retrieval
-        self.enroll(); before = self.search(); execute = self.store._execute_bounded
+        self.enroll(); before = self.search(); execute = self.store._execute_bounded_pipeline
         for shadow_enabled in (False, True):
             statements = []
             self.retrieval.parent_membership_read = reader.ReadSettings(
@@ -393,7 +439,7 @@ class ParentMembershipFastReadTests(ParentEnrollmentTests):
             def recorded(c, sql, values, deadline):
                 statements.append(sql)
                 return execute(c, sql, values, deadline)
-            with patch.object(self.store, '_execute_bounded', side_effect=recorded):
+            with patch.object(self.store, '_execute_bounded_pipeline', side_effect=recorded):
                 after = self.search()
             self.assertEqual(after['results'], before['results'])
             self.assertEqual(after['arms'], before['arms'])
@@ -431,14 +477,14 @@ class ParentMembershipFastReadTests(ParentEnrollmentTests):
 
     def test_presence_catalog_failure_refuses_without_retry_or_native_bypass(self):
         from recall_server import turbopuffer_retrieval as retrieval
-        self.enable(); execute = self.store._execute_bounded
+        self.enable(); execute = self.store._execute_bounded_pipeline
         attempts = []
         def absent_column(c, sql, values, deadline):
             if sql == retrieval._CERTIFICATE_PRESENCE_SQL:
                 attempts.append(sql)
                 return execute(c, 'SELECT missing_certificate_column_for_test FROM canonical_passages', (), deadline)
             return execute(c, sql, values, deadline)
-        with patch.object(self.store, '_execute_bounded', side_effect=absent_column), patch(
+        with patch.object(self.store, '_execute_bounded_pipeline', side_effect=absent_column), patch(
                 'recall_server.receipt_membership.lookup_current_search_membership',
                 wraps=lookup_current_search_membership) as native:
             result = self.search()

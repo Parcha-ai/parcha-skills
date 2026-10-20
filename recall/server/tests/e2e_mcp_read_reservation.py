@@ -181,6 +181,27 @@ class ReadReservation(unittest.TestCase):
             self.assertLess(elapsed, 2000)
         self.serving.flush_authorization_audit()
 
+    def test_http_singleton_catalog_uses_reserved_read_view(self):
+        arguments = {"query": "Sapphire archive receipt", "limit": 10}
+        status, before, _ = self.tool("recall_search", arguments)
+        self.assertEqual(status, 200, before)
+        original = before["result"]["structuredContent"]["results"]
+        self.assertTrue(original)
+        self.serving.verified_singleton_receipts = True
+        for certificates in ("0", "1"):
+            with self.subTest(certificates=certificates), patch.dict(os.environ, {
+                "RECALL_PARENT_MEMBERSHIP_READ": certificates,
+                "RECALL_PARENT_MEMBERSHIP_EPOCH": "read-reservation-fixture",
+            }):
+                status, result, _ = self.tool("recall_search", arguments)
+                self.assertEqual(status, 200, result)
+                answer = result["result"]["structuredContent"]
+                self.assertEqual(answer["diagnostics"]["authority_status"], "ok")
+                authority = answer["diagnostics"]["authority_stages"]
+                self.assertEqual(authority["path"], "singleton")
+                self.assertIsNotNone(authority["catalog_ms"])
+                self.assertEqual(answer["results"], original)
+
     def test_http_readiness_survives_general_stall_after_busy_grace(self):
         self.serving.readiness()
         self.serving._last_ready_at = time.monotonic() - self.serving.READINESS_BUSY_GRACE_SECONDS - 1
@@ -307,6 +328,31 @@ class ReadReservation(unittest.TestCase):
             stats = pool.get_stats()
             self.assertEqual(stats["pool_available"], stats["pool_size"])
         self.assertEqual(self.serving._pool.max_size + self.serving._read_pool.max_size, 8)
+
+    def test_pipeline_read_view_preserves_write_refusal_and_cancellation(self):
+        from recall_server.db import SearchDeadlineExceeded
+
+        view = self.serving.read_only_view()
+        with self.assertRaises(AttributeError):
+            view.capture
+        with self.assertRaises(AttributeError):
+            view.migrate
+        with self.assertRaises(psycopg.errors.ReadOnlySqlTransaction):
+            with view.connect() as connection:
+                view._execute_bounded_pipeline(connection,
+                    "INSERT INTO reservation_commit_fixture VALUES (%s)",
+                    (uuid.uuid4().hex,), time.monotonic() + 1)
+        with self.assertRaises(SearchDeadlineExceeded):
+            with view.connect() as connection:
+                view._execute_bounded_pipeline(connection, "SELECT pg_sleep(1)",
+                    (), time.monotonic() + .02)
+        with view.connect() as connection:
+            row = view._execute_bounded_pipeline(connection,
+                "SELECT current_setting('transaction_read_only') AS mode, 1 AS value",
+                (), time.monotonic() + 1).fetchone()
+            self.assertEqual(row, {"mode": "on", "value": 1})
+        stats = self.serving._read_pool.get_stats()
+        self.assertEqual(stats["pool_available"], stats["pool_size"])
 
     def test_background_constructor_does_not_inherit_http_reservation(self):
         worker = BrainStore(os.environ["RECALL_DATABASE_URL"], pool_max_size=8)

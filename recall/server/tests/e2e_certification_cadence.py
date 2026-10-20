@@ -22,7 +22,7 @@ class CertificationCadenceTests(CertificationSelectionTests):
         blocked, release, completed, search_after_cert = (threading.Event() for _ in range(4))
         now = [0.0]
         proof_calls, search_calls = [], []
-        native_query = self.store._execute_bounded
+        native_query = self.store._execute_bounded_pipeline
         native_iter = psycopg.ServerCursor.__iter__
         native_resume = remainder.resume
 
@@ -66,7 +66,7 @@ class CertificationCadenceTests(CertificationSelectionTests):
                 interval_seconds=30, once=True, skip_embedding=True,
                 clock=lambda: now[0], search_plane=search)
 
-        with patch.object(self.store, '_execute_bounded', side_effect=query), patch.object(
+        with patch.object(self.store, '_execute_bounded_pipeline', side_effect=query), patch.object(
             psycopg.ServerCursor, '__iter__', iterate
         ), patch.object(remainder, 'resume', side_effect=resume), patch(
             'recall_server.logical_evidence_projection.PROJECTION_PROGRESS_INTERVAL_SECONDS', .02
@@ -104,7 +104,7 @@ class CertificationCadenceTests(CertificationSelectionTests):
         scan = CanonicalParquetScanProjector(self.store, LogicalEvidenceProjectionStore(self.archive))
         blocked, release, completed, searched = (threading.Event() for _ in range(4))
         now = [0.0]
-        native_build, native_resume, native_query = scan._build, remainder.resume, self.store._execute_bounded
+        native_build, native_resume, native_query = scan._build, remainder.resume, self.store._execute_bounded_pipeline
         expired = []
 
         def query(connection, statement, arguments, deadline):
@@ -144,7 +144,7 @@ class CertificationCadenceTests(CertificationSelectionTests):
                 interval_seconds=30, once=True, skip_embedding=True,
                 clock=lambda: now[0], search_plane=search)
 
-        with patch.object(self.store, '_execute_bounded', side_effect=query), patch.object(
+        with patch.object(self.store, '_execute_bounded_pipeline', side_effect=query), patch.object(
             scan, '_build', side_effect=build
         ), patch.object(remainder, 'resume', side_effect=resume), patch(
             'recall_server.projection_worker.PROJECTION_PROGRESS_INTERVAL_SECONDS', .02
