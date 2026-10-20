@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 
+from contracts.source_units import codex_history_source_unit_index
 from .passage_projection import COMPLETE_SOURCE_UNITS, build_passages, passage_identity
 
 # Change whenever visible extraction, tokenization, or source-unit grouping changes.
@@ -12,9 +13,9 @@ from .passage_projection import COMPLETE_SOURCE_UNITS, build_passages, passage_i
 # Version 3 includes Claude request-replay tool leaves and single-owner handbacks,
 # both introduced after version 2. Other source extraction remains compatible.
 CHECKPOINT_VERSION = 3
-# Codex epoch 5 adds exact text leaves from mixed text/image output lists.
+# Codex epoch 6 includes visible messages in captured replacement history.
 # Other source contracts retain their existing epoch.
-CODEX_CHECKPOINT_VERSION = 5
+CODEX_CHECKPOINT_VERSION = 6
 
 
 def checkpoint_version(source_id):
@@ -86,6 +87,19 @@ def make_checkpoint(candidate, manifest, messages, passages, policy, *, previous
     prefix_bytes = previous['prefix_message_bytes'] if previous else 0
     last = passages[-1]
     first = last.spans[0]
+    # Native reads restart at a record boundary. Walk the existing sequence
+    # backwards once, including an earlier history record if a window overlaps
+    # it. This keeps a copied history message from becoming the wrong restart.
+    previous_index = len(passages) - 2
+    while codex_history_source_unit_index(first.source_unit) is not None and previous_index >= 0:
+        earlier = passages[previous_index]
+        if not any(span.record_ordinal == first.record_ordinal
+                   and codex_history_source_unit_index(span.source_unit) is not None
+                   for span in getattr(earlier, 'spans', ())):
+            break
+        last = earlier
+        first = last.spans[0]
+        previous_index -= 1
     index, byte, ordinal = first.message_index, first.source_byte_start, last.ordinal
     local_index = index - message_base
     if messages[local_index].source_unit in COMPLETE_SOURCE_UNITS:

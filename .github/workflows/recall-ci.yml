@@ -245,6 +245,7 @@ jobs:
             e2e_tool_group_publication.py \
             e2e_claude_first_projection.py \
             e2e_codex_tool_publication.py \
+            e2e_codex_compacted_history.py \
             e2e_worker_typed_admission.py \
             e2e_typed_admission_live_backlog.py \
             e2e_codex_typed_output_blocks.py \
