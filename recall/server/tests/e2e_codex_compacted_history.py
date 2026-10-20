@@ -21,7 +21,8 @@ def history():
         dict(type='message', role='developer', content=[dict(type='input_text', text='PRIVATE INSTRUCTIONS')]),
         message('assistant', 'The window stays closed; no inspection completion is claimed. 🪟', 'reply'),
         dict(type='compaction', encrypted_content='OPAQUE SYNTHETIC BYTES'),
-    ]))
+        message('assistant', 'PRIVATE GENERATED COMPACTION OUTPUT', 'summary'),
+    ], replacement_history_metadata=[{}, {}, {}, {}, {'compaction_output': True}]))
 
 
 class CodexCompactedHistory(unittest.TestCase):
@@ -42,6 +43,7 @@ class CodexCompactedHistory(unittest.TestCase):
         for row in rows:
             self.assertNotIn('PRIVATE INSTRUCTIONS', row['text_redacted'])
             self.assertNotIn('OPAQUE SYNTHETIC BYTES', row['text_redacted'])
+            self.assertNotIn('PRIVATE GENERATED COMPACTION OUTPUT', row['text_redacted'])
             self.assertIn(raw, [chunk['text'] for chunk in self.grant_and_open(row)['chunks']])
             for span in row['spans']:
                 text, _, origin = resolve_codex_history_source_unit(raw, span['source_unit'])
