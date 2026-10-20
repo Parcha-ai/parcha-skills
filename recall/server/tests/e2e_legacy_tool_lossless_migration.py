@@ -10,6 +10,125 @@ from recall_server.logical_evidence import LogicalEvidenceError
 
 
 class LosslessLegacyMigration(LegacyToolMigration):
+    def enroll(self):
+        row = self.document()
+        return self.passages.request_extraction_version(
+            tenant_id=self.tenant, principal_id=self.principal, source_id=self.source,
+            logical_document_id=row['logical_document_id'], revision=row['revision'],
+            source_document_sha256=row['source_document_sha256'],
+            extraction_version='tool_groups_v1')
+
+    def test_explicit_enrollment_refuses_partial_historical_byte_loss(self):
+        self.seed(mixed=True)
+        before = self.published_rows()
+        self.assertEqual(self.enroll()['status'], 'queued')
+        native = passage_index.iter_passages
+
+        def omit_last_byte(**kwargs):
+            messages = kwargs['messages']
+            if isinstance(messages, tuple) and messages and messages[0].source_unit:
+                kwargs['messages'] = (replace(messages[0], text=messages[0].text[:-1]), *messages[1:])
+            return native(**kwargs)
+
+        candidate = self.passages._pending(tenant_id=self.tenant, limit=1)[0]
+        for incremental in (False, True):
+            with self.subTest(incremental=incremental):
+                with patch.object(passage_index, 'iter_passages', side_effect=omit_last_byte):
+                    with self.assertRaisesRegex(LogicalEvidenceError, 'legacy_tool_migration_required'):
+                        self.passages._prepare(candidate, incremental=incremental)
+        self.assertEqual(self.published_rows(), before)
+        self.assertEqual(self.document()['applied_extraction_version'], 'legacy')
+        self.assertEqual(self.pending(), 1)
+
+    def test_explicit_enrollment_preserves_mixed_history_and_terminates(self):
+        normal, result = 'Demande café 日本語.', 'Résultat historique 🙂.'
+        self.seed_blocks([{'type': 'text', 'text': normal},
+                          {'type': 'tool_result', 'content': result}])
+        self.assertEqual(self.enroll()['status'], 'queued')
+        candidate = self.passages._pending(tenant_id=self.tenant, limit=1)[0]
+        prepared = self.passages._prepare(candidate)
+        try:
+            self.assertEqual(prepared.legacy_migration['projected']['requested_extraction_version'],
+                             'tool_groups_v1')
+            self.assertEqual(self.passages._commit(prepared)['status'], 'committed')
+        finally:
+            prepared.close()
+        self.assert_domains({None: normal,
+            'claude.tool-result.string.v1#/message/content/1/content': result})
+        self.assertEqual(self.document()['applied_extraction_version'], 'tool_groups_v1')
+        self.assertIsNotNone(self.document()['extraction_coverage'])
+        self.assertEqual(self.enroll()['status'], 'current')
+        self.assertEqual(self.project()['documents'], 0)
+        self.assertEqual(self.pending(), 0)
+
+    def test_explicit_enrollment_checks_historical_rows_again_at_commit(self):
+        self.seed(mixed=True)
+        self.assertEqual(self.enroll()['status'], 'queued')
+        candidate = self.passages._pending(tenant_id=self.tenant, limit=1)[0]
+        prepared = self.passages._prepare(candidate, incremental=True)
+        try:
+            with self.store.connect() as connection:
+                connection.execute("UPDATE canonical_passages SET text_sha256=%s WHERE tenant_id=%s",
+                                   ('0' * 64, self.tenant))
+            changed = self.published_rows()
+            self.assertEqual(self.passages._commit(prepared)['status'], 'stale')
+            self.assertEqual(self.published_rows(), changed)
+            self.assertEqual(self.document()['applied_extraction_version'], 'legacy')
+            self.assertEqual(self.pending(), 1)
+        finally:
+            prepared.close()
+
+    def test_explicit_enrollment_missing_history_state_defers_without_mutation(self):
+        self.seed(mixed=True)
+        self.assertEqual(self.enroll()['status'], 'queued')
+        before = self.published_rows()
+        with patch.object(self.passages, '_append_state', return_value=None):
+            report = self.project()
+        self.assertEqual(report['documents'], 0)
+        self.assertEqual(report['unavailable'], 1)
+        self.assertEqual(self.published_rows(), before)
+        self.assertEqual(self.document()['applied_extraction_version'], 'legacy')
+        self.assertEqual(self.pending(), 1)
+        self.assertEqual(self.project()['documents'], 1)
+        self.assertEqual(self.pending(), 0)
+
+    def test_explicit_enrollment_without_historical_tools_keeps_coverage_and_terminates(self):
+        for mixed in (False, True):
+            with self.subTest(mixed=mixed):
+                if mixed:
+                    self.setUp()
+                self.seed(historical=False, mixed=mixed)
+                before = self.projected()
+                self.assertEqual(self.enroll()['status'], 'queued')
+                self.assertEqual(self.project()['documents'], 1)
+                after = self.projected()
+                for old in before:
+                    current = next(row for row in after if row['passage_id'] == old['passage_id'])
+                    for field in ('text_redacted', 'text_sha256', 'receipts', 'spans'):
+                        self.assertEqual(current[field], old[field])
+                self.assertTrue(any(row['text_redacted'] == 'Verified historical result.' for row in after))
+                self.assertIsNotNone(self.document()['extraction_coverage'])
+                self.assertEqual(self.document()['applied_extraction_version'], 'tool_groups_v1')
+                self.assertEqual(self.enroll()['status'], 'current')
+                self.assertEqual(self.project()['documents'], 0)
+                self.assertEqual(self.pending(), 0)
+
+    def test_explicit_unsupported_only_enrollment_records_zero_output_once(self):
+        self.ingest_blocks('unsupported', [
+            {'type': 'tool_result', 'content': {'not_a_supported_text_block': True}}])
+        with patch.object(passage_index, '_document_extraction_version', return_value='legacy'):
+            self.project()
+        self.assertEqual(self.projected(), [])
+        self.assertEqual(self.enroll()['status'], 'queued')
+        self.assertEqual(self.project()['documents'], 1)
+        self.assertEqual(self.projected(), [])
+        row = self.document()
+        self.assertEqual(row['applied_extraction_version'], 'tool_groups_v1')
+        self.assertEqual(row['extraction_coverage']['dispositions']['unsupported_result_content'], 1)
+        self.assertEqual(self.enroll()['status'], 'current')
+        self.assertEqual(self.project()['documents'], 0)
+        self.assertEqual(self.pending(), 0)
+
     def test_mixed_historical_domain_preserves_normal_and_typed_result(self):
         self.seed(mixed=True)
         before = self.projected()
