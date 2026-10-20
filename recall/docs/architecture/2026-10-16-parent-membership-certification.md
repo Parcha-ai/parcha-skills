@@ -109,3 +109,29 @@ queue. Keep the publisher invocation for parents that have not retired or cannot
 retire; removing it would discard their coverage. Reconsider that invocation only
 if measured lifecycle coverage makes it redundant. Neither invocation authorizes
 removing the native receipt/revision catalogs used by the fallback verifier.
+
+## Reusing certificates during enrollment
+
+Enrollment checks the existing reader's certificate eligibility against bounded
+metadata in an authorized repeatable-read snapshot. Retained passages whose
+current generation and binding still match can reuse that proof. Every other
+passage uses the original native receipt and ownership checks. The final
+publication lock, authorization check and complete-scope generation/binding
+comparison still run for both groups. Only differing certificate values are
+written; a reused row does not get another PostgreSQL tuple.
+
+Queue publication still starts its scan from the beginning, so an added passage
+before an older cursor is not skipped. Acknowledged prefixes, partial failures,
+Forget and uncertain commits keep their existing rules. Native comparison always
+runs the original verifier, even when enrollment can reuse a certificate.
+
+The enrollment result and `certify_published_passages` report `reused_passages`,
+`proved_passages` and `written_passages` separately. The existing `passages` and
+`certified_passages` totals count the validated scope, including reused rows;
+worker summaries retaining that total must not call it newly written or unique
+certificates. These passage totals are not completed-parent queue counts. An
+older result without the additive fields leaves their aggregate unknown.
+
+This adds one bounded metadata snapshot to enrollment, including wholly new
+batches. It avoids repeated native proof and tuple writes when valid certificates
+remain; it does not establish a production speedup or queue convergence rate.
