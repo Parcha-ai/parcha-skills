@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 """A locked publication queue row cannot block ready certification siblings."""
-import time
 import unittest
 from unittest.mock import patch
 
