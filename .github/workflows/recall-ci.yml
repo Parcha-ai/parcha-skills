@@ -170,6 +170,7 @@ jobs:
             e2e_typed_passage_visibility.py \
             e2e_legacy_tool_migration.py \
             e2e_legacy_tool_lossless_migration.py \
+            e2e_completed_legacy_extraction.py \
             e2e_claude_legacy_envelope.py \
             e2e_typed_document_visibility.py \
             e2e_passage_origin.py \

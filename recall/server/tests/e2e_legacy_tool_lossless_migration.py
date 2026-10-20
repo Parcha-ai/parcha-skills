@@ -147,7 +147,7 @@ class LosslessLegacyMigration(LegacyToolMigration):
 
     def test_current_visible_checkpoint_keeps_append_reuse(self):
         self.seed(historical=False, mixed=True)
-        self.assertEqual(self.document()['append_checkpoint']['version'], 2)
+        self.assertEqual(self.document()['append_checkpoint']['version'], passage_append.CHECKPOINT_VERSION)
         with patch.object(passage_index, '_legacy_result_intervals',
                           side_effect=AssertionError('current checkpoint unexpectedly rebuilt')):
             prepared = self.append_and_prepare(native='zz-arrival')
@@ -157,7 +157,7 @@ class LosslessLegacyMigration(LegacyToolMigration):
             self.assertEqual(self.passages._commit(prepared)['status'], 'committed')
         finally:
             prepared.close()
-        self.assertEqual(self.document()['append_checkpoint']['version'], 2)
+        self.assertEqual(self.document()['append_checkpoint']['version'], passage_append.CHECKPOINT_VERSION)
         self.assertEqual(self.document()['applied_extraction_version'], 'legacy')
         for row in self.projected():
             self.grant_and_open(row)
@@ -174,7 +174,7 @@ class LosslessLegacyMigration(LegacyToolMigration):
             self.assertEqual(self.passages._commit(prepared)['status'], 'committed')
         finally:
             prepared.close()
-        self.assertEqual(self.document()['append_checkpoint']['version'], 2)
+        self.assertEqual(self.document()['append_checkpoint']['version'], passage_append.CHECKPOINT_VERSION)
         for row in self.projected():
             self.grant_and_open(row)
 
@@ -188,7 +188,7 @@ class LosslessLegacyMigration(LegacyToolMigration):
             self.assertEqual(self.passages._commit(first)['status'], 'committed')
         finally:
             first.close()
-        self.assertEqual(self.document()['append_checkpoint']['version'], 2)
+        self.assertEqual(self.document()['append_checkpoint']['version'], passage_append.CHECKPOINT_VERSION)
         second = self.append_and_prepare(native='zzz-arrival')
         try:
             self.assertIsNotNone(second.previous_checkpoint)

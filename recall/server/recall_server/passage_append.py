@@ -9,7 +9,9 @@ from .passage_projection import COMPLETE_SOURCE_UNITS, build_passages, passage_i
 # Change whenever visible extraction, tokenization, or source-unit grouping changes.
 # Version 1 can describe historical visible tool-result concatenations. Rebuild
 # it once before resuming with the current normal/typed extraction domains.
-CHECKPOINT_VERSION = 2
+# Version 3 includes Claude request-replay tool leaves and single-owner handbacks,
+# both introduced after version 2. Other source extraction remains compatible.
+CHECKPOINT_VERSION = 3
 
 
 def reuse_enabled():
@@ -64,7 +66,14 @@ def resume_passages(messages, checkpoint, arguments):
 
 def make_checkpoint(candidate, manifest, messages, passages, policy, *, previous=None):
     if not passages or not messages:
-        return None
+        if not candidate.source_id.startswith('claude:'):
+            return None
+        # Record completed extraction even when no reusable visible prefix exists.
+        # Missing prefix fields deliberately cannot satisfy proves_append.
+        return dict(version=CHECKPOINT_VERSION, full_rebuild_only=True,
+            source_document_sha256=candidate.source_document_sha256,
+            revision=candidate.revision,
+            manifest_sha256=candidate.manifest_reference['content_sha256'])
     message_base = previous['message_index'] if previous else 0
     prefix_bytes = previous['prefix_message_bytes'] if previous else 0
     last = passages[-1]
@@ -89,10 +98,10 @@ def proves_append(checkpoint, projected, candidate, manifest, read_part):
     """Prove the old record stream is an exact prefix without reading old objects."""
     try:
         # Only Claude's historical visible tool-result extraction changed.
-        # Unchanged source contracts can keep their exact v1 prefix proof.
+        # Unchanged source contracts can keep their exact v1/v2 prefix proof.
         compatible = isinstance(checkpoint, dict) and (
             checkpoint.get('version') == CHECKPOINT_VERSION
-            or (checkpoint.get('version') == 1 and not candidate.source_id.startswith('claude:')))
+            or (checkpoint.get('version') in (1, 2) and not candidate.source_id.startswith('claude:')))
         if (not compatible
             or checkpoint['policy_fingerprint'] != projected['policy_fingerprint']
             or checkpoint['revision'] != projected['revision']
