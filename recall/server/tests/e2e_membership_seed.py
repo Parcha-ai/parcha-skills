@@ -252,6 +252,125 @@ class HistoricalMembershipSeedTests(ParentMembershipPublicationTests):
         self.assertTrue(all(a['membership_binding_sha256'] != b['membership_binding_sha256']
                             for a,b in zip(before,after,strict=True)))
 
+    def acknowledged_prefix(self, *, legacy):
+        class StoppedAfterAcknowledgedPrefix(BaseException):
+            pass
+        fields = ('tenant_id', 'source_id', 'native_parent_id', 'logical_document_id',
+                  'passage_id', 'policy_fingerprint', 'text_sha256', 'receipts',
+                  'manifest_content_sha256', 'manifest_revision', 'projected_revision',
+                  'passage_revision', 'source_document_sha256')
+        current_binding = enrollment._binding
+        def binding(row, scope):
+            if not legacy:
+                return current_binding(row, scope)
+            payload = ['recall.passage-membership-binding.v2', scope['binding_epoch'],
+                       *[row[field] for field in fields]]
+            return hashlib.sha256(json.dumps(payload, ensure_ascii=False,
+                separators=(',', ':'), allow_nan=False).encode()).hexdigest()
+        change = remainder.change_cursor
+        def stop(*args, **kwargs):
+            acknowledged = change(*args, **kwargs)
+            if acknowledged and kwargs.get('after') is not None:
+                raise StoppedAfterAcknowledgedPrefix()
+            return acknowledged
+        with (patch.object(remainder, '_CHECKPOINT_VERSION', 1 if legacy else 2),
+              patch.object(enrollment, '_binding', side_effect=binding),
+              patch.dict(enrollment._CERTIFICATION_LIMITS, passages=1)):
+            self.assertEqual(self.seed()['queued'], 1)
+            with patch.object(remainder, 'change_cursor', side_effect=stop):
+                with self.assertRaises(StoppedAfterAcknowledgedPrefix):
+                    remainder.resume(self.store, self.queued()[0], settings=self.settings(),
+                                     deadline_at=time.monotonic()+5)
+            self.assertEqual(self.compare()['certified_passages'], 1)
+        prefix = self.queued()[0]
+        self.assertEqual(prefix['checkpoint']['after'], min(self.ids))
+        return prefix
+
+    def test_legacy_binding_prefix_reproved_before_completion(self):
+        prefix = self.acknowledged_prefix(legacy=True)
+        self.assertEqual(self.compare()['certified_passages'], 0)
+        self.assertEqual(self.seed()['queued'], 0)
+        self.assertEqual(self.queued(), [prefix])
+        outcome = remainder.resume(self.store, prefix, settings=self.settings(),
+                                   deadline_at=time.monotonic()+5)
+        self.assertEqual(outcome['status'], 'enrolled')
+        self.assertEqual(outcome['certified_passages'], len(self.ids))
+        self.assertEqual(self.queued(), [])
+        compared = self.compare()
+        self.assertEqual(compared['certified_passages'], len(self.ids))
+        self.assertEqual(compared['native_allowed_passages'], len(self.ids))
+        self.assertEqual(compared['disagreements'], 0)
+
+    def test_current_binding_prefix_is_not_reproved(self):
+        prefix = self.acknowledged_prefix(legacy=False)
+        native = enrollment.certify_published_passages
+        requested = []
+        def capture(*args, **kwargs):
+            requested.extend(kwargs['passage_ids'])
+            return native(*args, **kwargs)
+        with patch.object(enrollment, 'certify_published_passages', side_effect=capture):
+            outcome = remainder.resume(self.store, prefix, settings=self.settings(),
+                                       deadline_at=time.monotonic()+5)
+        self.assertEqual(outcome['status'], 'enrolled')
+        self.assertEqual(requested, sorted(self.ids)[1:])
+        self.assertEqual(self.compare()['certified_passages'], len(self.ids))
+
+    def test_v3_binding_with_old_checkpoint_reproved_once(self):
+        prefix = self.acknowledged_prefix(legacy=False)
+        checkpoint = dict(prefix['checkpoint'], version=1)
+        with self.store.connect() as connection:
+            connection.execute(
+                'UPDATE canonical_passage_projection_queue SET certification_checkpoint=%s::jsonb '
+                'WHERE tenant_id=%s', (json.dumps(checkpoint), self.tenant))
+        self.assertEqual(self.compare()['certified_passages'], 1)
+        outcome = remainder.resume(self.store, self.queued()[0], settings=self.settings(),
+                                   deadline_at=time.monotonic()+5)
+        self.assertEqual(outcome['status'], 'enrolled')
+        self.assertEqual(outcome['certified_passages'], len(self.ids))
+        self.assertEqual(self.compare()['certified_passages'], len(self.ids))
+
+    def test_legacy_prefix_with_active_intent_keeps_progress(self):
+        prefix = self.acknowledged_prefix(legacy=True)
+        self.passive_retirement()
+        self.active_retirement()
+        with patch.object(enrollment, 'certify_published_passages', side_effect=AssertionError('busy proof')):
+            outcome = remainder.resume(self.store, prefix, settings=self.settings(),
+                                       deadline_at=time.monotonic()+5)
+        self.assertEqual(outcome['status'], 'busy')
+        self.assertEqual(self.queued(), [prefix])
+        self.assertEqual(self.compare()['certified_passages'], 0)
+
+    def test_legacy_prefix_migration_lost_ack_keeps_native_retry(self):
+        prefix = self.acknowledged_prefix(legacy=True)
+        original = enrollment._connect
+        query = enrollment._query
+        migrated = []
+        def track(*args):
+            result = query(*args)
+            if 'SET changed_at=clock_timestamp(),certification_checkpoint=' in args[2]:
+                migrated.append(True)
+            return result
+        @contextmanager
+        def lost_ack(*args):
+            with original(*args) as connection:
+                yield connection
+            if migrated:
+                raise OSError('lost checkpoint migration commit response')
+        with (patch.object(enrollment, '_connect', side_effect=lost_ack),
+              patch.object(enrollment, '_query', side_effect=track)):
+            outcome = remainder.resume(self.store, prefix, settings=self.settings(),
+                                       deadline_at=time.monotonic()+5)
+        self.assertEqual(outcome['status'], 'failed')
+        self.assertEqual(outcome['certified_passages'], 0)
+        retained = self.queued()[0]
+        self.assertEqual(retained['checkpoint']['version'], 2)
+        self.assertEqual(retained['checkpoint']['after'], '')
+        self.assertEqual(self.compare()['certified_passages'], 0)
+        outcome = remainder.resume(self.store, retained, settings=self.settings(),
+                                   deadline_at=time.monotonic()+5)
+        self.assertEqual(outcome['status'], 'enrolled')
+        self.assertEqual(self.compare()['certified_passages'], len(self.ids))
+
     def test_active_retirement_still_defers_seed(self):
         self.passive_retirement()
         self.active_retirement()
