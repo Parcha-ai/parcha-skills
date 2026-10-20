@@ -1,6 +1,6 @@
 """Recall central BrainStore service."""
 
-SCHEMA_VERSION = 94
+SCHEMA_VERSION = 95
 # H3-e': migration 067 drops the Postgres vector/tsvector plane (passage
 # embeddings, the embedding ledger, canonical_passages.search_vector). It is
 # destructive, so ``migrate`` applies it only when asked to retire the plane
@@ -59,3 +59,6 @@ PROJECTOR_VERSION = 3
 
 # Optional durable parent-scoped vendor reconciliation.
 SEARCH_PARENT_RECONCILIATION_VERSION = 94
+# Reader rollback floor for archived historical singleton receipt metadata.
+# This marker admits no document and does not enable writer retention.
+HISTORICAL_SINGLETON_RECEIPT_VERSION = 95

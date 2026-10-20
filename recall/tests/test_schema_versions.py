@@ -74,7 +74,7 @@ class ExpectedSchemaVersionsTests(unittest.TestCase):
                     self.versions(latest, native_file)
 
     def test_unknown_latest_is_not_implicitly_allowed(self):
-        for latest in (69, 95):
+        for latest in (69, 96):
             with self.subTest(latest=latest):
                 with self.assertRaisesRegex(AssertionError, "unreviewed latest"):
                     self.versions(latest, False)
@@ -102,3 +102,7 @@ class ExpectedSchemaVersionsTests(unittest.TestCase):
     def test_parent_reconciliation_is_explicitly_supported(self):
         self.assertEqual(self.versions(94, False), [*range(1, 71), *range(72, 95)])
         self.assertEqual(self.versions(94, True), list(range(1, 95)))
+
+    def test_historical_singleton_reader_floor_is_explicitly_supported(self):
+        self.assertEqual(self.versions(95, False), [*range(1, 71), *range(72, 96)])
+        self.assertEqual(self.versions(95, True), list(range(1, 96)))

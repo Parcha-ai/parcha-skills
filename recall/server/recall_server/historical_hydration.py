@@ -43,6 +43,17 @@ def hydrate_historical_rows(
             ).fetchall()
 
     def authorized_chunks():
+        if getattr(store, "verified_singleton_receipts", False):
+            from .receipt_membership import lookup_receipt_metadata
+
+            return [
+                member for member in lookup_receipt_metadata(
+                    store, tenant_id=tenant_id, authorized_sources=tuple(source_ids),
+                    receipts=tuple(row["receipt"] for row in rows),
+                    allow_verified_singletons=True, current_only=False,
+                    deadline_at=deadline_at,
+                ).values() if not member["is_current"]
+            ]
         with store.connect() as c:
             return store._execute_bounded(
                 c,

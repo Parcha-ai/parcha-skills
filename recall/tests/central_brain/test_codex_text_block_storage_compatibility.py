@@ -17,7 +17,7 @@ class CodexTextBlockStorageCompatibility(unittest.TestCase):
 
     def test_missing_codex_contract_future_and_duplicate_remain_refused(self):
         for versions in ([n for n in range(1, 94) if n != 90],
-                         list(range(1, 96)), list(range(1, 94))+[93]):
+                         list(range(1, 97)), list(range(1, 94))+[93]):
             with self.subTest(versions=versions):
                 snapshot = healthy_snapshot()
                 snapshot['migration_versions'] = versions

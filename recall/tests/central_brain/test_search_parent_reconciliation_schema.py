@@ -14,7 +14,7 @@ class ParentReconciliationSchema(unittest.TestCase):
                 self.assertEqual(assess_snapshot(snapshot)['schema_version'], latest)
 
     def test_future_duplicate_and_missing_core_remain_refused(self):
-        for versions in (list(range(1,96)), list(range(1,95))+[94],
+        for versions in (list(range(1,97)), list(range(1,95))+[94],
                          [v for v in range(1,95) if v != 69]):
             snapshot = healthy_snapshot()
             snapshot['migration_versions'] = versions

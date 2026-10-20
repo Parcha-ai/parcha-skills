@@ -200,6 +200,7 @@ jobs:
             e2e_singleton_maintenance_membership.py \
             e2e_singleton_metadata_restore.py \
             e2e_singleton_metadata_admission.py \
+            e2e_retired_historical_singleton.py \
             e2e_singleton_survivor_fence.py \
             e2e_singleton_profile_capability.py \
             e2e_singleton_retirement_store.py \

@@ -12,7 +12,7 @@ from tests.central_brain.test_core_deployment import healthy_snapshot  # noqa: E
 
 class AdditiveMembershipSchemaCompatibility(unittest.TestCase):
     def test_known_91_and_92_preserve_both_planes(self):
-        self.assertEqual(SCHEMA_VERSION, 94)
+        self.assertEqual(SCHEMA_VERSION, 95)
         for latest in (91, 92):
             for retired in (False, True):
                 snapshot = healthy_snapshot()
@@ -30,7 +30,7 @@ class AdditiveMembershipSchemaCompatibility(unittest.TestCase):
                     assess_snapshot(snapshot)
 
     def test_future_gap_duplicate_and_privilege_still_refuse(self):
-        for versions in (list(range(1, 96)), [n for n in range(1, 93) if n != 69],
+        for versions in (list(range(1, 97)), [n for n in range(1, 93) if n != 69],
                          list(range(1, 93)) + [92]):
             snapshot = healthy_snapshot()
             snapshot['migration_versions'] = versions
