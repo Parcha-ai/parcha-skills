@@ -31,6 +31,7 @@ from . import (
     CODEX_EXTRACTION_VERSION,
     SEARCH_PUBLICATION_CHECKPOINT_VERSION,
     ADDITIVE_MEMBERSHIP_GENERATION_VERSION,
+    CODEX_TEXT_BLOCK_STORAGE_VERSION,
 )
 
 
@@ -246,7 +247,12 @@ def assess_snapshot(snapshot: dict[str, Any], profile: str = "production") -> di
                       + ([SEARCH_PUBLICATION_CHECKPOINT_VERSION]
                          if SEARCH_PUBLICATION_CHECKPOINT_VERSION in versions else [])
                       + ([ADDITIVE_MEMBERSHIP_GENERATION_VERSION]
-                         if ADDITIVE_MEMBERSHIP_GENERATION_VERSION in versions else []))
+                         if ADDITIVE_MEMBERSHIP_GENERATION_VERSION in versions else [])
+                      + ([CODEX_TEXT_BLOCK_STORAGE_VERSION]
+                         if CODEX_TEXT_BLOCK_STORAGE_VERSION in versions else []))
+    if (CODEX_TEXT_BLOCK_STORAGE_VERSION in versions
+            and CODEX_EXTRACTION_VERSION not in versions):
+        raise CapabilityError("schema_drift")
     if (CODEX_EXTRACTION_VERSION in versions
             and DOCUMENT_EXTRACTION_VERSION not in versions):
         raise CapabilityError("schema_drift")
