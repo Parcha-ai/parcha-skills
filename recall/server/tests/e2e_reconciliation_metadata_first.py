@@ -155,7 +155,10 @@ class ReconciliationMetadataFirst(RetainedPassageReceipts):
             connection.execute('UPDATE canonical_passages SET text_redacted=%s,text_sha256=%s '
                                'WHERE tenant_id=%s AND passage_id=%s',
                                (body, digest, self.tenant, identifier))
-        namespace.rows[identifier]['text_sha256'] = digest
+        with self.store.connect() as connection:
+            current = writer.passages_by_id(connection, self.tenant, [identifier])[0]
+        namespace.rows[identifier] = passage_row(
+            {**current, 'actors': [tuple(a) for a in current['actors']]})
         expected = deepcopy(namespace.rows)
         with self.body_work(writer) as work:
             outcome = search_parent_reconciliation.step(writer, self.tenant)
