@@ -11,6 +11,31 @@ from recall_server.passage_projection import PassagePolicy
 
 
 class CodexTypedOutputBlocks(CodexToolPublication):
+    def test_same_source_epoch_rebuild_reconciles_retained_vendor_absence(self):
+        original_checkpoint = passage_append.make_checkpoint
+        def old_checkpoint(*args, **kwargs):
+            return dict(original_checkpoint(*args, **kwargs), version=3)
+        self.ingest('unchanged-string', result=True)
+        with patch.object(passage_append, 'make_checkpoint', old_checkpoint):
+            self.assertEqual(self.project()['documents'], 1)
+        before = self.projected()
+        document = self.document()
+        self.writer.drain(tenant_id=self.tenant, max_months=2)
+        namespace = self.client.namespace(self.settings.namespace(self.tenant))
+        namespace.rows.clear()
+        self.assertEqual(self.passages.seed_backfill(tenant_id=self.tenant), 1)
+        self.assertEqual(self.project()['documents'], 1)
+        after = self.projected()
+        self.assertEqual(before, after)
+        self.assertEqual(self.document()['source_document_sha256'], document['source_document_sha256'])
+        with self.store.connect() as connection:
+            self.assertEqual(connection.execute(
+                'SELECT count(*) AS count FROM search_parent_reconciliation WHERE tenant_id=%s',
+                (self.tenant,)).fetchone()['count'], 1)
+        self.writer.drain_quantum(tenant_id=self.tenant, max_months=2)
+        self.assertEqual(set(namespace.rows), {row['passage_id'] for row in before})
+        self.assertEqual(self.passages.seed_backfill(tenant_id=self.tenant), 0)
+
     def test_old_mixed_output_epoch_rebuilds_once_with_both_seed_owners(self):
         import time
         original_checkpoint = passage_append.make_checkpoint

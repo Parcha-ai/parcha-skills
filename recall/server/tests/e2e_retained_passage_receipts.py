@@ -92,6 +92,251 @@ class RetainedPassageReceipts(unittest.TestCase):
                 embed_sha256 FROM canonical_passages WHERE tenant_id=%s ORDER BY ordinal''',
                 (self.tenant,)).fetchall()
 
+    def test_retained_missing_vendor_row_is_reconciled_after_native_rebuild(self):
+        from recall_server.search_outbox import enqueue_search_outbox
+
+        self.ingest(1)
+        self.project()
+        self.writer.drain(tenant_id=self.tenant, max_months=2)
+        namespace = self.client.namespace(self.settings.namespace(self.tenant))
+        before = self.rows()
+        self.assertEqual(len(before), 1)
+        missing_id = before[0]['passage_id']
+        # Reproduce the observed absence, without asserting how it arose.
+        del namespace.rows[missing_id]
+        self.ingest(2)
+        rebuilt = self.project()
+        self.assertEqual(rebuilt['retained'], 1)
+        self.assertEqual(self.rows()[0]['passage_id'], missing_id)
+        with self.store.connect() as connection:
+            month = connection.execute(
+                "SELECT month FROM search_projection_shards WHERE tenant_id=%s",
+                (self.tenant,)).fetchone()['month']
+            enqueue_search_outbox(connection, tenant_id=self.tenant,
+                source_id=self.source, months=[month], reason='logical-update')
+        drained = self.writer.drain(tenant_id=self.tenant, max_months=2)
+        self.assertEqual(drained['failed'], 0)
+        self.assertIn(missing_id, namespace.rows,
+            'native incremental publication skipped retained missing evidence')
+
+    def reconciliation_row(self):
+        with self.store.connect() as connection:
+            return connection.execute("SELECT * FROM search_parent_reconciliation WHERE tenant_id=%s",
+                (self.tenant,)).fetchone()
+
+    def restart_writer(self, *, batch_rows=1):
+        return TurbopufferProjector(self.store, self.settings, client=self.client,
+            batch_rows=batch_rows, write_concurrency=1, tokens_per_minute=0)
+
+    def test_parent_reconciliation_survives_hot_rebuilds_and_restarts(self):
+        text = ' '.join(f'Synthetic archive segment {index} preserves useful evidence.' for index in range(500))
+        self.ingest(1, text=text)
+        self.project()
+        self.writer.drain(tenant_id=self.tenant, max_months=2)
+        namespace = self.client.namespace(self.settings.namespace(self.tenant))
+        ids = {row['passage_id'] for row in self.rows()}
+        self.assertGreater(len(ids), 2)
+        namespace.rows.clear()
+        observed = []
+        for index in range(len(ids)):
+            self.ingest(index+2, text=text)
+            self.project()
+            outcome = self.restart_writer().drain_quantum(tenant_id=self.tenant, max_months=2)
+            self.assertEqual(outcome['failed'], 0)
+            observed.append(namespace.writes[-1]['upsert_rows'][0]['id'])
+            self.assertEqual(self.reconciliation_row()['page_checkpoint']['after'], index)
+        self.assertEqual(set(observed), ids)
+        self.assertEqual(len(observed), len(set(observed)))
+        self.assertGreater(self.reconciliation_row()['generation'],
+                           self.reconciliation_row()['page_checkpoint']['generation'])
+        writes = len(namespace.writes)
+        # EOF observes a newer generation, then the next pass skips correct rows.
+        for _ in range(len(ids)+2):
+            self.restart_writer().drain_quantum(tenant_id=self.tenant, max_months=2)
+        self.assertIsNone(self.reconciliation_row())
+        self.assertEqual(len(namespace.writes), writes)
+
+    def test_unknown_vendor_ack_rechecks_presence_without_reembedding(self):
+        self.ingest(1)
+        self.project()
+        self.writer.drain(tenant_id=self.tenant, max_months=2)
+        namespace = self.client.namespace(self.settings.namespace(self.tenant))
+        namespace.rows.clear()
+        self.ingest(2)
+        self.project()
+        write = namespace.write
+        def unknown(**kwargs):
+            write(**kwargs)
+            raise RuntimeError('synthetic ACK loss after vendor write')
+        with patch.object(namespace, 'write', side_effect=unknown):
+            outcome = self.restart_writer().drain_quantum(tenant_id=self.tenant, max_months=2)
+        self.assertEqual(outcome['failed'], 1)
+        self.assertEqual(self.reconciliation_row()['page_checkpoint']['after'], -1)
+        writes = len(namespace.writes)
+        outcome = self.restart_writer().drain_quantum(tenant_id=self.tenant, max_months=2)
+        self.assertEqual(outcome['failed'], 0)
+        self.assertEqual(len(namespace.writes), writes)
+        self.restart_writer().drain_quantum(tenant_id=self.tenant, max_months=2)
+        self.assertIsNone(self.reconciliation_row())
+
+    def test_reconciliation_forget_between_presence_and_native_write(self):
+        self.ingest(1)
+        self.project()
+        self.writer.drain(tenant_id=self.tenant, max_months=2)
+        namespace = self.client.namespace(self.settings.namespace(self.tenant))
+        namespace.rows.clear()
+        self.ingest(2)
+        self.project()
+        receipt = self.rows()[0]['receipts'][0]
+        request = dict(contract='recall.forget-request.v1', schema_version=1,
+            tenant_id=self.tenant, principal_id=self.principal, source_id=self.source,
+            target_receipt=receipt, mode='explicit_forget', reason='owner_requested',
+            requested_at='2026-10-13T00:00:00Z', idempotency_key='forget-reconcile')
+        query = namespace.query
+        def forget(**kwargs):
+            response = query(**kwargs)
+            self.plane.forget(request)
+            return response
+        writes = len(namespace.writes)
+        with patch.object(namespace, 'query', side_effect=forget):
+            outcome = self.restart_writer().drain_quantum(tenant_id=self.tenant, max_months=2)
+        self.assertEqual(outcome['failed'], 1)
+        self.assertEqual(len(namespace.writes), writes)
+        self.assertEqual(namespace.rows, {})
+
+    def test_parent_reconciliation_rolls_back_with_native_commit(self):
+        from recall_server import search_parent_reconciliation
+        self.ingest(1)
+        self.project()
+        self.ingest(2)
+        self.logical.project_pending(tenant_id=self.tenant, batch_size=2,
+            max_batches=1, upload_concurrency=1)
+        before = self.rows()
+        enqueue = search_parent_reconciliation.enqueue
+        def fail_after_enqueue(connection, *args):
+            enqueue(connection, *args)
+            self.assertEqual(connection.execute(
+                'SELECT count(*) AS count FROM search_parent_reconciliation WHERE tenant_id=%s',
+                (self.tenant,)).fetchone()['count'], 1)
+            raise RuntimeError('synthetic failure after durable obligation')
+        with patch.object(search_parent_reconciliation, 'enqueue', side_effect=fail_after_enqueue):
+            with self.assertRaisesRegex(RuntimeError, 'after durable obligation'):
+                self.passages.project_pending(tenant_id=self.tenant, batch_size=2,
+                    max_batches=1, concurrency=1)
+        self.assertIsNone(self.reconciliation_row())
+        self.assertEqual(self.rows(), before)
+
+    def test_unknown_sql_ack_resumes_committed_parent_cursor(self):
+        self.ingest(1)
+        self.project()
+        self.writer.drain(tenant_id=self.tenant, max_months=2)
+        namespace = self.client.namespace(self.settings.namespace(self.tenant))
+        namespace.rows.clear()
+        self.ingest(2)
+        self.project()
+        execute = self.store._execute_bounded
+        def lose_ack(connection, sql, args, deadline):
+            result = execute(connection, sql, args, deadline)
+            if 'SET page_checkpoint=%s WHERE' in sql:
+                connection.commit()
+                raise RuntimeError('synthetic SQL commit ACK loss')
+            return result
+        with patch.object(self.store, '_execute_bounded', side_effect=lose_ack):
+            outcome = self.restart_writer().drain_quantum(tenant_id=self.tenant, max_months=2)
+        self.assertEqual(outcome['failed'], 1)
+        self.assertEqual(self.reconciliation_row()['page_checkpoint']['after'], 0)
+        writes = len(namespace.writes)
+        self.restart_writer().drain_quantum(tenant_id=self.tenant, max_months=2)
+        self.assertIsNone(self.reconciliation_row())
+        self.assertEqual(len(namespace.writes), writes)
+
+    def test_metadata_budget_refuses_before_hydration_without_advancing(self):
+        from recall_server import search_parent_reconciliation
+        self.ingest(1)
+        self.project()
+        self.writer.drain(tenant_id=self.tenant, max_months=2)
+        self.ingest(2)
+        self.project()
+        writer = self.restart_writer()
+        with patch.object(search_parent_reconciliation, 'MAX_METADATA_BYTES', 1):
+            with patch.object(writer, 'passages_by_id', wraps=writer.passages_by_id) as hydrate:
+                outcome = writer.drain_quantum(tenant_id=self.tenant, max_months=2)
+        self.assertEqual(outcome['failed'], 1)
+        hydrate.assert_not_called()
+        self.assertEqual(self.reconciliation_row()['page_checkpoint']['after'], -1)
+
+    def test_metadata_growth_after_presence_is_bounded_by_native_write_owner(self):
+        from recall_server import search_parent_reconciliation
+        self.ingest(1)
+        self.project()
+        self.writer.drain(tenant_id=self.tenant, max_months=2)
+        namespace = self.client.namespace(self.settings.namespace(self.tenant))
+        namespace.rows.clear()
+        self.ingest(2)
+        self.project()
+        query = namespace.query
+        def grow(**kwargs):
+            response = query(**kwargs)
+            with self.store.connect() as connection:
+                connection.execute('UPDATE canonical_passages SET header_redacted=%s WHERE tenant_id=%s',
+                    ('Synthetic metadata growth. '*2000, self.tenant))
+            return response
+        writes = len(namespace.writes)
+        with patch.object(search_parent_reconciliation, 'MAX_METADATA_BYTES', 8192), \
+                patch.object(namespace, 'query', side_effect=grow):
+            outcome = self.restart_writer().drain_quantum(tenant_id=self.tenant, max_months=2)
+        self.assertEqual(outcome['failed'], 1)
+        self.assertEqual(len(namespace.writes), writes)
+        self.assertEqual(self.reconciliation_row()['page_checkpoint']['after'], -1)
+
+    def test_metadata_byte_prefix_advances_across_restart(self):
+        from recall_server.passage_projection import PassagePolicy
+        self.passages.policy = PassagePolicy(8, 0)
+        text = ' '.join(f'segment{index}' for index in range(1100))
+        self.ingest(1, text=text)
+        self.project()
+        self.writer.drain(tenant_id=self.tenant, max_months=2)
+        ids = {row['passage_id'] for row in self.rows()}
+        self.assertGreaterEqual(len(ids), 128)
+        # Each native row fits8MiB; the first128 rows together do not.
+        with self.store.connect() as connection:
+            connection.execute('UPDATE canonical_passages SET header_redacted=%s WHERE tenant_id=%s',
+                ('Synthetic large header. '*3200, self.tenant))
+        self.ingest(2, text=text)
+        self.project()
+        namespace = self.client.namespace(self.settings.namespace(self.tenant))
+        namespace.rows.clear()
+        first = self.restart_writer(batch_rows=128).drain_quantum(tenant_id=self.tenant, max_months=2)
+        self.assertEqual(first['failed'], 0, 'feasible metadata prefix must make progress')
+        self.assertGreater(first['rows'], 0)
+        self.assertLess(first['rows'], 128)
+        self.assertEqual(self.reconciliation_row()['page_checkpoint']['after'], first['rows']-1)
+        writes = first['rows']
+        for _ in range(len(ids)):
+            outcome = self.restart_writer(batch_rows=128).drain_quantum(tenant_id=self.tenant, max_months=2)
+            self.assertEqual(outcome['failed'], 0)
+            writes += outcome['rows']
+            if self.reconciliation_row() is None:
+                break
+        self.assertIsNone(self.reconciliation_row())
+        self.assertEqual(set(namespace.rows), ids)
+        self.assertEqual(writes, len(ids), 'acknowledged prefixes must not be re-embedded')
+
+    def test_destination_change_restarts_parent_presence_pass(self):
+        self.ingest(1)
+        self.project()
+        self.writer.drain(tenant_id=self.tenant, max_months=2)
+        self.ingest(2)
+        self.project()
+        self.restart_writer().drain_quantum(tenant_id=self.tenant, max_months=2)
+        namespace = self.client.namespace(self.settings.namespace(self.tenant))
+        namespace.rows.clear()
+        writer = self.restart_writer()
+        writer.settings = TurbopufferSettings(api_key='synthetic-rotated-account')
+        outcome = writer.drain_quantum(tenant_id=self.tenant, max_months=2)
+        self.assertEqual(outcome['failed'], 0)
+        self.assertEqual(len(namespace.rows), 1)
+
     def test_metadata_revision_refreshes_retained_receipts_and_search(self):
         self.assertEqual(self.ingest(1)['inserted'], 1)
         self.project()

@@ -33,6 +33,72 @@ class CooperativePublication(ParentProgress):
         method = getattr(self.writer, 'drain_quantum', self.writer.drain)
         return method(tenant_id=self.tenant, max_months=2)
 
+    def test_hot_month_live_generator_finishes_without_prefix_rewrite(self):
+        with self.store.connect() as connection:
+            claim = next(row for row in self.writer.claim_months(connection,
+                tenant_id=self.tenant, limit=10) if row['source_id'] == self.sources['large'])
+        steps = self.writer._month_steps(claim)
+        for step in steps:
+            if 'retired' not in step:
+                with self.store.connect() as connection:
+                    enqueue_search_outbox(connection, tenant_id=self.tenant,
+                        source_id=claim['source_id'], months=[claim['month']], reason='logical-update')
+        namespace = self.client.namespace(self.settings.namespace(self.tenant))
+        large_ids = {key for key, row in namespace.rows.items()
+                     if row['source_id'] == self.sources['large']}
+        self.assertEqual(len(large_ids), 3)
+        before = sum(len(write.get('upsert_rows', [])) for write in namespace.writes)
+        self.writer.drain(tenant_id=self.tenant, max_months=10)
+        after = sum(len(write.get('upsert_rows', [])) for write in namespace.writes)
+        self.assertLessEqual(after-before, 1, 'only the separate small source may be new')
+
+    def test_hot_month_restart_repeats_acknowledged_first_page(self):
+        examined = []
+        for _ in range(3):
+            publisher = TurbopufferProjector(self.store, self.settings, client=self.client,
+                batch_rows=1, write_concurrency=1, tokens_per_minute=0)
+            with self.store.connect() as connection:
+                claim = next(row for row in publisher.claim_months(connection,
+                    tenant_id=self.tenant, limit=10) if row['source_id'] == self.sources['large'])
+            steps = publisher._month_steps(claim)
+            next(steps)
+            namespace = self.client.namespace(self.settings.namespace(self.tenant))
+            examined.append(namespace.writes[-1]['upsert_rows'][0]['id'])
+            with self.store.connect() as connection:
+                enqueue_search_outbox(connection, tenant_id=self.tenant,
+                    source_id=claim['source_id'], months=[claim['month']], reason='logical-update')
+            steps.close()
+        self.assertEqual(len(set(examined)), 1,
+            'characterize existing generation-scoped restart; do not assume durable cross-generation cursor')
+        large_ids = {key for key, row in namespace.rows.items()
+                     if row['source_id'] == self.sources['large']}
+        self.assertEqual(len(large_ids), 1)
+
+    def test_parent_reconciliation_error_cannot_starve_month_across_restarts(self):
+        from unittest.mock import patch
+        from recall_server import search_parent_reconciliation
+        from recall_server.search_parent_reconciliation import enqueue
+        with self.store.connect() as connection:
+            parent = connection.execute("SELECT * FROM canonical_passage_documents WHERE tenant_id=%s LIMIT 1",
+                (self.tenant,)).fetchone()
+            enqueue(connection, self.tenant, parent['source_id'], parent['logical_document_id'])
+        with patch.object(search_parent_reconciliation, 'step', side_effect=ValueError('synthetic read refusal')):
+            for _ in range(12):
+                self.writer = TurbopufferProjector(self.store, self.settings, client=self.client,
+                    batch_rows=1, write_concurrency=1, tokens_per_minute=0)
+                outcome = self.quantum()
+                self.assertEqual(outcome['failed'], 1)
+                self.assertGreaterEqual(outcome['pending'], 1)
+        namespace = self.client.namespace(self.settings.namespace(self.tenant))
+        self.assertEqual(len(namespace.rows), 4)
+        with self.store.connect() as connection:
+            self.assertEqual(connection.execute(
+                'SELECT count(*) AS count FROM search_projection_outbox WHERE tenant_id=%s',
+                (self.tenant,)).fetchone()['count'], 0)
+            self.assertEqual(connection.execute(
+                'SELECT count(*) AS count FROM search_parent_reconciliation WHERE tenant_id=%s',
+                (self.tenant,)).fetchone()['count'], 1)
+
     def test_fresh_logical_commit_resumes_before_giant_month_second_page(self):
         with self.store.connect() as c:
             insert_record(c, tenant=self.tenant, source=self.sources['small'], parent='fresh', native='fresh',
