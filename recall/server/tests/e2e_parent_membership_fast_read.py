@@ -494,9 +494,23 @@ class ParentMembershipFastReadTests(ParentEnrollmentTests):
         native.assert_not_called()
 
     def test_original_verifier_and_catalog_sql_are_unchanged(self):
+        import inspect
         from recall_server import receipt_membership, turbopuffer_retrieval
-        self.assertEqual(hashlib.sha256(Path(receipt_membership.__file__).read_bytes()).hexdigest(),
-            'ecdbee3fbb573c7acb631ab7f026468523c1cb516f6e2bdc47a8e7afcd267fb9')
+        # 095 adds exact archived historical membership. The current-search
+        # verifier and its receipt parser retain their original source bytes.
+        self.assertIn(hashlib.sha256(Path(receipt_membership.__file__).read_bytes()).hexdigest(), (
+            'ecdbee3fbb573c7acb631ab7f026468523c1cb516f6e2bdc47a8e7afcd267fb9',
+            '569c04110b0a7821179ff628f4a532c1dd53bfedf6ee532425e3552017ad7639',
+        ))
+        for function, expected in (
+            (receipt_membership.lookup_current_search_membership,
+             '39325d79f5c77b25e77decc430e9933dbbad4853822ba3444ec71ee52edf0f33'),
+            (receipt_membership._identity,
+             'a3a2faccc0f2fca2f3a5668cf0269e699b8e43e56f125554c3739b5eb961316e'),
+        ):
+            with self.subTest(function=function.__name__):
+                self.assertEqual(hashlib.sha256(inspect.getsource(function).encode()).hexdigest(),
+                                 expected)
         original_sha = '33cbb2194d20a5a75b67879de1d707910844d41be8c118e90e5de9712de6dac4'
         origin_sha = '7c2ef4b4d8629c8abb042b5de7940b271b133a5f8c7a743e188c816b9e530636'
         projection = '                                   passage.spans AS origin_spans,\n'
