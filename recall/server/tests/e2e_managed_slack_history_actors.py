@@ -189,7 +189,7 @@ class ManagedSlackHistoryActors(ManagedSlackIdentity):
         with self.store.connect() as c:
             self.assertEqual(c.execute('SELECT count(*) AS n FROM canonical_event_actors WHERE tenant_id=%s AND source_id=%s',(self.tenant,other)).fetchone()['n'],0)
 
-    def thin_history(self):
+    def thin_history(self, *, max_batches=1):
         from recall_server.canonical_thinning import thin_canonical_bodies
         self.project()
         # Model the existing durable-archive admission with the exact local
@@ -198,7 +198,7 @@ class ManagedSlackHistoryActors(ManagedSlackIdentity):
             c.execute("UPDATE raw_artifacts SET storage_backend='s3' WHERE tenant_id=%s",(self.tenant,))
             c.execute("UPDATE canonical_evidence_documents SET manifest_storage_backend='s3' WHERE tenant_id=%s",(self.tenant,))
         try:
-            report=thin_canonical_bodies(self.store,tenant_id=self.tenant,batch_size=10,max_batches=1)
+            report=thin_canonical_bodies(self.store,tenant_id=self.tenant,batch_size=10,max_batches=max_batches)
             self.assertGreater(report['events'],0)
         finally:
             with self.store.connect() as c:
