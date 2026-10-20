@@ -12,7 +12,11 @@ from typing import Iterable, Iterator
 
 import orjson
 
-from contracts.source_units import codex_tool_source_unit_role
+from contracts.source_units import (
+    codex_history_source_unit_index,
+    codex_tool_source_unit_role,
+    iter_codex_history_source_units,
+)
 
 from .actor_attribution import ActorLink, actor_links
 from .logical_evidence import LogicalEvidenceError, LogicalEvidenceRecord
@@ -226,9 +230,20 @@ def _tool_unit(source_unit: str | None) -> bool:
     )))
 
 
+def _pointed_unit(source_unit: str | None) -> bool:
+    return _tool_unit(source_unit) or codex_history_source_unit_index(source_unit) is not None
+
+
 def _ordered_messages(messages: tuple["PassageMessage", ...]) -> bool:
     for prior, following in zip(messages, messages[1:]):
         if following.record_ordinal >= prior.record_ordinal + prior.record_count:
+            continue
+        before = codex_history_source_unit_index(prior.source_unit)
+        after = codex_history_source_unit_index(following.source_unit)
+        if (before is not None and after is not None and before < after
+                and (prior.record_ordinal, prior.record_count, prior.occurred_at, prior.receipts)
+                == (following.record_ordinal, following.record_count,
+                    following.occurred_at, following.receipts)):
             continue
         # One explicitly resolved provider block can contain multiple leaf spans.
         if not (_tool_unit(prior.source_unit) and _tool_unit(following.source_unit)
@@ -281,7 +296,8 @@ class PassageMessage:
             or not isinstance(self.record_count, int)
             or self.record_count < 1
             or (self.source_unit is not None and self.source_unit not in COMPLETE_SOURCE_UNITS
-                and not _tool_unit(self.source_unit))
+                and not _tool_unit(self.source_unit)
+                and codex_history_source_unit_index(self.source_unit) is None)
             or actor_links(self.actor_links) != self.actor_links
         ):
             raise ValueError(
@@ -423,7 +439,7 @@ def _spans(tokens: list[_Token], messages: tuple[PassageMessage, ...]) -> tuple[
                 passage_byte_start=passage_offset,
                 passage_byte_end=passage_offset + span_size,
                 source_unit=(messages[message_index].source_unit
-                             if _tool_unit(messages[message_index].source_unit) else None),
+                             if _pointed_unit(messages[message_index].source_unit) else None),
                 origin=messages[message_index].origin,
             )
         )
@@ -438,7 +454,7 @@ def _reader_span_windows(tokens: list[_Token], messages: tuple[PassageMessage, .
     token overlap or discard leaves: each ordinary window is partitioned after
     tokenization. Legacy windows retain their byte-identical geometry.
     """
-    if not any(_tool_unit(messages[t.message_index].source_unit) for t in tokens):
+    if not any(_pointed_unit(messages[t.message_index].source_unit) for t in tokens):
         yield tokens
         return
     start = 0
@@ -464,7 +480,7 @@ def reconstruct_passage(
         try:
             message = messages[span.message_index]
             if (message.record_ordinal != span.record_ordinal
-                    or (_tool_unit(span.source_unit) and message.source_unit != span.source_unit)):
+                    or (_pointed_unit(span.source_unit) and message.source_unit != span.source_unit)):
                 raise ValueError("passage record pointer is stale")
             fragment = message.text.encode()[
                 span.source_byte_start:span.source_byte_end
@@ -676,7 +692,8 @@ def iter_passages(
             if not isinstance(message, PassageMessage):
                 raise ValueError("lossless passage message is invalid")
             message.validate()
-            if codex_tool_source_unit_role(message.source_unit) is not None and (
+            if (codex_tool_source_unit_role(message.source_unit) is not None
+                    or codex_history_source_unit_index(message.source_unit) is not None) and (
                 not source_id.startswith("codex:")
                 or any(not receipt.startswith("recall://" + source_id + "/") for receipt in message.receipts)
             ):
@@ -967,6 +984,28 @@ def iter_visible_messages(
     for group in _logical_record_groups(records, first_record_ordinal=first_record_ordinal):
         first = group[0]
         source_text = "".join(record.text for record in group)
+        if (first.event_kind == "transcript_record" and first.receipts
+                and not first.roles
+                and all(receipt.startswith("recall://codex:") for receipt in first.receipts)):
+            emitted_history = False
+            try:
+                for unit, text, provenance in iter_codex_history_source_units(source_text):
+                    origin = ({key: provenance[key] for key in
+                               ("message_id", "turn_id", "role", "text_sha256")}
+                              if "message_id" in provenance else None)
+                    message = PassageMessage(
+                        record_ordinal=first.ordinal, record_count=len(group),
+                        occurred_at=first.occurred_at, roles=(provenance["role"],),
+                        receipts=first.receipts, text=text, source_unit=unit, origin=origin,
+                    )
+                    message.validate()
+                    emitted_history = True
+                    yield message
+            except ValueError:
+                # A malformed or duplicate-key envelope remains raw evidence.
+                continue
+            if emitted_history:
+                continue
         dense_roles = first.roles
         if not dense_roles and (
             any(link.relation == "author" for link in first.actor_links)
