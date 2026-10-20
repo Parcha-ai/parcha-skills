@@ -1836,6 +1836,22 @@ cursor advances only after an acknowledged certificate batch. Interrupted proof
 can safely run again against current generation, bindings, live grants, and Forget.
 No archive hydration, embedding, or source publication repeats for this phase.
 
+Before deploying source-turn certification scheduling, run the existing migration
+owner with `085a_membership_remainder_concurrent.sql`. It builds the partial
+`canonical_passage_certification_source_idx` concurrently. Then run
+`operations/certification_source_index_readiness.sql` to verify its exact
+definition and ready/valid/live flags, even when the index already exists. An
+interrupted or mismatched same-name index refuses rollout acceptance and needs
+operator repair; successful migration or `IF NOT EXISTS` alone is not acceptance. This companion records no new
+schema version. An older worker can run with the index left in place.
+
+The worker's first allowance uses the existing durable oldest-first queue order,
+so a restart honors prior failure rotation. Later allowances start after the last
+source it actually attempted, wrapping only when no later source has pending
+work. Within a source it visits the oldest parent first. This process-local
+scheduling hint never advances an unattempted source or an acknowledged proof checkpoint.
+Explicit maintenance consumers keep their existing global oldest-first order.
+
 On schema 85 and later, a first or legacy publication without a generation also
 retains this queue row, with a null generation and an empty proof cursor. The
 consumer rotates the row in a short committed transaction, releases its queue
