@@ -134,10 +134,37 @@ def retain(connection, candidate, settings):
 
 
 def pending(
-    store, *, tenant_id, limit, deadline_at, logical_document_id=None, source_id=None
+    store, *, tenant_id, limit, deadline_at, logical_document_id=None, source_id=None,
+    after_source=None,
 ):
     # The reason exists on old schemas; no column lookup or archive hydration is
     # needed when no certification rows exist before migration085.
+    if after_source is not None:
+        where = """reason='certification' AND (%s::text IS NULL OR tenant_id=%s)
+            AND (%s::text IS NULL OR logical_document_id=%s)
+            AND (%s::text IS NULL OR source_id=%s)"""
+        params = (tenant_id, tenant_id, logical_document_id, logical_document_id,
+                  source_id, source_id)
+        order = "tenant_id,source_id,changed_at,logical_document_id"
+        with native._connect(store, deadline_at) as connection:
+            return native._query(
+                store, connection,
+                """WITH next AS MATERIALIZED (
+                    SELECT * FROM canonical_passage_projection_queue WHERE """ + where + """
+                      AND (tenant_id,source_id)>(%s::text,%s::text)
+                    ORDER BY """ + order + """ LIMIT %s
+                ), selected AS (
+                    SELECT * FROM next
+                    UNION ALL
+                    (SELECT * FROM canonical_passage_projection_queue WHERE """ + where + """
+                       AND NOT EXISTS(SELECT 1 FROM next)
+                     ORDER BY """ + order + """ LIMIT %s)
+                )
+                SELECT tenant_id,source_id,logical_document_id,generation,
+                       to_jsonb(selected)->'certification_checkpoint' AS checkpoint
+                  FROM selected ORDER BY """ + order,
+                (*params, *after_source, limit, *params, limit), deadline_at,
+            ).fetchall()
     with native._connect(store, deadline_at) as connection:
         return native._query(
             store,
