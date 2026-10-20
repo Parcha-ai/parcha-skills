@@ -626,5 +626,78 @@ class ScheduledThinning(unittest.TestCase):
         self.assertEqual(projection_totals()["bodies_thinned"], before)
 
 
+    def test_committed_wave_submits_and_collects_thinning_at_existing_cadence(self):
+        import threading
+        import time
+        from recall_server.projection_worker import BackgroundBodyThinner, run_projection_worker
+        from tests.central_brain.test_projection_worker import _Logical, _Passages
+
+        for suffix in ('first', 'second', 'third'):
+            self.insert(suffix)
+        owner, now, starts = self, [0.0], []
+        entered = [threading.Event(), threading.Event()]
+        release = [threading.Event(), threading.Event()]
+        thinner = CanonicalBodyThinner(self.store, tenant_id=self.tenant)
+
+        def prepare(busy):
+            owner.assertTrue(busy)
+
+            def work():
+                index = len(starts)
+                starts.append(now[0])
+                owner.assertLess(index, 2, 'overlapping or catch-up thinning call')
+                entered[index].set()
+                owner.assertTrue(release[index].wait(5), 'test did not release native work')
+                return thinner.thin(batch_size=1)
+
+            return work
+
+        with BackgroundBodyThinner(prepare, clock=lambda: now[0]) as scheduler:
+            class Logical(_Logical):
+                def project_pending(inner, **kwargs):
+                    # The native logical executor chooses this callback while
+                    # commits remain ready, without invoking its idle heartbeat.
+                    progress = kwargs['on_progress']
+                    for index, at in enumerate((0.0, 30.0)):
+                        now[0] = at
+                        progress()
+                        owner.assertTrue(entered[index].wait(1),
+                                         'committed wave did not submit thinning')
+                        for _ in range(3):
+                            progress()
+                        owner.assertEqual(len(starts), index + 1)
+                        release[index].set()
+                        deadline = time.monotonic() + 3
+                        while scheduler.completed_attempts < index + 1:
+                            owner.assertLess(time.monotonic(), deadline,
+                                             'committed wave did not collect thinning')
+                            progress()
+                            time.sleep(0.005)
+                        owner.assertEqual(owner.remaining(), 2 - index)
+                        if index == 0:
+                            now[0] = 29.999
+                            progress()
+                            owner.assertEqual(starts, [0.0])
+                    owner.assertEqual(scheduler.completed_attempts, 2)
+                    owner.assertEqual(scheduler.failed_attempts, 0)
+                    return super().project_pending(**kwargs)
+
+            try:
+                result = run_projection_worker(
+                    Logical([]), _Passages([]), tenant_id=self.tenant, once=True,
+                    logical_batch_size=5, passage_batch_size=5, embedding_batch_size=64,
+                    max_batches_per_cycle=1, upload_concurrency=1, passage_concurrency=1,
+                    interval_seconds=30, skip_embedding=True, background_thinner=scheduler,
+                    clock=lambda: now[0],
+                )
+            finally:
+                for event in release:
+                    event.set()
+        self.assertEqual(starts, [0.0, 30.0])
+        self.assertEqual(result['canonical_bodies_thinned'], 2)
+        self.assertEqual(self.remaining(), 1)
+
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

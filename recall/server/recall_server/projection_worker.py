@@ -631,6 +631,7 @@ def run_projection_worker(
             def publish_progress():
                 # Frequent completions can prevent the idle heartbeat entirely.
                 maintain_retirement(True)
+                maintain_thinning(True)
                 publish_ready()
                 service_due_parquet()
 
