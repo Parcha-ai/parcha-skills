@@ -183,6 +183,23 @@ class NoWorkPrefix(SingletonMetadataAdmission):
         self.assertEqual(result['completed_noop_parents'], 0)
         self.assertEqual(self.ledger()['last_record_ordinal'], -1)
 
+    def test_locked_physical_tail_does_not_block_admitted_prefix(self):
+        self.append_after_retired_prefix()
+        with self.store.connect() as c, c.transaction():
+            tail = c.execute('''SELECT document_id FROM canonical_documents
+                WHERE tenant_id=%s AND source_id=%s AND native_id='turn/zz-tail'
+                  AND is_current FOR UPDATE NOWAIT''', (self.tenant, self.source)).fetchone()
+            self.assertIsNotNone(tail)
+            with patch.object(self.archive, 'read_raw',
+                              side_effect=AssertionError('admitted prefix reopened')):
+                result = self.run_parent(1)
+        self.assertFalse(result['commit_outcome_unknown'])
+        self.assertEqual(result['errors'], {})
+        self.assertEqual(result['cleared_documents'], 0)
+        self.assertEqual(result['completed_parent_proofs'], 0)
+        self.assertEqual(self.ledger()['last_record_ordinal'], 0)
+        self.assertEqual(self.ledger()['status'], 'partial')
+
     def test_append_between_no_work_check_and_cursor_write_refuses(self):
         self.drain()
         execute = self.store._execute_bounded
