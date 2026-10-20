@@ -11,8 +11,9 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY connectors/requirements.txt /opt/recall/requirements.txt
+COPY collector/requirements.txt /opt/recall/collector-requirements.txt
 RUN python -m pip install --no-cache-dir --disable-pip-version-check --no-compile \
-      -r requirements.txt
+      --only-binary=backports.zstd -r requirements.txt -r collector-requirements.txt
 
 COPY --chown=10001:10001 connectors /opt/recall/connectors
 COPY --chown=10001:10001 client /opt/recall/client
@@ -21,6 +22,7 @@ COPY --chown=10001:10001 privacy /opt/recall/privacy
 COPY --chown=10001:10001 contracts /opt/recall/contracts
 COPY --chown=10001:10001 scripts/install_gws.py /opt/recall/scripts/install_gws.py
 COPY --chown=10001:10001 skills/recall/scripts/codex_identity.py /opt/recall/skills/recall/scripts/codex_identity.py
+COPY --chown=10001:10001 skills/recall/scripts/codex_rollout.py /opt/recall/skills/recall/scripts/codex_rollout.py
 
 RUN python /opt/recall/scripts/install_gws.py \
       --target x86_64-unknown-linux-gnu \
