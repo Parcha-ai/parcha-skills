@@ -263,6 +263,8 @@ class FakeConnection:
 
     def execute(self, sql: str, params: Any = None) -> FakeResult:
         self.statements.append(("SQL", sql, params))
+        if sql == "SELECT to_regclass('public.search_parent_reconciliation') IS NOT NULL AS ready":
+            return FakeResult([{"ready": False}])
         if "FROM canonical_passage_projection_queue" in sql and "SELECT" in sql:
             return FakeResult([
                 {

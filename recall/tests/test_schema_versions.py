@@ -74,7 +74,7 @@ class ExpectedSchemaVersionsTests(unittest.TestCase):
                     self.versions(latest, native_file)
 
     def test_unknown_latest_is_not_implicitly_allowed(self):
-        for latest in (69, 94):
+        for latest in (69, 95):
             with self.subTest(latest=latest):
                 with self.assertRaisesRegex(AssertionError, "unreviewed latest"):
                     self.versions(latest, False)
@@ -98,3 +98,7 @@ class ExpectedSchemaVersionsTests(unittest.TestCase):
     def test_codex_text_block_storage_is_explicitly_supported(self):
         self.assertEqual(self.versions(93, False), [*range(1, 71), *range(72, 94)])
         self.assertEqual(self.versions(93, True), list(range(1, 94)))
+
+    def test_parent_reconciliation_is_explicitly_supported(self):
+        self.assertEqual(self.versions(94, False), [*range(1, 71), *range(72, 95)])
+        self.assertEqual(self.versions(94, True), list(range(1, 95)))
