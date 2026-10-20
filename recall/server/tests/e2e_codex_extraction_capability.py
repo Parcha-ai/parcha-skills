@@ -58,6 +58,8 @@ def scenario(admin_dsn, root, retired):
                 connection.execute(sql.SQL("ALTER TABLE canonical_passage_documents DROP CONSTRAINT {}, ADD CONSTRAINT {} CHECK ({} IN ('legacy','tool_groups_v1'))").format(
                     sql.Identifier('canonical_passage_documents_'+field+'_check'),
                     sql.Identifier('canonical_passage_documents_'+field+'_check'),sql.Identifier(field)))
+            # Recreate the optional table with its marker on the later full migrate.
+            connection.execute('DROP TABLE search_parent_reconciliation')
             connection.execute('DELETE FROM schema_migrations WHERE version>=90')
         tenant, source, _, projection, _, _ = original.fixture(store, root, count=2)
         with store.connect() as connection:
