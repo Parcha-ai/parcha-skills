@@ -2199,6 +2199,10 @@ class CanonicalPassageProjector:
                         extraction["source_document_sha256"] == candidate.source_document_sha256
                         and (diff.to_insert or diff.to_delete or diff.moved or metadata_changed)),
                 )
+                if retained_ids:
+                    from .search_parent_reconciliation import enqueue
+                    enqueue(connection, candidate.tenant_id, candidate.source_id,
+                            candidate.logical_document_id)
                 # H3-a: the search outbox sees only what this commit changed.
                 # Deleted rows become tombstones; every month an inserted or
                 # deleted passage touched is queued for the Lance writer.
