@@ -1074,27 +1074,26 @@ class CanonicalParquetScanProjector:
                           pointer.policy_fingerprint AS passage_policy_fingerprint,
                           pointer.source_document_sha256 AS passage_source_sha256,
                           pointer.passage_count,
-                          coalesce(attributed.links,'[]'::jsonb) AS actor_links
+                          coalesce(jsonb_agg(jsonb_build_object(
+                              'actor_id',link.actor_id,
+                              'display_name',actor.display_name,
+                              'relation',link.relation
+                          ) ORDER BY link.actor_id,link.relation)
+                          FILTER (WHERE link.actor_id IS NOT NULL),
+                          '[]'::jsonb) AS actor_links
                      FROM canonical_evidence_documents document
                      LEFT JOIN canonical_passage_documents pointer
                        ON pointer.tenant_id=document.tenant_id
                       AND pointer.source_id=document.source_id
                       AND pointer.logical_document_id=document.logical_document_id
-                     LEFT JOIN LATERAL (
-                          SELECT jsonb_agg(jsonb_build_object(
-                                     'actor_id',link.actor_id,
-                                     'display_name',actor.display_name,
-                                     'relation',link.relation
-                                 ) ORDER BY link.actor_id,link.relation) AS links
-                            FROM canonical_evidence_document_actors link
-                            JOIN brain_actors actor
-                              ON actor.tenant_id=link.tenant_id
-                             AND actor.actor_id=link.actor_id
-                           WHERE link.tenant_id=document.tenant_id
-                             AND link.source_id=document.source_id
-                             AND link.logical_document_id=
-                                 document.logical_document_id
-                     ) attributed ON true
+                     LEFT JOIN (
+                          canonical_evidence_document_actors link
+                          JOIN brain_actors actor
+                            ON actor.tenant_id=link.tenant_id
+                           AND actor.actor_id=link.actor_id
+                     ) ON link.tenant_id=document.tenant_id
+                      AND link.source_id=document.source_id
+                      AND link.logical_document_id=document.logical_document_id
                     WHERE document.tenant_id=%s AND document.source_id=%s
                       AND document.last_occurred_at >= %s
                       AND document.first_occurred_at < %s
@@ -1107,7 +1106,9 @@ class CanonicalParquetScanProjector:
                       )
                     """
                 + (" AND document.logical_document_id=ANY(%s)" if document_ids is not None else "")
-                + " ORDER BY document.logical_document_id",
+                + """ GROUP BY document.tenant_id,document.source_id,document.logical_document_id,
+                              pointer.tenant_id,pointer.source_id,pointer.logical_document_id
+                      ORDER BY document.logical_document_id""",
                 (
                     candidate.tenant_id,
                     candidate.source_id,
