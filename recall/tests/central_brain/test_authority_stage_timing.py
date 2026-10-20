@@ -67,7 +67,7 @@ class AuthorityStageTimingTests(unittest.TestCase):
             clock[0] += .05
             return {(row['source_id'], receipt) for receipt in kwargs['receipts']}
 
-        store.connect, store._execute_bounded = connect, execute
+        store.connect, store._execute_bounded_pipeline = connect, execute
         with patch('recall_server.turbopuffer_retrieval.time.monotonic', side_effect=lambda: clock[0]), \
                 patch('recall_server.receipt_membership.lookup_current_search_membership', side_effect=membership):
             diagnostics = retrieval._authorize_ranges(results, legs, deadline_at=100.0)
@@ -124,7 +124,7 @@ class AuthorityStageTimingTests(unittest.TestCase):
                         raise RuntimeError('private-membership-error')
                     return {(row['source_id'], receipt) for receipt in row['receipts']}
 
-                store.connect, store._execute_bounded = connect, execute
+                store.connect, store._execute_bounded_pipeline = connect, execute
                 with patch('recall_server.receipt_membership.lookup_current_search_membership', side_effect=membership):
                     diagnostics = retrieval._hydrate_ranges(results, legs, deadline_at=time.monotonic()+5)
                 self.assertEqual(diagnostics['authority_status'],

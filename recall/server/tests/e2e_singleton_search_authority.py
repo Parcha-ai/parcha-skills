@@ -223,7 +223,7 @@ class SingletonSearchTests(fixtures.ReceiptMembershipTests):
         self.prepare_search()
         document = self.baseline(self.receipt)
         self.admit_fixture(document['document_id'])
-        execute = self.store._execute_bounded
+        execute = self.store._execute_bounded_pipeline
         observed = []
         def delete_after_catalog(connection, statement, values, deadline):
             result = execute(connection, statement, values, deadline)
@@ -234,7 +234,7 @@ class SingletonSearchTests(fixtures.ReceiptMembershipTests):
                                   (self.tenant, document['document_id']))
             return result
         with patch.object(self.store, 'verified_singleton_receipts', True):
-            with patch.object(self.store, '_execute_bounded', delete_after_catalog):
+            with patch.object(self.store, '_execute_bounded_pipeline', delete_after_catalog):
                 result = self.search()
             self.assertTrue(result['results'])
             self.assertEqual(observed, [dict(isolation='repeatable read', readonly='on')])
