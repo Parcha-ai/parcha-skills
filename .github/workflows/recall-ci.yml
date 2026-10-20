@@ -232,6 +232,7 @@ jobs:
             e2e_managed_slack_identity.py \
             e2e_managed_slack_history_actors.py \
             e2e_managed_slack_captured_actors.py \
+            e2e_slack_thinned_document_attribution.py \
             e2e_slack_contact_skip_boundary.py \
             e2e_workspace_rail.py \
             e2e_retrieval_eval.py \
