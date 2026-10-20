@@ -228,7 +228,7 @@ class _ReadOnlyStore:
 
     def __getattr__(self, name):
         value = getattr(self._store, name)
-        if callable(value) and name != "_execute_bounded":
+        if callable(value) and name not in ("_execute_bounded", "_execute_bounded_pipeline"):
             raise AttributeError(name)
         return value
 
