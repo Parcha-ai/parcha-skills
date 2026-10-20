@@ -275,6 +275,57 @@ class PreparedPassageDocument:
 _LEGACY_PASSAGES = """SELECT passage_id,ordinal,revision,text_sha256,receipts,spans
     FROM canonical_passages WHERE tenant_id=%s AND source_id=%s
       AND logical_document_id=%s ORDER BY ordinal"""
+
+# Scheduling only: epoch 5 changes only the v4 resolver-refusal branch. Keep the
+# old checkpoint; an actual source update still uses the unchanged append proof.
+_CODEX_BACKFILL_CURRENT = """
+    (projected.append_checkpoint->'version'=to_jsonb(%s::integer)
+     OR (%s::integer=5 AND projected.append_checkpoint->'version'='4'::jsonb
+         AND projected.applied_extraction_version='codex_tool_groups_v1'
+         AND projected.source_document_sha256=evidence.document_content_sha256
+         AND projected.append_checkpoint->'revision'=to_jsonb(evidence.revision)
+         AND projected.append_checkpoint->>'source_document_sha256'=evidence.document_content_sha256
+         AND projected.append_checkpoint->>'manifest_sha256'=evidence.manifest_content_sha256
+         AND NOT EXISTS (SELECT 1 FROM canonical_evidence_document_queue pending
+             WHERE pending.tenant_id=evidence.tenant_id AND pending.source_id=evidence.source_id
+               AND pending.native_parent_id=evidence.native_parent_id)
+         AND projected.append_checkpoint->'tool_groups'->'version'='1'::jsonb
+         AND projected.append_checkpoint->'tool_groups'->>'extraction_version'='codex_tool_groups_v1'
+         AND projected.append_checkpoint->'tool_groups'->'record_count'=to_jsonb(evidence.record_count)
+         AND projected.append_checkpoint->'tool_groups'->'coverage'=projected.extraction_coverage
+         AND projected.append_checkpoint->'tool_groups'->'messages'=
+             projected.extraction_coverage->'included_string_leaves'
+         AND projected.extraction_coverage->>'contract'='recall.codex-tool-event-projection.v1'
+         AND projected.extraction_coverage ?& ARRAY['contract','events','tool_blocks','groups',
+             'string_leaves','included_string_leaves','dispositions']
+         AND CASE WHEN jsonb_typeof(projected.extraction_coverage)='object'
+             THEN projected.extraction_coverage - ARRAY['contract','events','tool_blocks','groups',
+                 'string_leaves','included_string_leaves','dispositions']
+             END='{}'::jsonb
+         AND NOT EXISTS (
+             SELECT 1 FROM jsonb_each(CASE
+                 WHEN jsonb_typeof(projected.extraction_coverage)='object'
+                 THEN projected.extraction_coverage ELSE '{}'::jsonb END) counter
+             WHERE counter.key NOT IN ('contract','dispositions')
+               AND (jsonb_typeof(counter.value)<>'number' OR counter.value::text !~ '^(0|[1-9][0-9]*)$'))
+         AND projected.extraction_coverage->'events'<=to_jsonb(evidence.record_count)
+         AND projected.extraction_coverage->'events'>'0'::jsonb
+         AND projected.extraction_coverage->'tool_blocks'<=projected.extraction_coverage->'events'
+         AND projected.extraction_coverage->'string_leaves'<=projected.extraction_coverage->'tool_blocks'
+         AND projected.extraction_coverage->'included_string_leaves'<=projected.extraction_coverage->'string_leaves'
+         AND projected.extraction_coverage->'groups'=projected.extraction_coverage->'included_string_leaves'
+         AND jsonb_typeof(projected.extraction_coverage->'dispositions')='object'
+         AND NOT EXISTS (
+             SELECT 1 FROM jsonb_each(CASE
+                 WHEN jsonb_typeof(projected.extraction_coverage->'dispositions')='object'
+                 THEN projected.extraction_coverage->'dispositions' ELSE '{}'::jsonb END) disposition
+             WHERE disposition.key NOT IN ('invalid_json','unsupported_provider_event',
+                 'source_unit_refused','provider_role_or_receipts_mismatch','empty_string','no_token_content')
+                OR jsonb_typeof(disposition.value)<>'number'
+                OR disposition.value::text !~ '^(0|[1-9][0-9]*)$')
+         AND coalesce(projected.extraction_coverage->'dispositions'->'source_unit_refused',
+                      '0'::jsonb)='0'::jsonb))
+"""
 _MIGRATION_FIELDS = ('revision', 'source_document_sha256', 'policy_fingerprint',
                      'requested_extraction_version', 'applied_extraction_version')
 
@@ -1001,7 +1052,7 @@ class CanonicalPassageProjector:
         tenant_id = self._tenant(tenant_id)
         with self.store.connect() as connection:
             result = connection.execute(
-                """INSERT INTO canonical_passage_projection_queue(
+                f"""INSERT INTO canonical_passage_projection_queue(
                        tenant_id,source_id,logical_document_id,revision,
                        generation,reason,changed_at
                    )
@@ -1020,7 +1071,7 @@ class CanonicalPassageProjector:
                       AND (evidence.source_id NOT LIKE 'claude:%%'
                            OR projected.append_checkpoint->'version'=to_jsonb(%s::integer))
                       AND (evidence.source_id NOT LIKE 'codex:%%'
-                           OR projected.append_checkpoint->'version'=to_jsonb(%s::integer))
+                           OR {_CODEX_BACKFILL_CURRENT})
                    WHERE (%s::text IS NULL OR evidence.tenant_id=%s)
                       AND projected.logical_document_id IS NULL
                    ON CONFLICT(tenant_id,source_id,logical_document_id)
@@ -1029,6 +1080,7 @@ class CanonicalPassageProjector:
                        reason='backfill',changed_at=clock_timestamp()
                    WHERE canonical_passage_projection_queue.reason='certification'""",
                 (self.policy.fingerprint, passage_append.CHECKPOINT_VERSION,
+                 passage_append.CODEX_CHECKPOINT_VERSION,
                  passage_append.CODEX_CHECKPOINT_VERSION, tenant_id, tenant_id),
             )
         return max(0, result.rowcount)
@@ -1060,33 +1112,34 @@ class CanonicalPassageProjector:
         with self.store.connect(timeout=max(0.001, deadline_at - time.monotonic())) as connection:
             rows = self.store._execute_bounded(
                 connection,
-                """WITH page AS MATERIALIZED (
-                    SELECT tenant_id,source_id,logical_document_id,revision
+                f"""WITH page AS MATERIALIZED (
+                    SELECT tenant_id,source_id,logical_document_id,revision,
+                           document_content_sha256,manifest_content_sha256,record_count,native_parent_id
                     FROM canonical_evidence_documents
                     WHERE tenant_id=%s AND source_id=%s
                       AND logical_document_id>%s
                       AND logical_document_id<=%s
                     ORDER BY logical_document_id LIMIT %s
                 ), eligible AS MATERIALIZED (
-                    SELECT page.*,
+                    SELECT evidence.*,
                            projected.logical_document_id IS NOT NULL AS current,
                            coalesce(queue.reason<>'certification',false) AS conflict
-                    FROM page
+                    FROM page evidence
                     LEFT JOIN canonical_passage_documents projected
-                      ON projected.tenant_id=page.tenant_id
-                     AND projected.source_id=page.source_id
-                     AND projected.logical_document_id=page.logical_document_id
-                     AND projected.revision=page.revision
+                      ON projected.tenant_id=evidence.tenant_id
+                     AND projected.source_id=evidence.source_id
+                     AND projected.logical_document_id=evidence.logical_document_id
+                     AND projected.revision=evidence.revision
                      AND projected.policy_fingerprint=%s
                      AND projected.requested_extraction_version=projected.applied_extraction_version
-                     AND (page.source_id NOT LIKE 'claude:%%'
+                     AND (evidence.source_id NOT LIKE 'claude:%%'
                           OR projected.append_checkpoint->'version'=to_jsonb(%s::integer))
-                     AND (page.source_id NOT LIKE 'codex:%%'
-                          OR projected.append_checkpoint->'version'=to_jsonb(%s::integer))
+                     AND (evidence.source_id NOT LIKE 'codex:%%'
+                          OR {_CODEX_BACKFILL_CURRENT})
                     LEFT JOIN canonical_passage_projection_queue queue
-                      ON queue.tenant_id=page.tenant_id
-                     AND queue.source_id=page.source_id
-                     AND queue.logical_document_id=page.logical_document_id
+                      ON queue.tenant_id=evidence.tenant_id
+                     AND queue.source_id=evidence.source_id
+                     AND queue.logical_document_id=evidence.logical_document_id
                 ), costs AS MATERIALIZED (
                     SELECT eligible.*,parts.source_bytes
                     FROM eligible
@@ -1133,6 +1186,7 @@ class CanonicalPassageProjector:
                 ORDER BY budgeted.logical_document_id""",
                 (tenant_id, source_id, after or "", upper, limit,
                  self.policy.fingerprint, passage_append.CHECKPOINT_VERSION,
+                 passage_append.CODEX_CHECKPOINT_VERSION,
                  passage_append.CODEX_CHECKPOINT_VERSION,
                  max_source_bytes, max_source_bytes, max_source_bytes,
                  max_source_bytes, max_source_bytes),

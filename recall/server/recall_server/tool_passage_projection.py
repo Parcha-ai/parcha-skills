@@ -22,7 +22,8 @@ def tool_evidence_context(spans) -> str:
         unit = span.get('source_unit') if isinstance(span, dict) else span.source_unit
         if isinstance(unit, str) and unit.startswith(('claude.tool-input.string.v1#', 'codex.tool-input.string.v1#')):
             kinds.add('tool_input')
-        elif isinstance(unit, str) and unit.startswith(('claude.tool-result.string.v1#', 'codex.tool-result.string.v1#')):
+        elif isinstance(unit, str) and unit.startswith(('claude.tool-result.string.v1#',
+                'codex.tool-result.string.v1#', 'codex.tool-result.block-text.v1#')):
             kinds.add('tool_result')
     if not kinds:
         return ''
@@ -216,29 +217,51 @@ def extract_codex_tool_event_groups(
         unit = f'codex.tool-{kind}.string.v1#/payload/{field}'
         try:
             text, evidence_kind, provenance = resolve_codex_tool_source_unit(raw, unit)
+            resolved = [(unit, text, evidence_kind, provenance)]
         except (ValueError, RecursionError):
-            dispositions['source_unit_refused'] += 1
-            continue
-        role = provenance['role']
+            # Keep successful whole-output coordinates unchanged. Mixed custom
+            # outputs use the additive contract for each exact text leaf.
+            resolved = []
+            refused = 0
+            if form == 'custom_tool_call_output' and isinstance(payload.get('output'), list):
+                for index, block in enumerate(payload['output']):
+                    if not isinstance(block, dict) or block.get('type') != 'input_text':
+                        refused += 1
+                        continue
+                    block_unit = f'codex.tool-result.block-text.v1#/payload/output/{index}/text'
+                    try:
+                        text, evidence_kind, provenance = resolve_codex_tool_source_unit(raw, block_unit)
+                        resolved.append((block_unit, text, evidence_kind, provenance))
+                    except (ValueError, RecursionError):
+                        refused += 1
+            if not resolved:
+                dispositions['source_unit_refused'] += 1
+                continue
+            dispositions['unsupported_output_block'] += refused
+        role = resolved[0][3]['role']
         if first.roles not in ((), (role,)) or not first.receipts:
             dispositions['provider_role_or_receipts_mismatch'] += 1
             continue
-        leaves += 1
-        if not text or not text.strip():
-            dispositions['empty_string' if not text else 'no_token_content'] += 1
-            continue
-        origin = dict(evidence_kind=evidence_kind, provider_role=role,
-                      enclosing_pointer='/payload', semantic_role='unknown',
-                      source_tool=provenance)
-        message = PassageMessage(record_ordinal=first.ordinal,
-            record_count=len(records_group), occurred_at=first.occurred_at,
-            roles=(role,), receipts=first.receipts, text=text,
-            actor_links=first.actor_links, source_unit=unit, origin=origin)
-        message.validate()
-        output.append(ToolEventGroup((message,), raw, '/payload', evidence_kind,
-                                     role, provenance.get('call_id')))
+        messages = []
+        for unit, text, evidence_kind, provenance in resolved:
+            leaves += 1
+            if not text or not text.strip():
+                dispositions['empty_string' if not text else 'no_token_content'] += 1
+                continue
+            origin = dict(evidence_kind=evidence_kind, provider_role=role,
+                          enclosing_pointer='/payload', semantic_role='unknown',
+                          source_tool=provenance)
+            message = PassageMessage(record_ordinal=first.ordinal,
+                record_count=len(records_group), occurred_at=first.occurred_at,
+                roles=(role,), receipts=first.receipts, text=text,
+                actor_links=first.actor_links, source_unit=unit, origin=origin)
+            message.validate()
+            messages.append(message)
+        if messages:
+            output.append(ToolEventGroup(tuple(messages), raw, '/payload', evidence_kind,
+                                         role, provenance.get('call_id')))
     coverage = dict(contract='recall.codex-tool-event-projection.v1', events=events,
                     tool_blocks=blocks, groups=len(output), string_leaves=leaves,
-                    included_string_leaves=len(output),
+                    included_string_leaves=sum(len(group.messages) for group in output),
                     dispositions=dict(sorted(dispositions.items())))
     return tuple(output), coverage

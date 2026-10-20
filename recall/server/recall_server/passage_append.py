@@ -12,9 +12,9 @@ from .passage_projection import COMPLETE_SOURCE_UNITS, build_passages, passage_i
 # Version 3 includes Claude request-replay tool leaves and single-owner handbacks,
 # both introduced after version 2. Other source extraction remains compatible.
 CHECKPOINT_VERSION = 3
-# Codex's typed output lists were previously raw-only. Other source contracts
-# retain their existing epoch; no unrelated Claude rebuild is required.
-CODEX_CHECKPOINT_VERSION = 4
+# Codex epoch 5 adds exact text leaves from mixed text/image output lists.
+# Other source contracts retain their existing epoch.
+CODEX_CHECKPOINT_VERSION = 5
 
 
 def checkpoint_version(source_id):
