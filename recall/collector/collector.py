@@ -776,27 +776,28 @@ class Collector:
             candidates = [item for item in candidates if item not in segments]
             try:
                 selected_segments = self._codex_segments(segments)
-            except CollectorRuntimeError:
+                divergent = False
+                if len(candidates) > 1:
+                    duplicate_sessions += 1
+                    self.db.executemany(
+                        "UPDATE codex_session_locations SET last_scan_id=? WHERE path=?",
+                        [
+                            (scan_id, item["path_text"])
+                            for item in candidates
+                            if item["cached_current"]
+                        ],
+                    )
+                    divergent = len({
+                        self._content_digest(item["path"])
+                        for item in candidates
+                    }) > 1
+            except (CollectorRuntimeError, DecodedSourceInvalid):
+                # No physical copy may win when equivalence cannot be proved.
                 conflicts += 1
                 self.db.execute("UPDATE codex_session_locations SET status='identity_conflict' "
                                 "WHERE session_id=? AND last_scan_id=?", (session_id, scan_id))
                 self._protect_codex_session(session_id, scan_id)
                 continue
-            divergent = False
-            if len(candidates) > 1:
-                duplicate_sessions += 1
-                self.db.executemany(
-                    "UPDATE codex_session_locations SET last_scan_id=? WHERE path=?",
-                    [
-                        (scan_id, item["path_text"])
-                        for item in candidates
-                        if item["cached_current"]
-                    ],
-                )
-                divergent = len({
-                    self._content_digest(item["path"])
-                    for item in candidates
-                }) > 1
             session = self.db.execute(
                 "SELECT * FROM codex_sessions WHERE session_id=?",
                 (session_id,),

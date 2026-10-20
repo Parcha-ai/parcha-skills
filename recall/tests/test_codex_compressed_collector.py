@@ -262,6 +262,53 @@ class CompressedCollectorTest(unittest.TestCase):
             "SELECT * FROM files WHERE path=?", (str(bad),),
         ).fetchone()), checkpoint)
 
+    def test_corrupt_duplicate_group_retains_history_and_allows_other_session(self):
+        plain = self.active / f"rollout-{SESSION}.jsonl"
+        plain.write_bytes(zstd.decompress(FIXTURE.read_bytes()))
+        collector = self.collector()
+        self.addCleanup(collector.close)
+        self.assertEqual(collector.scan()["records_queued"], 2)
+        self.assertEqual(collector.flush()["acked"], 2)
+        prefix = self._rows(collector)
+        corrupt = self.archived / (plain.name + ".zst")
+        corrupt.write_bytes(zstd.compress(plain.read_bytes() + b"{}\n" * 50_000) + b"bad")
+        other_id = "019f9999-2222-7333-8444-555555555555"
+        fixture._rollout(self.active / f"rollout-{other_id}.jsonl", other_id)
+        result = collector.scan()
+        self.assertEqual(result["identity_conflicts"], 1)
+        self.assertEqual(result["records_queued"], 2)
+        self.assertEqual(result["tombstones_queued"], 0)
+        self.assertEqual(collector.flush()["acked"], 2)
+        self.assertTrue(set(prefix) <= set(self._rows(collector)))
+        self.assertEqual(len(self._rows(collector)), 4)
+
+    def test_corrupt_segment_duplicate_protects_segment_and_allows_other_session(self):
+        segment_id = "019f6666-7777-7888-8999-aaaaaaaaaaaa"
+        plain = self.active / f"rollout-2026-08-11T00-00-00-{SESSION}_{segment_id}.jsonl"
+        plain.write_text(
+            fixture._line({"type": "session_meta", "payload": {
+                "id": SESSION, "session_id": SESSION, "history_mode": "paginated",
+                "history_base": {"thread_id": SESSION, "end_ordinal_exclusive": 2, "end_byte_offset": 255},
+            }})
+            + fixture._line({"type": "response_item", "payload": {"type": "message", "marker": "segment"}}),
+        )
+        collector = self.collector()
+        self.addCleanup(collector.close)
+        self.assertEqual(collector.scan()["records_queued"], 2)
+        self.assertEqual(collector.flush()["acked"], 2)
+        prefix = self._rows(collector)
+        corrupt = self.archived / (plain.name + ".zst")
+        corrupt.write_bytes(zstd.compress(plain.read_bytes() + b"{}\n" * 50_000) + b"bad")
+        other_id = "019f9999-2222-7333-8444-555555555555"
+        fixture._rollout(self.active / f"rollout-{other_id}.jsonl", other_id)
+        result = collector.scan()
+        self.assertEqual(result["identity_conflicts"], 1)
+        self.assertEqual(result["records_queued"], 2)
+        self.assertEqual(result["tombstones_queued"], 0)
+        self.assertEqual(collector.flush()["acked"], 2)
+        self.assertTrue(set(prefix) <= set(self._rows(collector)))
+        self.assertEqual(len(self._rows(collector)), 4)
+
     def test_flush_failure_clears_scan_decode_deadline(self):
         collector = self.collector(brain_writer=object(), archive=object(), tenant_id="tenant:test")
         self.addCleanup(collector.close)
