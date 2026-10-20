@@ -24,7 +24,23 @@ for a full rebuild through the existing ordinary or bounded seed owner. Old epoc
 Successful old passages remain identical, and unsupported-only parents terminate
 without an invented reusable prefix. Claude and other source epochs are unchanged.
 
-Epoch 5 does not enroll a legacy document in typed extraction. Such documents
-still need the existing guarded `request_extraction_version` operation. Campaigns
-must retain that distinction and use finite admission/ACK batches; shipping this
-code alone does not prove corpus repair or publication.
+Epoch 5 alone does not enroll a legacy document in typed extraction. The ordinary
+projection worker now requests those upgrades through the same locked transaction
+as `request_extraction_version`. Its internal scope is tenant-bound and requires
+the source's current owner grant; the public API still requires its caller's
+authority and exact document pins. Revision/hash drift or pending Forget refuses
+the request. Requested/applied versions and the existing queue preserve progress
+across restarts.
+
+At most once per 30 seconds, admission gets a three-second metadata allowance.
+It rotates source turns and fills only the observed headroom below the configured
+passage batch size, counting existing non-certification queue entries. Concurrent
+external producers can change that depth. Admission never reads source bodies or
+excludes a parent by byte size; the existing part reader and disk-backed publisher
+own preparation. Large parents remain owed, and a parent-count bound is not a
+bound on downstream archive or passage bytes.
+
+Admission failure yields until a later turn without stopping ordinary publication.
+A lost ACK stops that admission attempt; durable requested mode prevents the next
+turn from blindly enqueueing it again. Shipping this code alone does not establish
+corpus repair, vendor publication, source completeness or net queue drain.
