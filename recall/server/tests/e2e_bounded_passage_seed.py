@@ -251,7 +251,7 @@ class BoundedPassageSeed(LegacyToolMigration):
                 FROM canonical_passage_documents WHERE tenant_id=%s""",
                 (self.tenant,),
             ).fetchall()
-        self.assertEqual(versions, [{"version": "4"}, {"version": "4"}])
+        self.assertEqual(versions, [{"version": str(passage_append.CODEX_CHECKPOINT_VERSION)}] * 2)
         self.assertEqual(self.passages.seed_backfill(tenant_id=self.tenant), 0)
         self.assertEqual(
             [row["disposition"] for row in self.page(upper=keys[-1])["rows"]],
