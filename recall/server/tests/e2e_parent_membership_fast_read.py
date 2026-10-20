@@ -372,7 +372,8 @@ class ParentMembershipFastReadTests(ParentEnrollmentTests):
             optional_query_rows=[len(x) for x in optional], optional_execute_ms=timings,
             catalog_ms=stages['catalog_ms'], native_receipts=stages['native_receipts'],
             certified=stages['parent_membership_read']['certified_passages'])))
-        self.assertEqual(after, before)
+        # Private authority SQL is unordered; compare every field and duplicate.
+        self.assertCountEqual(after, before)
         self.assertEqual(native.call_count, 1)
         self.assertEqual(set(native.call_args.kwargs['receipts']), {self.receipt, self.physical_receipt})
         self.assertEqual(stages['parent_membership_read']['fallback_passages'], 39)
