@@ -228,6 +228,37 @@ def initialize_published_parent_generation(store, *, tenant_id, source_id,
     return 'initialized' if generation is not None else 'unknown-generation'
 
 
+def _capture_for_enrollment(store, scope, deadline):
+    """Reuse current certificates; leave native proof and comparison unchanged."""
+    from .parent_membership_read import ReadSettings, partition_fetched
+
+    with _connect(store, deadline) as connection, connection.transaction():
+        connection.execute('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY')
+        if not _authorized(store, connection, scope, deadline):
+            return dict(status='unauthorized')
+        rows = _rows(store, connection, scope, deadline)
+        if not _complete(rows, scope):
+            return dict(status='incomplete')
+        selected = [dict(row, membership_metadata_complete=True,
+                         membership_metadata=row, membership_metadata_bytes=0) for row in rows]
+        # _rows already measures the entire bounded batch in PostgreSQL.
+        selected[0]['membership_metadata_bytes'] = rows[0]['metadata_bytes']
+        certified, _ = partition_fetched(selected=selected,
+            settings=ReadSettings(enabled=True, binding_epoch=scope['binding_epoch']),
+            deadline_at=deadline)
+    retained = [row for row in rows if (row['source_id'], row['passage_id']) in certified]
+    missing = tuple(row['passage_id'] for row in rows
+                    if (row['source_id'], row['passage_id']) not in certified)
+    if missing:
+        captured = _capture(store, dict(scope, passage_ids=missing), deadline, prove_ownership=True)
+        if captured['status'] != 'captured':
+            return captured
+        rows = retained + captured['rows']
+    return dict(status='captured', rows=rows, reused_passages=len(retained),
+                proved_passages=len(missing),
+                unique_receipts=len({receipt for row in rows for receipt in row['receipts']}))
+
+
 def _enroll(store, scope, deadline_at):
     with _connect(store,deadline_at) as connection, connection.transaction():
         if not _authorized(store,connection,scope,deadline_at):
@@ -239,7 +270,7 @@ def _enroll(store, scope, deadline_at):
             passage_selection='AND passage.passage_id=ANY(%s)', ordering=''),
             (scope['tenant_id'],scope['source_id'],scope['native_parent_id'],list(scope['passage_ids'])),
             deadline_at)
-    captured=_capture(store,scope,deadline_at,prove_ownership=True)
+    captured=_capture_for_enrollment(store,scope,deadline_at)
     if captured['status']!='captured':
         return captured
     rows=captured['rows']
@@ -259,17 +290,25 @@ def _enroll(store, scope, deadline_at):
         if (not _complete(current,scope) or any(
                 bindings[row['passage_id']]!=(_binding(row,scope),row['generation']) for row in current)):
             return dict(status='changed')
-        updated=_query(store,connection,"""UPDATE canonical_passages passage
+        # Every row passed the locked currentness check. Only differing
+        # certificates need a new tuple; reuse acknowledges no new proof/write.
+        bindings={row['passage_id']:bindings[row['passage_id']] for row in current
+                  if (row['membership_binding_sha256'],row['membership_generation'])
+                     != bindings[row['passage_id']]}
+        if bindings:
+            updated=_query(store,connection,"""UPDATE canonical_passages passage
             SET membership_generation=certificate.generation,
                 membership_binding_sha256=certificate.binding
             FROM unnest(%s::text[],%s::bigint[],%s::text[]) AS certificate(passage_id,generation,binding)
             WHERE passage.tenant_id=%s AND passage.source_id=%s
               AND passage.passage_id=certificate.passage_id""",
-            (list(bindings),[value[1] for value in bindings.values()],[value[0] for value in bindings.values()],
-             scope['tenant_id'],scope['source_id']),deadline_at)
-        if updated.rowcount!=len(bindings):
-            raise ValueError('parent_membership_publication_changed')
-    return dict(status='enrolled',passages=len(rows),unique_receipts=captured['unique_receipts'])
+                (list(bindings),[value[1] for value in bindings.values()],[value[0] for value in bindings.values()],
+                 scope['tenant_id'],scope['source_id']),deadline_at)
+            if updated.rowcount!=len(bindings):
+                raise ValueError('parent_membership_publication_changed')
+    return dict(status='enrolled',passages=len(rows),unique_receipts=captured['unique_receipts'],
+                reused_passages=captured['reused_passages'], proved_passages=captured['proved_passages'],
+                written_passages=len(bindings))
 
 
 def _compare(store, scope, deadline_at):
@@ -369,26 +408,30 @@ def certify_published_passages(store, *, tenant_id, source_id, logical_document_
     if owner is None:
         return dict(status='unavailable',certified_passages=0)
     certified=0
+    counts=dict(reused_passages=0,proved_passages=0,written_passages=0)
     limits=dict(_CERTIFICATION_LIMITS)
     for start in range(0,len(passage_ids),limits['passages']):
         if time.monotonic()>=deadline_at:
-            return dict(status='deadline',certified_passages=certified)
+            return dict(status='deadline',certified_passages=certified,**counts)
         try:
             outcome=enroll_parent_passages(store,tenant_id=tenant_id,source_id=source_id,
                 principal_id=owner['owner_principal_id'],native_parent_id=owner['native_parent_id'],
                 passage_ids=passage_ids[start:start+limits['passages']],limits=limits,
                 binding_epoch=settings.binding_epoch,deadline_at=deadline_at)
         except Exception as error:
-            # Earlier batches have committed. Report those acknowledged writes
-            # even when a later batch fails; they are not a current-coverage claim.
-            return dict(status='failed',certified_passages=certified,
+            # Earlier batches validated their complete scope. Preserve separate
+            # reuse/proof/write counts; none is a current-coverage claim.
+            return dict(status='failed',certified_passages=certified,**counts,
                 failure=certification_failure(error, source_id=source_id,
                     logical_document_id=logical_document_id, native_parent_id=owner['native_parent_id']))
         if outcome['status']=='enrolled':
             certified+=outcome['passages']
+            for name in counts:
+                value=outcome.get(name)
+                counts[name]=counts[name]+value if counts[name] is not None and value is not None else None
         else:
-            return dict(status=outcome['status'],certified_passages=certified)
-    return dict(status='enrolled',certified_passages=certified)
+            return dict(status=outcome['status'],certified_passages=certified,**counts)
+    return dict(status='enrolled',certified_passages=certified,**counts)
 
 
 def certify_retired_parent(store, *, tenant_id, source_id, native_parent_id,
