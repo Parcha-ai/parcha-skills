@@ -13,7 +13,7 @@ import threading
 from array import array
 from collections import Counter
 from collections.abc import Sequence
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field, replace
 from datetime import datetime
@@ -1225,10 +1225,13 @@ class CanonicalPassageProjector:
             )
         return tuple(candidates)
 
-    def _requeue_missing(self, candidate: PassageCandidate) -> int:
-        """Rebuild a current logical document whose immutable part disappeared."""
+    def _requeue_missing(self, candidate: PassageCandidate, *, connection=None) -> int:
+        """Ask the logical owner to rebuild this exact current catalog revision.
 
-        with self.store.connect() as connection:
+        Receipt repair can share its admission transaction; missing-part callers
+        retain the original independently committed queue operation.
+        """
+        with (self.store.connect() if connection is None else nullcontext(connection)) as connection:
             result = connection.execute(
                 """INSERT INTO canonical_evidence_document_queue(
                        tenant_id,source_id,native_parent_id,generation,
@@ -2452,6 +2455,7 @@ class CanonicalPassageProjector:
         Existing pending work is never overwritten or inferred to be our outcome.
         """
         from .control import ControlPlane
+        from . import passage_receipt_repair as receipt_repair
 
         unsigned = {key: value for key, value in plan.items() if key != "proof_sha256"}
         proof = hashlib.sha256(
@@ -2480,22 +2484,7 @@ class CanonicalPassageProjector:
                 )
 
             row = query(
-                """SELECT evidence.native_parent_id,evidence.revision,
-                   evidence.created_at::text AS catalog_created_at,evidence.document_content_sha256,
-                   evidence.manifest_content_sha256,evidence.manifest_object_key,evidence.manifest_version_id,
-                   projected.revision AS projected_revision,projected.policy_fingerprint,
-                   projected.source_document_sha256,passage.revision AS passage_revision,
-                   passage.text_sha256,passage.receipts,
-                   source.owner_principal_id,grant_row.permission AS source_permission
-              FROM canonical_evidence_documents evidence
-              JOIN canonical_passage_documents projected USING(tenant_id,source_id,logical_document_id)
-              JOIN canonical_passages passage USING(tenant_id,source_id,logical_document_id)
-              JOIN canonical_sources source USING(tenant_id,source_id)
-              JOIN canonical_source_grants grant_row USING(tenant_id,source_id)
-             WHERE evidence.tenant_id=%s AND evidence.source_id=%s
-               AND evidence.logical_document_id=%s AND passage.passage_id=%s
-               AND grant_row.principal_id=%s
-             FOR SHARE OF source,grant_row,evidence,projected,passage NOWAIT""",
+                receipt_repair.CATALOG,
                 (
                     tenant,
                     target["source_id"],
@@ -2573,6 +2562,10 @@ class CanonicalPassageProjector:
                 ).fetchone()["count"]
             if stale != plan["stale_receipts"] or stale <= 0:
                 raise ValueError("witness_changed")
+            if "supersession" in plan:
+                receipt_repair.validate_admission(
+                    self.store, connection, plan, deadline
+                )
             inserted = query(
                 """INSERT INTO canonical_passage_projection_queue(
                 tenant_id,source_id,logical_document_id,revision,generation,reason,changed_at)
@@ -2591,6 +2584,19 @@ class CanonicalPassageProjector:
             )
             if inserted.rowcount != 1:
                 raise ValueError("projection_pending")
+            if "supersession" in plan:
+                # A current replacement is not proof that the archived logical
+                # manifest contains it. Reuse the native logical rebuild owner
+                # atomically, so either lane order eventually publishes current
+                # source records. An unchanged manifest takes its existing noop.
+                self.store._set_statement_deadline(connection, deadline)
+                logical = self._requeue_missing(SimpleNamespace(
+                    tenant_id=tenant, source_id=target["source_id"],
+                    logical_document_id=target["logical_document_id"],
+                    revision=row["revision"],
+                ), connection=connection)
+                if logical != 1:
+                    raise ValueError("catalog_changed")
         return {"status": "queued", "proof_sha256": proof, "repair_complete": False}
 
     def repair_empty(

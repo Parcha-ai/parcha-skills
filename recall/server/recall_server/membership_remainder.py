@@ -192,7 +192,7 @@ def change_cursor(store, row, checkpoint, *, deadline_at, after=None):
 
 
 def resume(store, row, *, settings, deadline_at):
-    """One finite parent slice; optional failures never repeat source publication."""
+    """One finite slice; only proved supersession schedules ordinary repair."""
     certified = 0
     checkpoint = row["checkpoint"]
     first_slice = True
@@ -344,6 +344,11 @@ def resume(store, row, *, settings, deadline_at):
             )
             certified += outcome["certified_passages"]
             if outcome["status"] != "enrolled":
+                if outcome["status"] == "membership-unproved":
+                    from .passage_receipt_repair import reconcile
+                    repaired = reconcile(store, row, checkpoint, ids, deadline_at)
+                    if repaired is not None:
+                        return dict(status=repaired, certified_passages=certified)
                 if outcome["status"] not in ("failed", "deadline", "busy", "changed"):
                     change_cursor(store, row, checkpoint, deadline_at=deadline_at)
                 return dict(outcome, certified_passages=certified)
