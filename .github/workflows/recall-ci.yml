@@ -190,6 +190,7 @@ jobs:
             e2e_search_page_partition.py \
             e2e_search_publication_certificates.py \
             e2e_search_publication_page_keys.py \
+            e2e_publication_correlated_eligibility.py \
             e2e_publication_time_id_index.py \
             e2e_search_durable_page.py \
             e2e_publication_guard_codes.py \
