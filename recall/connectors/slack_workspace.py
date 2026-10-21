@@ -57,6 +57,10 @@ class SlackThreadUnavailable(SlackChannelUnavailable):
     """The saved historical thread position no longer exists."""
 
 
+class _SlackLiveCursorExpired(ConnectorUpstreamError):
+    """An opaque history or reply position expired before its next turn."""
+
+
 class _SlackDiscoveryCursorExpired(ConnectorUpstreamError):
     """The provider rejected an existing discovery continuation."""
 
@@ -236,7 +240,7 @@ def _state(
     expected = v2_expected | {"coverage", "channel_lower", "capture_version"}
     expected_coverage = "public" if public_history else "member"
     if (
-        not isinstance(value, dict) or set(value) != expected or value.get("v") != 4
+        not isinstance(value, dict) or set(value) != expected or value.get("v") not in (4, 5)
         or value.get("coverage") not in {"member", "public"}
         or value.get("phase") not in {"discover", "users", "history", "threads"}
         or not isinstance(value.get("channels"), list)
@@ -258,6 +262,11 @@ def _state(
         or not _valid_time_bounds(value)
     ):
         raise ConnectorContractError("slack workspace cursor is invalid")
+    if value["v"] == 5:
+        from connectors.slack_source import SLACK_TS
+        if any(value[key] is not None and SLACK_TS.fullmatch(value[key]) is None
+               for key in ("page", "thread_page") if value["phase"] in {"history", "threads"}):
+            raise ConnectorContractError("slack workspace timestamp position is invalid")
     if value["channel_lower"] is not None and not _valid_time_bounds({
         "watermark": value["channel_lower"], "upper": value["upper"],
     }):
@@ -465,7 +474,7 @@ class SlackWorkspaceConnector:
                     if not isinstance(raw, str) or len(raw.encode()) > 4096:
                         return {"status": "invalid"}
             value = json.loads(raw)
-            if not isinstance(value, dict) or value.get("v") != 4:
+            if not isinstance(value, dict) or value.get("v") not in (4, 5):
                 return {"status": "unsupported_version"}
             if value.get("coverage") != ("public" if self.public_history else "member"):
                 return {"status": "stale_authority_or_selection"}
@@ -549,6 +558,8 @@ class SlackWorkspaceConnector:
             _log_request_failure(operation, "response", response.get("error"))
             if operation == "channels.list" and response.get("error") == "invalid_cursor":
                 raise _SlackDiscoveryCursorExpired("connector_upstream_error")
+            if operation in ("messages.history", "messages.replies") and response.get("error") == "invalid_cursor":
+                raise _SlackLiveCursorExpired("connector_upstream_error")
             if response.get("error") == "thread_not_found":
                 raise SlackThreadUnavailable("connector_upstream_error")
             if response.get("error") in ("channel_not_found", "not_in_channel", "is_archived"):
@@ -572,6 +583,20 @@ class SlackWorkspaceConnector:
                 self._request("channels.join", {"channel": channel_id})
         try:
             return pull(state, limit=self.page_size, **options)
+        except _SlackLiveCursorExpired:
+            position = "thread_page" if state["phase"] == "threads" else "page"
+            if historical or state["v"] != 4 or not state[position]:
+                raise
+            # V4 has no durable message boundary. Replay this channel's original
+            # window once; V5 positions become durable only with the native ACK.
+            recovered = {**state, "v": 5, "phase": "history", "page": None,
+                         "threads": [], "thread_index": 0, "thread_page": None}
+            try:
+                return self._pull_history(recovered, limit=self.page_size)
+            except ConnectorPageCapacityError:
+                if self.page_size <= 20:
+                    raise
+                return self._pull_history(recovered, limit=20)
         except ConnectorPageCapacityError:
             if self.page_size <= 20:
                 raise
@@ -710,7 +735,11 @@ class SlackWorkspaceConnector:
             query.update(inclusive=False, latest=state["page"] or query["latest"])
         else:
             if state["page"]:
-                query["cursor"] = state["page"]
+                if state["v"] == 5:
+                    from connectors.slack_reconciliation import live_time_boundary
+                    query["latest"] = live_time_boundary(state["page"], descending=True)
+                else:
+                    query["cursor"] = state["page"]
             if state["channel_lower"] != EPOCH:
                 query["oldest"] = _oldest(state["channel_lower"])
         response = self._request("messages.history", query)
@@ -729,6 +758,9 @@ class SlackWorkspaceConnector:
         if historical:
             from connectors.slack_reconciliation import time_page
             next_page = time_page(response, messages, query, descending=True)
+        elif state["v"] == 5:
+            from connectors.slack_reconciliation import live_time_page
+            next_page = live_time_page(response, messages, query, descending=True)
         else:
             next_page = _next(response)
         if threads:
@@ -753,7 +785,11 @@ class SlackWorkspaceConnector:
             if state["thread_page"]:
                 query["oldest"] = state["thread_page"]
         elif state["thread_page"]:
-            query["cursor"] = state["thread_page"]
+            if state["v"] == 5:
+                from connectors.slack_reconciliation import live_time_boundary
+                query["oldest"] = live_time_boundary(state["thread_page"], descending=False)
+            else:
+                query["cursor"] = state["thread_page"]
         response = self._request("messages.replies", query)
         if historical and response.get("is_limited") not in (None, False):
             raise SlackChannelUnavailable("slack_history_limited")
@@ -765,6 +801,9 @@ class SlackWorkspaceConnector:
                 raise ConnectorContractError("slack historical thread root is missing")
             from connectors.slack_reconciliation import time_page
             next_thread_page = time_page(response, messages, query, descending=False)
+        elif state["v"] == 5:
+            from connectors.slack_reconciliation import live_time_page
+            next_thread_page = live_time_page(response, messages, query, descending=False)
         else:
             next_thread_page = _next(response)
         if next_thread_page:
