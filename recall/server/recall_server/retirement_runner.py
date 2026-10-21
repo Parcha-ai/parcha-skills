@@ -569,6 +569,10 @@ def run_retirement(
         cleared_documents=0,
         cleared_chunks=0,
         retired_metadata_chunks=0,
+        parent_thinned_documents=0,
+        parent_thinned_events=0,
+        parent_thin_document_bytes_removed=0,
+        parent_thin_event_bytes_replaced=0,
         cleared_utf8_bytes=0,
         eligible_documents=0,
         committed_sql_ms=0.0,
@@ -741,6 +745,10 @@ def run_retirement(
             "cleared_chunks",
             "retired_metadata_chunks",
             "cleared_utf8_bytes",
+            "parent_thinned_documents",
+            "parent_thinned_events",
+            "parent_thin_document_bytes_removed",
+            "parent_thin_event_bytes_replaced",
         ):
             report[field] += result.get(field, 0)
         if report["commit_outcome_unknown"] or "retirement_owner_required" in errors:
