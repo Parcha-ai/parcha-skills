@@ -63,6 +63,27 @@ def time_page(response, messages, query, *, descending):
     return (min if descending else max)(timestamps, key=Decimal)
 
 
+def live_time_boundary(timestamp, *, descending):
+    """Exclude only the ACKed timestamp on the native microsecond lattice."""
+    from connectors.slack_source import SLACK_TS
+    if not isinstance(timestamp, str) or SLACK_TS.fullmatch(timestamp) is None:
+        raise ConnectorContractError('slack time pagination timestamp is invalid')
+    return format(Decimal(timestamp) + Decimal('-0.000001' if descending else '0.000001'), 'f')
+
+
+def live_time_page(response, messages, query, *, descending):
+    """Reuse the strict proof for the equivalent inclusive live interval."""
+    strict = {**query,
+              'oldest': format(Decimal(query.get('oldest', '0')) - Decimal('0.000001'), 'f'),
+              'latest': format(Decimal(query['latest']) + Decimal('0.000001'), 'f')}
+    boundary = time_page(response, messages, strict, descending=descending)
+    if boundary is not None:
+        following = Decimal(live_time_boundary(boundary, descending=descending))
+        if not Decimal(query.get('oldest', '0')) <= following <= Decimal(query['latest']):
+            raise ConnectorContractError('slack time pagination did not advance')
+    return boundary
+
+
 class SlackReconciliation:
     def __init__(self, connector, db: sqlite3.Connection, provider_epoch: str):
         if not isinstance(provider_epoch, str) or not re.fullmatch('[0-9a-f]{64}', provider_epoch):
