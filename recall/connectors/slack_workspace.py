@@ -669,10 +669,11 @@ class SlackWorkspaceConnector:
         }
         if historical:
             query.update(inclusive=False, latest=state["page"] or query["latest"])
-        elif state["page"]:
-            query["cursor"] = state["page"]
-        elif state["channel_lower"] != EPOCH:
-            query["oldest"] = _oldest(state["channel_lower"])
+        else:
+            if state["page"]:
+                query["cursor"] = state["page"]
+            if state["channel_lower"] != EPOCH:
+                query["oldest"] = _oldest(state["channel_lower"])
         response = self._request("messages.history", query)
         if historical and response.get("is_limited") not in (None, False):
             raise SlackChannelUnavailable("slack_history_limited")
