@@ -80,7 +80,7 @@ class TypedUpgradeCapacityIndex(WorkerTypedAdmission):
                 SET requested_extraction_version=CASE WHEN policy_fingerprint=repeat('d',64)
                     THEN 'tool_groups_v1' ELSE 'codex_tool_groups_v1' END
                 WHERE tenant_id=%s AND logical_document_id=ANY(%s::text[])''',
-                (self.tenant, ['ldoc_'+hashlib.md5(str(i).encode()).hexdigest() for i in
+                (self.tenant, ['ldoc_'+hashlib.md5(str(i).encode(), usedforsecurity=False).hexdigest() for i in
                               list(range(1, qualifying+1))+list(range(4000,4050))+list(range(9000,9050))]))
             for table in ('canonical_passage_documents','canonical_passage_projection_queue',
                           'canonical_evidence_documents','canonical_sources','canonical_source_grants'):
