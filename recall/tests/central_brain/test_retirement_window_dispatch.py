@@ -1,4 +1,5 @@
 """Dispatch only changes the proof strategy; both owners keep the same bounds."""
+import os
 import time
 import unittest
 from unittest.mock import MagicMock, patch
@@ -36,9 +37,14 @@ class WindowDispatchTests(unittest.TestCase):
                 diagnostic = {}
                 arguments = self.arguments(records)
                 expected = {"status": "stopped", "complete": False}
-                with patch.object(owner, "retire_parent_chunks", return_value=expected) as full, \
+                store = MagicMock(search_plane="turbopuffer", verified_singleton_receipts=True)
+                # Dispatch is observed after optional preparation found no work.
+                # create=True also runs this fixture on the pre-preparation runtime.
+                with patch.dict(os.environ, {"RECALL_CHUNK_BODY_READS": "archive"}), \
+                     patch.object(window, "_thin_before_parent", return_value=None, create=True), \
+                     patch.object(owner, "retire_parent_chunks", return_value=expected) as full, \
                      patch.object(window, "retire_window", return_value=expected) as subset:
-                    window.retire_parent_windows(MagicMock(), MagicMock(),
+                    window.retire_parent_windows(store, MagicMock(),
                         **arguments, diagnostic=diagnostic)
                 selected = full if records == 1 else subset
                 selected.assert_called_once()
@@ -50,9 +56,12 @@ class WindowDispatchTests(unittest.TestCase):
         for records,batch_documents in ((101,256),(50_000,256),(3,2)):
             with self.subTest(records=records,batch_documents=batch_documents):
                 arguments=self.arguments(records,batch_documents)
-                with patch.object(owner,"retire_parent_chunks") as full, \
+                store = MagicMock(search_plane="turbopuffer", verified_singleton_receipts=True)
+                with patch.dict(os.environ, {"RECALL_CHUNK_BODY_READS": "archive"}), \
+                     patch.object(window, "_thin_before_parent", return_value=None, create=True), \
+                     patch.object(owner,"retire_parent_chunks") as full, \
                      patch.object(window,"retire_window",return_value={"status":"stopped","complete":False}) as subset:
-                    actual=window.retire_parent_windows(MagicMock(),MagicMock(),**arguments)
+                    actual=window.retire_parent_windows(store,MagicMock(),**arguments)
                 self.assertEqual(actual["status"],"stopped")
                 full.assert_not_called()
                 subset.assert_called_once()
