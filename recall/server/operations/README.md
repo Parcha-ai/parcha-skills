@@ -101,3 +101,70 @@ DROP INDEX CONCURRENTLY public.canonical_documents_live_authority_idx;
 
 The covering index disappears with its constraint. Query and service code need no
 rollback; recheck serving latency, authority, schema history and storage afterward.
+
+## Publication page order
+
+`publication_page_time_id_index_concurrent.sql` adds the optional
+`canonical_passages_page_time_id_idx` on
+`(tenant_id, source_id, first_occurred_at, passage_id)`. It supplies the existing
+publication cursor's exact order, including equal timestamps. Query predicates,
+receipt authority, page limits, checkpoints and schema versions stay unchanged.
+The operation is outside automatic migrations; serving does not require it.
+
+Retain `canonical_passages_time_idx` on
+`(tenant_id, source_id, first_occurred_at, last_occurred_at)`. Passage retrieval
+has temporal-overlap predicates on both endpoints, and the Parquet passage stream
+also filters both endpoints. A replacement/drop requires separate workload and
+plan evidence; this operation supplies none.
+
+1. Use the existing bounded index-operation owner with a dedicated connection.
+   Record the current fleet, schema history, exact old/new index definitions and
+   OIDs, constraint ownership, table/index sizes, provider disk/WAL/replica
+   headroom and baseline serving/publication measurements. If the new name exists,
+   require its exact definition and valid/ready/live state; an incompatible or
+   invalid object requires explicit reconciliation, never `IF NOT EXISTS` alone.
+2. Admit one concurrent build using the existing owner limits: 900-second
+   statement timeout, 30-second lock timeout, 64MiB maintenance memory and zero
+   parallel maintenance workers. Run the SQL file through the existing
+   `BrainStore._migrate_concurrently` owner, outside a transaction block. Do not
+   start another build or redeploy/restart writers as part of this operation.
+3. Monitor the identified build PID in `pg_stat_progress_create_index`, recording
+   phase, blocks/tuples completed, and locker waits. Compare provider CPU/I/O,
+   replica lag, free space and serving health with the recorded baseline. The
+   memory setting does not bound disk, WAL or total build work. Concurrent builds
+   make two table scans and may wait for existing transactions; a small local
+   build time cannot predict production duration. See PostgreSQL's
+   [concurrent-build contract](https://www.postgresql.org/docs/17/sql-createindex.html#SQL-CREATEINDEX-CONCURRENTLY)
+   and [progress fields](https://www.postgresql.org/docs/17/progress-reporting.html#CREATE-INDEX-PROGRESS-REPORTING).
+4. On a lost acknowledgement, timeout or disconnect, reconcile the same operation
+   and exact index OID with the active build before any further DDL. An invalid
+   leftover can consume space and write work. Do not retry or drop it implicitly.
+   Once the owned build is terminal, an operator may inspect its exact definition
+   and dependencies, explicitly drop that index concurrently, then separately
+   admit a rebuild. Never cancel unrelated sessions or use `CASCADE`.
+5. After success, run `publication_page_time_id_index_readiness.sql`; it requires
+   the exact definition and valid/ready/live flags. Record actual bytes, unchanged
+   schema history and old-index OID, then run original serving/authority checks.
+   Compare ordinary selection-phase deadlines, whole-month completion and queue
+   progress over a stated interval. Index existence or a changed plan alone is
+   not a throughput result.
+
+For footprint planning, measure bytes per row with representative key lengths
+and multiply by the current catalog's estimated row count, explicitly retaining
+that estimate's uncertainty. Add build scratch, WAL and replica effects; do not
+scale local elapsed time or assume old-index space will be reclaimed. The new
+index adds ongoing insert/update/delete maintenance. The exact index size and
+write impact must be measured after installation.
+
+Rollback changes no query or checkpoint: after confirming the exact new index
+identity, no active build, and no unexpected constraint/dependency ownership,
+run this single statement outside a transaction through the same bounded owner:
+
+```sql
+DROP INDEX CONCURRENTLY public.canonical_passages_page_time_id_idx;
+```
+
+Reconcile an uncertain drop before retrying. Verify the new index is absent,
+`canonical_passages_time_idx` and schema history remain intact, and original
+serving/authority checks pass. No schema marker, reader rollout or worker restart
+is required for either apply or rollback.
