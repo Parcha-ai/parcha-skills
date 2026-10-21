@@ -135,18 +135,31 @@ _PASSAGE_ELIGIBLE_SQL = f"""     WHERE passage.tenant_id=%s
        AND passage.first_occurred_at<%s
        AND (%s::timestamptz IS NULL OR passage.created_at>=%s::timestamptz)
        AND (passage.first_occurred_at,passage.passage_id)>(%s,%s)
+       AND EXISTS (
+           SELECT 1 FROM canonical_passage_documents projected
+           JOIN canonical_evidence_documents evidence
+             USING(tenant_id,source_id,logical_document_id)
+           WHERE projected.tenant_id=passage.tenant_id
+             AND projected.source_id=passage.source_id
+             AND projected.logical_document_id=passage.logical_document_id
+             AND projected.revision=passage.revision
+             AND projected.policy_fingerprint=passage.policy_fingerprint
+           OFFSET 0
+       )
        AND {_LIVE_PASSAGE_PREDICATE}
      ORDER BY passage.first_occurred_at,passage.passage_id
      LIMIT %s
 """
 
-# Keep eligibility before LIMIT. Hydrate only those exact keys in this same
-# SQL snapshot, avoiding wide body/origin rows in the keyset sort.
-# OFFSET 0 prevents flattening the per-key lookup into a whole-source join.
+# Keep eligibility before LIMIT and correlate parent checks to each passage.
+# This prevents a parent-first join from expanding the source before sorting.
+# The outer scan may still inspect many keys when eligible passages are sparse.
+# Hydration retains the same snapshot and exact selected keys.
 _PASSAGE_PAGE_SQL = (
     "WITH eligible_page AS MATERIALIZED (\n"
     " SELECT passage.tenant_id,passage.source_id,passage.passage_id,passage.first_occurred_at\n"
-    + _PASSAGE_FROM_SQL + _PASSAGE_ELIGIBLE_SQL + ")\n"
+    " FROM canonical_passages passage\n"
+    + _PASSAGE_ELIGIBLE_SQL + ")\n"
     + " SELECT hydrated.* FROM eligible_page selected\n"
     " CROSS JOIN LATERAL (\n"
     + _PASSAGE_SELECT_SQL + _PASSAGE_FROM_SQL
