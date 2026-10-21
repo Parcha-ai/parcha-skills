@@ -1,13 +1,17 @@
 """Productive preparation before large-parent archive retirement attempts."""
 import json
+import os
+import uuid
 import time
 import unittest
 from dataclasses import replace
 from unittest.mock import patch
 import psycopg
-from e2e_thinning_retirement_transition import ThinningRetirement
+from psycopg import sql
+from psycopg.conninfo import make_conninfo
+import e2e_thinning_retirement_transition as retained
 from recall_server import retirement_runner as runner, parent_chunk_window as window
-from recall_server.db import SearchDeadlineExceeded
+from recall_server.db import BrainStore, SearchDeadlineExceeded
 
 from recall_server import chunk_retirement as retirement
 from recall_server.canonical_thinning import _thin_selected
@@ -16,10 +20,23 @@ from recall_server.receipt_membership import lookup_receipt_metadata
 
 
 class ProductiveEOF(unittest.TestCase):
-    setUpClass = classmethod(ThinningRetirement.setUpClass.__func__)
-    tearDownClass = classmethod(ThinningRetirement.tearDownClass.__func__)
-    setUp = ThinningRetirement.setUp
-    ledger = ThinningRetirement.ledger
+    @classmethod
+    def setUpClass(cls):
+        # Keep synthetic parent rows and statistics out of later native fixtures.
+        admin_dsn = os.environ['RECALL_DATABASE_URL']
+        database = 'productive_retirement_' + uuid.uuid4().hex
+        with psycopg.connect(admin_dsn, autocommit=True) as admin:
+            admin.execute(sql.SQL('CREATE DATABASE {}').format(sql.Identifier(database)))
+        def drop_database():
+            with psycopg.connect(admin_dsn, autocommit=True) as admin:
+                admin.execute(sql.SQL('DROP DATABASE {}').format(sql.Identifier(database)))
+        cls.addClassCleanup(drop_database)
+        cls.store = BrainStore(make_conninfo(admin_dsn, dbname=database))
+        cls.addClassCleanup(cls.store.close)
+        cls.store.migrate()
+
+    setUp = retained.ThinningRetirement.setUp
+    ledger = retained.ThinningRetirement.ledger
 
     def state(self):
         with self.store.connect() as c:
@@ -151,9 +168,6 @@ class ProductiveEOF(unittest.TestCase):
 
     def test_577_rows_thin_without_archive_replay_then_original_traversal(self):
         self.prepare_eof(count=577, mixed=False, advance=False)
-        with self.store.connect() as c:
-            for relation in ('canonical_events','canonical_documents','raw_artifacts','canonical_chunks'):
-                c.execute('ANALYZE '+relation)
         for expected in (256, 256, 65):
             observed = self.run_observed('bounded-577-thinning', 1)
             self.assertEqual(observed['result']['parent_thinned_documents'], expected)
