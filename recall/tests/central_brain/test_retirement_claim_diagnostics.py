@@ -141,8 +141,19 @@ class ClaimDiagnosticTests(unittest.TestCase):
             )
         self.assertEqual(len(calls), 2)
         self.assertEqual(retire.call_count, 1)
+        # Optional additive counters are a closed group. The existing fake
+        # completed parent performs no preparatory thinning on either runtime.
+        thinning_counters = {
+            "parent_thinned_documents", "parent_thinned_events",
+            "parent_thin_document_bytes_removed", "parent_thin_event_bytes_replaced",
+        }
+        present = thinning_counters.intersection(result)
+        if present:
+            self.assertEqual(present, thinning_counters)
+            for field in thinning_counters:
+                self.assertEqual(result[field], 0)
         self.assertEqual(
-            set(result),
+            set(result) - thinning_counters,
             {
                 "status",
                 "attempted_parents",
