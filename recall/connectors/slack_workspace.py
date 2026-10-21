@@ -429,6 +429,55 @@ class SlackWorkspaceConnector:
                 WHERE workspace_id=? AND authority=? AND started_cycle=? AND started_selection=?""",
                 (before["cycle"], *self._scope, before["cycle"], *self._scope, before["cycle"], self._selection))
 
+    def _committed_live_cursor_status(self) -> dict[str, Any]:
+        """Observe persisted progress only; never migrate or reset a cursor."""
+        db = self._checkpoint_db
+        assert db is not None
+        row = db.execute("SELECT value FROM meta WHERE key='committed_cursor'").fetchone()
+        if row is None:
+            return {"status": "absent"}
+        try:
+            raw = json.loads(row[0])
+            if raw is None:
+                return {"status": "absent"}
+            if not isinstance(raw, str) or len(raw.encode()) > 4096:
+                return {"status": "invalid"}
+            if self._reconciliation is not None:
+                marker = self._reconciliation.marker(raw)
+                saved = db.execute("""SELECT state_json FROM slack_reconciliation_state
+                    WHERE workspace_id=? AND authority=?""", self._scope).fetchone()
+                if marker is None and saved is not None:
+                    return {"status": "invalid"}
+                if marker is not None:
+                    state = json.loads(saved[0]) if saved else {}
+                    if type(state.get("step")) is not int or state["step"] != marker:
+                        return {"status": "invalid"}
+                    if (state.get("epoch") != self._reconciliation.epoch
+                            or state.get("selection") != self._selection):
+                        return {"status": "stale_authority_or_selection"}
+                    raw = state.get("live_cursor")
+                    if raw is None:
+                        return {"status": "absent"}
+                    if not isinstance(raw, str) or len(raw.encode()) > 4096:
+                        return {"status": "invalid"}
+            value = json.loads(raw)
+            if not isinstance(value, dict) or value.get("v") != 4:
+                return {"status": "unsupported_version"}
+            if value.get("coverage") != ("public" if self.public_history else "member"):
+                return {"status": "stale_authority_or_selection"}
+            value = _state(raw, self.channel_ids, self.public_history)
+            return {
+                "status": "observed", "phase": value["phase"], "cycle": value["cycle"],
+                "channel_index": value["channel_index"], "channel_count": len(value["channels"]),
+                "thread_index": value["thread_index"], "thread_count": len(value["threads"]),
+                "history_page_present": bool(value["page"]),
+                "reply_page_present": bool(value["thread_page"]),
+                "discovery_page_present": bool(value["discovery_page"]),
+                "cursor_sha256": hashlib.sha256(raw.encode()).hexdigest(),
+            }
+        except (ValueError, TypeError, AttributeError, ConnectorContractError):
+            return {"status": "invalid"}
+
     def checkpoint_status(self) -> dict[str, Any]:
         """Aggregate evidence only: no channel IDs, API cursors, or message text."""
         assert self._checkpoint_db is not None
@@ -443,11 +492,25 @@ class SlackWorkspaceConnector:
             FROM slack_channel_coverage WHERE workspace_id=? AND authority=?""" + selected + """)
             SELECT count(*),
             count(history_through),sum(CASE WHEN last_seen_cycle=? THEN 1 ELSE 0 END),
-            sum(CASE WHEN scanned_cycle=? THEN 1 ELSE 0 END), min(history_through)
+            sum(CASE WHEN scanned_cycle=? THEN 1 ELSE 0 END), min(history_through),
+            sum(CASE WHEN last_seen_cycle>=? THEN 1 ELSE 0 END),
+            sum(CASE WHEN last_seen_cycle<? THEN 1 ELSE 0 END),
+            min(CASE WHEN last_seen_cycle>=? THEN history_through END),
+            min(CASE WHEN last_seen_cycle<? THEN history_through END)
             FROM channels""",
             (SLACK_MESSAGE_CAPTURE_VERSION, SLACK_MESSAGE_CAPTURE_VERSION,
-             *self._scope, *self.channel_ids, discovery[0], discovery[0])).fetchone()
+             *self._scope, *self.channel_ids, discovery[0], discovery[0],
+             discovery[1], discovery[1], discovery[1], discovery[1])).fetchone()
         return {
+            "committed_live_cursor": self._committed_live_cursor_status(),
+            "last_completed_discovery_inventory": ({
+                "status": "observed", "cycle": discovery[1],
+                "channels_seen_since": counts[5] or 0,
+                "channels_not_seen_since": counts[6] or 0,
+                "oldest_history_through_seen_since": counts[7],
+                "oldest_history_through_not_seen_since": counts[8],
+            } if discovery[1] is not None and discovery[5] == self._selection
+                else {"status": "no_matching_completed_discovery"}),
             "capture_version": SLACK_MESSAGE_CAPTURE_VERSION,
             "scope": "public_channels" if self.public_history else "bot_accessible_public_channels",
             "selection": "configured_channels" if self.channel_ids else "workspace_discovery",
