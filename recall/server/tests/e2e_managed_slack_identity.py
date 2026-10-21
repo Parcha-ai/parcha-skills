@@ -177,9 +177,14 @@ class ManagedSlackIdentity(SlackIdentityFixture):
             return original(policy,value)
         with patch.object(PrivacyPolicy,'apply',record_apply):
             self.assertEqual(self.step(worker)['failed'],0)
-        self.assertEqual(len(seen),2)
+        self.assertIn(len(seen),(2,4))
         self.assertEqual(seen[0],seen[1])
         self.assertEqual(seen[0]['provenance']['metadata']['secret'],'[REDACTED:credential]')
+        if len(seen)==4:
+            # A post-capture repair verifies and enrolls the same archived input.
+            self.assertEqual(seen[2],seen[3])
+            self.assertEqual(seen[2],seen[0])
+            self.assertEqual(seen[2]['provenance']['metadata']['secret'],'[REDACTED:credential]')
         self.assertEqual(self.counts(),(1,0))
 
     def test_managed_expired_claim_during_pull_refuses_identity_write(self):
