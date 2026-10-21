@@ -44,6 +44,7 @@ class ArchilArchiveDeletionTests(unittest.TestCase):
             'ARCHIL_API_KEY': 'key-synthetic',
             'RECALL_ARCHIL_DISK_ID': 'dsk-0123456789abcdef',
             'RECALL_ARCHIL_REGION': 'aws-us-west-2',
+            'RECALL_EVIDENCE_DELETE_MODE': 'archil',
         }
         self.patch = mock.patch('server.recall_server.archil_archive.ArchilDisk', return_value=self.disk)
         self.constructor = self.patch.start()
@@ -57,7 +58,7 @@ class ArchilArchiveDeletionTests(unittest.TestCase):
             tenant_id='tenant:synthetic', source_id='source:synthetic', created_at='2026-10-21T00:00:00Z')
         self.disk.lengths[self.reference.object_key] = self.reference.size_bytes
 
-    def test_all_delete_owners_use_disk_and_stale_backing_cannot_be_readmitted(self):
+    def test_all_delete_owners_use_disk_and_cleanup_requires_backing_confirmation(self):
         import time
         for owner in ('public', 'internal', 'bounded'):
             with self.subTest(owner=owner):
@@ -72,7 +73,14 @@ class ArchilArchiveDeletionTests(unittest.TestCase):
                 self.assertIn((self.store.bucket, self.reference.object_key), self.origin.objects)
                 self.assertEqual(self.disk.calls[-1], ('DELETE', self.reference.object_key))
                 with self.assertRaises(ArchiveError):
-                    self.store.verify_raw(self.contract)
+                    self.store.confirm_raw_deletion(self.contract)
+        self.origin.objects.clear()
+        self.store.confirm_raw_deletion(self.contract)
+
+    def test_new_upload_verification_does_not_wait_for_disk_discovery(self):
+        self.disk.lengths.clear()
+        self.store.verify_raw(self.contract)
+        self.assertEqual(self.disk.calls, [])
 
     def test_object_not_yet_imported_is_not_acknowledged_as_deleted(self):
         self.disk.lengths.clear()
@@ -99,12 +107,6 @@ class ArchilArchiveDeletionTests(unittest.TestCase):
             self.store.delete_internal_raw(self.contract)
         self.assertFalse(any(operation == 'DELETE' for operation, _ in self.disk.calls))
 
-    def test_wrong_disk_size_is_not_deleted(self):
-        self.disk.lengths[self.reference.object_key] += 1
-        with self.assertRaises(ArchiveError):
-            self.store.delete_internal_raw(self.contract)
-        self.assertFalse(any(operation == 'DELETE' for operation, _ in self.disk.calls))
-
     def test_disk_only_object_is_not_acknowledged_as_already_missing(self):
         self.origin.objects.clear()
         with self.assertRaises(ArchiveError):
@@ -122,6 +124,16 @@ class ArchilArchiveDeletionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             build_evidence_archive_store(dict(self.env, RECALL_EVIDENCE_ARCHIVE_BACKEND='s3'),
                                          client_factory=lambda **_: self.origin)
+
+    def test_rollout_hold_blocks_deletion_while_capture_still_works(self):
+        env = {key: value for key, value in self.env.items() if key not in
+               {'ARCHIL_API_KEY', 'RECALL_ARCHIL_DISK_ID', 'RECALL_ARCHIL_REGION'}}
+        env['RECALL_EVIDENCE_DELETE_MODE'] = 'hold'
+        held = build_evidence_archive_store(env, client_factory=lambda **_: self.origin)
+        held.verify_raw(self.contract)
+        with self.assertRaises(ArchiveError):
+            held.delete_internal_raw(self.contract)
+        self.assertIn((self.store.bucket, self.reference.object_key), self.origin.objects)
 
     def test_raw_archive_is_not_rerouted(self):
         raw = {key.replace('RECALL_EVIDENCE_', 'RECALL_'): value for key, value in self.env.items()}

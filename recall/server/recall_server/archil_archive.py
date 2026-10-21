@@ -6,7 +6,7 @@ import json
 import re
 from urllib.parse import quote
 
-from .archive import ArchiveCorruption, ArchiveError, ArchiveNotFound, OBJECT_KEY_RE, S3_DEADLINE_CONNECT_TIMEOUT
+from .archive import ArchiveError, ArchiveNotFound, OBJECT_KEY_RE, S3_DEADLINE_CONNECT_TIMEOUT
 
 
 _HOSTS = {
@@ -92,12 +92,14 @@ class ArchilDisk:
 
 
 class ArchilArchiveClient:
-    """Keep original S3 integrity checks and require the disk to have the object.
+    """Keep original S3 integrity checks and delete through the disk.
 
-    The backing bucket synchronizes asynchronously. A disk miss while the
-    origin still has bytes is retryable; it cannot acknowledge cleanup or
-    admit a new catalog reference to an already deleted disk object.
+    The durable cleanup queue blocks admission while deletion synchronizes.
+    Confirm backing absence before acknowledging cleanup; unrelated new
+    uploads do not have to wait for Archil's background discovery.
     """
+
+    requires_deletion_claim = True
 
     def __init__(self, origin, disk, bucket):
         self._origin = origin
@@ -121,22 +123,51 @@ class ArchilArchiveClient:
             if self._disk.size(key) is not None:
                 raise ArchiveError('Archil archive backing synchronization pending') from None
             raise
-        size = self._disk.size(key)
-        if size is None:
-            raise ArchiveError('Archil archive synchronization pending')
-        if size != metadata.get('ContentLength'):
-            raise ArchiveCorruption('Archil archive size mismatch')
         return metadata
 
     def delete_object(self, **kwargs):
-        self._disk.delete(self._key(kwargs))
+        key = self._key(kwargs)
+        if self._disk.size(key) is None:
+            raise ArchiveError('Archil archive discovery pending')
+        self._disk.delete(key)
         return {}
+
+    def confirm_deleted(self, **kwargs):
+        self._key(kwargs)
+        try:
+            self._origin.head_object(**kwargs)
+        except ArchiveNotFound:
+            if self._disk.size(kwargs['Key']) is None:
+                return
+        raise ArchiveError('Archil archive backing synchronization pending')
+
+
+class HeldArchiveClient:
+    """Keep capture available while all admission writers receive the guard."""
+
+    requires_deletion_claim = True
+
+    def __init__(self, origin):
+        self._origin = origin
+
+    def __getattr__(self, name):
+        return getattr(self._origin, name)
+
+    def delete_object(self, **kwargs):
+        raise ArchiveError('evidence archive deletion is held')
 
 
 def coordinate_evidence_archive(store, values):
-    names = ('ARCHIL_API_KEY', 'RECALL_ARCHIL_DISK_ID', 'RECALL_ARCHIL_REGION')
-    if not any(name in values for name in names):
+    mode = values.get('RECALL_EVIDENCE_DELETE_MODE', 'direct')
+    if mode not in {'direct', 'hold', 'archil'}:
+        raise ValueError('evidence archive deletion mode is invalid')
+    if mode == 'direct':
         return store
+    if mode == 'hold':
+        store.client = HeldArchiveClient(store.client)
+        store.deadline_client = HeldArchiveClient(store.deadline_client)
+        return store
+    names = ('ARCHIL_API_KEY', 'RECALL_ARCHIL_DISK_ID', 'RECALL_ARCHIL_REGION')
     if (store.compatibility_profile != 'aws-unversioned'
             or any(not isinstance(values.get(name), str) or not values[name].strip() for name in names)):
         raise ValueError('Archil archive configuration is incomplete or versioned')
