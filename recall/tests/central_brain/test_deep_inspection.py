@@ -750,6 +750,9 @@ class DeepInspectionContractTests(unittest.TestCase):
                     return Rows([{"present": True}])
                 if "FROM canonical_artifact_forget_tombstones" in sql:
                     return Rows([])
+                if ("SELECT tenant_id,source_id,artifact_id" in sql
+                        and "FROM canonical_evidence_cleanup_queue" in sql and "attempts>0" in sql):
+                    return Rows([])  # No deletion has claimed these new uploads.
                 if "WITH targets AS" in sql:
                     return Rows([])  # These uploads have no committed catalogue yet.
                 if "FROM canonical_documents document" in sql and "JOIN unnest" in sql:
