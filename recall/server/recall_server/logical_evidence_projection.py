@@ -1634,6 +1634,30 @@ class CanonicalLogicalEvidenceProjector:
                     [r['artifact_id'] for r in rows])).fetchall()
         return {(r['tenant_id'],r['source_id'],r['artifact_id']) for r in live}
 
+    @staticmethod
+    def _record_cleanup_attempts(connection, identities):
+        connection.execute(
+            """WITH failed(
+                   tenant_id,source_id,artifact_id
+               ) AS (
+                   SELECT * FROM unnest(
+                       %s::text[],%s::text[],%s::text[]
+                   )
+               )
+               UPDATE canonical_evidence_cleanup_queue queue
+                  SET attempts=queue.attempts+1,
+                      last_attempt_at=clock_timestamp()
+                 FROM failed
+                WHERE queue.tenant_id=failed.tenant_id
+                  AND queue.source_id=failed.source_id
+                  AND queue.artifact_id=failed.artifact_id""",
+            (
+                [identity[0] for identity in identities],
+                [identity[1] for identity in identities],
+                [identity[2] for identity in identities],
+            ),
+        )
+
     def _drain_cleanup(
         self,
         *,
@@ -1653,40 +1677,66 @@ class CanonicalLogicalEvidenceProjector:
         # Keep locks through each delete, but release the transaction/connection
         # before another network wave. Never retry an identity within this drain.
         attempted: list[tuple[str, str, str]] = []
-        while len(attempted) < limit:
+        coordinated = getattr(
+            getattr(getattr(self.projection, "archive", None), "client", None),
+            "requires_deletion_claim", False,
+        ) is True
+        claimed: list[tuple[str, str, str]] = []
+        while len(attempted) < limit or claimed:
             with self.store.connect() as connection:
                 with connection.transaction():
-                    rows = connection.execute(
-                        """SELECT queue.*
-                             FROM canonical_evidence_cleanup_queue queue
-                            WHERE (%s::text IS NULL OR queue.tenant_id=%s)
-                              AND NOT EXISTS (
-                                  SELECT 1 FROM unnest(
-                                      %s::text[],%s::text[],%s::text[]
-                                  ) AS attempted(tenant_id,source_id,artifact_id)
-                                  WHERE attempted.tenant_id=queue.tenant_id
-                                    AND attempted.source_id=queue.source_id
-                                    AND attempted.artifact_id=queue.artifact_id
-                              )
-                            ORDER BY queue.queued_at,queue.tenant_id,
-                                     queue.source_id,queue.artifact_id
-                            LIMIT %s
-                            FOR UPDATE SKIP LOCKED""",
-                        (
-                            tenant_id,
-                            tenant_id,
-                            [identity[0] for identity in attempted],
-                            [identity[1] for identity in attempted],
-                            [identity[2] for identity in attempted],
-                            min(concurrency, limit - len(attempted)),
-                        ),
-                    ).fetchall()
+                    if claimed:
+                        # Claims count against the limit. Revisit only these
+                        # identities after commit, reacquiring both guards.
+                        rows = connection.execute(
+                            """SELECT queue.* FROM canonical_evidence_cleanup_queue queue
+                               JOIN unnest(%s::text[],%s::text[],%s::text[])
+                                 AS claimed(tenant_id,source_id,artifact_id)
+                               USING (tenant_id,source_id,artifact_id)
+                               ORDER BY queue.tenant_id,queue.source_id,queue.artifact_id
+                               FOR UPDATE OF queue SKIP LOCKED""",
+                            tuple([identity[index] for identity in claimed] for index in range(3)),
+                        ).fetchall()
+                        # A zero-attempt row here was removed and re-enqueued
+                        # since our commit. Leave that new work for another drain.
+                        rows = [row for row in rows if row['attempts'] > 0]
+                        newly_claimed = set(claimed)
+                        claimed = []
+                    else:
+                        rows = connection.execute(
+                            """SELECT queue.*
+                                 FROM canonical_evidence_cleanup_queue queue
+                                WHERE (%s::text IS NULL OR queue.tenant_id=%s)
+                                  AND NOT EXISTS (
+                                      SELECT 1 FROM unnest(
+                                          %s::text[],%s::text[],%s::text[]
+                                      ) AS attempted(tenant_id,source_id,artifact_id)
+                                      WHERE attempted.tenant_id=queue.tenant_id
+                                        AND attempted.source_id=queue.source_id
+                                        AND attempted.artifact_id=queue.artifact_id
+                                  )
+                                ORDER BY queue.queued_at,queue.tenant_id,
+                                         queue.source_id,queue.artifact_id
+                                LIMIT %s
+                                FOR UPDATE SKIP LOCKED""",
+                            (
+                                tenant_id,
+                                tenant_id,
+                                [identity[0] for identity in attempted],
+                                [identity[1] for identity in attempted],
+                                [identity[2] for identity in attempted],
+                                min(concurrency, limit - len(attempted)),
+                            ),
+                        ).fetchall()
+                        if not rows:
+                            break
+                        attempted.extend(
+                            (row["tenant_id"], row["source_id"], row["artifact_id"])
+                            for row in rows
+                        )
+                        newly_claimed = set()
                     if not rows:
-                        break
-                    attempted.extend(
-                        (row["tenant_id"], row["source_id"], row["artifact_id"])
-                        for row in rows
-                    )
+                        continue
                     # Queue locks precede artifact locks here; never wait on an
                     # admission owner that may itself need this queue row.
                     from .canonical import _lock_artifacts
@@ -1701,6 +1751,21 @@ class CanonicalLogicalEvidenceProjector:
                         row['tenant_id'],row['source_id'],row['artifact_id']) in live]
                     removable = [row for row in rows if (
                         row['tenant_id'],row['source_id'],row['artifact_id']) not in live]
+                    if coordinated:
+                        first_attempt = [row for row in removable if row['attempts'] == 0]
+                        claimed = [(row['tenant_id'], row['source_id'], row['artifact_id'])
+                                   for row in first_attempt]
+                        if claimed:
+                            self._record_cleanup_attempts(connection, claimed)
+                        # First attempts cannot call the provider until this
+                        # transaction commits. An uncertain commit exits here.
+                        removable = [row for row in removable if row['attempts'] > 0]
+                        retries = [(row['tenant_id'], row['source_id'], row['artifact_id'])
+                                   for row in removable if (
+                                       row['tenant_id'], row['source_id'], row['artifact_id'])
+                                   not in newly_claimed]
+                        if retries:
+                            self._record_cleanup_attempts(connection, retries)
                     references = [
                         self._reference(row)
                         for row in removable
@@ -1761,28 +1826,8 @@ class CanonicalLogicalEvidenceProjector:
                                 [identity[2] for identity in succeeded],
                             ),
                         )
-                    if failed:
-                        connection.execute(
-                            """WITH failed(
-                                   tenant_id,source_id,artifact_id
-                               ) AS (
-                                   SELECT * FROM unnest(
-                                       %s::text[],%s::text[],%s::text[]
-                                   )
-                               )
-                               UPDATE canonical_evidence_cleanup_queue queue
-                                  SET attempts=queue.attempts+1,
-                                      last_attempt_at=clock_timestamp()
-                                 FROM failed
-                                WHERE queue.tenant_id=failed.tenant_id
-                                  AND queue.source_id=failed.source_id
-                                  AND queue.artifact_id=failed.artifact_id""",
-                            (
-                                [identity[0] for identity in failed],
-                                [identity[1] for identity in failed],
-                                [identity[2] for identity in failed],
-                            ),
-                        )
+                    if failed and not coordinated:
+                        self._record_cleanup_attempts(connection, failed)
         with self.store.connect() as connection:
             pending = connection.execute(
                 """SELECT count(*) AS count

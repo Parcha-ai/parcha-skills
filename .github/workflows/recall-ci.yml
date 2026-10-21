@@ -114,6 +114,7 @@ jobs:
             e2e_mcp_read_reservation.py \
             e2e_cleanup_transaction_waves.py \
             e2e_archive_reference_lifetime.py \
+            e2e_archil_cleanup_admission.py \
             e2e_archive_admission_races.py \
             e2e_cleanup_reference_indexes.py \
             e2e_archive_reprojection.py \

@@ -386,6 +386,18 @@ def _guard_artifact_admission(connection, tenant_id: str, source_id: str, artifa
         (tenant_id, source_id, list(artifact_ids)),
     ).fetchone():
         raise CanonicalLifecycleError("canonical_artifact_forgotten")
+    # The cleanup queue also retains unknown or asynchronously synchronized
+    # deletions. Do not revive an unowned object while its deletion is pending.
+    # A live owner uses exactly the predicate that protects it from cleanup.
+    pending = connection.execute("""SELECT tenant_id,source_id,artifact_id
+        FROM canonical_evidence_cleanup_queue
+        WHERE tenant_id=%s AND source_id=%s AND artifact_id=ANY(%s) AND attempts>0""",
+        (tenant_id, source_id, list(artifact_ids))).fetchall()
+    if pending:
+        from .logical_evidence_projection import CanonicalLogicalEvidenceProjector
+        live = CanonicalLogicalEvidenceProjector._live_cleanup_references(connection, pending)
+        if any((row['tenant_id'], row['source_id'], row['artifact_id']) not in live for row in pending):
+            raise CanonicalLifecycleError("canonical_artifact_cleanup_pending")
 
 
 def _suppressed_ownership_available(connection) -> bool:
