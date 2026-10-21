@@ -85,6 +85,7 @@ jobs:
             e2e_canonical_body_thinning.py \
             e2e_bounded_canonical_thinning.py \
             e2e_thinning_retirement_transition.py \
+            e2e_retirement_productive_eof.py \
             e2e_committed_body_keys.py \
             e2e_logical_source_integrity.py \
             e2e_logical_source_fairness.py \

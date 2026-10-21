@@ -111,6 +111,8 @@ class RetirementSupervisor:
                 "claim_wall_ms=%s parent_wall_ms=%s metadata_capture_ms=%s retired_metadata_chunks=%s "
                 "metadata_rows=%s metadata_fetches=%s metadata_fetch_ms=%s "
                 "metadata_membership_calls=%s metadata_membership_ms=%s metadata_spool_ms=%s "
+                "parent_thinned_documents=%s parent_thinned_events=%s "
+                "parent_thin_document_bytes_removed=%s parent_thin_event_bytes_replaced=%s "
                 "maintenance_phase=%s claim_phase=%s sqlstate=%s "
                 "membership_certified_passages=%s membership_failed_parents=%s "
                 "membership_deferred_parents=%s membership_elapsed_ms=%s "
@@ -151,6 +153,10 @@ class RetirementSupervisor:
                 result.get("metadata_membership_calls"),
                 result.get("metadata_membership_ms"),
                 result.get("metadata_spool_ms"),
+                result.get("parent_thinned_documents"),
+                result.get("parent_thinned_events"),
+                result.get("parent_thin_document_bytes_removed"),
+                result.get("parent_thin_event_bytes_replaced"),
                 result.get("maintenance_phase"),
                 result.get("claim_phase"),
                 result.get("sqlstate"),
