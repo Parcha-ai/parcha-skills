@@ -57,6 +57,10 @@ class SlackThreadUnavailable(SlackChannelUnavailable):
     """The saved historical thread position no longer exists."""
 
 
+class _SlackDiscoveryCursorExpired(ConnectorUpstreamError):
+    """The provider rejected an existing discovery continuation."""
+
+
 class JsonRail(Protocol):
     def request(
         self, operation_id: str, *, path: Mapping[str, Any] | None = None,
@@ -543,6 +547,8 @@ class SlackWorkspaceConnector:
             _log_request_failure(operation, "response", "response_invalid")
         elif response.get("ok") is not True:
             _log_request_failure(operation, "response", response.get("error"))
+            if operation == "channels.list" and response.get("error") == "invalid_cursor":
+                raise _SlackDiscoveryCursorExpired("connector_upstream_error")
             if response.get("error") == "thread_not_found":
                 raise SlackThreadUnavailable("connector_upstream_error")
             if response.get("error") in ("channel_not_found", "not_in_channel", "is_archived"):
@@ -576,6 +582,31 @@ class SlackWorkspaceConnector:
     def _page(self, records: list[ConnectorRecordV2], state: dict[str, Any], more: bool) -> ConnectorPage:
         return ConnectorPage(records=tuple(records), next_cursor=_cursor(state), has_more=more)
 
+    def _unfinished_discovery_channels(self, channels: list[str], state: dict[str, Any]) -> list[str]:
+        db = self._checkpoint_db
+        if db is None or not channels:
+            return channels
+        discovery = db.execute("""SELECT started_cycle,started_selection FROM slack_discovery_coverage
+            WHERE workspace_id=? AND authority=?""", self._scope).fetchone()
+        if not discovery or discovery[0] != state["cycle"] or discovery[1] != self._selection:
+            return channels
+        ids = [channel.rsplit(":", 1)[0] for channel in channels]
+        rows = db.execute("""SELECT channel_id,history_through FROM slack_channel_coverage
+            WHERE workspace_id=? AND authority=? AND capture_version=?
+              AND scanned_cycle=? AND last_seen_cycle=? AND history_through IS NOT NULL
+              AND channel_id IN (""" + ",".join("?" for _ in ids) + ")",
+            (*self._scope, SLACK_MESSAGE_CAPTURE_VERSION, state["cycle"], state["cycle"], *ids))
+        upper = datetime.fromisoformat(state["upper"].replace("Z", "+00:00"))
+        completed = set()
+        for channel, through in rows:
+            try:
+                if datetime.fromisoformat(through.replace("Z", "+00:00")) >= upper:
+                    completed.add(channel)
+            except (AttributeError, TypeError, ValueError):
+                # An invalid ledger value cannot authorize skipping history.
+                continue
+        return [channel for channel in channels if channel.rsplit(":", 1)[0] not in completed]
+
     def _pull_discover(self, state: dict[str, Any]) -> ConnectorPage:
         query: dict[str, Any] = {
             "exclude_archived": not self.public_history,
@@ -584,7 +615,14 @@ class SlackWorkspaceConnector:
         }
         if state["discovery_page"]:
             query["cursor"] = state["discovery_page"]
-        response = self._request("channels.list", query)
+        try:
+            response = self._request("channels.list", query)
+        except _SlackDiscoveryCursorExpired:
+            if not state["discovery_page"]:
+                raise
+            # Keep this cycle's window and ACKed coverage; restart only the listing.
+            response = self._request("channels.list", {key: value for key, value in query.items()
+                                                       if key != "cursor"})
         channels = []
         for raw in _items(response.get("channels"), "channels", CHANNEL_BATCH_SIZE):
             if not isinstance(raw, dict) or not isinstance(raw.get("id"), str):
@@ -596,6 +634,7 @@ class SlackWorkspaceConnector:
             if encoded not in channels:
                 channels.append(encoded)
         channels.sort()
+        channels = self._unfinished_discovery_channels(channels, state)
         next_page = _next(response)
         state = {
             **state, "channels": channels, "channel_index": 0, "channel_lower": None,
