@@ -63,6 +63,26 @@ class WorkerWriteStore:
                 finally:
                     self._local.connection = None
 
+    @contextmanager
+    def coordinator_connect(self):
+        """Use the existing reserved pool capacity for sequential cleanup."""
+        if getattr(self._local, "active", False):
+            raise RuntimeError("nested worker checkout is unsupported")
+        deadline = time.monotonic() + 5.0
+        self._local.active = True
+        try:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise PoolTimeout("worker SQL admission timed out")
+            with self._store.connect(timeout=remaining) as connection:
+                self._local.connection = connection
+                try:
+                    yield connection
+                finally:
+                    self._local.connection = None
+        finally:
+            self._local.active = False
+
     def prepare_pool(self, minimum_size, *, timeout=60.0):
         if (
             isinstance(minimum_size, bool)

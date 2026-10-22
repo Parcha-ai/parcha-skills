@@ -1608,11 +1608,13 @@ class CanonicalLogicalEvidenceProjector:
         limit: int = 500,
         concurrency: int = 1,
         on_progress: Callable[[], None] | None = None,
+        _coordinator: bool = False,
     ) -> dict[str, int | str]:
         with _phase_timing("cleanup") as counts:
             result = self._drain_cleanup(
                 tenant_id=tenant_id, limit=limit, concurrency=concurrency,
                 **({"on_progress": on_progress} if on_progress is not None else {}),
+                **({"_coordinator": True} if _coordinator else {}),
             )
             counts.update({key: int(result[key]) for key in
                            ("completed", "deleted", "failures", "pending")})
@@ -1680,9 +1682,11 @@ class CanonicalLogicalEvidenceProjector:
         limit: int = 500,
         concurrency: int = 1,
         on_progress: Callable[[], None] | None = None,
+        _coordinator: bool = False,
     ) -> dict[str, int | str]:
         if (
             not 1 <= limit <= 5_000
+            or type(_coordinator) is not bool
             or isinstance(concurrency, bool)
             or not isinstance(concurrency, int)
             or not 1 <= concurrency <= 32
@@ -1690,6 +1694,8 @@ class CanonicalLogicalEvidenceProjector:
             raise LogicalEvidenceError("logical_evidence_budget_invalid")
         tenant_id = self._tenant(tenant_id)
         completed = deleted = failures = 0
+        connect = (getattr(self.store, "coordinator_connect", self.store.connect)
+                   if _coordinator else self.store.connect)
         # Keep locks through each delete, but release the transaction/connection
         # before another network wave. Never retry an identity within this drain.
         attempted: list[tuple[str, str, str]] = []
@@ -1700,7 +1706,7 @@ class CanonicalLogicalEvidenceProjector:
         claimed: list[tuple[str, str, str]] = []
         next_progress = time.monotonic() + PROJECTION_PROGRESS_INTERVAL_SECONDS
         while len(attempted) < limit or claimed:
-            with self.store.connect() as connection:
+            with connect() as connection:
                 with connection.transaction():
                     if claimed:
                         # Claims count against the limit. Revisit only these
@@ -1850,7 +1856,7 @@ class CanonicalLogicalEvidenceProjector:
             if on_progress is not None and time.monotonic() >= next_progress:
                 on_progress()
                 next_progress = time.monotonic() + PROJECTION_PROGRESS_INTERVAL_SECONDS
-        with self.store.connect() as connection:
+        with connect() as connection:
             pending = connection.execute(
                 """SELECT count(*) AS count
                      FROM canonical_evidence_cleanup_queue
@@ -2640,12 +2646,15 @@ class CanonicalLogicalEvidenceProjector:
         repaired = failed = 0
         old_objects_deleted = cleanup_failures = source_races = pruned = 0
         cleanup_completed = cleanup_pending = 0
+        cleanup_options = ({"_coordinator": True}
+                           if callable(getattr(self.store, "coordinator_connect", None)) else {})
         # Object deletes are S3 round trips, not database work: measured at
         # ~8 s each in production when serialized, they held one cycle for
         # 25 minutes. Fan them out independently of the upload budget.
         if on_heartbeat is None:
             cleanup = self.drain_cleanup(
                 tenant_id=tenant_id,
+                **cleanup_options,
                 limit=5_000,
                 concurrency=cleanup_concurrency,
             )
@@ -2896,10 +2905,12 @@ class CanonicalLogicalEvidenceProjector:
             if on_heartbeat is None:
                 return self.drain_cleanup(
                     tenant_id=tenant_id, limit=5_000, concurrency=cleanup_concurrency,
+                    **cleanup_options,
                 )
             try:
                 return publish_with_refill(executor, lambda: self.drain_cleanup(
                     tenant_id=tenant_id, limit=5_000, concurrency=cleanup_concurrency,
+                    **cleanup_options,
                     on_progress=on_heartbeat,
                 ))
             except BaseException:
@@ -3009,6 +3020,7 @@ class CanonicalLogicalEvidenceProjector:
             if not cleanup_interrupted:
                 self.drain_cleanup(
                     tenant_id=tenant_id,
+                    **cleanup_options,
                     limit=5_000,
                     concurrency=cleanup_concurrency,
                 )
@@ -3025,6 +3037,7 @@ class CanonicalLogicalEvidenceProjector:
             )
             cleanup = self.drain_cleanup(
                 tenant_id=tenant_id, limit=5_000, concurrency=cleanup_concurrency,
+                **cleanup_options,
                 **({"on_progress": on_heartbeat} if on_heartbeat is not None else {}),
             )
             old_objects_deleted += int(cleanup["deleted"])
