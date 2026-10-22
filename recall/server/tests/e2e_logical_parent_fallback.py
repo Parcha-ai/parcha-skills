@@ -60,8 +60,22 @@ def queries():
                                   AND encode(sha256(convert_to(
                                       root_fields.content->>'text','UTF8')),'hex')
                                       =document.text_sha256,false) AS literal_text,"""
+    compact_literal_column = """coalesce(event.kind='connector_record'
+                                  AND root_fields.content->>'kind' IN (
+                                      'communication_message.v1','document.v1')
+                                  AND ((jsonb_typeof(root_fields.content->'text')='string'
+                                      AND encode(sha256(convert_to(
+                                          root_fields.content->>'text','UTF8')),'hex')
+                                          =document.text_sha256)
+                                    OR (event.body_location='raw'
+                                      AND jsonb_typeof(root_fields.content->'_recall_typed_text_sha256')='string'
+                                      AND root_fields.content->>'_recall_typed_text_sha256'
+                                          =document.text_sha256)),false) AS literal_text,"""
     legacy_input = current
     if ' AS literal_text,' in current:
+        matches = [column for column in (literal_column, compact_literal_column) if column in current]
+        assert len(matches) == 1
+        literal_column, = matches
         assert current.count(literal_column) == 1
         legacy_input = current.replace(literal_column, '')
     # Hints add metadata to the current projection, not the frozen legacy SQL.
