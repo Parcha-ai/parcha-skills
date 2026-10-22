@@ -184,7 +184,9 @@ class RetainedPassageReceipts(unittest.TestCase):
             self.ingest(3, text='Changed current source evidence.')
             return result
         writes = len(namespace.writes)
-        with patch.object(namespace, 'query', side_effect=revise):
+        # Reach the revision race independently of the default search latency budget.
+        with patch.object(self.store, 'search_deadline_ms', 5000), \
+                patch.object(namespace, 'query', side_effect=revise):
             with self.assertRaisesRegex(ValueError, 'write_incomplete'):
                 search_parent_reconciliation.step(self.restart_writer(), self.tenant)
         self.assertEqual(len(namespace.writes), writes)
