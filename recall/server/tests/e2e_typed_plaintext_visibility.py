@@ -4,11 +4,11 @@ import hashlib
 import unittest
 from unittest.mock import patch
 
-from connectors.slack_source import normalize_slack_message
 import e2e_handback_projection as publication_fixture
 import e2e_slack_canonical_capture_read as capture_fixture
 import e2e_archive_reprojection as archive_fixture
 import e2e_compact_canonical_bodies as compact_fixture
+from connectors.slack_source import normalize_slack_message
 from recall_server import passage_projection
 from recall_server.canonical import CanonicalArchiveGateway, CanonicalLifecycleError, CanonicalPlane
 from recall_server.logical_evidence_projection import CanonicalLogicalEvidenceProjector
