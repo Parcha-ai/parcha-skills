@@ -1090,10 +1090,14 @@ class CanonicalLogicalEvidenceProjector:
                               coalesce(event.kind='connector_record'
                                   AND root_fields.content->>'kind' IN (
                                       'communication_message.v1','document.v1')
-                                  AND jsonb_typeof(root_fields.content->'text')='string'
-                                  AND encode(sha256(convert_to(
-                                      root_fields.content->>'text','UTF8')),'hex')
-                                      =document.text_sha256,false) AS literal_text,
+                                  AND ((jsonb_typeof(root_fields.content->'text')='string'
+                                      AND encode(sha256(convert_to(
+                                          root_fields.content->>'text','UTF8')),'hex')
+                                          =document.text_sha256)
+                                    OR (event.body_location='raw'
+                                      AND jsonb_typeof(root_fields.content->'_recall_typed_text_sha256')='string'
+                                      AND root_fields.content->>'_recall_typed_text_sha256'
+                                          =document.text_sha256)),false) AS literal_text,
                               source_record.source_chunks,
                               source_record.chunk_count,
                               source_record.chunk_receipts,
