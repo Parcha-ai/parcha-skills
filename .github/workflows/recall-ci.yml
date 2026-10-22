@@ -241,6 +241,7 @@ jobs:
             e2e_managed_connector_worker.py \
             e2e_managed_slack_identity.py \
             e2e_slack_capture_before_repair.py \
+            e2e_slack_canonical_capture_read.py \
             e2e_managed_slack_history_actors.py \
             e2e_managed_slack_captured_actors.py \
             e2e_slack_thinned_document_attribution.py \
