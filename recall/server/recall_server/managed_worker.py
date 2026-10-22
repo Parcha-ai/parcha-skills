@@ -872,12 +872,18 @@ class ManagedConnectorWorker:
                     privacy=PrivacyPolicy(mode=row["privacy_mode"]),
                 )
                 captured = None
-                if row.get('connector_id') == 'slack.messages':
-                    from .slack_captured_attribution import repair_slice, progress_report
-                    captured = repair_slice(self, row, runner, deadline_at=started + self.lease_seconds)
-                    if captured is not None:
-                        captured = progress_report(row, runner)
-                result = runner.run_once()
+                try:
+                    result = runner.run_once()
+                finally:
+                    # Capture and its durable ACK get the first opportunity;
+                    # a provider failure still leaves a bounded repair turn.
+                    if row.get('connector_id') == 'slack.messages':
+                        repair_deadline = started + min(self.interval_seconds, self.lease_seconds)
+                        if time.monotonic() < repair_deadline:
+                            from .slack_captured_attribution import repair_slice, progress_report
+                            captured = repair_slice(self, row, runner, deadline_at=repair_deadline)
+                            if captured is not None:
+                                captured = progress_report(row, runner)
             if result.get("status") == "backoff":
                 code = result.get("error_code", "connector_rate_limited")
                 self._finish(
