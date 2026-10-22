@@ -6,9 +6,9 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from e2e_managed_slack_captured_actors import CapturedSlackActors
 from connectors.sdk import ConnectorPage
 from connectors.slack_source import normalize_slack_message
-from e2e_managed_slack_captured_actors import CapturedSlackActors
 
 
 class CaptureBeforeRepair(CapturedSlackActors):
