@@ -500,10 +500,12 @@ class CanonicalLogicalEvidenceProjector:
             raise LogicalEvidenceError("logical_evidence_state_invalid")
         text = self._restored_record_text(row, text)
         segments = self._text_segments(text)
-        roles = _explicit_roles(row["explicit_role_values"])
+        literal_text = row.get("literal_text", False)
+        roles = () if literal_text else _explicit_roles(row["explicit_role_values"])
         attributed = actor_links(row.get("actor_links") or ())
         use_cached_content = (
             canonical_content_bytes is not None
+            and not literal_text
             and len(segments) == 1
         )
         for segment_ordinal, segment in enumerate(segments):
@@ -523,6 +525,7 @@ class CanonicalLogicalEvidenceProjector:
                     else None
                 ),
                 actor_links=attributed,
+                literal_text=literal_text,
             )
 
     def _record_stream(self, cursor: Any, *, locate=None, start_ordinal=0):
@@ -538,13 +541,12 @@ class CanonicalLogicalEvidenceProjector:
                 or revision < 1
             ):
                 raise LogicalEvidenceError("logical_evidence_state_invalid")
-            (
-                parsed,
-                structural_types,
-                structural_roles,
-                canonical_content,
-            ) = _parsed_structural_values(text)
-            if not parsed:
+            if row.get("literal_text", False):
+                parsed, structural_types, structural_roles, canonical_content = False, (), (), None
+            else:
+                (parsed, structural_types, structural_roles,
+                 canonical_content) = _parsed_structural_values(text)
+            if not parsed and not row.get("literal_text", False):
                 structural_types = tuple(row["fallback_type_values"])
                 structural_roles = tuple(row["fallback_role_values"])
             if set(structural_types).intersection(
@@ -1085,6 +1087,13 @@ class CanonicalLogicalEvidenceProjector:
                               source_record.event_text,
                               document.revision AS document_revision,
                               document.text_sha256 AS document_text_sha256,
+                              coalesce(event.kind='connector_record'
+                                  AND root_fields.content->>'kind' IN (
+                                      'communication_message.v1','document.v1')
+                                  AND jsonb_typeof(root_fields.content->'text')='string'
+                                  AND encode(sha256(convert_to(
+                                      root_fields.content->>'text','UTF8')),'hex')
+                                      =document.text_sha256,false) AS literal_text,
                               source_record.source_chunks,
                               source_record.chunk_count,
                               source_record.chunk_receipts,
