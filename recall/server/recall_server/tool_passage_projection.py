@@ -97,6 +97,9 @@ def extract_tool_event_groups(
     for records_group in _logical_record_groups(records, first_record_ordinal=first_record_ordinal):
         events += 1
         first = records_group[0]
+        if first.literal_text:
+            dispositions['literal_provider_text'] += 1
+            continue
         raw = ''.join(record.text for record in records_group)
         try:
             event = json.loads(raw, object_pairs_hook=_unique_pairs)
@@ -195,6 +198,9 @@ def extract_codex_tool_event_groups(
     for records_group in _logical_record_groups(records, first_record_ordinal=first_record_ordinal):
         events += 1
         first = records_group[0]
+        if first.literal_text:
+            dispositions['literal_provider_text'] += 1
+            continue
         raw = ''.join(record.text for record in records_group)
         try:
             event = json.loads(raw, object_pairs_hook=_unique_pairs)

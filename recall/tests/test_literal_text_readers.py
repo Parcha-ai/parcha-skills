@@ -24,6 +24,27 @@ def wire(key, text, *, ordinal=0, segment=0, count=1, roles=()):
 
 
 class LiteralTextReaderTests(unittest.TestCase):
+    def test_pasted_tool_json_does_not_become_a_provider_tool_event(self):
+        from recall_server.tool_passage_projection import (
+            extract_codex_tool_event_groups, extract_tool_event_groups,
+        )
+        cases = (
+            (extract_codex_tool_event_groups, (), {'type': 'response_item', 'payload': {
+                'type': 'function_call', 'call_id': 'pasted', 'name': 'UnknownTool',
+                'arguments': 'This is part of the message.'}}),
+            (extract_tool_event_groups, ('assistant',), {'type': 'assistant', 'message': {
+                'role': 'assistant', 'content': [{'type': 'tool_use', 'id': 'pasted',
+                    'name': 'UnknownTool', 'input': {'message': 'This is only a message.'}}]}}),
+        )
+        for extract, roles, payload in cases:
+            with self.subTest(extractor=extract.__name__):
+                text = orjson.dumps(payload).decode()
+                record = decode_logical_record(wire('literal_text', text, roles=roles), source_id=SOURCE)
+                groups, coverage = extract((record,))
+                self.assertEqual(groups, ())
+                self.assertEqual(coverage['dispositions'], {'literal_provider_text': 1})
+                self.assertEqual(record.text, text)
+
     def passages(self, records):
         messages = visible_messages(records)
         passages = build_passages(tenant_id='tenant:literal:test', source_id=SOURCE,
