@@ -800,7 +800,9 @@ class CapturedSlackActors(ManagedSlackHistoryActors):
         original = worker._reconcile_slack_page
         def unknown(row, records, **kwargs):
             result = original(row, records, **kwargs)
-            if any(record.native_id == self.message.native_id for record in records):
+            if (any(record.native_id == self.message.native_id for record in records) or
+                    any(event['native_id'] == self.message.native_id
+                        for event in kwargs.get('captured_documents', ()))):
                 raise RuntimeError('synthetic lost acknowledgement after commit')
             return result
         with patch.object(worker, '_reconcile_slack_page', side_effect=unknown):
