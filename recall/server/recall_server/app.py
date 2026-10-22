@@ -121,6 +121,41 @@ COUNTERS = {
 COUNTER_LOCK = threading.Lock()
 
 
+def _slack_failure_details(error: Exception) -> tuple[str, int | str, str]:
+    """Log fixed provider categories, never exception prose or request data."""
+    cause = error.__cause__
+    if cause is None:
+        return "none", "none", "none"
+    cause_name = type(cause).__name__
+    if cause_name not in {
+        "ClientError", "ReadTimeoutError", "ConnectTimeoutError",
+        "EndpointConnectionError", "ConnectionClosedError", "SSLError",
+        "HTTPClientError", "NoCredentialsError", "PartialCredentialsError",
+        "TimeoutError", "ConnectionError", "OSError",
+    }:
+        cause_name = "other"
+    response = vars(cause).get("response")
+    status: int | str = "none"
+    code = "none"
+    if isinstance(response, dict):
+        metadata = response.get("ResponseMetadata")
+        if isinstance(metadata, dict):
+            value = metadata.get("HTTPStatusCode")
+            if type(value) is int and 100 <= value <= 599:
+                status = value
+        detail = response.get("Error")
+        value = detail.get("Code") if isinstance(detail, dict) else None
+        if isinstance(value, str):
+            code = value if value in {
+                "AccessDenied", "NoSuchBucket", "NoSuchKey", "NoSuchVersion",
+                "RequestTimeout", "SlowDown", "ServiceUnavailable", "InternalError",
+                "PreconditionFailed", "ConditionalRequestConflict", "InvalidRequest",
+                "InvalidArgument", "InvalidDigest", "BadDigest", "SignatureDoesNotMatch",
+                "ExpiredToken", "InvalidAccessKeyId", "NotImplemented",
+            } else "other"
+    return cause_name, status, code
+
+
 class Handler(BaseHTTPRequestHandler):
     store: BrainStore
     archive_store = None
@@ -1705,7 +1740,10 @@ class Handler(BaseHTTPRequestHandler):
                     self.legacy_write_error_status(exc), {"error": exc.error_code},
                 )
             except Exception as exc:
-                LOG.error("slack webhook failed type=%s", type(exc).__name__)
+                LOG.error(
+                    "slack webhook failed type=%s cause=%s status=%s code=%s",
+                    type(exc).__name__, *_slack_failure_details(exc),
+                )
                 self.send_json(500, {"error": "slack webhook failed"})
             return
         if path == WEBHOOK_PATH:
