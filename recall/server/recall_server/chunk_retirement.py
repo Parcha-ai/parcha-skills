@@ -351,10 +351,13 @@ def _parent_deadline(deadline_at):
     return deadline_at
 
 
-def require_retirement_owner(store, connection, scope, principal_id, deadline_at, *, lock=True):
+def require_retirement_owner(store, connection, scope, principal_id, deadline_at, *, lock=True,
+                             phase_observer=None):
     """Lock storage-maintenance authority; only read-only snapshots omit locks."""
     from .control import ControlError, ControlPlane
 
+    if phase_observer is not None:
+        phase_observer('parent_thin_owner')
     found = store._execute_bounded(connection, """SELECT source.owner_principal_id,grant_row.permission
         FROM canonical_sources source JOIN canonical_source_grants grant_row USING(tenant_id,source_id)
         WHERE source.tenant_id=%s AND source.source_id=%s
@@ -367,7 +370,11 @@ def require_retirement_owner(store, connection, scope, principal_id, deadline_at
         return
     # The explicit source grant is necessary but not sufficient. Recheck and
     # lock the existing company-admin predicate for each bounded mutation.
+    if phase_observer is not None:
+        phase_observer('parent_thin_deadline')
     store._set_statement_deadline(connection, deadline_at)
+    if phase_observer is not None:
+        phase_observer('parent_thin_admin')
     try:
         ControlPlane._brain_admin(connection, principal_id=principal_id,
                                   tenant_id=scope[0], lock=lock)
