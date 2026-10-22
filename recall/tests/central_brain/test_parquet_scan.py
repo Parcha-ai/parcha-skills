@@ -1222,7 +1222,7 @@ class ParquetFragmentDeltaTest(unittest.TestCase):
         cleanup = [
             parameters
             for query, parameters in statements
-            if "canonical_evidence_cleanup_queue" in query
+            if "INSERT INTO canonical_evidence_cleanup_queue" in query
         ]
         self.assertEqual(
             sorted(parameters[2] for parameters in cleanup),

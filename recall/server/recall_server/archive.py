@@ -728,6 +728,14 @@ class S3ArchiveStore(_ArchiveStore):
             raise ArchiveNotFound("archive object not found")
         return {}
 
+    def confirm_raw_deletion(self, value: dict[str, Any]) -> None:
+        """Keep derived cleanup queued until a coordinated delete has settled."""
+        confirm = getattr(self.client, 'confirm_deleted', None)
+        if callable(confirm):
+            reference = self._from_contract(value)
+            confirm(Bucket=self.bucket, Key=reference.object_key,
+                    **self._version_kwargs(reference))
+
     def _existing_reference(
         self,
         request: ArchiveRequest,

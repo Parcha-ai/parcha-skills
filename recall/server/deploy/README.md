@@ -560,6 +560,22 @@ immutability with content-addressed keys and conditional writes. Archil
 serverless execution requires an Archil disk in a supported AWS region; that
 disk may mount the same S3 bucket.
 
+For an unversioned AWS evidence bucket mounted by Archil, set
+`RECALL_EVIDENCE_DELETE_MODE=archil` on every service that builds the evidence
+archive. This uses the existing `ARCHIL_API_KEY`, `RECALL_ARCHIL_DISK_ID` and
+`RECALL_ARCHIL_REGION`. Startup checks that the disk has exactly that bucket
+mounted at its root, without a prefix. Deletions go through Archil's S3 API.
+Uploads and integrity checks keep using the original bucket, including its
+custom metadata. Raw capture storage is unchanged.
+
+During rollout, deploy every writer with `RECALL_EVIDENCE_DELETE_MODE=hold`
+before activating `archil`. Hold blocks evidence deletion while capture and
+publication remain available. Cleanup commits its intent before calling the
+provider and stays queued until both storage views report absence. Unrelated
+new uploads do not wait for disk discovery. Use `hold` for rollback; never
+switch an Archil-backed bucket to direct deletion. The default `direct` mode
+retains existing behavior for deployments without coordinated disk deletion.
+
 ```bash
 python -m recall_server.cli evidence-archive-check
 python -m recall_server.cli backfill-canonical-evidence \

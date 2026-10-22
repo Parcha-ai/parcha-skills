@@ -191,10 +191,13 @@ def build_evidence_archive_store(
             values, "RECALL_EVIDENCE_ARCHIVE_NAMESPACE_KEY"
         ),
     }
-    return build_archive_store(
+    from .archil_archive import coordinate_evidence_archive
+
+    store = build_archive_store(
         translated, client_factory=client_factory, deadline_reads=deadline_reads,
         deadline_read_timeout_seconds=deadline_read_timeout_seconds,
     )
+    return coordinate_evidence_archive(store, values)
 
 
 def probe_archive(store: S3ArchiveStore) -> dict[str, Any]:

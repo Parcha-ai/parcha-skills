@@ -423,6 +423,97 @@ def _advance_without_physical_work(store, *, scope, principal_id, reviewed_plan,
         skipped_records=through-cursor, sql_ms=(time.monotonic()-started)*1000)
 
 
+def _thin_before_parent(store, *, scope, principal_id, limits, deadline_at, reviewed_plan,
+                 required_scope_epoch, diagnostic=None):
+    """Do one bounded native thinning page before this parent archive attempt."""
+    from .canonical_thinning import _thin_selected
+    from .chunk_retirement import (
+        ChunkRetirementError, _parent_progress, _try_parent_native_locks,
+        require_retirement_owner,
+    )
+    from .db import SearchDeadlineExceeded
+
+    bound = min(256, limits.batch_documents)
+    deadline = min(deadline_at, time.monotonic() + 5)
+    _attempt_phase(diagnostic, 'parent_thin_nomination')
+    try:
+        with store.connect() as connection, connection.transaction():
+            connection.execute('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY')
+            require_retirement_owner(store, connection, scope[:2], principal_id, deadline, lock=False)
+            # Parent-local advisory prerequisites avoid an unthinnable prefix.
+            # The native thinner rechecks all eligibility under its locks.
+            # Correlated probes avoid repeatedly scanning/aggregating source
+            # keys. LIMIT bounds returned candidates, not prior events examined.
+            rows = store._execute_bounded(connection, '''SELECT document.source_id,
+                    document.document_id,document.native_id,document.revision
+                FROM (SELECT tenant_id,source_id,event_id,artifact_id FROM canonical_events
+                    WHERE tenant_id=%s AND source_id=%s
+                      AND coalesce(native_parent_id,native_id)=%s
+                    ORDER BY source_ordinal,occurred_at,native_id OFFSET 0) event
+                JOIN LATERAL (SELECT source_id,document_id,native_id,revision,body_location
+                    FROM canonical_documents document
+                    WHERE document.tenant_id=event.tenant_id AND document.source_id=event.source_id
+                      AND document.event_id=event.event_id AND document.is_current
+                      AND document.deleted_at IS NULL
+                    OFFSET 0) document ON true
+                WHERE document.body_location='inline'
+                  AND EXISTS (SELECT 1 FROM (
+                    SELECT storage_backend,state FROM raw_artifacts
+                    WHERE tenant_id=event.tenant_id AND source_id=event.source_id
+                      AND artifact_id=event.artifact_id OFFSET 0) artifact
+                    WHERE artifact.storage_backend='s3' AND artifact.state='live' OFFSET 0)
+                  AND EXISTS (SELECT 1 FROM canonical_chunks chunk
+                    WHERE chunk.tenant_id=event.tenant_id AND chunk.source_id=event.source_id
+                      AND chunk.document_id=document.document_id AND chunk.deleted_at IS NULL OFFSET 0)
+                LIMIT %s''', (*scope, bound), deadline).fetchall()
+    except SearchDeadlineExceeded:
+        # This read-only transaction has rolled back; the original proof keeps
+        # the remaining caller deadline. Never swallow an uncertain write ACK.
+        return None
+    if not rows:
+        return None
+    _attempt_phase(diagnostic, 'parent_thin_sql')
+    with store.connect() as connection, connection.transaction():
+        store._set_statement_deadline(connection, deadline)
+        query = lambda sql, values=(): store._execute_bounded(connection, sql, values, deadline)
+        require_retirement_owner(store, connection, scope[:2], principal_id, deadline)
+        if not _try_parent_native_locks(query, scope, [*rows, dict(native_id=scope[2])]):
+            raise ChunkRetirementError('parent_retirement_lock_busy')
+        query('''SELECT 1 FROM canonical_evidence_documents
+            WHERE tenant_id=%s AND source_id=%s AND native_parent_id=%s
+            FOR UPDATE NOWAIT''', scope).fetchone()
+        current = read_parent_catalog(store, connection, scope, deadline, lock=True)
+        if parent_retirement_plan(scope, manifest_identity(current['manifest'])) != reviewed_plan:
+            _fail('plan_changed')
+        progress = _parent_progress(store, connection, scope, deadline, lock=True)
+        if (not progress or not progress['enabled']
+                or progress['scope_epoch'] != required_scope_epoch):
+            raise ChunkRetirementError('parent_retirement_disabled')
+        if current['queue'] is not None:
+            _fail('pending')
+        witnesses = _witnesses(store, connection, scope,
+            tuple(row['native_id'] for row in rows), deadline, lock=True)
+        if any(witnesses[row['native_id']] is None
+                or witnesses[row['native_id']]['is_tombstone']
+                or any(witnesses[row['native_id']][key] != row[key]
+                    for key in ('document_id', 'revision')) for row in rows):
+            _fail('witness_changed')
+        # Existing eligibility, parent locks and retirement-epoch reset remain
+        # in the same original thinning statement. No proof is synthesized.
+        store._set_statement_deadline(connection, deadline)
+        changed = _thin_selected(connection, scope[0], rows, bound)
+        _check_deadline(deadline)
+        _attempt_phase(diagnostic, 'parent_thin_commit_ack')
+    if not changed['documents']:
+        return None
+    # Thinning may have reset the cursor/epoch. Reclaim instead of continuing
+    # retirement with this attempt's old scope, even when no reset was needed.
+    return dict(status='stopped', complete=False, batches=1,
+        parent_thinned_documents=changed['documents'], parent_thinned_events=changed['events'],
+        parent_thin_document_bytes_removed=changed['document_bytes'],
+        parent_thin_event_bytes_replaced=changed['event_bytes'])
+
+
 def retire_window(store, archive, *, scope, principal_id, limits, deadline_at, reviewed_plan,
                   metadata_mode='keep', remaining_bytes=None, should_stop=None, required_scope_epoch=None, diagnostic=None,
                   no_work_probe_state=None):
@@ -499,7 +590,9 @@ def retire_parent_windows(store, archive, *, tenant_id, source_id, native_parent
             **({"diagnostic": diagnostic} if diagnostic is not None else {}))
     meter = RunArchive(archive,max_bytes=limits.max_archive_bytes)
     totals = dict(retired_metadata_chunks=0,cleared_documents=0,cleared_chunks=0,
-        cleared_utf8_bytes=0,hashed_utf8_bytes=0,hash_ms=0.0,sql_ms=0.0,batches=0)
+        cleared_utf8_bytes=0,hashed_utf8_bytes=0,hash_ms=0.0,sql_ms=0.0,batches=0,
+        parent_thinned_documents=0,parent_thinned_events=0,
+        parent_thin_document_bytes_removed=0,parent_thin_event_bytes_replaced=0)
     # A rolled-back optional SQL timeout need not recur in every window.
     # Fresh parent attempts retry; archive proof and its fences remain mandatory.
     no_work_probe_state = {}
@@ -510,6 +603,18 @@ def retire_parent_windows(store, archive, *, tenant_id, source_id, native_parent
             _attempt_phase(diagnostic, 'parent_sql')
             if store._execute_bounded(connection,'SELECT 1 FROM schema_migrations WHERE version=69',(),deadline_at).fetchone() is None:
                 raise ChunkRetirementError('parent_retirement_schema_required')
+        if (metadata_mode == 'singleton' and reviewed_plan['manifest']['record_count'] > MAX_DOCUMENTS
+                and not (should_stop is not None and should_stop())):
+            from .chunk_retirement import _require_singleton_archive_runtime
+            _require_singleton_archive_runtime(store)
+            _check_deadline(deadline_at)
+            thinned = _thin_before_parent(store, scope=scope, principal_id=owner_principal_id,
+                limits=limits, deadline_at=deadline_at, reviewed_plan=reviewed_plan,
+                required_scope_epoch=required_scope_epoch, diagnostic=diagnostic)
+            if thinned is not None:
+                for key in totals:
+                    totals[key] += thinned.get(key, 0)
+                return {**thinned, **totals}
         while totals['batches'] < limits.max_batches:
             if time.monotonic() >= deadline_at or should_stop is not None and should_stop():
                 result = dict(status='stopped',complete=False)
