@@ -137,7 +137,7 @@ class CooperativeCleanupTests(unittest.TestCase):
         with patch('recall_server.logical_evidence_projection.time',
                    SimpleNamespace(monotonic=lambda: clock[0])):
             result = projector.drain_cleanup(limit=9, concurrency=1, on_progress=maintenance)
-        self.assertEqual(callbacks, [0, 1])
+        self.assertEqual(callbacks, [1])
         self.assertEqual(len(projector.projection.calls), 9)
         self.assertEqual(len(set(projector.projection.calls)), 9)
         self.assertEqual((result['deleted'], result['failures'], result['pending']), (0, 9, 9))
@@ -193,6 +193,28 @@ class CooperativeCleanupTests(unittest.TestCase):
         self.assertEqual([item.native_parent_id for item in projector.queue], ['large'])
         self.assertFalse(any(thread.name.startswith(('recall-logical-refill', 'recall-logical-evidence', 'recall-logical-cleanup'))
                              for thread in threading.enumerate()))
+
+    def test_empty_cleanup_does_not_add_a_maintenance_tick(self):
+        projector = Projector([])
+        projector.store.rows.clear()
+        callbacks = []
+        result = projector.drain_cleanup(limit=9, concurrency=1,
+                                         on_progress=lambda: callbacks.append(True))
+        self.assertEqual(result['pending'], 0)
+        self.assertEqual(callbacks, [])
+        self.assertEqual(projector.projection.calls, [])
+
+    def test_fast_cleanup_keeps_the_existing_maintenance_cadence(self):
+        projector = Projector([])
+        projector.projection.release.set()
+        callbacks = []
+        with patch('recall_server.logical_evidence_projection.time',
+                   SimpleNamespace(monotonic=lambda: 0.0)):
+            result = projector.drain_cleanup(limit=9, concurrency=1,
+                                             on_progress=lambda: callbacks.append(True))
+        self.assertEqual(result['failures'], 9)
+        self.assertEqual(callbacks, [])
+        self.assertEqual(len(set(projector.projection.calls)), 9)
 
     def test_standalone_keeps_initial_cleanup_before_logical_admission(self):
         projector = Projector(['small'])

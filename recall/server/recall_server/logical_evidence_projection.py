@@ -1685,8 +1685,6 @@ class CanonicalLogicalEvidenceProjector:
             "requires_deletion_claim", False,
         ) is True
         claimed: list[tuple[str, str, str]] = []
-        if on_progress is not None:
-            on_progress()
         next_progress = time.monotonic() + PROJECTION_PROGRESS_INTERVAL_SECONDS
         while len(attempted) < limit or claimed:
             with self.store.connect() as connection:
