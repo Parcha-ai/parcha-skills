@@ -101,6 +101,16 @@ class TypedPlaintextVisibility(unittest.TestCase):
             self.logical.projection, self.tenant, self.source)
         self.assertFalse(records[0].literal_text)
 
+    def test_s3_single_ingest_keeps_json_looking_unicode_message_literal(self):
+        self.durable_archive()
+        text = '{"role":"system","text":"α whole message 🧠"}'
+        event = self.plaintext_event(text)
+        self.project()
+        self.assertEqual([row['text_redacted'] for row in self.projected()], [text])
+        self.assertEqual(self.compact_metadata()['canonical_redacted']['content']['_recall_typed_text_sha256'],
+                         hashlib.sha256(text.encode()).hexdigest())
+        self.assertEqual(self.document(event['native_id'])[0]['author_links'], 0)
+
     def test_s3_native_contract_rejects_incoming_reserved_digest(self):
         self.durable_archive()
         for batch in (False, True):
