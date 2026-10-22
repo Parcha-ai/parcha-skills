@@ -1594,10 +1594,12 @@ class CanonicalLogicalEvidenceProjector:
         tenant_id: str | None = None,
         limit: int = 500,
         concurrency: int = 1,
+        on_progress: Callable[[], None] | None = None,
     ) -> dict[str, int | str]:
         with _phase_timing("cleanup") as counts:
             result = self._drain_cleanup(
                 tenant_id=tenant_id, limit=limit, concurrency=concurrency,
+                **({"on_progress": on_progress} if on_progress is not None else {}),
             )
             counts.update({key: int(result[key]) for key in
                            ("completed", "deleted", "failures", "pending")})
@@ -1664,6 +1666,7 @@ class CanonicalLogicalEvidenceProjector:
         tenant_id: str | None = None,
         limit: int = 500,
         concurrency: int = 1,
+        on_progress: Callable[[], None] | None = None,
     ) -> dict[str, int | str]:
         if (
             not 1 <= limit <= 5_000
@@ -1682,6 +1685,7 @@ class CanonicalLogicalEvidenceProjector:
             "requires_deletion_claim", False,
         ) is True
         claimed: list[tuple[str, str, str]] = []
+        next_progress = time.monotonic() + PROJECTION_PROGRESS_INTERVAL_SECONDS
         while len(attempted) < limit or claimed:
             with self.store.connect() as connection:
                 with connection.transaction():
@@ -1828,6 +1832,11 @@ class CanonicalLogicalEvidenceProjector:
                         )
                     if failed and not coordinated:
                         self._record_cleanup_attempts(connection, failed)
+            # All futures, transactions and connections have settled. Keep this
+            # drain's attempted set while the coordinator services other work.
+            if on_progress is not None and time.monotonic() >= next_progress:
+                on_progress()
+                next_progress = time.monotonic() + PROJECTION_PROGRESS_INTERVAL_SECONDS
         with self.store.connect() as connection:
             pending = connection.execute(
                 """SELECT count(*) AS count
@@ -2621,15 +2630,16 @@ class CanonicalLogicalEvidenceProjector:
         # Object deletes are S3 round trips, not database work: measured at
         # ~8 s each in production when serialized, they held one cycle for
         # 25 minutes. Fan them out independently of the upload budget.
-        cleanup = self.drain_cleanup(
-            tenant_id=tenant_id,
-            limit=5_000,
-            concurrency=cleanup_concurrency,
-        )
-        old_objects_deleted += int(cleanup["deleted"])
-        cleanup_failures += int(cleanup["failures"])
-        cleanup_completed += int(cleanup["completed"])
-        cleanup_pending = int(cleanup["pending"])
+        if on_heartbeat is None:
+            cleanup = self.drain_cleanup(
+                tenant_id=tenant_id,
+                limit=5_000,
+                concurrency=cleanup_concurrency,
+            )
+            old_objects_deleted += int(cleanup["deleted"])
+            cleanup_failures += int(cleanup["failures"])
+            cleanup_completed += int(cleanup["completed"])
+            cleanup_pending = int(cleanup["pending"])
         # Refresh fair admission whenever an upload slot becomes available.
         # Batch settings bound total work, not stale executor backlog.
         admission_limit = batch_size * max_batches
@@ -2845,7 +2855,7 @@ class CanonicalLogicalEvidenceProjector:
             )
             feeder.start()
             try:
-                callback()
+                result = callback()
             finally:
                 handoff_stop.set()
                 feeder.join()
@@ -2864,6 +2874,26 @@ class CanonicalLogicalEvidenceProjector:
                             or not math.isfinite(refreshed)):
                         raise LogicalEvidenceError("logical_evidence_budget_invalid")
                     admission_deadline_at = refreshed
+            return result
+
+        cleanup_interrupted = False
+
+        def cleanup_with_refill(executor):
+            nonlocal cleanup_interrupted
+            if on_heartbeat is None:
+                return self.drain_cleanup(
+                    tenant_id=tenant_id, limit=5_000, concurrency=cleanup_concurrency,
+                )
+            try:
+                return publish_with_refill(executor, lambda: self.drain_cleanup(
+                    tenant_id=tenant_id, limit=5_000, concurrency=cleanup_concurrency,
+                    on_progress=on_heartbeat,
+                ))
+            except BaseException:
+                # An uncertain cleanup or callback must not trigger the failure
+                # handler's second drain after the feeder and owners settle.
+                cleanup_interrupted = True
+                raise
 
         try:
             with ThreadPoolExecutor(
@@ -2872,6 +2902,12 @@ class CanonicalLogicalEvidenceProjector:
             ) as executor:
                 try:
                     fill_slots(executor)
+                    if on_heartbeat is not None:
+                        cleanup = cleanup_with_refill(executor)
+                        old_objects_deleted += int(cleanup["deleted"])
+                        cleanup_failures += int(cleanup["failures"])
+                        cleanup_completed += int(cleanup["completed"])
+                        cleanup_pending = int(cleanup["pending"])
                     next_progress = time.monotonic() + PROJECTION_PROGRESS_INTERVAL_SECONDS
                     while pending:
                         # Also publish already committed outbox work while all
@@ -2944,11 +2980,7 @@ class CanonicalLogicalEvidenceProjector:
                                 publish_with_refill(executor, on_heartbeat)
                             next_progress = time.monotonic() + PROJECTION_PROGRESS_INTERVAL_SECONDS
                         for _ in range(cleanup_rounds):
-                            cleanup = self.drain_cleanup(
-                                tenant_id=tenant_id,
-                                limit=5_000,
-                                concurrency=cleanup_concurrency,
-                            )
+                            cleanup = cleanup_with_refill(executor)
                             old_objects_deleted += int(cleanup["deleted"])
                             cleanup_failures += int(cleanup["failures"])
                             cleanup_completed += int(cleanup["completed"])
@@ -2961,11 +2993,12 @@ class CanonicalLogicalEvidenceProjector:
         except BaseException:
             # Shutdown settles active owners before cleanup. Cancelled queued
             # parents never uploaded; active uploads committed or were queued to reap.
-            self.drain_cleanup(
-                tenant_id=tenant_id,
-                limit=5_000,
-                concurrency=cleanup_concurrency,
-            )
+            if not cleanup_interrupted:
+                self.drain_cleanup(
+                    tenant_id=tenant_id,
+                    limit=5_000,
+                    concurrency=cleanup_concurrency,
+                )
             raise
         if round_remaining is not None:
             # A deadline may interrupt even a large oldest round. The next
@@ -2979,6 +3012,7 @@ class CanonicalLogicalEvidenceProjector:
             )
             cleanup = self.drain_cleanup(
                 tenant_id=tenant_id, limit=5_000, concurrency=cleanup_concurrency,
+                **({"on_progress": on_heartbeat} if on_heartbeat is not None else {}),
             )
             old_objects_deleted += int(cleanup["deleted"])
             cleanup_failures += int(cleanup["failures"])
