@@ -84,6 +84,7 @@ jobs:
             e2e_storage_legacy_cut.py \
             e2e_canonical_body_thinning.py \
             e2e_bounded_canonical_thinning.py \
+            e2e_native_thinning_plan.py \
             e2e_thinning_retirement_transition.py \
             e2e_retirement_productive_eof.py \
             e2e_retirement_thin_phase.py \
