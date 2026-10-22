@@ -206,10 +206,11 @@ def _record(worker, row, selected, deadline, *, contacts_only=False, skip_only=F
                 AND target_identity_sha256=%s''', (row['tenant_id'], row['source_id'],
                 _identity_sha256(row['tenant_id'], row['source_id'], selected['native_id']))).fetchone():
             return None
-        document = selected['content_kind'] == 'document.v1' and not contacts_only
+        canonical_content = selected['content_kind'] in {
+            'communication_message.v1', 'document.v1'} and not contacts_only
         event = worker._require_captured_slack_event(c, row, selected['native_id'],
             {selected['native_id']: (selected['event_id'], selected['content_sha256'])},
-            **({'captured_document': True} if document or thinned else {}))
+            **({'captured_document': True} if canonical_content or thinned else {}))
         if skip_only:
             # The native current-event check holds the event lock. Thinning may
             # have changed its representation since the page nominated a skip.
@@ -217,7 +218,7 @@ def _record(worker, row, selected, deadline, *, contacts_only=False, skip_only=F
                 FROM canonical_events WHERE tenant_id=%s AND source_id=%s AND event_id=%s''',
                 (row['tenant_id'], row['source_id'], selected['event_id'])).fetchone()['kind']
             return None if kind in {'communication_message.v1', 'document.v1'} else _NOT_A_CONTACT_SKIP
-        if document and not thinned:
+        if canonical_content and not thinned:
             # Validate accepted typed content before it leaves the read boundary.
             # Pure malformed-input failures become debt, never write failures.
             from .projectors import validate_envelope
@@ -356,8 +357,7 @@ def repair_slice(worker, row, runner, *, deadline_at):
     for selected in page:
         contacts_only = state['phase'] == 'contacts' and not retry
         no_raw_read = (selected.get('body_location') == 'raw' or
-            selected['content_kind'] == 'document.v1' or
-            contacts_only and selected['content_kind'] == 'communication_message.v1')
+            selected['content_kind'] in {'communication_message.v1', 'document.v1'})
         charge = 0 if no_raw_read else min(max(0, selected['size_bytes'] or 0), MAX_RECORD_BYTES + 100_000)
         if time.monotonic() >= deadline or archive_budget.consumed + charge > MAX_PAGE_BYTES:
             return state
