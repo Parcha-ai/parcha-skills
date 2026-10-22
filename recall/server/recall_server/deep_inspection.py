@@ -140,7 +140,7 @@ EVIDENCE_RECORD_KEYS = frozenset({
     "ordinal",
     "receipts",
 })
-EVIDENCE_RECORD_BODY_KEYS = frozenset({"content", "text", "content_fragment"})
+EVIDENCE_RECORD_BODY_KEYS = frozenset({"content", "text", "content_fragment", "literal_text"})
 
 
 class DeepInspectionError(RuntimeError):

@@ -125,7 +125,7 @@ def _decode_record(line: bytes, *, source_id: str) -> LogicalEvidenceRecord:
         "segment_ordinal",
     }
     payload_fields = set(value).intersection(
-        {"content", "content_fragment", "text"}
+        {"content", "content_fragment", "text", "literal_text"}
     )
     if set(value) != base | payload_fields or len(payload_fields) != 1:
         raise LogicalCorpusAuditError("logical part record schema is invalid")
@@ -134,6 +134,8 @@ def _decode_record(line: bytes, *, source_id: str) -> LogicalEvidenceRecord:
             value["content"],
             option=orjson.OPT_SORT_KEYS,
         ).decode()
+    elif "literal_text" in value:
+        text = value["literal_text"]
     elif "content_fragment" in value:
         text = value["content_fragment"]
     else:
@@ -149,6 +151,7 @@ def _decode_record(line: bytes, *, source_id: str) -> LogicalEvidenceRecord:
             segment_ordinal=value["segment_ordinal"],
             segment_count=value["segment_count"],
             text=text,
+            literal_text="literal_text" in value,
         )
         encoded = record.encode(source_id=source_id)
     except (KeyError, TypeError, ValueError) as error:

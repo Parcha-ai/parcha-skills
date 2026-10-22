@@ -10,14 +10,37 @@ from psycopg.pq import TransactionStatus
 from .db import BrainStore
 
 
-def _compact_event_expression(alias: str = "event") -> str:
+def _compact_event_expression(alias: str = "event", *, trusted_raw: bool = False) -> str:
     """Retain only routing metadata used after the full body moves to raw storage."""
 
     def structural(path: str) -> str:
         return f"jsonb_strip_nulls(jsonb_build_object('role',{alias}.canonical_redacted #> '{{{path},role}}','type',{alias}.canonical_redacted #> '{{{path},type}}'))"
 
+    typed_kind = f"{alias}.canonical_redacted #>> '{{content,kind}}'"
+    supported = f"{typed_kind} IN ('communication_message.v1','document.v1')"
+    typed_digest = (
+        f"CASE WHEN {supported} AND jsonb_typeof("
+        f"{alias}.canonical_redacted #> '{{content,text}}')='string' "
+        f"THEN encode(sha256(convert_to({alias}.canonical_redacted "
+        "#>> '{content,text}','UTF8')),'hex') "
+    )
+    if trusted_raw:
+        # Only server-owned existing-event callers may preserve compact facts.
+        # Incoming envelopes always derive the digest from their actual text.
+        typed_digest += (
+            f"WHEN {alias}.body_location='raw' AND {supported} "
+            f"AND jsonb_typeof({alias}.canonical_redacted "
+            "#> '{content,_recall_typed_text_sha256}')='string' "
+            f"AND {alias}.canonical_redacted #>> '{{content,_recall_typed_text_sha256}}' "
+            "~ '^[0-9a-f]{64}$' THEN "
+            f"{alias}.canonical_redacted #>> '{{content,_recall_typed_text_sha256}}' "
+        )
+    typed_digest += "END"
+
     content_metadata = (
         "jsonb_strip_nulls(jsonb_build_object("
+        f"'kind',CASE WHEN {supported} THEN {alias}.canonical_redacted #> '{{content,kind}}' END,"
+        f"'_recall_typed_text_sha256',{typed_digest},"
         f"'role',{alias}.canonical_redacted #> '{{content,role}}',"
         f"'type',{alias}.canonical_redacted #> '{{content,type}}',"
         f"'message',{structural('content,message')},"
@@ -75,7 +98,7 @@ def _compact_event_expression(alias: str = "event") -> str:
 
 def _thinning_statement(*, bounded: bool = False, probe: bool = False) -> str:
     """One authority/update owner for standalone and bounded worker selection."""
-    compact_event = _compact_event_expression()
+    compact_event = _compact_event_expression(trusted_raw=True)
     key_filter = document_filter = event_filter = ""
     document_relation = "canonical_documents document"
     event_relation = "canonical_events event"

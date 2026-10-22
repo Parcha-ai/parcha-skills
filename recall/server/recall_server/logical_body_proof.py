@@ -63,7 +63,8 @@ def iter_parent_bodies(archive, *, tenant_id, source_id, native_parent_id,
                 first, segment_index, body_bytes, oversized = record, 0, 0, False
             elif (record.event_native_id != first.event_native_id or record.event_kind != first.event_kind
                     or record.occurred_at != first.occurred_at or record.roles != first.roles
-                    or record.actor_links != first.actor_links or record.receipts):
+                    or record.actor_links != first.actor_links
+                    or record.literal_text != first.literal_text or record.receipts):
                 raise LogicalBodyProofError('logical_body_part_invalid')
             if record.segment_ordinal != segment_index or record.segment_count != first.segment_count:
                 raise LogicalBodyProofError('logical_body_part_invalid')
