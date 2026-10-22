@@ -118,13 +118,9 @@ def _thinning_statement(*, bounded: bool = False, probe: bool = False) -> str:
                             AND document.source_id=ANY(%s::text[])
                             AND document.document_id=ANY(%s::text[])"""
         document_filter = """AND document.tenant_id=%s
-                            AND document.source_id=ANY(%s::text[])
-                            AND document.document_id=ANY(ARRAY(
-                                SELECT document_id FROM candidates))"""
+                            AND document.source_id=ANY(%s::text[])"""
         event_filter = """AND event.tenant_id=%s
-                            AND event.source_id=ANY(%s::text[])
-                            AND event.event_id=ANY(ARRAY(
-                                SELECT event_id FROM candidates))"""
+                            AND event.source_id=ANY(%s::text[])"""
     lock_clause = "" if probe else "FOR UPDATE OF document,event SKIP LOCKED"
     projection = ("document.source_id,document.document_id" if probe else
                   """document.tenant_id,document.source_id,
