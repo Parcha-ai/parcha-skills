@@ -214,10 +214,11 @@ def _record(worker, row, selected, deadline, *, contacts_only=False, skip_only=F
         if skip_only:
             # The native current-event check holds the event lock. Thinning may
             # have changed its representation since the page nominated a skip.
-            kind = c.execute('''SELECT canonical_redacted#>>'{content,kind}' AS kind
+            current = c.execute('''SELECT canonical_redacted#>>'{content,kind}' AS kind,body_location
                 FROM canonical_events WHERE tenant_id=%s AND source_id=%s AND event_id=%s''',
-                (row['tenant_id'], row['source_id'], selected['event_id'])).fetchone()['kind']
-            return None if kind in {'communication_message.v1', 'document.v1'} else _NOT_A_CONTACT_SKIP
+                (row['tenant_id'], row['source_id'], selected['event_id'])).fetchone()
+            return (None if current['body_location'] != 'raw' and current['kind'] in {
+                'communication_message.v1', 'document.v1'} else _NOT_A_CONTACT_SKIP)
         if canonical_content and not thinned:
             # Validate accepted typed content before it leaves the read boundary.
             # Pure malformed-input failures become debt, never write failures.
@@ -362,7 +363,8 @@ def repair_slice(worker, row, runner, *, deadline_at):
         if time.monotonic() >= deadline or archive_budget.consumed + charge > MAX_PAGE_BYTES:
             return state
         reason = None
-        skip = contacts_only and selected['content_kind'] in {'communication_message.v1', 'document.v1'}
+        skip = (contacts_only and selected.get('body_location') != 'raw'
+                and selected['content_kind'] in {'communication_message.v1', 'document.v1'})
         if skip:
             debt_key = DEBT + hashlib.sha256(selected['native_id'].encode()).hexdigest()
             existing_debt = db.execute('SELECT 1 FROM meta WHERE key=?', (debt_key,)).fetchone()
