@@ -98,9 +98,9 @@ class CorrelatedEligibility(PublicationPageKeys):
         captured = []
         execute = self.store._execute_bounded
 
-        def capture(c, query, values, deadline):
+        def capture(c, query, values, deadline, **options):
             captured.append((query, values))
-            return execute(c, query, values, deadline)
+            return execute(c, query, values, deadline, **options)
 
         self.install_time_index()
         with patch.object(self.store, 'verified_singleton_receipts', True), self.store.connect() as c, c.transaction():
