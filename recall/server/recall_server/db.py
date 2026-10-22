@@ -3426,12 +3426,14 @@ class BrainStore:
         conn.execute("SELECT set_config('statement_timeout', %s, true)", (f"{remaining_ms}ms",))
 
     @staticmethod
-    def _execute_bounded(conn, sql: str, values: list[Any] | tuple[Any, ...], deadline_at: float | None):
+    def _execute_bounded(conn, sql: str, values: list[Any] | tuple[Any, ...], deadline_at: float | None,
+                         *, prepare: bool | None = None):
+        execute_options = {} if prepare is None else {"prepare": prepare}
         if deadline_at is None:
-            return conn.execute(sql, values)
+            return conn.execute(sql, values, **execute_options)
         BrainStore._set_statement_deadline(conn, deadline_at)
         try:
-            return conn.execute(sql, values)
+            return conn.execute(sql, values, **execute_options)
         except psycopg.errors.QueryCanceled as exc:
             # The cancelled statement aborted the transaction; roll it back so
             # the caller can reuse this connection for its fallback phase.

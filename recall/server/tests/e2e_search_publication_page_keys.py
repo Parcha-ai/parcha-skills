@@ -43,8 +43,8 @@ class PublicationPageKeys(PublicationCertificates):
         owner,claim=self.tied_fixture();original=BASELINE_SQL
         candidate=publication._PASSAGE_PAGE_SQL
         captured=[];execute=self.store._execute_bounded
-        def record(c,sql,args,deadline):
-            captured.append((sql,args));return execute(c,sql,args,deadline)
+        def record(c,sql,args,deadline,**options):
+            captured.append((sql,args));return execute(c,sql,args,deadline,**options)
         with patch.object(self.store,'verified_singleton_receipts',True),self.store.connect()as c,c.transaction():
             c.execute('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY')
             if getattr(self,'fixed_join_order',False):

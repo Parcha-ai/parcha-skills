@@ -11,6 +11,27 @@ from recall_server import logical_evidence_projection
 
 
 class CapturedSlackActors(ManagedSlackHistoryActors):
+    def after_captured_message_read(self, mutation):
+        from recall_server import slack_captured_attribution as captured
+        original = captured._record
+        def observed(worker, row, selected, deadline, **kwargs):
+            record = original(worker, row, selected, deadline, **kwargs)
+            if record is not None and selected['native_id'] == self.message.native_id:
+                mutation(selected, deadline)
+            return record
+        return patch.object(captured, '_record', side_effect=observed)
+
+    def test_after_read_fixture_maps_the_same_message_without_mutation(self):
+        worker, _ = self.captured()
+        self.message_phase(worker)
+        seen = []
+        with self.after_captured_message_read(lambda selected, deadline: seen.append(selected['native_id'])):
+            self.assertEqual(self.step(worker)['failed'], 0)
+        self.assertEqual(seen, [self.message.native_id])
+        self.assertEqual(self.counts(), (1, 1))
+        self.project()
+        self.assertEqual(len(self.scoped()), 1)
+
     def captured(self, *, thin=False, enroll=True):
         worker = self.managed()
         factory = worker.connector_factory
@@ -399,11 +420,11 @@ class CapturedSlackActors(ManagedSlackHistoryActors):
             self.assertEqual(self.captured_scheduling_rows(), saved)
             self.assertEqual(self.step(worker)['failed'], 0)
             self.assertEqual(self.captured_checkpoint()['unresolved'], 0)
-            # Create SDK-message debt through the ordinary disposition owner.
-            # Unlike typed-document retry, it needs an actual archive read.
+            # Create SDK-contact debt through the ordinary disposition owner.
+            # Contact identity still needs its original SDK raw input.
             original_record = captured._record
             def unavailable_message(worker, row, selected, deadline, **kwargs):
-                if selected['native_id'] == self.message.native_id:
+                if selected['native_id'] == self.contacts[0].native_id:
                     raise ValueError('synthetic prior SDK failure')
                 return original_record(worker, row, selected, deadline, **kwargs)
             with patch.object(captured, 'MAX_PAGE_RECORDS', 500), \
@@ -734,14 +755,11 @@ class CapturedSlackActors(ManagedSlackHistoryActors):
     def test_revoked_source_during_archive_read_refuses_attribution(self):
         worker, _ = self.captured()
         self.message_phase(worker)
-        original = worker.archive.read_raw
-        def revoke(reference):
-            payload = original(reference)
+        def revoke(reference, _deadline):
             with self.store.connect() as c:
                 c.execute('DELETE FROM canonical_source_grants WHERE tenant_id=%s AND source_id=%s AND principal_id=%s',
                     (self.tenant, self.source, self.principal))
-            return payload
-        with patch.object(worker.archive, 'read_raw', side_effect=revoke):
+        with self.after_captured_message_read(revoke):
             self.assertEqual(self.step(worker)['failed'], 1)
         self.assertEqual(self.counts(), (1, 0))
 
@@ -749,21 +767,18 @@ class CapturedSlackActors(ManagedSlackHistoryActors):
         import uuid
         worker, _ = self.captured()
         self.message_phase(worker)
-        original = worker.archive.read_raw
-        def forget(reference):
-            payload = original(reference)
+        def forget(reference, _deadline):
             if reference['artifact_id'] == target:
                 self.plane.forget(dict(contract='recall.forget-request.v1', schema_version=1,
                     tenant_id=self.tenant, principal_id=self.principal, source_id=self.source,
                     target_receipt=receipt, mode='explicit_forget', reason='owner_requested',
                     requested_at='2026-10-19T09:00:00Z', idempotency_key=uuid.uuid4().hex))
-            return payload
         with self.store.connect() as c:
             target = c.execute('SELECT artifact_id FROM canonical_events WHERE tenant_id=%s AND source_id=%s AND native_id=%s',
                 (self.tenant,self.source,self.message.native_id)).fetchone()['artifact_id']
             receipt = c.execute('SELECT receipt FROM canonical_chunks chunk JOIN canonical_documents document USING(tenant_id,source_id,document_id) WHERE document.tenant_id=%s AND document.source_id=%s AND document.native_id=%s',
                 (self.tenant,self.source,self.message.native_id)).fetchone()['receipt']
-        with patch.object(worker.archive, 'read_raw', side_effect=forget):
+        with self.after_captured_message_read(forget):
             self.assertEqual(self.step(worker)['failed'], 0)
         self.assertEqual(self.counts(), (1, 0))
         self.project()
@@ -805,10 +820,10 @@ class CapturedSlackActors(ManagedSlackHistoryActors):
         self.message_phase(worker)
         prior = len(calls)
         deadlines = []
-        def unavailable(reference, *, deadline_at):
+        def unavailable(reference, deadline_at):
             deadlines.append(deadline_at)
             raise ArchiveDeadlineExceeded()
-        with patch.object(worker.archive, 'read_raw_bounded', unavailable, create=True):
+        with self.after_captured_message_read(unavailable):
             self.assertEqual(self.step(worker)['failed'], 0)
         self.assertTrue(deadlines)
         self.assertEqual(len(calls), prior + 1)
@@ -829,14 +844,11 @@ class CapturedSlackActors(ManagedSlackHistoryActors):
     def test_expired_lease_during_archive_read_refuses_native_write(self):
         worker, _ = self.captured()
         self.message_phase(worker)
-        original = worker.archive.read_raw
-        def expire(reference):
-            payload = original(reference)
+        def expire(reference, _deadline):
             with self.store.connect() as c:
                 c.execute("UPDATE connector_installations SET lease_expires_at=now()-interval '1 second' WHERE id=%s",
                     (self.installation,))
-            return payload
-        with patch.object(worker.archive, 'read_raw', side_effect=expire):
+        with self.after_captured_message_read(expire):
             self.assertEqual(self.step(worker)['failed'], 1)
         self.assertEqual(self.counts(), (1, 0))
 
@@ -883,12 +895,10 @@ class CapturedSlackActors(ManagedSlackHistoryActors):
         from privacy.policy import PrivacyPolicy
         worker, _ = self.captured()
         self.message_phase(worker)
-        original = worker.archive.read_raw
         with self.store.connect() as c:
             target = c.execute('SELECT artifact_id FROM canonical_events WHERE tenant_id=%s AND source_id=%s AND native_id=%s',
                 (self.tenant,self.source,self.message.native_id)).fetchone()['artifact_id']
-        def revise(reference):
-            payload = original(reference)
+        def revise(reference, _deadline):
             if reference['artifact_id'] == target:
                 record = normalize_slack_message(workspace_id='T123',channel_id='C123',
                     value={'ts':'1789981200.000001','user':'U999','text':'Synthetic question'})
@@ -904,8 +914,7 @@ class CapturedSlackActors(ManagedSlackHistoryActors):
                     provenance={**decision.value['provenance'],'connector_id':'slack.messages',
                         'connector_schema_version':2,'artifact_ref':artifact},parent=record.native_parent_id)
                 self.plane.ingest_batch(tenant_id=self.tenant,principal_id=self.principal,events=[event])
-            return payload
-        with patch.object(worker.archive, 'read_raw', side_effect=revise):
+        with self.after_captured_message_read(revise):
             self.assertEqual(self.step(worker)['failed'], 0)
         self.assertEqual(self.counts(), (1, 0))
         self.project()
