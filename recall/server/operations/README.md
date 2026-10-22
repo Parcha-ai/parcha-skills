@@ -168,3 +168,47 @@ Reconcile an uncertain drop before retrying. Verify the new index is absent,
 `canonical_passages_time_idx` and schema history remain intact, and original
 serving/authority checks pass. No schema marker, reader rollout or worker restart
 is required for either apply or rollback.
+
+## Historical Claude and Codex admission
+
+`family_typed_candidate_index_concurrent.sql` supplies the bounded historical
+admission query with one shared eligible-parent index. It includes completed
+legacy Claude and noncurrent Codex modes, and excludes requested upgrades and
+completed typed parents in both families. The existing Codex candidate index
+includes completed typed Claude indefinitely; retain it for rollback, but install
+and verify this family index before enabling the family-aware worker.
+
+Use the existing guarded concurrent-index operation owner. Record exact fleet,
+schema, definitions/OIDs, estimated rows, disk/WAL/replica headroom and baseline
+health. Run the DDL through `BrainStore._migrate_concurrently` outside a transaction,
+with the accepted CREATE-only `lock_timeout=0`, 900-second statement timeout,
+960-second process limit, 64MiB maintenance memory and no parallel maintenance
+workers. Short catalog reads retain their original limits. The statement/process
+limits and exact-backend cancellation remain mandatory when lock timeout is zero.
+
+Run `family_typed_candidate_index_readiness.sql` after acknowledged completion.
+It requires the exact key, covering columns, predicate and valid/ready/live flags.
+An existing invalid or different object is not success. Reconcile unknown
+acknowledgements against the same operation and OID before any retry or cleanup.
+Retain `canonical_passage_documents_typed_candidate_idx` and
+`canonical_passage_documents_upgrade_idx`; schema history and reader capabilities
+do not change. Record actual index bytes and ordinary admission progress before
+claiming production benefit. Build scratch, WAL and write maintenance are additional
+costs; local plan improvements do not establish production latency.
+
+Family admission uses the existing global upgrade window and owner/currentness
+checks. Historical tool extraction adds passage and embedding work. Existing
+content-hash retention/reuse still applies; newly exposed tool text can require
+new embeddings. This operation does not establish answer coverage or reduce that
+work. No source-specific repair or forced upgrade belongs in this operation.
+
+For rollback, restore the previous worker admission code, verify no active build
+or unexpected dependency, then explicitly drop only the new index through the
+same bounded owner:
+
+```sql
+DROP INDEX CONCURRENTLY public.canonical_passage_documents_family_candidate_idx;
+```
+
+Reconcile an uncertain drop; verify original indexes/schema and serving authority.
+No automatic schema migration installs or removes this optional index.
