@@ -53,12 +53,23 @@ def queries():
         pass
     assert len(captured) == 1
     current = captured[0]
+    literal_column = """coalesce(event.kind='connector_record'
+                                  AND root_fields.content->>'kind' IN (
+                                      'communication_message.v1','document.v1')
+                                  AND jsonb_typeof(root_fields.content->'text')='string'
+                                  AND encode(sha256(convert_to(
+                                      root_fields.content->>'text','UTF8')),'hex')
+                                      =document.text_sha256,false) AS literal_text,"""
+    legacy_input = current
+    if ' AS literal_text,' in current:
+        assert current.count(literal_column) == 1
+        legacy_input = current.replace(literal_column, '')
     # Hints add metadata to the current projection, not the frozen legacy SQL.
     added = 'document.document_id,document.body_location,'
     assert current.count(added) == 1
     locators = 'document.body_record_ordinal,document.body_record_count,'
     assert current.count(locators) == 1
-    legacy = ROOT.sub('', current.replace(added, 'document.document_id,').replace(locators, ''))
+    legacy = ROOT.sub('', legacy_input.replace(added, 'document.document_id,').replace(locators, ''))
     for field in ('role', 'type'):
         for nested in ('message', 'payload'):
             legacy = re.sub(r"root_fields\.content\s*#>>\s*'\{" + nested + ',' + field + r"\}'",
@@ -145,6 +156,10 @@ def main():
                     cursor.execute(query, args)
                     all_rows.append(list(cursor))
             assert len(all_rows[0]) == len(all_rows[1]) == 264
+            if all_rows[1] and 'literal_text' in all_rows[1][0]:
+                assert all(row['literal_text'] is False for row in all_rows[1])
+                for row in all_rows[1]:
+                    del row['literal_text']
             for old, new in zip(*all_rows, strict=True):
                 assert set(new) == set(old) | {'body_location', 'body_record_ordinal', 'body_record_count'}
                 assert new['body_location'] == 'inline'
