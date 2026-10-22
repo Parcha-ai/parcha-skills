@@ -472,25 +472,32 @@ def _thin_before_parent(store, *, scope, principal_id, limits, deadline_at, revi
         return None
     if not rows:
         return None
-    _attempt_phase(diagnostic, 'parent_thin_sql')
+    _attempt_phase(diagnostic, 'parent_thin_connection')
     with store.connect() as connection, connection.transaction():
+        _attempt_phase(diagnostic, 'parent_thin_deadline')
         store._set_statement_deadline(connection, deadline)
         query = lambda sql, values=(): store._execute_bounded(connection, sql, values, deadline)
-        require_retirement_owner(store, connection, scope[:2], principal_id, deadline)
+        require_retirement_owner(store, connection, scope[:2], principal_id, deadline,
+                                 phase_observer=lambda phase: _attempt_phase(diagnostic, phase))
+        _attempt_phase(diagnostic, 'parent_thin_native_locks')
         if not _try_parent_native_locks(query, scope, [*rows, dict(native_id=scope[2])]):
             raise ChunkRetirementError('parent_retirement_lock_busy')
+        _attempt_phase(diagnostic, 'parent_thin_catalog_lock')
         query('''SELECT 1 FROM canonical_evidence_documents
             WHERE tenant_id=%s AND source_id=%s AND native_parent_id=%s
             FOR UPDATE NOWAIT''', scope).fetchone()
+        _attempt_phase(diagnostic, 'parent_thin_catalog')
         current = read_parent_catalog(store, connection, scope, deadline, lock=True)
         if parent_retirement_plan(scope, manifest_identity(current['manifest'])) != reviewed_plan:
             _fail('plan_changed')
+        _attempt_phase(diagnostic, 'parent_thin_progress')
         progress = _parent_progress(store, connection, scope, deadline, lock=True)
         if (not progress or not progress['enabled']
                 or progress['scope_epoch'] != required_scope_epoch):
             raise ChunkRetirementError('parent_retirement_disabled')
         if current['queue'] is not None:
             _fail('pending')
+        _attempt_phase(diagnostic, 'parent_thin_witnesses')
         witnesses = _witnesses(store, connection, scope,
             tuple(row['native_id'] for row in rows), deadline, lock=True)
         if any(witnesses[row['native_id']] is None
@@ -500,7 +507,9 @@ def _thin_before_parent(store, *, scope, principal_id, limits, deadline_at, revi
             _fail('witness_changed')
         # Existing eligibility, parent locks and retirement-epoch reset remain
         # in the same original thinning statement. No proof is synthesized.
+        _attempt_phase(diagnostic, 'parent_thin_deadline')
         store._set_statement_deadline(connection, deadline)
+        _attempt_phase(diagnostic, 'parent_thin_native')
         changed = _thin_selected(connection, scope[0], rows, bound)
         _check_deadline(deadline)
         _attempt_phase(diagnostic, 'parent_thin_commit_ack')
