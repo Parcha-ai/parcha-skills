@@ -1010,7 +1010,8 @@ class CanonicalPassageProjector:
             or (extraction_version == "codex_tool_groups_v1" and not source_id.startswith("codex:"))):
             raise ValueError("unsupported_document_extraction_request")
         if worker and (tenant_id != self.bound_tenant_id or principal_id is not None
-                       or extraction_version != "codex_tool_groups_v1"):
+                       or not source_id.startswith(("claude:", "codex:"))
+                       or extraction_version != _document_extraction_version(source_id, None)):
             raise ValueError("worker extraction scope is invalid")
         key = (tenant_id, source_id, logical_document_id)
         connect_options = ({"timeout": max(0.001, deadline_at-time.monotonic())}
@@ -1110,6 +1111,9 @@ class CanonicalPassageProjector:
                         WHERE projected.tenant_id=source.tenant_id AND projected.source_id=source.source_id
                           AND projected.requested_extraction_version=projected.applied_extraction_version
                           AND projected.requested_extraction_version<>'codex_tool_groups_v1'
+                          AND (projected.source_id LIKE 'codex:%%'
+                               OR (projected.source_id LIKE 'claude:%%'
+                                   AND projected.requested_extraction_version='legacy'))
                           AND projected.revision=evidence.revision
                           AND projected.source_document_sha256=evidence.document_content_sha256
                           AND projected.policy_fingerprint=%s
@@ -1122,7 +1126,8 @@ class CanonicalPassageProjector:
                                 AND queue.native_parent_id=evidence.native_parent_id)
                         ORDER BY projected.logical_document_id LIMIT %s
                     ) parent
-                    WHERE source.tenant_id=%s AND source.source_id LIKE 'codex:%%'
+                    WHERE source.tenant_id=%s
+                      AND (source.source_id LIKE 'codex:%%' OR source.source_id LIKE 'claude:%%')
                       AND grant_row.principal_id=source.owner_principal_id AND grant_row.permission='owner'
                 ) SELECT source_id,logical_document_id,revision,document_content_sha256
                 FROM candidates ORDER BY source_position,
@@ -1140,7 +1145,7 @@ class CanonicalPassageProjector:
                 outcome = self._request_extraction_version(tenant_id=tenant_id,
                     source_id=row['source_id'], logical_document_id=row['logical_document_id'],
                     revision=row['revision'], source_document_sha256=row['document_content_sha256'],
-                    extraction_version='codex_tool_groups_v1', principal_id=None,
+                    extraction_version=_document_extraction_version(row['source_id'], None), principal_id=None,
                     worker=True, deadline_at=deadline_at)
             except ValueError as error:
                 if str(error) not in {'source_or_projected_document_unavailable',
