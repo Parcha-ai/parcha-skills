@@ -851,7 +851,7 @@ def decode_logical_record(
     }
     optional = {"actor_links"} if "actor_links" in value else set()
     payload_fields = set(value).intersection(
-        {"content", "content_fragment", "text"}
+        {"content", "content_fragment", "text", "literal_text"}
     )
     if set(value) != base | optional | payload_fields or len(payload_fields) != 1:
         raise LogicalEvidenceError("passage_logical_record_invalid")
@@ -860,6 +860,8 @@ def decode_logical_record(
             value["content"],
             option=orjson.OPT_SORT_KEYS,
         ).decode()
+    elif "literal_text" in value:
+        text = value["literal_text"]
     elif "content_fragment" in value:
         text = value["content_fragment"]
     else:
@@ -876,6 +878,7 @@ def decode_logical_record(
             segment_count=value["segment_count"],
             text=text,
             actor_links=actor_links(value.get("actor_links", ())),
+            literal_text="literal_text" in value,
         )
         if verify_canonical:
             encoded = record.encode(source_id=source_id)
@@ -958,6 +961,7 @@ def _logical_record_groups(
                 or continuation.occurred_at != first.occurred_at
                 or continuation.roles != first.roles
                 or continuation.actor_links != first.actor_links
+                or continuation.literal_text != first.literal_text
                 or continuation.receipts
                 or continuation.segment_ordinal != segment_ordinal
                 or continuation.segment_count != first.segment_count
@@ -1009,6 +1013,7 @@ def iter_visible_messages(
         dense_roles = first.roles
         if not dense_roles and (
             any(link.relation == "author" for link in first.actor_links)
+            or first.literal_text
             or _typed_provider_text(first.event_kind, source_text)
         ):
             # Visibility and person resolution are separate: typed provider
@@ -1022,7 +1027,8 @@ def iter_visible_messages(
             continue
         # Claude wraps tool results in user-role envelopes. Keep those bytes
         # in captured evidence, but do not project them as conversational text.
-        text, source_unit = _visible_message(source_text)
+        text, source_unit = ((source_text if source_text.strip() else None, None)
+                             if first.literal_text else _visible_message(source_text))
         if source_unit == COMPLETE_ASSISTANT_FINAL_UNIT and first.roles != ("assistant",):
             source_unit = None
         if text is None:
@@ -1036,7 +1042,7 @@ def iter_visible_messages(
             text=text,
             actor_links=first.actor_links,
             source_unit=source_unit,
-            origin=_message_origin(source_text, text),
+            origin=None if first.literal_text else _message_origin(source_text, text),
         )
         message.validate()
         yield message
