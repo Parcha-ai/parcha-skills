@@ -623,6 +623,8 @@ class TurbopufferProjector:
                 (claim["tenant_id"], claim["source_id"], start, end,
                  since, since, cursor_time, cursor_id, page_rows),
                 deadline_at,
+                # Generic plans can scan the full month for a selective watermark.
+                prepare=False,
             ).fetchall()
         return [
             dict(row)
