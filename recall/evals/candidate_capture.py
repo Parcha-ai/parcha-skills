@@ -118,6 +118,8 @@ def _read_page(root, spec):
                 ordinal, count = span['record_ordinal'], span['record_count']
                 group = [records[o] for o in range(ordinal, ordinal + count)]
                 first = group[0]
+                # Provider literal text cannot establish a coding-session family.
+                require(not any('literal_text' in record for record in group), 'native_identity_unavailable')
                 require(first['segment_ordinal'] == 0 and first['segment_count'] == count, 'segment_count_mismatch')
                 codex_tool = spec['source_id'].startswith('codex:') and span.get('source_unit') not in legacy_units
                 if not codex_tool:
