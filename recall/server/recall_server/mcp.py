@@ -312,7 +312,8 @@ ALL_READ_TOOLS = (
             "hints, not proof: only recall:// values in opened_receipts are citation "
             "authority. To cite a match without dumping a large raw line, print one "
             "JSON object preserving event_native_id, occurred_at, ordinal, receipts, "
-            "and one of content, text, or content_fragment. An optional exact "
+            "and one of content, text, content_fragment, or literal_text. "
+            "literal_text is exact source text even when it looks like JSON. An optional exact "
             "`RECALL_EVIDENCE <receipt>` line may accompany, never replace, that record."
         ),
         "inputSchema": {
@@ -369,7 +370,8 @@ ALL_READ_TOOLS = (
             "such as `rg -L`. The sandbox is read-only and networkless. Each shard "
             "returns bounded stdout and only verified opened_receipts may be cited. "
             "For compact proof, emit JSON preserving event_native_id, occurred_at, "
-            "ordinal, receipts, and one of content, text, or content_fragment."
+            "ordinal, receipts, and one of content, text, content_fragment, or literal_text. "
+            "literal_text is exact source text even when it looks like JSON."
         ),
         "inputSchema": {
             "type": "object",

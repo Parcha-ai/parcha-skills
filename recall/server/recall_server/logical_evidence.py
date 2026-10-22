@@ -118,6 +118,7 @@ class LogicalEvidenceRecord:
     text: str
     canonical_content_bytes: bytes | None = None
     actor_links: tuple[ActorLink, ...] = ()
+    literal_text: bool = False
 
     def validate(self, *, source_id: str) -> None:
         if (
@@ -157,6 +158,11 @@ class LogicalEvidenceRecord:
                 and self.segment_count != 1
             )
             or actor_links(self.actor_links) != self.actor_links
+            or type(self.literal_text) is not bool
+            or (self.literal_text and (
+                self.event_kind != "connector_record"
+                or self.canonical_content_bytes is not None
+            ))
         ):
             raise LogicalEvidenceError("logical_evidence_record_invalid")
         _parsed_timestamp(self.occurred_at)
@@ -177,7 +183,9 @@ class LogicalEvidenceRecord:
         }
         if self.actor_links:
             value["actor_links"] = canonical_actor_links(self.actor_links)
-        if self.segment_count > 1:
+        if self.literal_text:
+            value["literal_text"] = self.text
+        elif self.segment_count > 1:
             value["content_fragment"] = self.text
         else:
             canonical = self.canonical_content_bytes

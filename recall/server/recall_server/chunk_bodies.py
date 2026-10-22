@@ -151,6 +151,7 @@ def _verified_body(row, segments, location, selected):
         if (segment.segment_ordinal != index or segment.segment_count != len(segments)
                 or segment.ordinal != segments[0].ordinal + index
                 or segment.event_kind != segments[0].event_kind
+                or segment.literal_text != segments[0].literal_text
                 or (index > 0 and segment.receipts)):
             raise ChunkBodyError("archived_chunk_body_unavailable")
     if list(segments[0].receipts) != [c["receipt"] for c in chunks]:

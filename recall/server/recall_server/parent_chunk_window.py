@@ -142,10 +142,10 @@ def _discover(archive, scope, manifest, parts, start, limits, deadline):
                 active = dict(native_id=record.event_native_id,first=record.ordinal,count=record.segment_count,
                     kind=record.event_kind,body_bytes=0)
                 segment = 0
-                shape = record.occurred_at, record.roles, record.actor_links
+                shape = record.occurred_at, record.roles, record.actor_links, record.literal_text
             if (record.event_native_id != active['native_id'] or record.event_kind != active['kind']
                     or record.segment_count != active['count'] or record.segment_ordinal != segment
-                    or (record.occurred_at,record.roles,record.actor_links) != shape
+                    or (record.occurred_at,record.roles,record.actor_links,record.literal_text) != shape
                     or segment > 0 and record.receipts):
                 _fail('event_boundary')
             active['body_bytes'] += len(record.text.encode())
