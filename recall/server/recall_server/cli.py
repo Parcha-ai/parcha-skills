@@ -510,7 +510,7 @@ def _compact_storage(
 def _recompact_oversized_event_pointers(store: BrainStore) -> dict[str, object]:
     """Remove obsolete head/tail previews after S3-backed body thinning."""
 
-    expression = _compact_event_expression()
+    expression = _compact_event_expression(trusted_raw=True)
     with store.connect() as connection:
         row = connection.execute(
             f"""WITH candidates AS MATERIALIZED (
@@ -561,7 +561,7 @@ def _recompact_oversized_event_pointers(store: BrainStore) -> dict[str, object]:
 def _recompact_raw_s3_event_bodies(store: BrainStore) -> dict[str, object]:
     """Remove inline bodies when the immutable raw artifact is live in S3."""
 
-    expression = _compact_event_expression()
+    expression = _compact_event_expression(trusted_raw=True)
     with store.connect() as connection:
         row = connection.execute(
             f"""WITH updated AS (
@@ -597,7 +597,7 @@ def _drain_prepared_event_compaction_queue(
 ) -> dict[str, object]:
     """Drain the shared authority-proven queue with resumable row claims."""
 
-    expression = _compact_event_expression()
+    expression = _compact_event_expression(trusted_raw=True)
     events = after_bytes = batches = 0
     with store.connect() as connection:
         if connection.execute(
@@ -680,7 +680,7 @@ def _recompact_s3_event_bodies(
             store, batch_size=batch_size,
         )
 
-    expression = _compact_event_expression()
+    expression = _compact_event_expression(trusted_raw=True)
     events = after_bytes = batches = 0
     while True:
         with store.connect() as connection:

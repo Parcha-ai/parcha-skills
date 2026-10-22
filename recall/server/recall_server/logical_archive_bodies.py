@@ -91,6 +91,7 @@ class ArchivedBodyLookup:
                         or record.occurred_at != first.occurred_at
                         or record.roles != first.roles
                         or record.actor_links != first.actor_links
+                        or record.literal_text != first.literal_text
                         or record.receipts):
                     raise _invalid()
                 if record.segment_ordinal != segment_index or record.segment_count != first.segment_count:

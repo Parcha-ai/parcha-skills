@@ -1491,7 +1491,7 @@ class CanonicalParquetScanProjector:
 
     @staticmethod
     def _record_content(record: dict[str, Any]) -> str:
-        content = record.get("text", record.get("content_fragment"))
+        content = record.get("literal_text", record.get("text", record.get("content_fragment")))
         if isinstance(content, str):
             return content
         return orjson.dumps(
