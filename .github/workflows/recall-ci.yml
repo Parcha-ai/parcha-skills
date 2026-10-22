@@ -200,6 +200,7 @@ jobs:
             e2e_publication_time_id_index.py \
             e2e_search_durable_page.py \
             e2e_publication_guard_codes.py \
+            e2e_publication_superseded_timeout.py \
             e2e_singleton_search_publication.py \
             e2e_singleton_parquet_receipts.py \
             e2e_singleton_agent_receipts.py \

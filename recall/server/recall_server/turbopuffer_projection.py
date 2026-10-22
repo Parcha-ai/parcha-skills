@@ -488,7 +488,7 @@ class TurbopufferProjector:
         return [
             dict(row)
             for row in connection.execute(
-                """SELECT tenant_id,source_id,month,generation,reason,queued_at
+                """SELECT tenant_id,source_id,month,generation,reason,queued_at,first_queued_at
                      FROM search_projection_outbox
                     WHERE tenant_id=%s
                     ORDER BY queued_at,source_id,month
@@ -1012,6 +1012,13 @@ class TurbopufferProjector:
                 verified = getattr(self.store, "verified_singleton_receipts", False)
                 try:
                     with timing.measure("page"), self.store.connect() as connection:
+                        if resume_after_timeout and (
+                                checkpoint_scope["destination"] != [self.settings.region,
+                                    self.settings.namespace(tenant_id), namespace_schema(self.settings)]
+                                or checkpoint_scope["credential_fingerprint"] != hashlib.sha256(
+                                    ("search-publication-account-v1\0" + self.settings.api_key).encode()).hexdigest()
+                                or checkpoint_scope["verified_singleton_receipts"] != verified):
+                            raise ValueError("publication_resume_scope_changed")
                         if verified:
                             connection.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
                             deadline = time.monotonic() + self.store.search_deadline_ms / 1000
@@ -1020,13 +1027,17 @@ class TurbopufferProjector:
                                     SELECT EXISTS (
                                         SELECT 1 FROM search_projection_outbox
                                          WHERE tenant_id=%s AND source_id=%s AND month=%s
-                                           AND generation=%s AND queued_at=%s AND reason=%s
+                                           AND ((%s AND generation=%s AND queued_at=%s AND reason=%s)
+                                             OR (NOT %s AND first_queued_at=%s
+                                                 AND generation>%s AND queued_at>%s))
                                     ) AND (
                                         SELECT built_at FROM search_projection_shards
                                          WHERE tenant_id=%s AND source_id=%s AND month=%s
                                     ) IS NOT DISTINCT FROM %s::timestamptz AS current
                                 """, (tenant_id, claim["source_id"], claim["month"],
-                                      claim["generation"], claim["queued_at"], claim["reason"],
+                                      checkpoint_current, claim["generation"], claim["queued_at"], claim["reason"],
+                                      checkpoint_current, claim.get("first_queued_at"),
+                                      claim["generation"], claim["queued_at"],
                                       tenant_id, claim["source_id"], claim["month"], catalog_watermark),
                                     deadline).fetchone()["current"]
                                 if not current:

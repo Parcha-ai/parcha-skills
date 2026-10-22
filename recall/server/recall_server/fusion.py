@@ -144,8 +144,10 @@ def leg_document_scores(
         elif score > entry["score"]:
             entry["score"] = score
     if mode == "rrf":
-        for entry in documents.values():
-            entry["normalized"] = 1.0 / (RRF_K + int(entry["rank"]))
+        # Parent admission ranks distinct parents; earlier sibling passages must
+        # not spend another parent's rank. Keep raw passage rank as provenance.
+        for parent_rank, entry in enumerate(documents.values(), start=1):
+            entry["normalized"] = 1.0 / (RRF_K + parent_rank)
         return documents, False
     raw = [float(entry["score"]) for entry in documents.values()]
     recency_mode = bool(raw) and all(value == 0.0 for value in raw)
