@@ -48,7 +48,19 @@ class ReviewLoopPackageTest(unittest.TestCase):
     def test_hung_greptile_run_does_not_block(self):
         text = SKILL.read_text()
         self.assertIn("more than 20 minutes after its\n  `started_at`", text)
-        self.assertIn("Reaching the 20-minute mark is not a timeout.", text)
+        self.assertIn("Reaching\n  the 20-minute mark is not a timeout.", text)
+
+    def test_poll_reaches_hung_run_recovery(self):
+        text = SKILL.read_text()
+        self.assertNotIn("for up to 10 minutes. A check run", text)
+        self.assertIn("A run that has started is never cut off at 10\n  minutes", text)
+        self.assertIn("up to 10 minutes from the trigger", text)
+        reference = (SKILL.parent / "references" / "graphql-queries.md").read_text()
+        self.assertIn("HUNG_AFTER_SECONDS=1200", reference)
+        self.assertIn("HUNG=1", reference)
+        self.assertIn("## Hung run: use or replace the summary", reference)
+        self.assertIn("Last reviewed commit:", reference)
+        self.assertNotIn("MAX_ATTEMPTS=60", reference)
 
     def test_uncapped_iterations_timeout_and_report(self):
         text = SKILL.read_text()

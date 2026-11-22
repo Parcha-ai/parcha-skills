@@ -124,8 +124,9 @@ through GraphQL, never assume a reply resolved anything.
   `started_at` lost its completion callback and will never finish. Stop waiting on it. If the
   summary comment's "Last reviewed commit" equals the PR's head SHA, use that summary's score
   as the result for the head. Otherwise post one `@greptile-apps review` trigger for the head
-  and keep polling the summary, which then decides on its own: the hung run never reaches a
-  terminal `conclusion`. Reaching the 20-minute mark is not a timeout.
+  and poll the summary for the replacement review (bounded; see the polling items below),
+  which then decides on its own: the hung run never reaches a terminal `conclusion`. Reaching
+  the 20-minute mark is not a timeout.
 - The trigger comment text is configurable; the default is `@greptile-apps review`. Post it at
   most once per push. Keep it to the mention: the reason for the re-review belongs in the
   thread replies, which Greptile reads, not in the trigger. A trigger must be a new comment;
@@ -136,11 +137,22 @@ through GraphQL, never assume a reply resolved anything.
   mentions `@greptile-apps`, including older prose triggers. Never collapse the latest
   trigger or a human's comment, and never delete a trigger. See
   `references/graphql-queries.md`.
-- Poll the check run at 10-second intervals for up to 10 minutes. A check run that has only
-  just appeared but is still `PENDING` or `IN_PROGRESS` is not a result: wait for a terminal
-  `conclusion` AND for the summary comment's `updated_at` to move past the trigger time before
-  reading a score. A freshly-appeared check run beside an unchanged summary means Greptile has
-  started but not finished, and reading the old summary then records a stale score.
+- Poll the check run at 10-second intervals. The poll ends in one of three ways: the run
+  reaches `completed`; the run is hung, so leave the check-run poll and follow the hung-run
+  rule above; or 10 minutes pass with neither a Greptile check run nor an updated summary (see
+  the large-PR item below), which is a timeout. A run that has started is never cut off at 10
+  minutes: it completes or turns hung by 20 minutes after its `started_at`, so the poll stays
+  bounded.
+- When the hung-run rule posts a trigger, poll the summary comment at 10-second intervals for
+  up to 10 minutes from the trigger. Stop when its "Last reviewed commit" equals the head SHA
+  and it carries a score; that score is the result, and the hung run's missing `conclusion`
+  does not matter. After 10 minutes without that, it is a timeout. The example in
+  `references/graphql-queries.md` covers both polls.
+- Outside the hung-run case, a check run that has only just appeared but is still `PENDING`
+  or `IN_PROGRESS` is not a result: wait for a terminal `conclusion` AND for the summary
+  comment's `updated_at` to move past the trigger time before reading a score. A
+  freshly-appeared check run beside an unchanged summary means Greptile has started but not
+  finished, and reading the old summary then records a stale score.
 - On large PRs the tagged review may never create a check run for the new head; Greptile instead
   edits its existing summary comment. If no check run appears after a few attempts, poll the most
   recently updated Greptile issue comment and stop when its `updated_at` is later than the trigger
