@@ -178,7 +178,7 @@ gh api "repos/{owner}/{repo}/commits/$HEAD_SHA/check-runs" \
 ```
 
 Post the trigger comment only when no run is `PENDING`, `IN_PROGRESS`, `queued`, or
-`in_progress`:
+`in_progress`, or when the only such run is hung (see "Hung run: use or replace the summary"):
 
 ```bash
 gh pr comment <PR_NUMBER> --body "@greptile-apps review"
@@ -186,27 +186,69 @@ gh pr comment <PR_NUMBER> --body "@greptile-apps review"
 
 ## Bounded poll for the check run
 
+The check-run poll ends when the run completes, when it turns hung (still in progress more
+than 20 minutes after `started_at`), or after 10 minutes with no started Greptile check run.
+A run that is missing or still `queued` (no `started_at`) counts as not started. A started
+run is never cut off before it can turn hung.
+
 ```bash
-ATTEMPTS=0
-MAX_ATTEMPTS=60
+HUNG_AFTER_SECONDS=1200
+NO_RUN_TIMEOUT_SECONDS=600
 POLL_INTERVAL_SECONDS=10
+POLL_STARTED=$(date +%s)
+HUNG=0
 while true; do
-  ATTEMPTS=$((ATTEMPTS + 1))
-  if [ "$ATTEMPTS" -gt "$MAX_ATTEMPTS" ]; then
-    echo "Timed out waiting for the Greptile check run after about 10 minutes." >&2
-    exit 1
-  fi
   CHECK=$(gh api "repos/{owner}/{repo}/commits/$HEAD_SHA/check-runs" \
-    --jq '.check_runs[] | select(.name | test("greptile"; "i"))' 2>/dev/null)
-  if [ -z "$CHECK" ]; then
+    --jq '[.check_runs[] | select(.name | test("greptile"; "i"))] | last // empty' 2>/dev/null)
+  STATUS=$(echo "$CHECK" | jq -r '.status // empty')
+  if [ "$STATUS" = "completed" ]; then
+    break
+  fi
+  STARTED_AT=$(echo "$CHECK" | jq -r '.started_at // empty')
+  if [ -z "$STARTED_AT" ]; then
+    if [ $(( $(date +%s) - POLL_STARTED )) -ge "$NO_RUN_TIMEOUT_SECONDS" ]; then
+      echo "Timed out: no started Greptile check run after about 10 minutes." >&2
+      exit 1
+    fi
     sleep "$POLL_INTERVAL_SECONDS"; continue
   fi
-  STATUS=$(echo "$CHECK" | jq -r '.status // "completed"')
-  if [ "$STATUS" = "completed" ]; then
+  RUN_AGE=$(jq -nr --arg s "$STARTED_AT" 'now - ($s | fromdateiso8601) | floor')
+  if [ "$RUN_AGE" -gt "$HUNG_AFTER_SECONDS" ]; then
+    HUNG=1
     break
   fi
   sleep "$POLL_INTERVAL_SECONDS"
 done
+```
+
+## Hung run: use or replace the summary
+
+When `HUNG=1`, the check run will never complete. Read the summary's "Last reviewed commit".
+If it already equals the head, its score is the result. Otherwise post one trigger and poll
+the summary for up to 10 minutes from the trigger.
+
+```bash
+summary_for_head() {
+  gh api --paginate "repos/{owner}/{repo}/issues/<PR_NUMBER>/comments?per_page=100" \
+    | jq -s -r --arg head "$HEAD_SHA" 'add
+      | map(select(.user.login | test("greptile"; "i")))
+      | sort_by(.updated_at) | last // empty
+      | select(.body | test("Last reviewed commit: \\[[^\\]]*\\]\\([^)]*/commit/" + $head + "\\)"))
+      | select(.body | test("[0-5]/5|greptile_confidence_score:[0-5]"))
+      | .updated_at'
+}
+
+if [ "$HUNG" = 1 ] && [ -z "$(summary_for_head)" ]; then
+  gh pr comment <PR_NUMBER> --body "@greptile-apps review"
+  TRIGGER_POSTED=$(date +%s)
+  until [ -n "$(summary_for_head)" ]; do
+    if [ $(( $(date +%s) - TRIGGER_POSTED )) -ge 600 ]; then
+      echo "Timed out waiting for Greptile's replacement summary after about 10 minutes." >&2
+      exit 1
+    fi
+    sleep "$POLL_INTERVAL_SECONDS"
+  done
+fi
 ```
 
 On timeout, stop the loop and report; never continue with stale or missing results.
