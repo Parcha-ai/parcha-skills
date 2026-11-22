@@ -301,17 +301,21 @@ def git(args: list[str], cwd: Path) -> str:
 
 
 def actual_changes(workdir: Path, base: str, precap_path: Path) -> set[str]:
+    # -z keeps paths verbatim; without it git quotes paths with spaces (status) or
+    # non-ASCII bytes (both), and the quoted form never matches the Footprint entry.
     changed: set[str] = set()
-    committed = git(["diff", "--name-only", f"{base}...HEAD"], workdir)
-    changed.update(line.strip() for line in committed.splitlines() if line.strip())
-    status = git(["status", "--porcelain", "--untracked-files=all"], workdir)
-    for line in status.splitlines():
-        if len(line) < 4:
+    committed = git(["diff", "--name-only", "-z", f"{base}...HEAD"], workdir)
+    changed.update(path for path in committed.split("\0") if path)
+    status = git(["status", "--porcelain", "-z", "--untracked-files=all"], workdir).split("\0")
+    i = 0
+    while i < len(status):
+        entry = status[i]
+        i += 1
+        if len(entry) < 4:
             continue
-        path = line[3:]
-        if " -> " in path:
-            path = path.split(" -> ", 1)[1]
-        changed.add(path.strip())
+        changed.add(entry[3:])
+        if "R" in entry[:2] or "C" in entry[:2]:
+            i += 1  # a rename or copy is followed by its source path, which is not a change
     try:
         rel = os.path.relpath(precap_path.resolve(), workdir.resolve())
         changed.discard(rel)
