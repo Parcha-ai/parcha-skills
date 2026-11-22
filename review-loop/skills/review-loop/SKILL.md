@@ -119,7 +119,13 @@ through GraphQL, never assume a reply resolved anything.
   `gh pr checks <PR_NUMBER> --json name,state` and at
   `repos/{owner}/{repo}/commits/<HEAD_SHA>/check-runs` for a check whose name matches
   `greptile` (case-insensitive). If its state is `PENDING` or `IN_PROGRESS`, do not post; wait
-  for it.
+  for it until it completes or becomes hung (next item).
+- Hung run: a Greptile check run still `IN_PROGRESS` more than 20 minutes after its
+  `started_at` lost its completion callback and will never finish. Stop waiting on it. If the
+  summary comment's "Last reviewed commit" equals the PR's head SHA, use that summary's score
+  as the result for the head. Otherwise post one `@greptile-apps review` trigger for the head
+  and keep polling the summary, which then decides on its own: the hung run never reaches a
+  terminal `conclusion`. Reaching the 20-minute mark is not a timeout.
 - The trigger comment text is configurable; the default is `@greptile-apps review`. Post it at
   most once per push. Keep it to the mention: the reason for the re-review belongs in the
   thread replies, which Greptile reads, not in the trigger. A trigger must be a new comment;

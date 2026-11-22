@@ -45,6 +45,11 @@ class ReviewLoopPackageTest(unittest.TestCase):
         self.assertIn("Never dismiss a human review", text)
         self.assertIn("never mints", text)
 
+    def test_hung_greptile_run_does_not_block(self):
+        text = SKILL.read_text()
+        self.assertIn("more than 20 minutes after its\n  `started_at`", text)
+        self.assertIn("Reaching the 20-minute mark is not a timeout.", text)
+
     def test_uncapped_iterations_timeout_and_report(self):
         text = SKILL.read_text()
         self.assertRegex(text, r"\| `--max-iterations N` \| no \| None \(no cap\)")
