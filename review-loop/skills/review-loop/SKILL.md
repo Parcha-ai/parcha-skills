@@ -139,10 +139,11 @@ through GraphQL, never assume a reply resolved anything.
   `references/graphql-queries.md`.
 - Poll the check run at 10-second intervals. The poll ends in one of three ways: the run
   reaches `completed`; the run is hung, so leave the check-run poll and follow the hung-run
-  rule above; or 10 minutes pass with neither a Greptile check run nor an updated summary (see
-  the large-PR item below), which is a timeout. A run that has started is never cut off at 10
-  minutes: it completes or turns hung by 20 minutes after its `started_at`, so the poll stays
-  bounded.
+  rule above; or 10 minutes pass with no started Greptile check run and no updated summary
+  (see the large-PR item below), which is a timeout. A run still `queued` with no `started_at`
+  has not started and falls under that 10-minute timeout. A run that has started is never cut
+  off at 10 minutes: it completes or turns hung by 20 minutes after its `started_at`, so the
+  poll stays bounded.
 - When the hung-run rule posts a trigger, poll the summary comment at 10-second intervals for
   up to 10 minutes from the trigger. Stop when its "Last reviewed commit" equals the head SHA
   and it carries a score; that score is the result, and the hung run's missing `conclusion`

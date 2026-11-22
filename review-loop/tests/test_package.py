@@ -53,7 +53,8 @@ class ReviewLoopPackageTest(unittest.TestCase):
     def test_poll_reaches_hung_run_recovery(self):
         text = SKILL.read_text()
         self.assertNotIn("for up to 10 minutes. A check run", text)
-        self.assertIn("A run that has started is never cut off at 10\n  minutes", text)
+        self.assertIn("A run that has started is never cut\n  off at 10 minutes", text)
+        self.assertIn("still `queued` with no `started_at`", text)
         self.assertIn("up to 10 minutes from the trigger", text)
         reference = (SKILL.parent / "references" / "graphql-queries.md").read_text()
         self.assertIn("HUNG_AFTER_SECONDS=1200", reference)
@@ -61,6 +62,7 @@ class ReviewLoopPackageTest(unittest.TestCase):
         self.assertIn("## Hung run: use or replace the summary", reference)
         self.assertIn("Last reviewed commit:", reference)
         self.assertNotIn("MAX_ATTEMPTS=60", reference)
+        self.assertIn("STARTED_AT=$(echo \"$CHECK\" | jq -r '.started_at // empty')", reference)
 
     def test_uncapped_iterations_timeout_and_report(self):
         text = SKILL.read_text()

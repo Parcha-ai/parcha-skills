@@ -187,8 +187,9 @@ gh pr comment <PR_NUMBER> --body "@greptile-apps review"
 ## Bounded poll for the check run
 
 The check-run poll ends when the run completes, when it turns hung (still in progress more
-than 20 minutes after `started_at`), or after 10 minutes with no Greptile check run at all.
-A started run is never cut off before it can turn hung.
+than 20 minutes after `started_at`), or after 10 minutes with no started Greptile check run.
+A run that is missing or still `queued` (no `started_at`) counts as not started. A started
+run is never cut off before it can turn hung.
 
 ```bash
 HUNG_AFTER_SECONDS=1200
@@ -199,18 +200,19 @@ HUNG=0
 while true; do
   CHECK=$(gh api "repos/{owner}/{repo}/commits/$HEAD_SHA/check-runs" \
     --jq '[.check_runs[] | select(.name | test("greptile"; "i"))] | last // empty' 2>/dev/null)
-  if [ -z "$CHECK" ]; then
+  STATUS=$(echo "$CHECK" | jq -r '.status // empty')
+  if [ "$STATUS" = "completed" ]; then
+    break
+  fi
+  STARTED_AT=$(echo "$CHECK" | jq -r '.started_at // empty')
+  if [ -z "$STARTED_AT" ]; then
     if [ $(( $(date +%s) - POLL_STARTED )) -ge "$NO_RUN_TIMEOUT_SECONDS" ]; then
-      echo "Timed out: no Greptile check run after about 10 minutes." >&2
+      echo "Timed out: no started Greptile check run after about 10 minutes." >&2
       exit 1
     fi
     sleep "$POLL_INTERVAL_SECONDS"; continue
   fi
-  STATUS=$(echo "$CHECK" | jq -r '.status // "completed"')
-  if [ "$STATUS" = "completed" ]; then
-    break
-  fi
-  RUN_AGE=$(echo "$CHECK" | jq -r 'if .started_at then (now - (.started_at | fromdateiso8601) | floor) else 0 end')
+  RUN_AGE=$(jq -nr --arg s "$STARTED_AT" 'now - ($s | fromdateiso8601) | floor')
   if [ "$RUN_AGE" -gt "$HUNG_AFTER_SECONDS" ]; then
     HUNG=1
     break
